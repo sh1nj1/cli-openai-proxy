@@ -327,47 +327,25 @@ async function handleNonStreamingResponse(
  * Returns available models
  */
 export function handleModels(_req: Request, res: Response): void {
-  res.json({
-    object: "list",
-    data: [
-      {
-        id: "claude-opus-4-6",
-        object: "model",
-        owned_by: "anthropic",
-        created: Math.floor(Date.now() / 1000),
-      },
-      {
-        id: "claude-opus-4",
-        object: "model",
-        owned_by: "anthropic",
-        created: Math.floor(Date.now() / 1000),
-      },
-      {
-        id: "claude-sonnet-4-5-20250929",
-        object: "model",
-        owned_by: "anthropic",
-        created: Math.floor(Date.now() / 1000),
-      },
-      {
-        id: "claude-sonnet-4",
-        object: "model",
-        owned_by: "anthropic",
-        created: Math.floor(Date.now() / 1000),
-      },
-      {
-        id: "claude-haiku-4-5-20251001",
-        object: "model",
-        owned_by: "anthropic",
-        created: Math.floor(Date.now() / 1000),
-      },
-      {
-        id: "claude-haiku-4",
-        object: "model",
-        owned_by: "anthropic",
-        created: Math.floor(Date.now() / 1000),
-      },
-    ],
-  });
+  const now = Math.floor(Date.now() / 1000);
+  const baseModels = [
+    "claude-opus-4-6",
+    "claude-opus-4",
+    "claude-sonnet-4-5-20250929",
+    "claude-sonnet-4",
+    "claude-haiku-4-5-20251001",
+    "claude-haiku-4",
+  ];
+  const prefixes = ["", "openai/", "anthropic/", "claude-max/", "claude-code-cli/"];
+  const data = prefixes.flatMap((prefix) =>
+    baseModels.map((id) => ({
+      id: `${prefix}${id}`,
+      object: "model" as const,
+      owned_by: "anthropic",
+      created: now,
+    }))
+  );
+  res.json({ object: "list", data });
 }
 
 /**

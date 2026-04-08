@@ -91,7 +91,6 @@ export class ClaudeSubprocess extends EventEmitter {
         // Parse JSON stream from stdout
         this.process.stdout?.on("data", (chunk: Buffer) => {
           const data = chunk.toString();
-          console.error(`[Subprocess] Received ${data.length} bytes of stdout`);
           this.buffer += data;
           this.processBuffer();
         });
@@ -100,15 +99,17 @@ export class ClaudeSubprocess extends EventEmitter {
         this.process.stderr?.on("data", (chunk: Buffer) => {
           const errorText = chunk.toString().trim();
           if (errorText) {
-            // Don't emit as error unless it's actually an error
-            // Claude CLI may write debug info to stderr
-            console.error("[Subprocess stderr]:", errorText.slice(0, 200));
+            console.error("[Subprocess stderr]:", errorText);
           }
         });
 
         // Handle process close
         this.process.on("close", (code) => {
-          console.error(`[Subprocess] Process closed with code: ${code}`);
+          if (code !== 0) {
+            console.error(`[Subprocess] Process exited with error code: ${code}`);
+          } else {
+            console.error(`[Subprocess] Process closed with code: ${code}`);
+          }
           this.clearTimeout();
           // Process any remaining buffer
           if (this.buffer.trim()) {
@@ -170,15 +171,27 @@ export class ClaudeSubprocess extends EventEmitter {
         this.emit("message", message);
 
         if (isContentDelta(message)) {
-          // Emit content delta for streaming
+          const delta = (message as ClaudeCliStreamEvent).event?.delta;
+          if (delta?.text) {
+            process.stderr.write(delta.text);
+          }
           this.emit("content_delta", message as ClaudeCliStreamEvent);
         } else if (isAssistantMessage(message)) {
           this.emit("assistant", message);
         } else if (isResultMessage(message)) {
+          const result = message as ClaudeCliResult;
+          if (result.is_error || result.subtype === "error") {
+            console.error(`\n[Subprocess] Error: ${result.result}`);
+          }
+          const usage = result.usage;
+          if (usage) {
+            console.error(`[Subprocess] Tokens: in=${usage.input_tokens || 0} out=${usage.output_tokens || 0} cache_read=${usage.cache_read_input_tokens || 0} cache_write=${usage.cache_creation_input_tokens || 0}`);
+          }
           this.emit("result", message);
         }
       } catch {
         // Non-JSON output, emit as raw
+        console.error("[Subprocess raw]:", trimmed);
         this.emit("raw", trimmed);
       }
     }
