@@ -68,7 +68,8 @@ async function main(): Promise<void> {
   console.log(`  Port:      ${port}`);
   console.log(`  API keys:  ${process.env.API_KEYS ? "enabled" : "disabled (open access)"}`);
   console.log(`  Debug:     ${process.env.DEBUG ? "enabled" : "disabled"}`);
-  console.log(`  Timeout:   ${process.env.TIMEOUT || "600000"}ms`);
+  const timeoutMs = parseInt(process.env.TIMEOUT || "6000000", 10);
+  console.log(`  Timeout:   ${timeoutMs}ms (${(timeoutMs / 60000).toFixed(1)} min)`);
 
   // Show CLI command template
   console.log("\n[CLI Command]");

@@ -17,6 +17,15 @@ import type { ClaudeCliAssistant, ClaudeCliResult, ClaudeCliStreamEvent } from "
 import { usageTracker } from "../usage/tracker.js";
 import { isAuthEnabled } from "./auth.js";
 
+const DEFAULT_TIMEOUT_MS = 6000000;
+
+function getTimeoutMs(): number {
+  const raw = process.env.TIMEOUT;
+  if (!raw) return DEFAULT_TIMEOUT_MS;
+  const parsed = parseInt(raw, 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : DEFAULT_TIMEOUT_MS;
+}
+
 /**
  * Handle POST /v1/chat/completions
  *
@@ -218,6 +227,7 @@ async function handleStreamingResponse(
       model: cliInput.model,
       systemPrompt: cliInput.systemPrompt,
       sessionId: cliInput.sessionId,
+      timeout: getTimeoutMs(),
     }).catch((err) => {
       console.error("[Streaming] Subprocess start error:", err);
       reject(err);
@@ -307,6 +317,7 @@ async function handleNonStreamingResponse(
         model: cliInput.model,
         systemPrompt: cliInput.systemPrompt,
         sessionId: cliInput.sessionId,
+        timeout: getTimeoutMs(),
       })
       .catch((error) => {
         res.status(500).json({
