@@ -11,20 +11,13 @@ import { openaiToCli } from "../adapter/openai-to-cli.js";
 import {
   cliResultToOpenai,
   createDoneChunk,
+  extractJsonFromText,
 } from "../adapter/cli-to-openai.js";
 import type { OpenAIChatRequest } from "../types/openai.js";
 import type { ClaudeCliAssistant, ClaudeCliResult, ClaudeCliStreamEvent } from "../types/claude-cli.js";
 import { usageTracker } from "../usage/tracker.js";
 import { isAuthEnabled } from "./auth.js";
-
-const DEFAULT_TIMEOUT_MS = 6000000;
-
-function getTimeoutMs(): number {
-  const raw = process.env.TIMEOUT;
-  if (!raw) return DEFAULT_TIMEOUT_MS;
-  const parsed = parseInt(raw, 10);
-  return Number.isFinite(parsed) && parsed > 0 ? parsed : DEFAULT_TIMEOUT_MS;
-}
+import { PKG_VERSION, getTimeoutMs, KEEPALIVE_INTERVAL_MS } from "../config.js";
 
 /**
  * Handle POST /v1/chat/completions
@@ -59,9 +52,9 @@ export async function handleChatCompletions(
     const subprocess = new ClaudeSubprocess();
 
     if (stream) {
-      await handleStreamingResponse(req, res, subprocess, cliInput, requestId, requestedModel, startTime);
+      await handleStreamingResponse(req, res, subprocess, cliInput, requestId, requestedModel, startTime, cliInput.jsonMode);
     } else {
-      await handleNonStreamingResponse(res, subprocess, cliInput, requestId, requestedModel, startTime);
+      await handleNonStreamingResponse(res, subprocess, cliInput, requestId, requestedModel, startTime, cliInput.jsonMode);
     }
   } catch (error) {
     const message = error instanceof Error ? error.message : "Unknown error";
@@ -102,7 +95,8 @@ async function handleStreamingResponse(
   cliInput: ReturnType<typeof openaiToCli>,
   requestId: string,
   requestedModel: string,
-  startTime: number
+  startTime: number,
+  jsonMode?: boolean
 ): Promise<void> {
   // Set SSE headers
   res.setHeader("Content-Type", "text/event-stream");
@@ -121,36 +115,57 @@ async function handleStreamingResponse(
     let isFirst = true;
     let lastModel = requestedModel;
     let isComplete = false;
+    let jsonBuffer = "";
+    let keepaliveInterval: NodeJS.Timeout | null = null;
+
+    const clearKeepalive = () => {
+      if (keepaliveInterval) {
+        clearInterval(keepaliveInterval);
+        keepaliveInterval = null;
+      }
+    };
 
     // Handle actual client disconnect (response stream closed)
     res.on("close", () => {
+      clearKeepalive();
       if (!isComplete) {
-        // Client disconnected before response completed - kill subprocess
         subprocess.kill();
       }
       resolve();
     });
 
+    if (jsonMode) {
+      keepaliveInterval = setInterval(() => {
+        if (!res.writableEnded) {
+          res.write(":keepalive\n\n");
+        }
+      }, KEEPALIVE_INTERVAL_MS);
+    }
+
     // Handle streaming content deltas
     subprocess.on("content_delta", (event: ClaudeCliStreamEvent) => {
       const text = event.event.delta?.text || "";
       if (text && !res.writableEnded) {
-        const chunk = {
-          id: `chatcmpl-${requestId}`,
-          object: "chat.completion.chunk",
-          created: Math.floor(Date.now() / 1000),
-          model: requestedModel,
-          choices: [{
-            index: 0,
-            delta: {
-              role: isFirst ? "assistant" : undefined,
-              content: text,
-            },
-            finish_reason: null,
-          }],
-        };
-        res.write(`data: ${JSON.stringify(chunk)}\n\n`);
-        isFirst = false;
+        if (jsonMode) {
+          jsonBuffer += text;
+        } else {
+          const chunk = {
+            id: `chatcmpl-${requestId}`,
+            object: "chat.completion.chunk",
+            created: Math.floor(Date.now() / 1000),
+            model: requestedModel,
+            choices: [{
+              index: 0,
+              delta: {
+                role: isFirst ? "assistant" : undefined,
+                content: text,
+              },
+              finish_reason: null,
+            }],
+          };
+          res.write(`data: ${JSON.stringify(chunk)}\n\n`);
+          isFirst = false;
+        }
       }
     });
 
@@ -161,6 +176,7 @@ async function handleStreamingResponse(
 
     subprocess.on("result", (result: ClaudeCliResult) => {
       isComplete = true;
+      clearKeepalive();
 
       // Track usage
       usageTracker.record({
@@ -175,6 +191,21 @@ async function handleStreamingResponse(
       });
 
       if (!res.writableEnded) {
+        if (jsonMode && jsonBuffer) {
+          const extracted = extractJsonFromText(jsonBuffer);
+          const chunk = {
+            id: `chatcmpl-${requestId}`,
+            object: "chat.completion.chunk",
+            created: Math.floor(Date.now() / 1000),
+            model: requestedModel,
+            choices: [{
+              index: 0,
+              delta: { role: "assistant" as const, content: extracted },
+              finish_reason: null,
+            }],
+          };
+          res.write(`data: ${JSON.stringify(chunk)}\n\n`);
+        }
         // Send final done chunk with finish_reason
         const doneChunk = createDoneChunk(requestId, lastModel);
         res.write(`data: ${JSON.stringify(doneChunk)}\n\n`);
@@ -186,6 +217,7 @@ async function handleStreamingResponse(
 
     subprocess.on("error", (error: Error) => {
       console.error("[Streaming] Error:", error.message);
+      clearKeepalive();
 
       usageTracker.record({
         model: requestedModel,
@@ -208,7 +240,7 @@ async function handleStreamingResponse(
     });
 
     subprocess.on("close", (code: number | null) => {
-      // Subprocess exited - ensure response is closed
+      clearKeepalive();
       if (!res.writableEnded) {
         if (code !== 0 && !isComplete) {
           // Abnormal exit without result - send error
@@ -229,6 +261,7 @@ async function handleStreamingResponse(
       sessionId: cliInput.sessionId,
       timeout: getTimeoutMs(),
     }).catch((err) => {
+      clearKeepalive();
       console.error("[Streaming] Subprocess start error:", err);
       reject(err);
     });
@@ -244,7 +277,8 @@ async function handleNonStreamingResponse(
   cliInput: ReturnType<typeof openaiToCli>,
   requestId: string,
   requestedModel: string,
-  startTime: number
+  startTime: number,
+  jsonMode?: boolean
 ): Promise<void> {
   return new Promise((resolve) => {
     let finalResult: ClaudeCliResult | null = null;
@@ -289,7 +323,7 @@ async function handleNonStreamingResponse(
           success: true,
         });
 
-        res.json(cliResultToOpenai(finalResult, requestId, requestedModel));
+        res.json(cliResultToOpenai(finalResult, requestId, requestedModel, jsonMode));
       } else if (!res.headersSent) {
         usageTracker.record({
           model: requestedModel,
@@ -337,7 +371,7 @@ async function handleNonStreamingResponse(
  *
  * Returns available models
  */
-export function handleModels(_req: Request, res: Response): void {
+const MODELS_DATA = (() => {
   const now = Math.floor(Date.now() / 1000);
   const baseModels = [
     "claude-opus-4-6",
@@ -348,15 +382,21 @@ export function handleModels(_req: Request, res: Response): void {
     "claude-haiku-4",
   ];
   const prefixes = ["", "openai/", "anthropic/", "claude-max/", "claude-code-cli/"];
-  const data = prefixes.flatMap((prefix) =>
-    baseModels.map((id) => ({
-      id: `${prefix}${id}`,
-      object: "model" as const,
-      owned_by: "anthropic",
-      created: now,
-    }))
-  );
-  res.json({ object: "list", data });
+  return Object.freeze({
+    object: "list" as const,
+    data: prefixes.flatMap((prefix) =>
+      baseModels.map((id) => ({
+        id: `${prefix}${id}`,
+        object: "model" as const,
+        owned_by: "anthropic",
+        created: now,
+      }))
+    ),
+  });
+})();
+
+export function handleModels(_req: Request, res: Response): void {
+  res.json(MODELS_DATA);
 }
 
 /**
@@ -381,7 +421,8 @@ export function handleUsage(req: Request, res: Response): void {
  * Returns recent request records
  */
 export function handleUsageRecent(req: Request, res: Response): void {
-  const limit = req.query.limit ? parseInt(req.query.limit as string, 10) : 20;
+  const raw = req.query.limit ? parseInt(req.query.limit as string, 10) : 20;
+  const limit = Math.min(Math.max(raw || 20, 1), 1000);
   const records = usageTracker.getRecent(limit);
 
   res.json({
@@ -401,7 +442,7 @@ export function handleHealth(_req: Request, res: Response): void {
   res.json({
     status: "ok",
     provider: "claude-code-cli",
-    version: "1.2.1",
+    version: PKG_VERSION,
     auth: isAuthEnabled() ? "enabled" : "disabled",
     usage: {
       totalRequests: summary.totalRequests,

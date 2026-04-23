@@ -23,6 +23,7 @@ export interface OpenAIChatRequest {
   top_p?: number;
   frequency_penalty?: number;
   presence_penalty?: number;
+  response_format?: { type: "text" | "json_object" | "json_schema"; json_schema?: unknown };
   user?: string; // Used for session mapping
 }
 

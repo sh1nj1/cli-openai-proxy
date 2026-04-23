@@ -10,26 +10,12 @@
 
 import { startServer, stopServer } from "./index.js";
 import { verifyClaude, verifyAuth } from "../subprocess/manager.js";
-import { readFileSync } from "fs";
-import { fileURLToPath } from "url";
-import path from "path";
+import { PKG_VERSION, getTimeoutMs } from "../config.js";
 
 const DEFAULT_PORT = 3456;
 
-function getVersion(): string {
-  try {
-    const __dirname = path.dirname(fileURLToPath(import.meta.url));
-    const pkg = JSON.parse(readFileSync(path.resolve(__dirname, "../../package.json"), "utf-8"));
-    return pkg.version || "unknown";
-  } catch {
-    return "unknown";
-  }
-}
-
 async function main(): Promise<void> {
-  const version = getVersion();
-
-  console.log(`\nclaude-max-api-proxy v${version}`);
+  console.log(`\nclaude-max-api-proxy v${PKG_VERSION}`);
   console.log("=".repeat(40));
 
   // Parse port and host from command line / environment
@@ -68,7 +54,7 @@ async function main(): Promise<void> {
   console.log(`  Port:      ${port}`);
   console.log(`  API keys:  ${process.env.API_KEYS ? "enabled" : "disabled (open access)"}`);
   console.log(`  Debug:     ${process.env.DEBUG ? "enabled" : "disabled"}`);
-  const timeoutMs = parseInt(process.env.TIMEOUT || "6000000", 10);
+  const timeoutMs = getTimeoutMs();
   console.log(`  Timeout:   ${timeoutMs}ms (${(timeoutMs / 60000).toFixed(1)} min)`);
 
   // Show CLI command template

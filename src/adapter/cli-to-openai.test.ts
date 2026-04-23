@@ -5,6 +5,7 @@ import {
   cliToOpenaiChunk,
   createDoneChunk,
   cliResultToOpenai,
+  extractJsonFromText,
 } from "./cli-to-openai.js";
 import type { ClaudeCliAssistant, ClaudeCliResult } from "../types/claude-cli.js";
 
@@ -112,5 +113,61 @@ describe("cliResultToOpenai", () => {
   it("normalizes model from modelUsage when no requestedModel", () => {
     const response = cliResultToOpenai(makeResult("Hello!"), "req-1");
     assert.equal(response.model, "claude-sonnet-4");
+  });
+
+  it("extracts JSON from mixed content in jsonMode", () => {
+    const mixed = '여기 마법입니다:\n```json\n{"name":"메테오"}\n```\n설명입니다.';
+    const response = cliResultToOpenai(makeResult(mixed), "req-1", undefined, true);
+    assert.equal(response.choices[0].message.content, '{"name":"메테오"}');
+  });
+
+  it("returns raw content when jsonMode is false", () => {
+    const mixed = 'Some text {"key":"val"} more text';
+    const response = cliResultToOpenai(makeResult(mixed), "req-1", undefined, false);
+    assert.equal(response.choices[0].message.content, mixed);
+  });
+});
+
+describe("extractJsonFromText", () => {
+  it("returns valid JSON as-is", () => {
+    const json = '{"name":"test","value":42}';
+    assert.equal(extractJsonFromText(json), json);
+  });
+
+  it("extracts JSON from markdown code fence", () => {
+    const text = 'Here is the spell:\n```json\n{"name":"메테오","element":"red"}\n```\nDesign rationale...';
+    assert.equal(extractJsonFromText(text), '{"name":"메테오","element":"red"}');
+  });
+
+  it("extracts JSON from code fence without language tag", () => {
+    const text = '```\n{"key":"value"}\n```';
+    assert.equal(extractJsonFromText(text), '{"key":"value"}');
+  });
+
+  it("extracts JSON object from surrounding text", () => {
+    const text = 'Here is my answer: {"name":"fireball","blocks":[]} and that is it.';
+    assert.equal(extractJsonFromText(text), '{"name":"fireball","blocks":[]}');
+  });
+
+  it("extracts JSON array from surrounding text", () => {
+    const text = 'Results: [{"a":1},{"b":2}] done.';
+    assert.equal(extractJsonFromText(text), '[{"a":1},{"b":2}]');
+  });
+
+  it("handles nested braces correctly", () => {
+    const json = '{"outer":{"inner":{"deep":true}}}';
+    const text = `Some prefix ${json} some suffix`;
+    assert.equal(extractJsonFromText(text), json);
+  });
+
+  it("handles strings with braces inside", () => {
+    const json = '{"msg":"hello {world}"}';
+    const text = `prefix ${json} suffix`;
+    assert.equal(extractJsonFromText(text), json);
+  });
+
+  it("returns original text if no valid JSON found", () => {
+    const text = "This is just plain text with no JSON.";
+    assert.equal(extractJsonFromText(text), text);
   });
 });

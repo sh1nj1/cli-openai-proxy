@@ -7,8 +7,6 @@
 
 import { spawn, ChildProcess } from "child_process";
 import { EventEmitter } from "events";
-import fs from "fs/promises";
-import path from "path";
 import type {
   ClaudeCliMessage,
   ClaudeCliAssistant,
@@ -17,6 +15,7 @@ import type {
 } from "../types/claude-cli.js";
 import { isAssistantMessage, isResultMessage, isContentDelta } from "../types/claude-cli.js";
 import type { ClaudeModel } from "../adapter/openai-to-cli.js";
+import { DEFAULT_TIMEOUT_MS } from "../config.js";
 
 export interface SubprocessOptions {
   model: ClaudeModel;
@@ -24,6 +23,17 @@ export interface SubprocessOptions {
   systemPrompt?: string;
   cwd?: string;
   timeout?: number;
+}
+
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+export function isValidSessionId(sessionId: string): boolean {
+  return UUID_RE.test(sessionId);
+}
+
+function redactSessionId(sessionId: string): string {
+  if (sessionId.length <= 8) return "***";
+  return `${sessionId.slice(0, 4)}…${sessionId.slice(-4)}`;
 }
 
 export interface SubprocessEvents {
@@ -34,8 +44,6 @@ export interface SubprocessEvents {
   close: (code: number | null) => void;
   raw: (line: string) => void;
 }
-
-const DEFAULT_TIMEOUT = 6000000; // 100 minutes
 
 export class ClaudeSubprocess extends EventEmitter {
   private process: ChildProcess | null = null;
@@ -48,7 +56,7 @@ export class ClaudeSubprocess extends EventEmitter {
    */
   async start(prompt: string, options: SubprocessOptions): Promise<void> {
     const args = this.buildArgs(options);
-    const timeout = options.timeout || DEFAULT_TIMEOUT;
+    const timeout = options.timeout || DEFAULT_TIMEOUT_MS;
 
     return new Promise((resolve, reject) => {
       try {
@@ -149,7 +157,13 @@ export class ClaudeSubprocess extends EventEmitter {
     }
 
     if (options.sessionId) {
-      args.push("--session-id", options.sessionId);
+      if (isValidSessionId(options.sessionId)) {
+        args.push("--session-id", options.sessionId);
+      } else {
+        console.error(
+          `[Subprocess] Ignoring invalid sessionId (expected UUID): ${redactSessionId(options.sessionId)}`
+        );
+      }
     }
 
     return args;
