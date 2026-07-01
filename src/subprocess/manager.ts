@@ -56,7 +56,8 @@ export class ClaudeSubprocess extends EventEmitter {
    */
   async start(prompt: string, options: SubprocessOptions): Promise<void> {
     const args = this.buildArgs(options);
-    const timeout = options.timeout || DEFAULT_TIMEOUT_MS;
+    // ?? (not ||) so a caller-supplied 0 means "no timeout" rather than falling back.
+    const timeout = options.timeout ?? DEFAULT_TIMEOUT_MS;
 
     return new Promise((resolve, reject) => {
       try {
@@ -72,14 +73,16 @@ export class ClaudeSubprocess extends EventEmitter {
           stdio: ["pipe", "pipe", "pipe"],
         });
 
-        // Set timeout
-        this.timeoutId = setTimeout(() => {
-          if (!this.isKilled) {
-            this.isKilled = true;
-            this.process?.kill("SIGTERM");
-            this.emit("error", new Error(`Request timed out after ${timeout}ms`));
-          }
-        }, timeout);
+        // Set timeout only when bounded; 0 = run until the subprocess exits itself.
+        if (timeout > 0) {
+          this.timeoutId = setTimeout(() => {
+            if (!this.isKilled) {
+              this.isKilled = true;
+              this.process?.kill("SIGTERM");
+              this.emit("error", new Error(`Request timed out after ${timeout}ms`));
+            }
+          }, timeout);
+        }
 
         // Handle spawn errors (e.g., claude not found)
         this.process.on("error", (err) => {

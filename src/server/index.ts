@@ -104,6 +104,12 @@ export async function startServer(config: ServerConfig): Promise<Server> {
   return new Promise((resolve, reject) => {
     serverInstance = createServer(app);
 
+    // A long-running completion (waiting on background subagents) can stream for
+    // hours. Disable Node's socket/request timeouts so nothing severs the
+    // connection mid-response; the subprocess is the only lifecycle bound.
+    serverInstance.timeout = 0; // no socket inactivity timeout
+    serverInstance.requestTimeout = 0; // no cap on total request duration
+
     serverInstance.on("error", (err: NodeJS.ErrnoException) => {
       if (err.code === "EADDRINUSE") {
         reject(new Error(`Port ${port} is already in use`));

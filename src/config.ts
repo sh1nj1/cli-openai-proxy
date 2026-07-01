@@ -2,11 +2,15 @@ import { readFileSync } from "fs";
 import { fileURLToPath } from "url";
 import path from "path";
 
-export const DEFAULT_TIMEOUT_MS = 6000000; // 100 minutes
+// 0 = no timeout: let `claude -p` run until it exits on its own. Combined with
+// the unbounded background-wait ceiling below, the CLI stays alive until its
+// subagents finish, then exits normally — so no external clock should cut it
+// short. Set TIMEOUT to a positive ms value to re-impose an upper bound.
+export const DEFAULT_TIMEOUT_MS = 0;
 
 // Since v2.1.182, `claude -p` caps how long it waits for background subagents
 // to finish at 10 minutes by default, then exits — cutting off longer runs.
-// 0 = wait until subagents finish; the request timeout above is the real bound.
+// 0 = wait until subagents finish (no ceiling).
 export const DEFAULT_BG_WAIT_CEILING_MS = 0;
 
 const KEEPALIVE_INTERVAL_MS = 15000;
