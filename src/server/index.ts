@@ -105,13 +105,17 @@ export async function startServer(config: ServerConfig): Promise<Server> {
   return new Promise((resolve, reject) => {
     serverInstance = createServer(app);
 
-    // A long-running completion (waiting on background subagents) can stream for
-    // hours. Track the configured request timeout (default 0 = never) so the
-    // socket isn't severed mid-response before the subprocess finishes; a
-    // positive TIMEOUT re-imposes the bound here too, matching the subprocess.
-    const socketTimeout = getTimeoutMs();
-    serverInstance.timeout = socketTimeout; // socket inactivity timeout
-    serverInstance.requestTimeout = socketTimeout; // cap on total request duration
+    // A long-running completion (waiting on background subagents) can stay
+    // connected for hours with the socket idle between keepalives. Track the
+    // configured request timeout (default 0 = never) as the socket inactivity
+    // timeout so it isn't severed before the subprocess finishes; a positive
+    // TIMEOUT re-imposes the bound here too, matching the subprocess.
+    //
+    // requestTimeout is intentionally left at Node's default: it only bounds
+    // receipt of the request itself (headers + body), a phase that always
+    // completes quickly here, and its timer is cleared before the long response
+    // phase. Zeroing it would gain nothing and expose a slow-request DoS window.
+    serverInstance.timeout = getTimeoutMs(); // socket inactivity timeout
 
     serverInstance.on("error", (err: NodeJS.ErrnoException) => {
       if (err.code === "EADDRINUSE") {

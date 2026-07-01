@@ -134,13 +134,15 @@ async function handleStreamingResponse(
       resolve();
     });
 
-    if (jsonMode) {
-      keepaliveInterval = setInterval(() => {
-        if (!res.writableEnded) {
-          res.write(":keepalive\n\n");
-        }
-      }, KEEPALIVE_INTERVAL_MS);
-    }
+    // Keep the SSE connection warm in every mode: while waiting on a quiet
+    // background subagent, no content deltas flow (jsonMode buffers them
+    // entirely), so without a periodic comment an idle-connection proxy could
+    // close the socket and reap the long run this change is meant to preserve.
+    keepaliveInterval = setInterval(() => {
+      if (!res.writableEnded) {
+        res.write(":keepalive\n\n");
+      }
+    }, KEEPALIVE_INTERVAL_MS);
 
     // Handle streaming content deltas
     subprocess.on("content_delta", (event: ClaudeCliStreamEvent) => {
