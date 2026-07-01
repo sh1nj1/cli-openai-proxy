@@ -15,7 +15,7 @@ import type {
 } from "../types/claude-cli.js";
 import { isAssistantMessage, isResultMessage, isContentDelta } from "../types/claude-cli.js";
 import type { ClaudeModel } from "../adapter/openai-to-cli.js";
-import { DEFAULT_TIMEOUT_MS } from "../config.js";
+import { DEFAULT_TIMEOUT_MS, getBgWaitCeilingMs } from "../config.js";
 
 export interface SubprocessOptions {
   model: ClaudeModel;
@@ -56,25 +56,33 @@ export class ClaudeSubprocess extends EventEmitter {
    */
   async start(prompt: string, options: SubprocessOptions): Promise<void> {
     const args = this.buildArgs(options);
-    const timeout = options.timeout || DEFAULT_TIMEOUT_MS;
+    // ?? (not ||) so a caller-supplied 0 means "no timeout" rather than falling back.
+    const timeout = options.timeout ?? DEFAULT_TIMEOUT_MS;
 
     return new Promise((resolve, reject) => {
       try {
         // Use spawn() for security - no shell interpretation
         this.process = spawn("claude", args, {
           cwd: options.cwd || process.cwd(),
-          env: { ...process.env },
+          env: {
+            ...process.env,
+            // Keep `claude -p` alive until background subagents finish instead of
+            // exiting at the CLI's 10-minute default cap (see config.ts).
+            CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS: String(getBgWaitCeilingMs()),
+          },
           stdio: ["pipe", "pipe", "pipe"],
         });
 
-        // Set timeout
-        this.timeoutId = setTimeout(() => {
-          if (!this.isKilled) {
-            this.isKilled = true;
-            this.process?.kill("SIGTERM");
-            this.emit("error", new Error(`Request timed out after ${timeout}ms`));
-          }
-        }, timeout);
+        // Set timeout only when bounded; 0 = run until the subprocess exits itself.
+        if (timeout > 0) {
+          this.timeoutId = setTimeout(() => {
+            if (!this.isKilled) {
+              this.isKilled = true;
+              this.process?.kill("SIGTERM");
+              this.emit("error", new Error(`Request timed out after ${timeout}ms`));
+            }
+          }, timeout);
+        }
 
         // Handle spawn errors (e.g., claude not found)
         this.process.on("error", (err) => {
