@@ -8,6 +8,7 @@ import express, { Express, Request, Response, NextFunction } from "express";
 import { createServer, Server } from "http";
 import { handleChatCompletions, handleModels, handleHealth, handleUsage, handleUsageRecent } from "./routes.js";
 import { initAuth, authMiddleware } from "./auth.js";
+import { getTimeoutMs } from "../config.js";
 
 export interface ServerConfig {
   port: number;
@@ -105,10 +106,12 @@ export async function startServer(config: ServerConfig): Promise<Server> {
     serverInstance = createServer(app);
 
     // A long-running completion (waiting on background subagents) can stream for
-    // hours. Disable Node's socket/request timeouts so nothing severs the
-    // connection mid-response; the subprocess is the only lifecycle bound.
-    serverInstance.timeout = 0; // no socket inactivity timeout
-    serverInstance.requestTimeout = 0; // no cap on total request duration
+    // hours. Track the configured request timeout (default 0 = never) so the
+    // socket isn't severed mid-response before the subprocess finishes; a
+    // positive TIMEOUT re-imposes the bound here too, matching the subprocess.
+    const socketTimeout = getTimeoutMs();
+    serverInstance.timeout = socketTimeout; // socket inactivity timeout
+    serverInstance.requestTimeout = socketTimeout; // cap on total request duration
 
     serverInstance.on("error", (err: NodeJS.ErrnoException) => {
       if (err.code === "EADDRINUSE") {
