@@ -282,12 +282,24 @@ async function handleNonStreamingResponse(
 ): Promise<void> {
   return new Promise((resolve) => {
     let finalResult: ClaudeCliResult | null = null;
+    let isComplete = false;
+
+    // With the request timeout unbounded by default, a client that disconnects
+    // (or an intermediary that times out) would otherwise leave the subprocess
+    // running forever with nobody to receive the result. Kill it on disconnect.
+    res.on("close", () => {
+      if (!isComplete) {
+        subprocess.kill();
+      }
+      resolve();
+    });
 
     subprocess.on("result", (result: ClaudeCliResult) => {
       finalResult = result;
     });
 
     subprocess.on("error", (error: Error) => {
+      isComplete = true;
       console.error("[NonStreaming] Error:", error.message);
 
       usageTracker.record({
@@ -310,6 +322,7 @@ async function handleNonStreamingResponse(
     });
 
     subprocess.on("close", (code: number | null) => {
+      isComplete = true;
       if (finalResult) {
         // Track usage
         usageTracker.record({
@@ -323,8 +336,12 @@ async function handleNonStreamingResponse(
           success: true,
         });
 
-        res.json(cliResultToOpenai(finalResult, requestId, requestedModel, jsonMode));
-      } else if (!res.headersSent) {
+        // res.writable is false once the client has disconnected; skip the
+        // write (usage is still recorded above) to avoid write-after-end.
+        if (res.writable) {
+          res.json(cliResultToOpenai(finalResult, requestId, requestedModel, jsonMode));
+        }
+      } else if (!res.headersSent && res.writable) {
         usageTracker.record({
           model: requestedModel,
           inputTokens: 0,
