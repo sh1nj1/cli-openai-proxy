@@ -29,6 +29,7 @@ export interface CliInput {
   model: ClaudeModel;
   systemPrompt?: string;
   sessionId?: string;
+  jsonMode?: boolean;
 }
 
 const MODEL_MAP: Record<string, ClaudeModel> = {
@@ -70,18 +71,19 @@ const MODEL_MAP: Record<string, ClaudeModel> = {
  * Extract Claude model alias from request model string
  */
 export function extractModel(model: string): ClaudeModel {
-  // Try direct lookup
   if (MODEL_MAP[model]) {
     return MODEL_MAP[model];
   }
 
-  // Try stripping provider prefix
-  const stripped = model.replace(/^claude-code-cli\//, "");
-  if (MODEL_MAP[stripped]) {
-    return MODEL_MAP[stripped];
+  // Strip any provider prefix (openai/, anthropic/, claude-max/, etc.)
+  const slashIdx = model.indexOf("/");
+  if (slashIdx !== -1) {
+    const stripped = model.slice(slashIdx + 1);
+    if (MODEL_MAP[stripped]) {
+      return MODEL_MAP[stripped];
+    }
   }
 
-  // Default to opus (Claude Max subscription)
   return "opus";
 }
 
@@ -131,14 +133,95 @@ export function messagesToPrompt(messages: OpenAIChatRequest["messages"]): strin
   return parts.join("\n").trim();
 }
 
+export const JSON_MODE_INSTRUCTION = "IMPORTANT: You must respond with a single valid JSON object only. No markdown, no code fences, no explanation, no extra text before or after the JSON. Output raw JSON only.";
+
+// Structural JSON-schema keys that constrain the shape of the output.
+// Free-text fields (description, title, $comment, examples, $id, $ref, $schema, $defs, definitions)
+// are stripped to prevent prompt injection via schema.
+const SCHEMA_STRUCTURAL_KEYS = new Set([
+  "type", "required", "items", "enum", "const",
+  "additionalProperties", "minItems", "maxItems", "uniqueItems",
+  "minLength", "maxLength",
+  "minimum", "maximum", "exclusiveMinimum", "exclusiveMaximum", "multipleOf",
+  "format", "pattern", "oneOf", "anyOf", "allOf", "not", "nullable",
+  "minProperties", "maxProperties",
+]);
+
+// Keys whose values are dictionaries of user-named fields to schemas.
+// Field names are preserved (they are the output field names the LLM must produce);
+// schema values are recursively sanitized.
+const SCHEMA_DICT_KEYS = new Set(["properties", "patternProperties"]);
+
+const SAFE_NAME_RE = /^[A-Za-z0-9_-]{1,64}$/;
+
+function sanitizeSchema(value: unknown): unknown {
+  if (Array.isArray(value)) {
+    return value.map(sanitizeSchema);
+  }
+  if (value && typeof value === "object") {
+    const input = value as Record<string, unknown>;
+    const result: Record<string, unknown> = {};
+    for (const [key, v] of Object.entries(input)) {
+      if (SCHEMA_DICT_KEYS.has(key) && v && typeof v === "object" && !Array.isArray(v)) {
+        const dict: Record<string, unknown> = {};
+        for (const [propName, propSchema] of Object.entries(v as Record<string, unknown>)) {
+          dict[propName] = sanitizeSchema(propSchema);
+        }
+        result[key] = dict;
+      } else if (SCHEMA_STRUCTURAL_KEYS.has(key)) {
+        result[key] = sanitizeSchema(v);
+      }
+      // else: drop free-text fields (description/title/$comment/examples/etc.)
+    }
+    return result;
+  }
+  return value;
+}
+
+function sanitizeSchemaWrapper(wrapper: unknown): object {
+  if (!wrapper || typeof wrapper !== "object") return {};
+  const w = wrapper as Record<string, unknown>;
+  const result: Record<string, unknown> = {};
+  if (typeof w.name === "string" && SAFE_NAME_RE.test(w.name)) {
+    result.name = w.name;
+  }
+  if (typeof w.strict === "boolean") {
+    result.strict = w.strict;
+  }
+  if (w.schema !== undefined) {
+    result.schema = sanitizeSchema(w.schema);
+  }
+  return result;
+}
+
+function buildJsonInstruction(responseFormat: OpenAIChatRequest["response_format"]): string {
+  if (responseFormat?.type === "json_schema" && responseFormat.json_schema) {
+    const sanitized = sanitizeSchemaWrapper(responseFormat.json_schema);
+    const schemaJson = JSON.stringify(sanitized);
+    return `IMPORTANT: You must respond with a single valid JSON object that conforms to this schema:\n${schemaJson}\nNo markdown, no code fences, no explanation, no extra text before or after the JSON. Output raw JSON only.`;
+  }
+  return JSON_MODE_INSTRUCTION;
+}
+
 /**
  * Convert OpenAI chat request to CLI input format
  */
 export function openaiToCli(request: OpenAIChatRequest): CliInput {
+  const jsonMode = request.response_format?.type === "json_object" || request.response_format?.type === "json_schema";
+  let systemPrompt = extractSystemPrompt(request.messages);
+
+  if (jsonMode) {
+    const instruction = buildJsonInstruction(request.response_format);
+    systemPrompt = systemPrompt
+      ? `${systemPrompt}\n\n${instruction}`
+      : instruction;
+  }
+
   return {
     prompt: messagesToPrompt(request.messages),
     model: extractModel(request.model),
-    systemPrompt: extractSystemPrompt(request.messages),
-    sessionId: request.user, // Use OpenAI's user field for session mapping
+    systemPrompt,
+    sessionId: request.user,
+    jsonMode,
   };
 }

@@ -7,8 +7,6 @@
 
 import { spawn, ChildProcess } from "child_process";
 import { EventEmitter } from "events";
-import fs from "fs/promises";
-import path from "path";
 import type {
   ClaudeCliMessage,
   ClaudeCliAssistant,
@@ -17,6 +15,7 @@ import type {
 } from "../types/claude-cli.js";
 import { isAssistantMessage, isResultMessage, isContentDelta } from "../types/claude-cli.js";
 import type { ClaudeModel } from "../adapter/openai-to-cli.js";
+import { DEFAULT_TIMEOUT_MS } from "../config.js";
 
 export interface SubprocessOptions {
   model: ClaudeModel;
@@ -24,6 +23,17 @@ export interface SubprocessOptions {
   systemPrompt?: string;
   cwd?: string;
   timeout?: number;
+}
+
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+export function isValidSessionId(sessionId: string): boolean {
+  return UUID_RE.test(sessionId);
+}
+
+function redactSessionId(sessionId: string): string {
+  if (sessionId.length <= 8) return "***";
+  return `${sessionId.slice(0, 4)}…${sessionId.slice(-4)}`;
 }
 
 export interface SubprocessEvents {
@@ -34,8 +44,6 @@ export interface SubprocessEvents {
   close: (code: number | null) => void;
   raw: (line: string) => void;
 }
-
-const DEFAULT_TIMEOUT = 600000; // 10 minutes
 
 export class ClaudeSubprocess extends EventEmitter {
   private process: ChildProcess | null = null;
@@ -48,7 +56,7 @@ export class ClaudeSubprocess extends EventEmitter {
    */
   async start(prompt: string, options: SubprocessOptions): Promise<void> {
     const args = this.buildArgs(options);
-    const timeout = options.timeout || DEFAULT_TIMEOUT;
+    const timeout = options.timeout || DEFAULT_TIMEOUT_MS;
 
     return new Promise((resolve, reject) => {
       try {
@@ -91,7 +99,6 @@ export class ClaudeSubprocess extends EventEmitter {
         // Parse JSON stream from stdout
         this.process.stdout?.on("data", (chunk: Buffer) => {
           const data = chunk.toString();
-          console.error(`[Subprocess] Received ${data.length} bytes of stdout`);
           this.buffer += data;
           this.processBuffer();
         });
@@ -100,15 +107,17 @@ export class ClaudeSubprocess extends EventEmitter {
         this.process.stderr?.on("data", (chunk: Buffer) => {
           const errorText = chunk.toString().trim();
           if (errorText) {
-            // Don't emit as error unless it's actually an error
-            // Claude CLI may write debug info to stderr
-            console.error("[Subprocess stderr]:", errorText.slice(0, 200));
+            console.error("[Subprocess stderr]:", errorText);
           }
         });
 
         // Handle process close
         this.process.on("close", (code) => {
-          console.error(`[Subprocess] Process closed with code: ${code}`);
+          if (code !== 0) {
+            console.error(`[Subprocess] Process exited with error code: ${code}`);
+          } else {
+            console.error(`[Subprocess] Process closed with code: ${code}`);
+          }
           this.clearTimeout();
           // Process any remaining buffer
           if (this.buffer.trim()) {
@@ -148,7 +157,13 @@ export class ClaudeSubprocess extends EventEmitter {
     }
 
     if (options.sessionId) {
-      args.push("--session-id", options.sessionId);
+      if (isValidSessionId(options.sessionId)) {
+        args.push("--session-id", options.sessionId);
+      } else {
+        console.error(
+          `[Subprocess] Ignoring invalid sessionId (expected UUID): ${redactSessionId(options.sessionId)}`
+        );
+      }
     }
 
     return args;
@@ -170,15 +185,27 @@ export class ClaudeSubprocess extends EventEmitter {
         this.emit("message", message);
 
         if (isContentDelta(message)) {
-          // Emit content delta for streaming
+          const delta = (message as ClaudeCliStreamEvent).event?.delta;
+          if (delta?.text) {
+            process.stderr.write(delta.text);
+          }
           this.emit("content_delta", message as ClaudeCliStreamEvent);
         } else if (isAssistantMessage(message)) {
           this.emit("assistant", message);
         } else if (isResultMessage(message)) {
+          const result = message as ClaudeCliResult;
+          if (result.is_error || result.subtype === "error") {
+            console.error(`\n[Subprocess] Error: ${result.result}`);
+          }
+          const usage = result.usage;
+          if (usage) {
+            console.error(`[Subprocess] Tokens: in=${usage.input_tokens || 0} out=${usage.output_tokens || 0} cache_read=${usage.cache_read_input_tokens || 0} cache_write=${usage.cache_creation_input_tokens || 0}`);
+          }
           this.emit("result", message);
         }
       } catch {
         // Non-JSON output, emit as raw
+        console.error("[Subprocess raw]:", trimmed);
         this.emit("raw", trimmed);
       }
     }

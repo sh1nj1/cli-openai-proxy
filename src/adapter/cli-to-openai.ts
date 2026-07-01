@@ -69,12 +69,15 @@ export function createDoneChunk(requestId: string, model: string): OpenAIChatChu
 export function cliResultToOpenai(
   result: ClaudeCliResult,
   requestId: string,
-  requestedModel?: string
+  requestedModel?: string,
+  jsonMode?: boolean
 ): OpenAIChatResponse {
   // Use the requested model so the gateway trusts the response
   const modelName = requestedModel || (result.modelUsage
     ? Object.keys(result.modelUsage)[0]
     : "claude-sonnet-4");
+
+  const content = jsonMode ? extractJsonFromText(result.result) : result.result;
 
   return {
     id: `chatcmpl-${requestId}`,
@@ -86,7 +89,7 @@ export function cliResultToOpenai(
         index: 0,
         message: {
           role: "assistant",
-          content: result.result,
+          content,
         },
         finish_reason: "stop",
       },
@@ -98,6 +101,62 @@ export function cliResultToOpenai(
         (result.usage?.input_tokens || 0) + (result.usage?.output_tokens || 0),
     },
   };
+}
+
+/**
+ * Extract JSON from text that may contain markdown fences or surrounding explanation.
+ * Returns the original text if no JSON is found or if it's already valid JSON.
+ */
+export function extractJsonFromText(text: string): string {
+  const trimmed = text.trim();
+  try {
+    JSON.parse(trimmed);
+    return trimmed;
+  } catch {
+    // Try extracting from markdown code fences
+    const fenceMatch = trimmed.match(/```(?:json)?\s*\n?([\s\S]*?)\n?```/);
+    if (fenceMatch) {
+      const candidate = fenceMatch[1].trim();
+      try {
+        JSON.parse(candidate);
+        return candidate;
+      } catch { /* fall through */ }
+    }
+
+    // Try finding the first { ... } or [ ... ] block
+    const braceStart = trimmed.indexOf("{");
+    const bracketStart = trimmed.indexOf("[");
+    const start = braceStart === -1 ? bracketStart
+      : bracketStart === -1 ? braceStart
+      : Math.min(braceStart, bracketStart);
+
+    if (start !== -1) {
+      const open = trimmed[start];
+      const close = open === "{" ? "}" : "]";
+      let depth = 0;
+      let inString = false;
+      let escape = false;
+      for (let i = start; i < trimmed.length; i++) {
+        const ch = trimmed[i];
+        if (escape) { escape = false; continue; }
+        if (ch === "\\") { escape = true; continue; }
+        if (ch === '"') { inString = !inString; continue; }
+        if (inString) continue;
+        if (ch === open) depth++;
+        else if (ch === close) {
+          depth--;
+          if (depth === 0) {
+            const candidate = trimmed.slice(start, i + 1);
+            try {
+              JSON.parse(candidate);
+              return candidate;
+            } catch { break; }
+          }
+        }
+      }
+    }
+  }
+  return text;
 }
 
 /**
