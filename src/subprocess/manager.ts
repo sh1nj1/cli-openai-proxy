@@ -15,7 +15,7 @@ import type {
 } from "../types/claude-cli.js";
 import { isAssistantMessage, isResultMessage, isContentDelta } from "../types/claude-cli.js";
 import type { ClaudeModel } from "../adapter/openai-to-cli.js";
-import { DEFAULT_TIMEOUT_MS } from "../config.js";
+import { DEFAULT_TIMEOUT_MS, getBgWaitCeilingMs } from "../config.js";
 
 export interface SubprocessOptions {
   model: ClaudeModel;
@@ -63,7 +63,12 @@ export class ClaudeSubprocess extends EventEmitter {
         // Use spawn() for security - no shell interpretation
         this.process = spawn("claude", args, {
           cwd: options.cwd || process.cwd(),
-          env: { ...process.env },
+          env: {
+            ...process.env,
+            // Keep `claude -p` alive until background subagents finish instead of
+            // exiting at the CLI's 10-minute default cap (see config.ts).
+            CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS: String(getBgWaitCeilingMs()),
+          },
           stdio: ["pipe", "pipe", "pipe"],
         });
 
