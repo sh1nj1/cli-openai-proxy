@@ -9,6 +9,7 @@ import { v4 as uuidv4 } from "uuid";
 import { runnerFactory, PAPERCLIP_MODEL_IDS, UnknownPaperclipModelError } from "../adapter/paperclip-registry.js";
 import type { AgentRunner } from "../adapter/paperclip-runner.js";
 import { openaiToCli } from "../adapter/openai-to-cli.js";
+import { materializeImages, ImageValidationError } from "../adapter/image-materializer.js";
 import {
   cliResultToOpenai,
   createDoneChunk,
@@ -48,14 +49,22 @@ export async function handleChatCompletions(
       return;
     }
 
-    // Convert to CLI input format
-    const cliInput = openaiToCli(body);
-    const subprocess = runnerFactory.create(requestedModel);
+    // Materialize any image_url parts to local temp files (data URLs) or inline
+    // links (http URLs) BEFORE conversion, so every adapter sees them uniformly.
+    // cleanup removes the per-request temp files once the response completes.
+    const { messages: preparedMessages, cleanup } = await materializeImages(body.messages);
+    try {
+      // Convert to CLI input format
+      const cliInput = openaiToCli({ ...body, messages: preparedMessages });
+      const subprocess = runnerFactory.create(requestedModel);
 
-    if (stream) {
-      await handleStreamingResponse(req, res, subprocess, cliInput, requestId, requestedModel, startTime, cliInput.jsonMode);
-    } else {
-      await handleNonStreamingResponse(res, subprocess, cliInput, requestId, requestedModel, startTime, cliInput.jsonMode);
+      if (stream) {
+        await handleStreamingResponse(req, res, subprocess, cliInput, requestId, requestedModel, startTime, cliInput.jsonMode);
+      } else {
+        await handleNonStreamingResponse(res, subprocess, cliInput, requestId, requestedModel, startTime, cliInput.jsonMode);
+      }
+    } finally {
+      await cleanup();
     }
   } catch (error) {
     const message = error instanceof Error ? error.message : "Unknown error";
@@ -69,6 +78,21 @@ export async function handleChatCompletions(
       stream,
       success: false,
     });
+
+    // A bad image (unsupported type, too large, malformed data URL) is a client
+    // error — surface it as an OpenAI-style 400 rather than a generic 500.
+    if (error instanceof ImageValidationError) {
+      if (!res.headersSent) {
+        res.status(400).json({
+          error: {
+            message,
+            type: "invalid_request_error",
+            code: "invalid_image",
+          },
+        });
+      }
+      return;
+    }
 
     // An unregistered paperclip/* model is a client error (unknown model), not a
     // server fault — surface it as an OpenAI-style 404 model_not_found rather than 500.

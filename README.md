@@ -69,6 +69,7 @@ model is named `paperclip/<adapterType>` (e.g. `paperclip/claude_local`). See
 
 - **OpenAI-compatible API** — Drop-in replacement for any OpenAI client
 - **Streaming** — Real-time token streaming via SSE
+- **Image input** — OpenAI `image_url` parts (base64 data URLs) are materialized to temp files and passed to the CLI as inline links, so the agent can see them; works across all adapters (Claude and `paperclip/*`)
 - **Usage tracking** — See token counts, cost savings, and request history
 - **API key auth** — Optional Bearer token auth for team/shared use
 - **Multiple models** — Opus, Sonnet, and Haiku

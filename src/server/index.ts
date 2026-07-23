@@ -30,7 +30,10 @@ function createApp(): Express {
   }
 
   // Middleware
-  app.use(express.json({ limit: "10mb" }));
+  // 30mb accommodates the 20MB decoded-image ceiling plus base64 (~33%) overhead
+  // and surrounding text, so oversized images hit the clean 400 in the image
+  // materializer rather than a raw 413 from the body parser.
+  app.use(express.json({ limit: "30mb" }));
 
   // Request logging (debug mode)
   app.use((req: Request, _res: Response, next: NextFunction) => {
