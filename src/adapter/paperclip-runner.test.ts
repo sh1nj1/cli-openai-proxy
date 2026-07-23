@@ -98,10 +98,27 @@ test("assigns a unique runId per run even within the same millisecond/process", 
   assert.equal(new Set(runIds).size, 3, "each run must get a distinct runId");
 });
 
-test("prompt-template injection sends the raw prompt via config.promptTemplate and forwards no claude-only flags", async () => {
+// Mirror of the adapter's single-pass renderTemplate + resolvePathValue (string case)
+// so a test can prove what codex actually feeds to stdin from ctx.config.promptTemplate.
+function renderLikeCodex(template: string, ctx: { context: unknown }): string {
+  return template.replace(/{{\s*([a-zA-Z0-9_.-]+)\s*}}/g, (_m, dotted: string) => {
+    let cursor: unknown = ctx;
+    for (const part of dotted.split(".")) {
+      if (typeof cursor !== "object" || cursor === null || Array.isArray(cursor)) return "";
+      cursor = (cursor as Record<string, unknown>)[part];
+    }
+    return typeof cursor === "string" ? cursor : "";
+  });
+}
+
+test("prompt-template injection routes the raw prompt through a context variable (verbatim {{ }}) and forwards no claude-only flags", async () => {
   // codex-local ignores context.paperclipTaskMarkdown; its prompt comes from
-  // renderTemplate(config.promptTemplate). It also rejects claude-only CLI flags
-  // (buildCodexExecArgs appends extraArgs verbatim to `codex exec`).
+  // renderTemplate(config.promptTemplate), which is single-pass. Assigning the raw
+  // prompt straight to promptTemplate lets renderTemplate substitute/strip the
+  // user's own {{ }} placeholders, so the raw prompt must ride a context variable
+  // referenced once. codex also rejects claude-only CLI flags (buildCodexExecArgs
+  // appends extraArgs verbatim to `codex exec`).
+  const rawPrompt = "Explain {{agent.name}} inside a Handlebars {{template}}.";
   let captured: import("@paperclipai/adapter-utils").AdapterExecutionContext | undefined;
   const fakeExecute: AdapterExecute = async (ctx) => {
     captured = ctx;
@@ -114,11 +131,18 @@ test("prompt-template injection sends the raw prompt via config.promptTemplate a
     { promptInjection: "prompt-template", outputMode: "summary", cliFlags: [] },
   );
   const closed = new Promise<void>((resolve) => runner.on("close", () => resolve()));
-  await runner.start("write a haiku", { model: "gpt-5" });
+  await runner.start(rawPrompt, { model: "gpt-5" });
   await closed;
 
   const ctx = captured!;
-  assert.equal(ctx.config.promptTemplate, "write a haiku", "raw prompt goes into promptTemplate for prompt-template adapters");
+  // The raw prompt must NOT sit directly in promptTemplate (renderTemplate would corrupt {{ }}).
+  assert.notEqual(ctx.config.promptTemplate, rawPrompt, "raw prompt must not be assigned directly to promptTemplate");
+  // What codex actually renders to stdin must equal the user's prompt verbatim.
+  assert.equal(
+    renderLikeCodex(ctx.config.promptTemplate as string, { context: ctx.context }),
+    rawPrompt,
+    "single-pass render must return the user's {{ }} delimiters verbatim",
+  );
   assert.equal(
     (ctx.context as Record<string, unknown>).paperclipTaskMarkdown,
     undefined,
@@ -127,7 +151,7 @@ test("prompt-template injection sends the raw prompt via config.promptTemplate a
   assert.deepEqual(ctx.config.extraArgs, [], "no claude-only flags reach a non-claude adapter");
 });
 
-test("prompt-template injection prepends the system prompt to the prompt", async () => {
+test("prompt-template injection prepends the system prompt to the prompt (rendered verbatim)", async () => {
   let captured: import("@paperclipai/adapter-utils").AdapterExecutionContext | undefined;
   const fakeExecute: AdapterExecute = async (ctx) => {
     captured = ctx;
@@ -143,7 +167,11 @@ test("prompt-template injection prepends the system prompt to the prompt", async
   await runner.start("body", { model: "gpt-5", systemPrompt: "Be terse." });
   await closed;
 
-  assert.equal(captured!.config.promptTemplate, "Be terse.\n\nbody");
+  const ctx = captured!;
+  assert.equal(
+    renderLikeCodex(ctx.config.promptTemplate as string, { context: ctx.context }),
+    "Be terse.\n\nbody",
+  );
 });
 
 test("summary output mode synthesizes content_delta + result from result.summary", async () => {

@@ -25,6 +25,11 @@ export type AdapterExecute = (ctx: AdapterExecutionContext) => Promise<AdapterEx
 // non-templated task-context section instead. See src/adapter/paperclip-runner.test.ts.
 const EMPTY_RENDERING_PROMPT_TEMPLATE = "{{__collavre_raw_prompt_via_context__}}";
 
+// Context key carrying the raw prompt for prompt-template adapters (e.g. codex).
+// promptTemplate references it once as {{context.<key>}}; renderTemplate's single
+// pass resolves it without re-scanning, so the user's {{ }} delimiters survive.
+const RAW_PROMPT_CONTEXT_KEY = "collavreRawPrompt";
+
 // Claude-code-only CLI flags. Non-claude adapters (e.g. codex) reject these:
 // their arg builders append config.extraArgs verbatim to their own CLI.
 const CLAUDE_CLI_FLAGS = ["--include-partial-messages", "--no-session-persistence"];
@@ -103,8 +108,14 @@ export class PaperclipRunner extends EventEmitter implements AgentRunner {
       context = { paperclipTaskMarkdown: prompt };
       if (options.systemPrompt) extraArgs.push("--append-system-prompt", options.systemPrompt);
     } else {
-      promptTemplate = options.systemPrompt ? `${options.systemPrompt}\n\n${prompt}` : prompt;
-      context = {};
+      // renderTemplate is single-pass, so route the raw prompt through a context
+      // variable referenced exactly once: the resolved value is NOT re-scanned, so
+      // the user's own {{ }} delimiters survive verbatim. Assigning the raw prompt
+      // straight to promptTemplate would let renderTemplate substitute/strip them
+      // (the same corruption the claude path avoids via paperclipTaskMarkdown).
+      const rawPrompt = options.systemPrompt ? `${options.systemPrompt}\n\n${prompt}` : prompt;
+      context = { [RAW_PROMPT_CONTEXT_KEY]: rawPrompt };
+      promptTemplate = `{{context.${RAW_PROMPT_CONTEXT_KEY}}}`;
     }
 
     const ctx: AdapterExecutionContext = {
