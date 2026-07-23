@@ -20,7 +20,7 @@ let serverInstance: Server | null = null;
 /**
  * Create and configure the Express app
  */
-function createApp(): Express {
+export function createApp(): Express {
   const app = express();
 
   // Initialize auth
@@ -28,9 +28,6 @@ function createApp(): Express {
   if (authStatus.enabled) {
     console.log(`[Server] API key auth enabled (${authStatus.keyCount} key(s))`);
   }
-
-  // Middleware
-  app.use(express.json({ limit: "10mb" }));
 
   // Request logging (debug mode)
   app.use((req: Request, _res: Response, next: NextFunction) => {
@@ -53,8 +50,16 @@ function createApp(): Express {
     res.sendStatus(200);
   });
 
-  // Auth middleware (skips /health automatically)
+  // Auth middleware (skips /health automatically). Runs BEFORE the body parser
+  // so an unauthenticated request is rejected with 401 without the server first
+  // buffering/parsing its (up to 30MB) body. OPTIONS/CORS above stay ahead of it
+  // so preflight requests — which carry no Authorization header — still succeed.
   app.use(authMiddleware);
+
+  // Body parsing. 30mb accommodates the 20MB decoded-image ceiling plus base64
+  // (~33%) overhead and surrounding text, so oversized images hit the clean 400
+  // in the image materializer rather than a raw 413 from the body parser.
+  app.use(express.json({ limit: "30mb" }));
 
   // Routes
   app.get("/health", handleHealth);
