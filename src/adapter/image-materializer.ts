@@ -99,6 +99,14 @@ export async function materializeImages(
 
   const materializePart = async (url: string): Promise<OpenAIContentPart> => {
     if (url.startsWith("http://") || url.startsWith("https://")) {
+      // startsWith alone accepts "https://" or "https://exa mple.com/…": a broken
+      // link the runner would start on. Require a syntactically valid URL so
+      // malformed input is a 400 instead of a confusing downstream failure.
+      try {
+        new URL(url);
+      } catch {
+        throw new ImageValidationError(`Malformed image URL: ${url.slice(0, 32)}`);
+      }
       return toMarkdownLink(url); // pass through; agent CLI fetches if it chooses
     }
     if (url.startsWith("data:")) {

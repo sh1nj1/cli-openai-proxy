@@ -93,6 +93,22 @@ describe("materializeImages", () => {
     await cleanup();
   });
 
+  it("rejects malformed http(s) URLs instead of passing a broken link to the runner", async () => {
+    // A string that merely starts with http(s):// but is not a valid URL (no host,
+    // embedded whitespace) would otherwise become a broken markdown link and start
+    // the runner, violating the 400 invalid_image contract.
+    for (const bad of ["https://", "http://", "https://exa mple.com/cat.png", "https:// "]) {
+      const messages: OpenAIChatMessage[] = [
+        { role: "user", content: [{ type: "image_url", image_url: { url: bad } }] },
+      ];
+      await assert.rejects(
+        () => materializeImages(messages),
+        ImageValidationError,
+        `expected rejection for url ${JSON.stringify(bad)}`
+      );
+    }
+  });
+
   it("rejects unsupported MIME types with a 400-style validation error", async () => {
     const messages: OpenAIChatMessage[] = [
       { role: "user", content: [{ type: "image_url", image_url: { url: `data:image/tiff;base64,${HELLO_B64}` } }] },
