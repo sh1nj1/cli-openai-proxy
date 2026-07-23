@@ -6,7 +6,8 @@
 
 import type { Request, Response } from "express";
 import { v4 as uuidv4 } from "uuid";
-import { ClaudeSubprocess } from "../subprocess/manager.js";
+import { runnerFactory, PAPERCLIP_MODEL_IDS, UnknownPaperclipModelError } from "../adapter/paperclip-registry.js";
+import type { AgentRunner } from "../adapter/paperclip-runner.js";
 import { openaiToCli } from "../adapter/openai-to-cli.js";
 import {
   cliResultToOpenai,
@@ -49,7 +50,7 @@ export async function handleChatCompletions(
 
     // Convert to CLI input format
     const cliInput = openaiToCli(body);
-    const subprocess = new ClaudeSubprocess();
+    const subprocess = runnerFactory.create(requestedModel);
 
     if (stream) {
       await handleStreamingResponse(req, res, subprocess, cliInput, requestId, requestedModel, startTime, cliInput.jsonMode);
@@ -68,6 +69,21 @@ export async function handleChatCompletions(
       stream,
       success: false,
     });
+
+    // An unregistered paperclip/* model is a client error (unknown model), not a
+    // server fault — surface it as an OpenAI-style 404 model_not_found rather than 500.
+    if (error instanceof UnknownPaperclipModelError) {
+      if (!res.headersSent) {
+        res.status(404).json({
+          error: {
+            message,
+            type: "invalid_request_error",
+            code: "model_not_found",
+          },
+        });
+      }
+      return;
+    }
 
     if (!res.headersSent) {
       res.status(500).json({
@@ -91,7 +107,7 @@ export async function handleChatCompletions(
 async function handleStreamingResponse(
   req: Request,
   res: Response,
-  subprocess: ClaudeSubprocess,
+  subprocess: AgentRunner,
   cliInput: ReturnType<typeof openaiToCli>,
   requestId: string,
   requestedModel: string,
@@ -275,7 +291,7 @@ async function handleStreamingResponse(
  */
 async function handleNonStreamingResponse(
   res: Response,
-  subprocess: ClaudeSubprocess,
+  subprocess: AgentRunner,
   cliInput: ReturnType<typeof openaiToCli>,
   requestId: string,
   requestedModel: string,
@@ -403,14 +419,22 @@ const MODELS_DATA = (() => {
   const prefixes = ["", "openai/", "anthropic/", "claude-max/", "claude-code-cli/"];
   return Object.freeze({
     object: "list" as const,
-    data: prefixes.flatMap((prefix) =>
-      baseModels.map((id) => ({
-        id: `${prefix}${id}`,
+    data: [
+      ...prefixes.flatMap((prefix) =>
+        baseModels.map((id) => ({
+          id: `${prefix}${id}`,
+          object: "model" as const,
+          owned_by: "anthropic",
+          created: now,
+        }))
+      ),
+      ...PAPERCLIP_MODEL_IDS.map((id) => ({
+        id,
         object: "model" as const,
-        owned_by: "anthropic",
+        owned_by: "paperclip",
         created: now,
-      }))
-    ),
+      })),
+    ],
   });
 })();
 

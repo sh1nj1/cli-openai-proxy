@@ -10,6 +10,7 @@
 
 import { startServer, stopServer } from "./index.js";
 import { verifyClaude, verifyAuth } from "../subprocess/manager.js";
+import { runPreflight } from "./preflight.js";
 import { PKG_VERSION, getTimeoutMs } from "../config.js";
 
 const DEFAULT_PORT = 3456;
@@ -28,25 +29,18 @@ async function main(): Promise<void> {
   const displayHost = host === "0.0.0.0" ? "localhost" : host;
   const baseUrl = `http://${displayHost}:${port}`;
 
-  // Verify Claude CLI
+  // Preflight. Claude CLI / auth are non-fatal: the proxy also serves
+  // paperclip/* adapter models (e.g. codex) that never touch the Claude CLI,
+  // so a codex-only host must still be able to start. Missing Claude is
+  // surfaced as a warning; a claude-targeted request fails cleanly at request
+  // time instead.
   console.log("\n[Preflight]");
-  console.log("  Checking Claude CLI...");
-  const cliCheck = await verifyClaude();
-  if (!cliCheck.ok) {
-    console.error(`  ✗ Claude CLI: ${cliCheck.error}`);
-    process.exit(1);
-  }
-  console.log(`  ✓ Claude CLI: ${cliCheck.version || "OK"}`);
-
-  // Verify authentication
-  console.log("  Checking authentication...");
-  const authCheck = await verifyAuth();
-  if (!authCheck.ok) {
-    console.error(`  ✗ Auth: ${authCheck.error}`);
-    console.error("    Run: claude auth login");
-    process.exit(1);
-  }
-  console.log("  ✓ Authentication: OK");
+  await runPreflight({
+    verifyClaude,
+    verifyAuth,
+    log: (m) => console.log(m),
+    warn: (m) => console.error(m),
+  });
 
   // Show configuration
   console.log("\n[Config]");
