@@ -58,6 +58,13 @@ Anthropic API --> Response --> OpenAI format --> Your App
 
 Anthropic blocks OAuth tokens from direct third-party API use. But the CLI can use them. This proxy bridges that gap.
 
+## Paperclip adapters
+
+Beyond the built-in direct Claude path, this proxy can run requests through
+[Paperclip](https://github.com/paperclipai/paperclip) agent adapters when the
+model is named `paperclip/<adapterType>` (e.g. `paperclip/claude_local`). See
+[docs/paperclip-adapters.md](docs/paperclip-adapters.md).
+
 ## Features
 
 - **OpenAI-compatible API** — Drop-in replacement for any OpenAI client
