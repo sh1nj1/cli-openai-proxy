@@ -75,6 +75,42 @@ test("paperclip/* model streams SSE deltas through the real route handler", asyn
   }
 });
 
+const codexAgentMessage = (text: string) =>
+  JSON.stringify({ type: "item.completed", item: { type: "agent_message", text } }) + "\n";
+
+test("streaming JSON mode extracts the final codex answer, not an intermediate JSON block", async () => {
+  // codex-jsonl streams one delta per agent_message block, so the client-side
+  // jsonBuffer concatenates every block. When an intermediate block is itself
+  // valid JSON, extractJsonFromText (first-match) must NOT return it: the final
+  // answer (result.result = result.summary) is authoritative.
+  const fakeExecute: AdapterExecute = async (ctx) => {
+    await ctx.onLog("stdout", codexAgentMessage('{"status":"working"}'));
+    await ctx.onLog("stdout", codexAgentMessage('{"answer":42}'));
+    return { exitCode: 0, signal: null, timedOut: false, sessionId: "s",
+      summary: '{"answer":42}', usage: { inputTokens: 3, outputTokens: 2 } };
+  };
+  const orig = runnerFactory.create;
+  runnerFactory.create = (model: string) =>
+    model.startsWith("paperclip/")
+      ? new PaperclipRunner(fakeExecute, { engine: "cli", command: "codex" },
+        { promptInjection: "prompt-template", outputMode: "codex-jsonl", cliFlags: [] })
+      : orig(model);
+
+  try {
+    const req = { body: { model: "paperclip/codex_local", stream: true,
+      response_format: { type: "json_object" },
+      messages: [{ role: "user", content: "hi" }] } } as unknown as Request;
+    const res = fakeRes();
+    await handleChatCompletions(req, res);
+    assert.match(res.body, /"content":"\{\\"answer\\":42\}"/, "final answer JSON is emitted");
+    assert.doesNotMatch(res.body, /"content":"\{\\"status\\":\\"working\\"\}"/,
+      "the intermediate JSON status block is NOT what the client receives");
+    assert.match(res.body, /data: \[DONE\]/, "terminated with [DONE]");
+  } finally {
+    runnerFactory.create = orig;
+  }
+});
+
 test("unregistered paperclip/* model returns 404 model_not_found (never runs Claude)", async () => {
   // Uses the REAL runnerFactory.create: an unregistered paperclip/* id must produce a
   // clean client error, not a spawned Claude subprocess and not a generic 500.

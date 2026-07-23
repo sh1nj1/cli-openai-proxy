@@ -42,9 +42,10 @@ const REGISTRY: Record<string, PaperclipModelSpec> = {
     // is ignored by buildCodexExecArgs. Without this codex blocks on approvals headless.
     baseConfig: { engine: "cli", command: "codex", dangerouslyBypassApprovalsAndSandbox: true },
     // codex ignores paperclipTaskMarkdown (prompt comes from rendered promptTemplate),
-    // rejects claude-only flags, and streams its own JSONL (text via result.summary).
+    // rejects claude-only flags, and streams its own `codex exec --json` NDJSON, which
+    // PaperclipRunner parses live (a content delta per completed agent_message block).
     promptInjection: "prompt-template",
-    outputMode: "summary",
+    outputMode: "codex-jsonl",
     // PaperclipRunner runs every adapter in a fresh /tmp/paperclip-run-* dir, which
     // is deliberately not a git repo. buildCodexExecArgs only adds --skip-git-repo-check
     // for its own sandbox lane, not for local `codex exec`, so declare it here (codex
