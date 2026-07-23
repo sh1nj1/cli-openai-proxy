@@ -31,6 +31,11 @@ All adapters run `engine: "cli"`. Option 1 is **stateless** (no session resume).
   `agent_message` block reaches stdout (e.g. the adapter's ACP fallback), the text
   falls back to the normalized `result.summary`, emitted as a single delta — so
   `--stream` requests always terminate correctly (`finish_reason` + `[DONE]`).
+  The live stream shows every block, but the canonical result (non-streaming
+  responses and JSON-mode extraction) is codex's final `agent_message`
+  (`result.summary`), not the concatenation of blocks: JSON mode runs the text
+  through `extractJsonFromText`, which returns the first JSON object, so an
+  intermediate status block that happens to be JSON must not shadow the answer.
 - **codex renders `promptTemplate`, but the raw prompt reaches it verbatim.**
   A prompt containing `{{ … }}` template delimiters is preserved (unlike a naive
   assignment, where the adapter's `renderTemplate()` would substitute/strip

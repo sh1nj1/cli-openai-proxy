@@ -209,8 +209,15 @@ async function handleStreamingResponse(
       });
 
       if (!res.writableEnded) {
-        if (jsonMode && jsonBuffer) {
-          const extracted = extractJsonFromText(jsonBuffer);
+        // Extract from the terminal answer, not the raw delta buffer: codex-jsonl
+        // streams one delta per agent_message block, so jsonBuffer concatenates
+        // intermediate blocks and extractJsonFromText (first-match) could return an
+        // intermediate status object. result.result is the canonical final answer
+        // (codex: final agent_message; claude: full result text) and equals jsonBuffer
+        // for single-block turns.
+        const jsonSource = result.result || jsonBuffer;
+        if (jsonMode && jsonSource) {
+          const extracted = extractJsonFromText(jsonSource);
           const chunk = {
             id: `chatcmpl-${requestId}`,
             object: "chat.completion.chunk",

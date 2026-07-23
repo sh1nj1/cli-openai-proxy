@@ -249,12 +249,15 @@ test("codex-jsonl mode streams a content delta per live agent_message block", as
   assert.equal(code, 0);
 });
 
-test("codex-jsonl mode streams multiple agent_message blocks and concatenates them for the result", async () => {
+test("codex-jsonl mode streams every agent_message block but reports the final answer as the result", async () => {
   const fakeExecute: AdapterExecute = async (ctx) => {
-    await ctx.onLog("stdout", codexAgentMessage("First block."));
-    await ctx.onLog("stdout", codexAgentMessage("Second block."));
+    // An intermediate block that is itself valid JSON (e.g. a status object)
+    // followed by the real answer. extractJsonFromText returns the FIRST JSON,
+    // so the non-streaming result must be the final answer, not the concatenation.
+    await ctx.onLog("stdout", codexAgentMessage('{"status":"working"}'));
+    await ctx.onLog("stdout", codexAgentMessage('{"answer":42}'));
     return { exitCode: 0, signal: null, timedOut: false, sessionId: "s",
-      summary: "Second block.", usage: { inputTokens: 3, outputTokens: 5 } };
+      summary: '{"answer":42}', usage: { inputTokens: 3, outputTokens: 5 } };
   };
   const runner = new PaperclipRunner(
     fakeExecute,
@@ -272,12 +275,19 @@ test("codex-jsonl mode streams multiple agent_message blocks and concatenates th
   await runner.start("hi", { model: "gpt-5" });
   await closed;
 
-  // Subsequent blocks are separated so the streamed view equals the accumulated result.
-  assert.deepEqual(deltas, ["First block.", "\n\nSecond block."], "each block streams; later blocks are separated");
+  // The live stream still shows every block (the feature), separated for readability.
+  assert.deepEqual(
+    deltas,
+    ['{"status":"working"}', '\n\n{"answer":42}'],
+    "each block streams live; later blocks are separated",
+  );
+  // The canonical result is codex's final agent_message (result.summary), NOT the
+  // concatenation: in JSON mode extractJsonFromText would otherwise return the
+  // intermediate {"status":"working"} instead of the real answer.
   assert.equal(
     results[0].result,
-    "First block.\n\nSecond block.",
-    "non-streaming result carries every block, not just the last (summary keeps only the last)",
+    '{"answer":42}',
+    "non-streaming result is the final answer block, not every block concatenated",
   );
 });
 

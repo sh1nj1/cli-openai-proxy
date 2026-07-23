@@ -67,10 +67,9 @@ export class PaperclipRunner extends EventEmitter implements AgentRunner {
   private killSignal: NodeJS.Signals = "SIGTERM";
   private cwd: string | null = null;
   private streamErrored = false;
-  // codex-jsonl mode: accumulates the text streamed live per agent_message block,
-  // so the terminal result carries the full answer (result.result) for the
-  // non-streaming path without re-emitting it as a duplicate content delta.
-  private codexText = "";
+  // codex-jsonl mode: true once at least one agent_message block streamed live, so
+  // the terminal emit skips a duplicate content delta (the answer is already on the
+  // wire) yet still falls back to a synthesized delta when nothing streamed.
   private codexStreamed = false;
 
   private readonly promptInjection: PromptInjection;
@@ -216,15 +215,15 @@ export class PaperclipRunner extends EventEmitter implements AgentRunner {
   }
 
   /** Live sink for codex-jsonl mode: each completed agent_message block streams as a
-   * content delta and accumulates into codexText for the terminal result. */
+   * content delta so agentic turns render block-by-block. The terminal result is
+   * sourced from result.summary (codex's final answer), not these live blocks. */
   private buildCodexSink() {
     return {
       onAgentMessage: (text: string) => {
         if (!text) return;
-        // Separate distinct message blocks so the streamed view matches the
-        // accumulated codexText the non-streaming result reports verbatim.
+        // Separate distinct message blocks so multi-block agentic turns render
+        // readably on the live wire.
         const chunk = this.codexStreamed ? `\n\n${text}` : text;
-        this.codexText += chunk;
         this.codexStreamed = true;
         const delta: ClaudeCliStreamEvent = {
           type: "stream_event",
@@ -240,18 +239,17 @@ export class PaperclipRunner extends EventEmitter implements AgentRunner {
 
   /**
    * Terminal emit for codex-jsonl mode. If agent_message blocks streamed live, the
-   * answer text is already on the wire — emit only the terminal `result` (usage/cost
-   * + the full accumulated text for the non-streaming path, which reads result.result)
-   * and skip re-emitting a content delta (that would duplicate the answer for streaming
-   * clients). If nothing streamed (e.g. the adapter's ACP fallback puts the text only in
+   * answer is already on the wire — emit only the terminal `result` (usage/cost) and
+   * skip re-emitting a content delta (that would duplicate the answer for streaming
+   * clients). Either way result.result carries result.summary, codex's final
+   * agent_message: the non-streaming path (and streaming JSON mode) run result.result
+   * through extractJsonFromText, which returns the FIRST JSON object — so concatenating
+   * intermediate blocks would let a status object win over the real answer.
+   * If nothing streamed (the adapter's ACP fallback puts the text only in
    * result.summary), synthesize it as one delta, preserving the pre-streaming behavior.
    */
   private emitCodexTerminal(result: AdapterExecutionResult): void {
-    if (this.codexStreamed) {
-      this.emitSummary(result, { text: this.codexText, skipContentDelta: true });
-    } else {
-      this.emitSummary(result);
-    }
+    this.emitSummary(result, { skipContentDelta: this.codexStreamed });
   }
 
   /** A codex adapter result that represents a failed run (not a throw). */
@@ -270,15 +268,14 @@ export class PaperclipRunner extends EventEmitter implements AgentRunner {
 
   /**
    * Synthesize the events routes.ts consumes from a normalized
-   * AdapterExecutionResult. `opts.text` overrides result.summary as the final text
-   * (codex-jsonl passes the live-accumulated blocks); `opts.skipContentDelta` omits
-   * the synthesized delta when the text already streamed live.
+   * AdapterExecutionResult. result.summary is the final answer; `opts.skipContentDelta`
+   * omits the synthesized delta when that text already streamed live (codex-jsonl).
    */
   private emitSummary(
     result: AdapterExecutionResult,
-    opts: { text?: string; skipContentDelta?: boolean } = {},
+    opts: { skipContentDelta?: boolean } = {},
   ): void {
-    const text = (opts.text ?? result.summary ?? "").toString();
+    const text = (result.summary ?? "").toString();
     const sessionId = result.sessionId ?? "";
     if (text && !opts.skipContentDelta) {
       const delta: ClaudeCliStreamEvent = {
