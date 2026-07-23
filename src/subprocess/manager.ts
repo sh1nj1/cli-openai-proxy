@@ -17,7 +17,10 @@ import { StreamJsonParser, type StreamJsonSink } from "../adapter/stream-json-pa
 import { DEFAULT_TIMEOUT_MS, getBgWaitCeilingMs } from "../config.js";
 
 export interface SubprocessOptions {
-  model: ClaudeModel;
+  // ClaudeModel literals keep autocomplete for the direct Claude path; the
+  // `string & {}` arm admits arbitrary model ids (e.g. codex) that flow through
+  // PaperclipRunner to a non-Claude adapter.
+  model: ClaudeModel | (string & {});
   sessionId?: string;
   systemPrompt?: string;
   cwd?: string;

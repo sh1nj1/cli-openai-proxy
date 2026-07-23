@@ -98,6 +98,87 @@ test("assigns a unique runId per run even within the same millisecond/process", 
   assert.equal(new Set(runIds).size, 3, "each run must get a distinct runId");
 });
 
+test("prompt-template injection sends the raw prompt via config.promptTemplate and forwards no claude-only flags", async () => {
+  // codex-local ignores context.paperclipTaskMarkdown; its prompt comes from
+  // renderTemplate(config.promptTemplate). It also rejects claude-only CLI flags
+  // (buildCodexExecArgs appends extraArgs verbatim to `codex exec`).
+  let captured: import("@paperclipai/adapter-utils").AdapterExecutionContext | undefined;
+  const fakeExecute: AdapterExecute = async (ctx) => {
+    captured = ctx;
+    return { exitCode: 0, signal: null, timedOut: false, sessionId: "s",
+      summary: "done", usage: { inputTokens: 1, outputTokens: 1 } };
+  };
+  const runner = new PaperclipRunner(
+    fakeExecute,
+    { engine: "cli", command: "codex" },
+    { promptInjection: "prompt-template", outputMode: "summary", cliFlags: [] },
+  );
+  const closed = new Promise<void>((resolve) => runner.on("close", () => resolve()));
+  await runner.start("write a haiku", { model: "gpt-5" });
+  await closed;
+
+  const ctx = captured!;
+  assert.equal(ctx.config.promptTemplate, "write a haiku", "raw prompt goes into promptTemplate for prompt-template adapters");
+  assert.equal(
+    (ctx.context as Record<string, unknown>).paperclipTaskMarkdown,
+    undefined,
+    "prompt-template adapters must not receive paperclipTaskMarkdown",
+  );
+  assert.deepEqual(ctx.config.extraArgs, [], "no claude-only flags reach a non-claude adapter");
+});
+
+test("prompt-template injection prepends the system prompt to the prompt", async () => {
+  let captured: import("@paperclipai/adapter-utils").AdapterExecutionContext | undefined;
+  const fakeExecute: AdapterExecute = async (ctx) => {
+    captured = ctx;
+    return { exitCode: 0, signal: null, timedOut: false, sessionId: "s",
+      summary: "done", usage: { inputTokens: 1, outputTokens: 1 } };
+  };
+  const runner = new PaperclipRunner(
+    fakeExecute,
+    { engine: "cli", command: "codex" },
+    { promptInjection: "prompt-template", outputMode: "summary", cliFlags: [] },
+  );
+  const closed = new Promise<void>((resolve) => runner.on("close", () => resolve()));
+  await runner.start("body", { model: "gpt-5", systemPrompt: "Be terse." });
+  await closed;
+
+  assert.equal(captured!.config.promptTemplate, "Be terse.\n\nbody");
+});
+
+test("summary output mode synthesizes content_delta + result from result.summary", async () => {
+  // codex emits its own JSONL (not claude stream-json), so the StreamJsonParser
+  // yields no content. The authoritative text is result.summary; the runner
+  // synthesizes the events routes.ts consumes so both stream + non-stream work.
+  const fakeExecute: AdapterExecute = async () => ({
+    exitCode: 0, signal: null, timedOut: false, sessionId: "s",
+    summary: "PAPERCLIP_CODEX_OK",
+    usage: { inputTokens: 7, outputTokens: 3 },
+  });
+  const runner = new PaperclipRunner(
+    fakeExecute,
+    { engine: "cli", command: "codex" },
+    { promptInjection: "prompt-template", outputMode: "summary", cliFlags: [] },
+  );
+  const deltas: string[] = [];
+  const results: ClaudeCliResult[] = [];
+  const closeCode = new Promise<number | null>((resolve) => {
+    runner.on("content_delta", (ev: ClaudeCliStreamEvent) => { deltas.push(ev.event.delta?.text || ""); });
+    runner.on("result", (r: ClaudeCliResult) => { results.push(r); });
+    runner.on("close", (code: number | null) => resolve(code));
+  });
+
+  await runner.start("hi", { model: "gpt-5" });
+  const code = await closeCode;
+
+  assert.deepEqual(deltas, ["PAPERCLIP_CODEX_OK"], "summary streamed as one content delta");
+  assert.equal(results.length, 1, "one synthesized result event");
+  assert.equal(results[0].result, "PAPERCLIP_CODEX_OK", "non-streaming text comes from result.result");
+  assert.equal(results[0].usage.input_tokens, 7);
+  assert.equal(results[0].usage.output_tokens, 3);
+  assert.equal(code, 0);
+});
+
 test("emits error and close(1) when execute rejects", async () => {
   const boom: AdapterExecute = async () => { throw new Error("adapter blew up"); };
   const runner = new PaperclipRunner(boom, { engine: "cli" });

@@ -78,7 +78,7 @@ test("paperclip/* model streams SSE deltas through the real route handler", asyn
 test("unregistered paperclip/* model returns 404 model_not_found (never runs Claude)", async () => {
   // Uses the REAL runnerFactory.create: an unregistered paperclip/* id must produce a
   // clean client error, not a spawned Claude subprocess and not a generic 500.
-  const req = { body: { model: "paperclip/codex_local", stream: false,
+  const req = { body: { model: "paperclip/definitely_not_registered", stream: false,
     messages: [{ role: "user", content: "hi" }] } } as unknown as Request;
   const res = fakeRes();
   let statusCode = 0;
@@ -88,5 +88,5 @@ test("unregistered paperclip/* model returns 404 model_not_found (never runs Cla
 
   assert.equal(statusCode, 404, "unknown paperclip adapter -> 404");
   assert.match(res.body, /"code":"model_not_found"/, "OpenAI-style model_not_found code");
-  assert.match(res.body, /paperclip\/codex_local/, "error names the requested model");
+  assert.match(res.body, /paperclip\/definitely_not_registered/, "error names the requested model");
 });

@@ -4,13 +4,26 @@
  * routes.ts uses to pick between PaperclipRunner and the direct ClaudeSubprocess.
  */
 import { execute as claudeLocalExecute } from "@paperclipai/adapter-claude-local/server";
-import { PaperclipRunner, type AgentRunner, type AdapterExecute } from "./paperclip-runner.js";
+import { execute as codexLocalExecute } from "@paperclipai/adapter-codex-local/server";
+import {
+  PaperclipRunner,
+  type AgentRunner,
+  type AdapterExecute,
+  type PromptInjection,
+  type OutputMode,
+} from "./paperclip-runner.js";
 import { ClaudeSubprocess } from "../subprocess/manager.js";
 
 export interface PaperclipModelSpec {
   adapterType: string;
   execute: AdapterExecute;
   baseConfig: Record<string, unknown>;
+  /** How this adapter receives the raw prompt (default "task-context"). */
+  promptInjection: PromptInjection;
+  /** How this adapter reports output (default "stream-json"). */
+  outputMode: OutputMode;
+  /** Adapter base CLI flags. claude-code flags for claude; [] for adapters that reject them. */
+  cliFlags: string[];
 }
 
 const REGISTRY: Record<string, PaperclipModelSpec> = {
@@ -18,6 +31,21 @@ const REGISTRY: Record<string, PaperclipModelSpec> = {
     adapterType: "claude_local",
     execute: claudeLocalExecute as AdapterExecute,
     baseConfig: { engine: "cli", command: "claude" },
+    promptInjection: "task-context",
+    outputMode: "stream-json",
+    cliFlags: ["--include-partial-messages", "--no-session-persistence"],
+  },
+  "paperclip/codex_local": {
+    adapterType: "codex_local",
+    execute: codexLocalExecute as AdapterExecute,
+    // codex reads its own approval-bypass key; claude's dangerouslySkipPermissions
+    // is ignored by buildCodexExecArgs. Without this codex blocks on approvals headless.
+    baseConfig: { engine: "cli", command: "codex", dangerouslyBypassApprovalsAndSandbox: true },
+    // codex ignores paperclipTaskMarkdown (prompt comes from rendered promptTemplate),
+    // rejects claude-only flags, and streams its own JSONL (text via result.summary).
+    promptInjection: "prompt-template",
+    outputMode: "summary",
+    cliFlags: [],
   },
 };
 
@@ -57,7 +85,11 @@ export function resolvePaperclipModel(model: string): PaperclipModelSpec | null 
 export function createRunner(model: string): AgentRunner {
   const spec = resolvePaperclipModel(model);
   if (spec) {
-    return new PaperclipRunner(spec.execute, spec.baseConfig);
+    return new PaperclipRunner(spec.execute, spec.baseConfig, {
+      promptInjection: spec.promptInjection,
+      outputMode: spec.outputMode,
+      cliFlags: spec.cliFlags,
+    });
   }
   if (model.startsWith(PAPERCLIP_MODEL_PREFIX)) {
     throw new UnknownPaperclipModelError(model, PAPERCLIP_MODEL_IDS);

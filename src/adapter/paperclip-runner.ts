@@ -12,7 +12,7 @@ import fs from "fs/promises";
 import path from "path";
 import type { AdapterExecutionContext, AdapterExecutionResult } from "@paperclipai/adapter-utils";
 import type { SubprocessOptions } from "../subprocess/manager.js";
-import type { ClaudeCliResult } from "../types/claude-cli.js";
+import type { ClaudeCliResult, ClaudeCliStreamEvent } from "../types/claude-cli.js";
 import { StreamJsonParser, type StreamJsonSink } from "./stream-json-parser.js";
 import { getBgWaitCeilingMs } from "../config.js";
 
@@ -25,6 +25,29 @@ export type AdapterExecute = (ctx: AdapterExecutionContext) => Promise<AdapterEx
 // non-templated task-context section instead. See src/adapter/paperclip-runner.test.ts.
 const EMPTY_RENDERING_PROMPT_TEMPLATE = "{{__collavre_raw_prompt_via_context__}}";
 
+// Claude-code-only CLI flags. Non-claude adapters (e.g. codex) reject these:
+// their arg builders append config.extraArgs verbatim to their own CLI.
+const CLAUDE_CLI_FLAGS = ["--include-partial-messages", "--no-session-persistence"];
+
+/**
+ * How a given adapter receives the raw user prompt, and how it reports output.
+ * These diverge per adapter — claude-local reads the prompt from a non-templated
+ * task-context section and streams claude stream-json; codex-local reads the
+ * prompt from a rendered promptTemplate and emits its own JSONL (so the final
+ * text must come from the normalized result.summary instead).
+ */
+export type PromptInjection = "task-context" | "prompt-template";
+export type OutputMode = "stream-json" | "summary";
+
+export interface PaperclipRunnerOptions {
+  /** Default "task-context" (claude-local). */
+  promptInjection?: PromptInjection;
+  /** Default "stream-json" (claude-local). */
+  outputMode?: OutputMode;
+  /** Adapter base CLI flags. Default = claude-code flags; pass [] for others. */
+  cliFlags?: string[];
+}
+
 export interface AgentRunner extends EventEmitter {
   start(prompt: string, options: SubprocessOptions): Promise<void>;
   kill(signal?: NodeJS.Signals): void;
@@ -36,11 +59,19 @@ export class PaperclipRunner extends EventEmitter implements AgentRunner {
   private isKilled = false;
   private cwd: string | null = null;
 
+  private readonly promptInjection: PromptInjection;
+  private readonly outputMode: OutputMode;
+  private readonly cliFlags: string[];
+
   constructor(
     private readonly execute: AdapterExecute,
     private readonly baseConfig: Record<string, unknown>,
+    options: PaperclipRunnerOptions = {},
   ) {
     super();
+    this.promptInjection = options.promptInjection ?? "task-context";
+    this.outputMode = options.outputMode ?? "stream-json";
+    this.cliFlags = options.cliFlags ?? CLAUDE_CLI_FLAGS;
   }
 
   async start(prompt: string, options: SubprocessOptions): Promise<void> {
@@ -50,11 +81,30 @@ export class PaperclipRunner extends EventEmitter implements AgentRunner {
     // ms (0 = unbounded) -> seconds (0 = adapter default/unbounded)
     const timeoutSec = options.timeout && options.timeout > 0 ? Math.ceil(options.timeout / 1000) : 0;
 
-    // --no-session-persistence mirrors the direct Claude path (subprocess/manager.ts): without it
-    // the CLI writes a transcript per run under the user's Claude config, growing unbounded and
-    // contradicting Option 1's stateless contract.
-    const extraArgs: string[] = ["--include-partial-messages", "--no-session-persistence"];
-    if (options.systemPrompt) extraArgs.push("--append-system-prompt", options.systemPrompt);
+    // Adapter base flags (claude-code flags by default; [] for adapters that
+    // reject them, e.g. codex). --no-session-persistence mirrors the direct
+    // Claude path: without it the CLI writes a transcript per run, growing
+    // unbounded and contradicting Option 1's stateless contract.
+    const extraArgs: string[] = [...this.cliFlags];
+
+    // Prompt input path is per-adapter:
+    //  - task-context (claude-local): promptTemplate renders to "" (an unknown
+    //    placeholder), and the raw prompt goes through the non-templated
+    //    paperclipTaskMarkdown section so any {{ }} delimiters survive verbatim.
+    //    systemPrompt rides the claude-only --append-system-prompt flag.
+    //  - prompt-template (codex-local): the adapter ignores paperclipTaskMarkdown
+    //    and builds its prompt from renderTemplate(promptTemplate), so the raw
+    //    prompt (system prompt prepended) goes straight into promptTemplate.
+    let promptTemplate: string;
+    let context: Record<string, unknown>;
+    if (this.promptInjection === "task-context") {
+      promptTemplate = EMPTY_RENDERING_PROMPT_TEMPLATE;
+      context = { paperclipTaskMarkdown: prompt };
+      if (options.systemPrompt) extraArgs.push("--append-system-prompt", options.systemPrompt);
+    } else {
+      promptTemplate = options.systemPrompt ? `${options.systemPrompt}\n\n${prompt}` : prompt;
+      context = {};
+    }
 
     const ctx: AdapterExecutionContext = {
       // randomUUID (not Date.now()+pid): Paperclip keys per-run bookkeeping
@@ -67,19 +117,23 @@ export class PaperclipRunner extends EventEmitter implements AgentRunner {
         ...this.baseConfig,
         engine: "cli", // MUST pin CLI lane (adapter defaults to ACP)
         cwd: this.cwd,
-        promptTemplate: EMPTY_RENDERING_PROMPT_TEMPLATE, // renders to ""; raw prompt goes via context below
-        model: options.model,
+        promptTemplate,
+        // Only forward the (claude-aliased) model on the claude path. For other
+        // adapters the OpenAI model id selected the adapter itself, not a model
+        // that adapter understands, so we let the adapter use its own default.
+        ...(this.promptInjection === "task-context" ? { model: options.model } : {}),
         dangerouslySkipPermissions: true,
         timeoutSec,
         extraArgs,
         env: { CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS: String(getBgWaitCeilingMs()) },
       },
-      // paperclipTaskMarkdown is appended verbatim (not run through renderTemplate), so the
-      // user's prompt reaches Claude with any {{ }} delimiters intact.
-      context: { paperclipTaskMarkdown: prompt },
+      context,
       onLog: async (stream: "stdout" | "stderr", chunk: string) => {
+        // Only the stream-json path feeds the parser; a summary-mode adapter emits
+        // its own (non-claude) JSONL, so its stdout is not parseable here — the
+        // authoritative text comes from result.summary on resolve.
         if (stream === "stdout") {
-          parser.push(chunk);
+          if (this.outputMode === "stream-json") parser.push(chunk);
         } else if (chunk.trim()) {
           console.error("[PaperclipRunner stderr]:", chunk.trim());
         }
@@ -93,7 +147,11 @@ export class PaperclipRunner extends EventEmitter implements AgentRunner {
     // Resolve immediately (like ClaudeSubprocess.start); drive execute in the background.
     void this.execute(ctx)
       .then((result) => {
-        parser.flush();
+        if (this.outputMode === "summary") {
+          this.emitSummary(result);
+        } else {
+          parser.flush();
+        }
         this.cleanupCwd();
         this.emit("close", result.exitCode ?? (result.timedOut ? 124 : 0));
       })
@@ -103,6 +161,46 @@ export class PaperclipRunner extends EventEmitter implements AgentRunner {
         this.emit("error", err instanceof Error ? err : new Error(String(err)));
         this.emit("close", 1);
       });
+  }
+
+  /**
+   * Synthesize the events routes.ts consumes from a normalized
+   * AdapterExecutionResult, for adapters whose live stdout is not claude
+   * stream-json (e.g. codex JSONL). result.summary is the authoritative final
+   * text; we stream it as one content delta (for --stream) and emit a result
+   * event carrying the same text (for the non-streaming path, which reads
+   * result.result). Token-by-token streaming is intentionally not attempted
+   * here — it would require a per-adapter live parser.
+   */
+  private emitSummary(result: AdapterExecutionResult): void {
+    const text = (result.summary ?? "").toString();
+    const sessionId = result.sessionId ?? "";
+    if (text) {
+      const delta: ClaudeCliStreamEvent = {
+        type: "stream_event",
+        event: { type: "content_block_delta", delta: { type: "text_delta", text } },
+        session_id: sessionId,
+        uuid: "",
+      };
+      this.emit("content_delta", delta);
+    }
+    const synthesized: ClaudeCliResult = {
+      type: "result",
+      subtype: result.timedOut || result.exitCode !== 0 ? "error" : "success",
+      is_error: Boolean(result.errorMessage) || result.timedOut || result.exitCode !== 0,
+      duration_ms: 0,
+      duration_api_ms: 0,
+      num_turns: 1,
+      result: text,
+      session_id: sessionId,
+      total_cost_usd: result.costUsd ?? 0,
+      usage: {
+        input_tokens: result.usage?.inputTokens ?? 0,
+        output_tokens: result.usage?.outputTokens ?? 0,
+      },
+      modelUsage: {},
+    };
+    this.emit("result", synthesized);
   }
 
   private buildSink(): StreamJsonSink {
