@@ -101,6 +101,34 @@ describe("materializeImages", () => {
     await assert.rejects(() => materializeImages(messages), ImageValidationError);
   });
 
+  it("rejects malformed base64 payloads instead of writing a bogus file", async () => {
+    // Buffer.from is permissive: "!!!!" decodes to an empty buffer rather than throwing,
+    // so without validation the proxy would write a 0-byte file and start the runner.
+    for (const bad of ["!!!!", "not*valid*base64", "AB", "abc"]) {
+      const messages: OpenAIChatMessage[] = [
+        { role: "user", content: [{ type: "image_url", image_url: { url: `data:image/png;base64,${bad}` } }] },
+      ];
+      await assert.rejects(
+        () => materializeImages(messages),
+        ImageValidationError,
+        `expected rejection for payload ${JSON.stringify(bad)}`
+      );
+    }
+  });
+
+  it("accepts base64 payloads containing whitespace/newlines", async () => {
+    // Real data URLs sometimes wrap base64 across lines; whitespace must not be treated as malformed.
+    const wrapped = HELLO_B64.slice(0, 2) + "\n  " + HELLO_B64.slice(2);
+    const messages: OpenAIChatMessage[] = [
+      { role: "user", content: [{ type: "image_url", image_url: { url: `data:image/png;base64,${wrapped}` } }] },
+    ];
+    const { messages: out, cleanup } = await materializeImages(messages);
+    const parts = out[0].content as any[];
+    const filePath = /\((.+)\)$/.exec(parts[0].text)![1];
+    assert.equal(readFileSync(filePath).toString(), "hello");
+    await cleanup();
+  });
+
   it("cleans up temp files even when a later image in the batch fails validation", async () => {
     // First image is valid (gets written), second is unsupported → must reject AND not leak the first file.
     let leaked = "";

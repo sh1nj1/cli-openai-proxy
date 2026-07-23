@@ -64,7 +64,17 @@ export async function materializeImages(
     if (!ext) {
       throw new ImageValidationError(`Unsupported image type: ${mime || "unknown"}`);
     }
-    const bytes = Buffer.from(url.slice(comma + 1), "base64");
+    // Buffer.from(..., "base64") silently drops invalid chars and returns a
+    // truncated/empty buffer instead of throwing, which would write a bogus file
+    // and start the runner. Reject anything that is not canonical base64 up front.
+    const payload = url.slice(comma + 1).replace(/\s/g, "");
+    if (payload.length === 0 || payload.length % 4 !== 0 || !/^[A-Za-z0-9+/]*={0,2}$/.test(payload)) {
+      throw new ImageValidationError("Malformed base64 image data");
+    }
+    const bytes = Buffer.from(payload, "base64");
+    if (bytes.length === 0) {
+      throw new ImageValidationError("Malformed base64 image data");
+    }
     if (bytes.length > MAX_IMAGE_BYTES) {
       throw new ImageValidationError(
         `Image exceeds ${MAX_IMAGE_BYTES} byte limit (${bytes.length} bytes)`
