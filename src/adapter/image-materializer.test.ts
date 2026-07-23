@@ -129,6 +129,29 @@ describe("materializeImages", () => {
     await cleanup();
   });
 
+  it("rejects an image_url part with a missing or empty url instead of silently dropping it", async () => {
+    // A falsy url would otherwise fall through unchanged and be dropped by extractText — a silent no-op.
+    const cases: unknown[] = [undefined, "", { type: "image_url" }];
+    for (const bad of cases) {
+      const part =
+        bad && typeof bad === "object" ? bad : { type: "image_url", image_url: { url: bad } };
+      const messages: OpenAIChatMessage[] = [{ role: "user", content: [part as any] }];
+      await assert.rejects(
+        () => materializeImages(messages),
+        ImageValidationError,
+        `expected rejection for ${JSON.stringify(bad)}`
+      );
+    }
+  });
+
+  it("rejects a non-string image_url.url with a validation error rather than a 500", async () => {
+    // A truthy non-string url would reach materializePart and throw on .startsWith → generic 500.
+    const messages: OpenAIChatMessage[] = [
+      { role: "user", content: [{ type: "image_url", image_url: { url: 12345 as any } }] },
+    ];
+    await assert.rejects(() => materializeImages(messages), ImageValidationError);
+  });
+
   it("cleans up temp files even when a later image in the batch fails validation", async () => {
     // First image is valid (gets written), second is unsupported → must reject AND not leak the first file.
     let leaked = "";

@@ -107,8 +107,15 @@ export async function materializeImages(
       }
       const parts: OpenAIContentPart[] = [];
       for (const part of msg.content) {
-        if (part.type === "image_url" && part.image_url?.url) {
-          parts.push(await materializePart(part.image_url.url));
+        if (part.type === "image_url") {
+          // Request bodies aren't runtime-typed: a missing/empty url would fall
+          // through and be dropped silently by extractText, and a non-string url
+          // would throw on .startsWith → generic 500. Reject both as 400 here.
+          const url = part.image_url?.url;
+          if (typeof url !== "string" || url.length === 0) {
+            throw new ImageValidationError("image_url.url must be a non-empty string");
+          }
+          parts.push(await materializePart(url));
         } else {
           parts.push(part);
         }
