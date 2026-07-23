@@ -44,9 +44,18 @@ function fakeRes(): Response & { body: string; ended: boolean; headers: Record<s
   res.setHeader = (k: string, v: string) => { res.headers[k] = v; };
   res.flushHeaders = () => { res.headersSent = true; };
   res.write = (chunk: string) => { res.body += chunk; return true; };
-  res.end = () => { res.ended = true; res.writableEnded = true; emitter.emit("close"); };
+  // Mirror Express: sending a response commits headers and ends the writable side,
+  // so the route's post-send guards (!res.headersSent / res.writable) see it as done.
+  res.end = () => {
+    res.ended = true; res.writableEnded = true; res.writable = false; res.headersSent = true;
+    emitter.emit("close");
+  };
   res.status = () => res;
-  res.json = (obj: unknown) => { res.body += JSON.stringify(obj); res.ended = true; return res; };
+  res.json = (obj: unknown) => {
+    res.body += JSON.stringify(obj);
+    res.ended = true; res.writableEnded = true; res.writable = false; res.headersSent = true;
+    return res;
+  };
   return res;
 }
 
@@ -106,6 +115,63 @@ test("streaming JSON mode extracts the final codex answer, not an intermediate J
     assert.doesNotMatch(res.body, /"content":"\{\\"status\\":\\"working\\"\}"/,
       "the intermediate JSON status block is NOT what the client receives");
     assert.match(res.body, /data: \[DONE\]/, "terminated with [DONE]");
+  } finally {
+    runnerFactory.create = orig;
+  }
+});
+
+test("usage-limit failure returns 429 insufficient_quota with the verbatim message (non-streaming)", async () => {
+  // A Claude Max usage limit must reach the client as a 429 carrying the CLI's own
+  // message, matching how the OpenAI endpoint reports quota exhaustion.
+  const limitMsg = "Claude AI usage limit reached. Resets at 3pm.";
+  const quotaExecute: AdapterExecute = async () => ({
+    exitCode: 1, signal: null, timedOut: false,
+    errorMessage: limitMsg, errorCode: "provider_quota", errorFamily: "provider_quota",
+  });
+  const orig = runnerFactory.create;
+  runnerFactory.create = (model: string) =>
+    model.startsWith("paperclip/")
+      ? new PaperclipRunner(quotaExecute, { engine: "cli" })
+      : orig(model);
+
+  try {
+    const req = { body: { model: "paperclip/claude_local", stream: false,
+      messages: [{ role: "user", content: "hi" }] } } as unknown as Request;
+    const res = fakeRes();
+    let statusCode = 0;
+    res.status = (code: number) => { statusCode = code; return res; };
+
+    await handleChatCompletions(req, res);
+
+    assert.equal(statusCode, 429, "usage limit -> HTTP 429");
+    assert.match(res.body, /"type":"insufficient_quota"/, "OpenAI insufficient_quota type");
+    assert.match(res.body, /Claude AI usage limit reached\. Resets at 3pm\./, "verbatim CLI message");
+  } finally {
+    runnerFactory.create = orig;
+  }
+});
+
+test("usage-limit failure streams the verbatim error in-band (streaming)", async () => {
+  const limitMsg = "Claude AI usage limit reached. Resets at 3pm.";
+  const quotaExecute: AdapterExecute = async () => ({
+    exitCode: 1, signal: null, timedOut: false,
+    errorMessage: limitMsg, errorCode: "provider_quota", errorFamily: "provider_quota",
+  });
+  const orig = runnerFactory.create;
+  runnerFactory.create = (model: string) =>
+    model.startsWith("paperclip/")
+      ? new PaperclipRunner(quotaExecute, { engine: "cli" })
+      : orig(model);
+
+  try {
+    const req = { body: { model: "paperclip/claude_local", stream: true,
+      messages: [{ role: "user", content: "hi" }] } } as unknown as Request;
+    const res = fakeRes();
+    await handleChatCompletions(req, res);
+
+    assert.match(res.body, /"type":"insufficient_quota"/, "in-band OpenAI error type");
+    assert.match(res.body, /Claude AI usage limit reached\. Resets at 3pm\./, "verbatim message in the stream");
+    assert.doesNotMatch(res.body, /"content":"/, "no empty success delta precedes the error");
   } finally {
     runnerFactory.create = orig;
   }
