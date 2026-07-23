@@ -6,7 +6,7 @@
 
 import type { Request, Response } from "express";
 import { v4 as uuidv4 } from "uuid";
-import { runnerFactory } from "../adapter/paperclip-registry.js";
+import { runnerFactory, PAPERCLIP_MODEL_IDS } from "../adapter/paperclip-registry.js";
 import type { AgentRunner } from "../adapter/paperclip-runner.js";
 import { openaiToCli } from "../adapter/openai-to-cli.js";
 import {
@@ -404,14 +404,22 @@ const MODELS_DATA = (() => {
   const prefixes = ["", "openai/", "anthropic/", "claude-max/", "claude-code-cli/"];
   return Object.freeze({
     object: "list" as const,
-    data: prefixes.flatMap((prefix) =>
-      baseModels.map((id) => ({
-        id: `${prefix}${id}`,
+    data: [
+      ...prefixes.flatMap((prefix) =>
+        baseModels.map((id) => ({
+          id: `${prefix}${id}`,
+          object: "model" as const,
+          owned_by: "anthropic",
+          created: now,
+        }))
+      ),
+      ...PAPERCLIP_MODEL_IDS.map((id) => ({
+        id,
         object: "model" as const,
-        owned_by: "anthropic",
+        owned_by: "paperclip",
         created: now,
-      }))
-    ),
+      })),
+    ],
   });
 })();
 
