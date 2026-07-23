@@ -33,6 +33,15 @@ const MIME_EXT: Record<string, string> = {
 const MAX_IMAGE_BYTES = 20 * 1024 * 1024;
 
 function toMarkdownLink(target: string): OpenAIContentPart {
+  // A bare markdown destination ends at the first unbalanced ')' and cannot hold
+  // whitespace, so a URL like ".../cat).png" would truncate the link and the CLI
+  // would never see the image. Wrap such targets in CommonMark's <...> delimited
+  // form (escaping the chars still special there). Safe targets — our own temp
+  // paths, plain URLs — stay bare so the emitted prompt matches the tested output.
+  if (/[()<>\s]/.test(target)) {
+    const escaped = target.replace(/[\\<>]/g, "\\$&");
+    return { type: "text", text: `![image](<${escaped}>)` };
+  }
   return { type: "text", text: `![image](${target})` };
 }
 

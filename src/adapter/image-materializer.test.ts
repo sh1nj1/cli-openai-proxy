@@ -78,6 +78,21 @@ describe("materializeImages", () => {
     await cleanup();
   });
 
+  it("wraps a URL containing ')' so the markdown destination is not truncated", async () => {
+    // A bare "![image](https://…/cat).png)" ends the link at the first ')', so the
+    // CLI receives a broken link and never sees the image. Delimit it instead.
+    const url = "https://example.com/cat).png";
+    const messages: OpenAIChatMessage[] = [
+      { role: "user", content: [{ type: "image_url", image_url: { url } }] },
+    ];
+    const { messages: out, cleanup } = await materializeImages(messages);
+    const text = (out[0].content as any[])[0].text;
+    const m = /^!\[image\]\(<(.+)>\)$/.exec(text);
+    assert.ok(m, `expected angle-bracket-delimited link, got: ${text}`);
+    assert.equal(m![1], url, "the full URL must survive intact");
+    await cleanup();
+  });
+
   it("rejects unsupported MIME types with a 400-style validation error", async () => {
     const messages: OpenAIChatMessage[] = [
       { role: "user", content: [{ type: "image_url", image_url: { url: `data:image/tiff;base64,${HELLO_B64}` } }] },
