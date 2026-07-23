@@ -6,7 +6,8 @@
 
 import type { Request, Response } from "express";
 import { v4 as uuidv4 } from "uuid";
-import { ClaudeSubprocess } from "../subprocess/manager.js";
+import { runnerFactory } from "../adapter/paperclip-registry.js";
+import type { AgentRunner } from "../adapter/paperclip-runner.js";
 import { openaiToCli } from "../adapter/openai-to-cli.js";
 import {
   cliResultToOpenai,
@@ -49,7 +50,7 @@ export async function handleChatCompletions(
 
     // Convert to CLI input format
     const cliInput = openaiToCli(body);
-    const subprocess = new ClaudeSubprocess();
+    const subprocess = runnerFactory.create(requestedModel);
 
     if (stream) {
       await handleStreamingResponse(req, res, subprocess, cliInput, requestId, requestedModel, startTime, cliInput.jsonMode);
@@ -91,7 +92,7 @@ export async function handleChatCompletions(
 async function handleStreamingResponse(
   req: Request,
   res: Response,
-  subprocess: ClaudeSubprocess,
+  subprocess: AgentRunner,
   cliInput: ReturnType<typeof openaiToCli>,
   requestId: string,
   requestedModel: string,
@@ -275,7 +276,7 @@ async function handleStreamingResponse(
  */
 async function handleNonStreamingResponse(
   res: Response,
-  subprocess: ClaudeSubprocess,
+  subprocess: AgentRunner,
   cliInput: ReturnType<typeof openaiToCli>,
   requestId: string,
   requestedModel: string,

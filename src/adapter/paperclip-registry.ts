@@ -35,3 +35,12 @@ export function createRunner(model: string): AgentRunner {
   }
   return new ClaudeSubprocess();
 }
+
+/**
+ * Mutable holder wrapping `createRunner`. routes.ts calls through this object
+ * (rather than the bare function) so tests can substitute the factory: ESM
+ * module namespace properties are read-only/non-configurable, so reassigning
+ * `registry.createRunner` directly is not possible; a plain object property
+ * can be swapped freely.
+ */
+export const runnerFactory = { create: createRunner };
