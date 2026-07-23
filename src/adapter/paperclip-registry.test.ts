@@ -1,6 +1,11 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { resolvePaperclipModel, createRunner, PAPERCLIP_MODEL_IDS } from "./paperclip-registry.js";
+import {
+  resolvePaperclipModel,
+  createRunner,
+  PAPERCLIP_MODEL_IDS,
+  UnknownPaperclipModelError,
+} from "./paperclip-registry.js";
 import { PaperclipRunner } from "./paperclip-runner.js";
 import { ClaudeSubprocess } from "../subprocess/manager.js";
 
@@ -20,6 +25,26 @@ test("returns null for non-paperclip models", () => {
 test("createRunner returns PaperclipRunner for paperclip models, ClaudeSubprocess otherwise", () => {
   assert.ok(createRunner("paperclip/claude_local") instanceof PaperclipRunner);
   assert.ok(createRunner("claude-opus-4") instanceof ClaudeSubprocess);
+});
+
+test("createRunner NEVER silently falls back to Claude for an unknown paperclip/* model", () => {
+  // Regression: `paperclip/codex_local` (and any unregistered paperclip/* id) used to
+  // fall through to `new ClaudeSubprocess()`, so requesting a Paperclip adapter silently
+  // ran Claude instead. A paperclip/* prefix must resolve to a Paperclip adapter or error.
+  assert.throws(() => createRunner("paperclip/codex_local"), UnknownPaperclipModelError);
+  assert.throws(() => createRunner("paperclip/definitely_not_registered"), UnknownPaperclipModelError);
+});
+
+test("UnknownPaperclipModelError names the model and lists the known ids", () => {
+  try {
+    createRunner("paperclip/codex_local");
+    assert.fail("expected createRunner to throw");
+  } catch (err) {
+    if (!(err instanceof UnknownPaperclipModelError)) throw err;
+    assert.equal(err.model, "paperclip/codex_local");
+    assert.ok(err.message.includes("paperclip/codex_local"));
+    assert.ok(err.message.includes("paperclip/claude_local")); // a known id is surfaced
+  }
 });
 
 test("PAPERCLIP_MODEL_IDS advertises the registered ids", () => {

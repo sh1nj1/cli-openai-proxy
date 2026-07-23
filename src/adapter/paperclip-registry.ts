@@ -23,15 +23,44 @@ const REGISTRY: Record<string, PaperclipModelSpec> = {
 
 export const PAPERCLIP_MODEL_IDS: string[] = Object.keys(REGISTRY);
 
+/** Prefix that routes a request to a Paperclip adapter rather than the direct Claude proxy. */
+export const PAPERCLIP_MODEL_PREFIX = "paperclip/";
+
+/**
+ * Thrown when a `paperclip/<adapterType>` model is requested but no adapter is
+ * registered for it. Surfacing this (instead of silently running Claude) is the
+ * whole point: `paperclip/*` must resolve to a Paperclip adapter or fail loudly.
+ */
+export class UnknownPaperclipModelError extends Error {
+  constructor(
+    public readonly model: string,
+    public readonly knownIds: string[],
+  ) {
+    const known = knownIds.length > 0 ? knownIds.join(", ") : "(none registered)";
+    super(`Unknown Paperclip adapter model "${model}". Registered paperclip models: ${known}.`);
+    this.name = "UnknownPaperclipModelError";
+  }
+}
+
 export function resolvePaperclipModel(model: string): PaperclipModelSpec | null {
   return REGISTRY[model] ?? null;
 }
 
-/** Pick the runner for a request's model. Both satisfy AgentRunner. */
+/**
+ * Pick the runner for a request's model. Both PaperclipRunner and ClaudeSubprocess
+ * satisfy AgentRunner.
+ *
+ * A `paperclip/*` model MUST resolve to a registered Paperclip adapter; an unknown
+ * one throws UnknownPaperclipModelError rather than falling back to Claude. Only
+ * non-`paperclip/*` models use the direct Claude proxy (this repo's default).
+ */
 export function createRunner(model: string): AgentRunner {
   const spec = resolvePaperclipModel(model);
   if (spec) {
     return new PaperclipRunner(spec.execute, spec.baseConfig);
+  }
+  if (model.startsWith(PAPERCLIP_MODEL_PREFIX)) {
+    throw new UnknownPaperclipModelError(model, PAPERCLIP_MODEL_IDS);
   }
   return new ClaudeSubprocess();
 }

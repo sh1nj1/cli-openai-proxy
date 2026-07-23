@@ -6,7 +6,7 @@
 
 import type { Request, Response } from "express";
 import { v4 as uuidv4 } from "uuid";
-import { runnerFactory, PAPERCLIP_MODEL_IDS } from "../adapter/paperclip-registry.js";
+import { runnerFactory, PAPERCLIP_MODEL_IDS, UnknownPaperclipModelError } from "../adapter/paperclip-registry.js";
 import type { AgentRunner } from "../adapter/paperclip-runner.js";
 import { openaiToCli } from "../adapter/openai-to-cli.js";
 import {
@@ -69,6 +69,21 @@ export async function handleChatCompletions(
       stream,
       success: false,
     });
+
+    // An unregistered paperclip/* model is a client error (unknown model), not a
+    // server fault — surface it as an OpenAI-style 404 model_not_found rather than 500.
+    if (error instanceof UnknownPaperclipModelError) {
+      if (!res.headersSent) {
+        res.status(404).json({
+          error: {
+            message,
+            type: "invalid_request_error",
+            code: "model_not_found",
+          },
+        });
+      }
+      return;
+    }
 
     if (!res.headersSent) {
       res.status(500).json({
