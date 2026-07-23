@@ -128,7 +128,7 @@ test("prompt-template injection routes the raw prompt through a context variable
   const runner = new PaperclipRunner(
     fakeExecute,
     { engine: "cli", command: "codex" },
-    { promptInjection: "prompt-template", outputMode: "summary", cliFlags: [] },
+    { promptInjection: "prompt-template", outputMode: "codex-jsonl", cliFlags: [] },
   );
   const closed = new Promise<void>((resolve) => runner.on("close", () => resolve()));
   await runner.start(rawPrompt, { model: "gpt-5" });
@@ -161,7 +161,7 @@ test("prompt-template injection prepends the system prompt to the prompt (render
   const runner = new PaperclipRunner(
     fakeExecute,
     { engine: "cli", command: "codex" },
-    { promptInjection: "prompt-template", outputMode: "summary", cliFlags: [] },
+    { promptInjection: "prompt-template", outputMode: "codex-jsonl", cliFlags: [] },
   );
   const closed = new Promise<void>((resolve) => runner.on("close", () => resolve()));
   await runner.start("body", { model: "gpt-5", systemPrompt: "Be terse." });
@@ -174,10 +174,10 @@ test("prompt-template injection prepends the system prompt to the prompt (render
   );
 });
 
-test("summary output mode synthesizes content_delta + result from result.summary", async () => {
-  // codex emits its own JSONL (not claude stream-json), so the StreamJsonParser
-  // yields no content. The authoritative text is result.summary; the runner
-  // synthesizes the events routes.ts consumes so both stream + non-stream work.
+test("codex-jsonl mode with no live agent_message falls back to result.summary", async () => {
+  // When no agent_message block streams on stdout (e.g. the adapter's ACP fallback
+  // puts the text only in result.summary), the runner synthesizes the events
+  // routes.ts consumes from result.summary so both stream + non-stream still work.
   const fakeExecute: AdapterExecute = async () => ({
     exitCode: 0, signal: null, timedOut: false, sessionId: "s",
     summary: "PAPERCLIP_CODEX_OK",
@@ -186,7 +186,7 @@ test("summary output mode synthesizes content_delta + result from result.summary
   const runner = new PaperclipRunner(
     fakeExecute,
     { engine: "cli", command: "codex" },
-    { promptInjection: "prompt-template", outputMode: "summary", cliFlags: [] },
+    { promptInjection: "prompt-template", outputMode: "codex-jsonl", cliFlags: [] },
   );
   const deltas: string[] = [];
   const results: ClaudeCliResult[] = [];
@@ -207,8 +207,82 @@ test("summary output mode synthesizes content_delta + result from result.summary
   assert.equal(code, 0);
 });
 
-test("summary mode surfaces a failed adapter result as error, not a success result", async () => {
-  // Summary-mode adapters (e.g. codex) resolve normal CLI failures as an
+// Emulates the `codex exec --json` NDJSON stream (see src/adapter/codex-jsonl-parser.ts).
+const codexLine = (obj: unknown) => JSON.stringify(obj) + "\n";
+const codexAgentMessage = (text: string) =>
+  codexLine({ type: "item.completed", item: { id: "item_0", type: "agent_message", text } });
+
+test("codex-jsonl mode streams a content delta per live agent_message block", async () => {
+  // Path 1: codex prints each completed agent_message as one JSONL line; the runner
+  // parses stdout live and emits a content delta per block instead of waiting for the
+  // process to exit and synthesizing a single delta from result.summary.
+  const fakeExecute: AdapterExecute = async (ctx) => {
+    await ctx.onLog("stdout", codexLine({ type: "thread.started", thread_id: "t1" }));
+    await ctx.onLog("stdout", codexLine({ type: "turn.started" }));
+    await ctx.onLog("stdout", codexAgentMessage("Hello from codex."));
+    await ctx.onLog("stdout", codexLine({ type: "turn.completed", usage: { input_tokens: 9, output_tokens: 4 } }));
+    return { exitCode: 0, signal: null, timedOut: false, sessionId: "s",
+      summary: "Hello from codex.", usage: { inputTokens: 9, outputTokens: 4 } };
+  };
+  const runner = new PaperclipRunner(
+    fakeExecute,
+    { engine: "cli", command: "codex" },
+    { promptInjection: "prompt-template", outputMode: "codex-jsonl", cliFlags: [] },
+  );
+  const deltas: string[] = [];
+  const results: ClaudeCliResult[] = [];
+  const closeCode = new Promise<number | null>((resolve) => {
+    runner.on("content_delta", (ev: ClaudeCliStreamEvent) => { deltas.push(ev.event.delta?.text || ""); });
+    runner.on("result", (r: ClaudeCliResult) => { results.push(r); });
+    runner.on("close", (code: number | null) => resolve(code));
+  });
+
+  await runner.start("hi", { model: "gpt-5" });
+  const code = await closeCode;
+
+  // The live block is the only content delta — result.summary must NOT be re-emitted
+  // (that would duplicate the answer for streaming clients).
+  assert.deepEqual(deltas, ["Hello from codex."], "one delta from the live block, not a duplicate summary delta");
+  assert.equal(results.length, 1, "one terminal result event");
+  assert.equal(results[0].result, "Hello from codex.", "non-streaming text mirrors the streamed text");
+  assert.equal(results[0].usage.output_tokens, 4);
+  assert.equal(code, 0);
+});
+
+test("codex-jsonl mode streams multiple agent_message blocks and concatenates them for the result", async () => {
+  const fakeExecute: AdapterExecute = async (ctx) => {
+    await ctx.onLog("stdout", codexAgentMessage("First block."));
+    await ctx.onLog("stdout", codexAgentMessage("Second block."));
+    return { exitCode: 0, signal: null, timedOut: false, sessionId: "s",
+      summary: "Second block.", usage: { inputTokens: 3, outputTokens: 5 } };
+  };
+  const runner = new PaperclipRunner(
+    fakeExecute,
+    { engine: "cli", command: "codex" },
+    { promptInjection: "prompt-template", outputMode: "codex-jsonl", cliFlags: [] },
+  );
+  const deltas: string[] = [];
+  const results: ClaudeCliResult[] = [];
+  const closed = new Promise<void>((resolve) => {
+    runner.on("content_delta", (ev: ClaudeCliStreamEvent) => { deltas.push(ev.event.delta?.text || ""); });
+    runner.on("result", (r: ClaudeCliResult) => { results.push(r); });
+    runner.on("close", () => resolve());
+  });
+
+  await runner.start("hi", { model: "gpt-5" });
+  await closed;
+
+  // Subsequent blocks are separated so the streamed view equals the accumulated result.
+  assert.deepEqual(deltas, ["First block.", "\n\nSecond block."], "each block streams; later blocks are separated");
+  assert.equal(
+    results[0].result,
+    "First block.\n\nSecond block.",
+    "non-streaming result carries every block, not just the last (summary keeps only the last)",
+  );
+});
+
+test("codex-jsonl mode surfaces a failed adapter result as error, not a success result", async () => {
+  // codex-jsonl adapters (e.g. codex) resolve normal CLI failures as an
   // AdapterExecutionResult with errorMessage/nonzero exitCode instead of
   // throwing. Emitting `result` here makes routes.ts report a 200 success, so a
   // failed run (missing creds, bad args, timeout) must emit `error` instead.
@@ -220,7 +294,7 @@ test("summary mode surfaces a failed adapter result as error, not a success resu
   const runner = new PaperclipRunner(
     failedExecute,
     { engine: "cli", command: "codex" },
-    { promptInjection: "prompt-template", outputMode: "summary", cliFlags: [] },
+    { promptInjection: "prompt-template", outputMode: "codex-jsonl", cliFlags: [] },
   );
   const results: ClaudeCliResult[] = [];
   let errMsg = "";
@@ -238,14 +312,14 @@ test("summary mode surfaces a failed adapter result as error, not a success resu
   assert.notEqual(code, 0, "close code reflects the failure");
 });
 
-test("summary mode surfaces a timed-out adapter result as error", async () => {
+test("codex-jsonl mode surfaces a timed-out adapter result as error", async () => {
   const timedOutExecute: AdapterExecute = async () => ({
     exitCode: 0, signal: null, timedOut: true, sessionId: "s", summary: "",
   });
   const runner = new PaperclipRunner(
     timedOutExecute,
     { engine: "cli", command: "codex" },
-    { promptInjection: "prompt-template", outputMode: "summary", cliFlags: [] },
+    { promptInjection: "prompt-template", outputMode: "codex-jsonl", cliFlags: [] },
   );
   const results: ClaudeCliResult[] = [];
   let errored = false;
@@ -261,7 +335,7 @@ test("summary mode surfaces a timed-out adapter result as error", async () => {
   assert.ok(errored, "timeout surfaces via the error event");
 });
 
-test("summary mode surfaces a signal-terminated adapter result as error", async () => {
+test("codex-jsonl mode surfaces a signal-terminated adapter result as error", async () => {
   // A child killed by a signal (SIGKILL from OOM, operator/system SIGTERM)
   // resolves with exitCode: null + signal set, and codex normalization only
   // sets errorMessage when (exitCode ?? 0) is nonzero — so this result carries
@@ -274,7 +348,7 @@ test("summary mode surfaces a signal-terminated adapter result as error", async 
   const runner = new PaperclipRunner(
     signaledExecute,
     { engine: "cli", command: "codex" },
-    { promptInjection: "prompt-template", outputMode: "summary", cliFlags: [] },
+    { promptInjection: "prompt-template", outputMode: "codex-jsonl", cliFlags: [] },
   );
   const results: ClaudeCliResult[] = [];
   let errMsg = "";

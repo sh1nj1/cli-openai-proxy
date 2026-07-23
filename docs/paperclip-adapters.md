@@ -7,7 +7,7 @@ packages) instead of the built-in direct Claude spawn. Registered adapters:
 | Model id                 | Paperclip package                   | Requires (on PATH, authed) | Live streaming        |
 |--------------------------|-------------------------------------|----------------------------|-----------------------|
 | `paperclip/claude_local` | `@paperclipai/adapter-claude-local` | `claude`                   | token-by-token        |
-| `paperclip/codex_local`  | `@paperclipai/adapter-codex-local`  | `codex`                    | single chunk at end   |
+| `paperclip/codex_local`  | `@paperclipai/adapter-codex-local`  | `codex`                    | per message block     |
 
 All adapters run `engine: "cli"`. Option 1 is **stateless** (no session resume).
 
@@ -20,12 +20,17 @@ All adapters run `engine: "cli"`. Option 1 is **stateless** (no session resume).
   all — the adapter uses its own configured default — because the OpenAI model
   id selected the adapter, not a model that adapter would understand. The tier /
   sub-model is not selectable through the model id in Option 1.
-- **codex (and any `summary` adapter) streams the full reply as one chunk.** Its
-  live stdout is codex JSONL, not Claude stream-json, so token-by-token
-  streaming is not attempted; the authoritative text is taken from the
-  normalized `result.summary` and emitted as a single content delta on
-  completion. `--stream` requests still terminate correctly (`finish_reason` +
-  `[DONE]`), just without incremental tokens.
+- **codex streams at message-block granularity (`codex-jsonl`), not token-by-token.**
+  Its live stdout is `codex exec --json` NDJSON, not Claude stream-json, so the
+  runner parses it live with a dedicated `CodexJsonlParser` and emits a content
+  delta per completed `agent_message` block. codex prints each message as one
+  JSONL line only once that message is fully generated (there are no token
+  deltas), so a single-message answer arrives as one block while an agentic turn
+  with multiple messages streams block-by-block as each completes. Token-by-token
+  streaming of the final answer would require the ACP engine (Path 2). If no
+  `agent_message` block reaches stdout (e.g. the adapter's ACP fallback), the text
+  falls back to the normalized `result.summary`, emitted as a single delta — so
+  `--stream` requests always terminate correctly (`finish_reason` + `[DONE]`).
 - **codex renders `promptTemplate`, but the raw prompt reaches it verbatim.**
   A prompt containing `{{ … }}` template delimiters is preserved (unlike a naive
   assignment, where the adapter's `renderTemplate()` would substitute/strip
@@ -69,11 +74,13 @@ applies:
 |-----------------|-----------------------------------------|--------------------------------------------|
 | Prompt input    | `task-context` — raw prompt via non-templated `context.paperclipTaskMarkdown` (delimiters survive) | `prompt-template` — raw prompt in `context.collavreRawPrompt`, referenced once as `{{context.collavreRawPrompt}}` (single-pass render, delimiters survive) |
 | CLI base flags  | `--include-partial-messages`, `--no-session-persistence` (+ `--append-system-prompt`) | none — codex rejects claude flags (its arg builder appends `extraArgs` verbatim) |
-| Output          | `stream-json` — `onLog` stdout teed through `StreamJsonParser` (token deltas) | `summary` — stdout is codex JSONL; final text synthesized from `result.summary` |
+| Output          | `stream-json` — `onLog` stdout teed through `StreamJsonParser` (token deltas) | `codex-jsonl` — `onLog` stdout teed through `CodexJsonlParser` (a content delta per `agent_message` block); `result.summary` is the terminal/fallback text |
 
-The `summary` path synthesizes the same `content_delta` + `result` events the
-route layer already consumes, so adding a `summary` adapter needs no route
-changes. Adapter approval bypass is per-adapter too: codex reads
+Both parsers emit the same `content_delta` + `result` events the route layer
+already consumes, so the SSE layer needs no per-adapter changes. When a
+`codex-jsonl` run streams no `agent_message` block, the runner synthesizes a
+single delta from `result.summary` (the pre-streaming behavior). Adapter approval
+bypass is per-adapter too: codex reads
 `dangerouslyBypassApprovalsAndSandbox` (claude's `dangerouslySkipPermissions`
 is ignored by codex).
 
