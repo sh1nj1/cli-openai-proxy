@@ -17,7 +17,13 @@ const resultLine = JSON.stringify({
 test("streams onLog stdout through the parser and emits events, then close(0)", async () => {
   const fakeExecute: AdapterExecute = async (ctx) => {
     assert.equal(ctx.config.engine, "cli", "must pin CLI lane");
-    assert.equal(ctx.config.promptTemplate, "hello prompt", "raw prompt goes to promptTemplate");
+    // Raw prompt must NOT go through promptTemplate (the adapter renders {{...}} there).
+    assert.notEqual(ctx.config.promptTemplate, "hello prompt", "raw prompt must not sit in promptTemplate");
+    assert.equal(
+      (ctx.context as Record<string, unknown>).paperclipTaskMarkdown,
+      "hello prompt",
+      "raw prompt goes through the non-templated task context section",
+    );
     await ctx.onLog("stdout", deltaLine);
     await ctx.onLog("stdout", resultLine);
     return { exitCode: 0, signal: null, timedOut: false, sessionId: "s",
@@ -40,6 +46,36 @@ test("streams onLog stdout through the parser and emits events, then close(0)", 
   assert.ok(results.length > 0, "result event fired");
   assert.equal(results[0].usage.output_tokens, 1);
   assert.equal(code, 0);
+});
+
+test("preserves {{ }} template delimiters verbatim and disables session persistence", async () => {
+  const rawPrompt = "Explain what {{agent.name}} means in a Handlebars {{template}}.";
+  let captured: import("@paperclipai/adapter-utils").AdapterExecutionContext | undefined;
+  const fakeExecute: AdapterExecute = async (ctx) => {
+    captured = ctx;
+    return { exitCode: 0, signal: null, timedOut: false, sessionId: "s",
+      usage: { inputTokens: 1, outputTokens: 1 } };
+  };
+  const runner = new PaperclipRunner(fakeExecute, { engine: "cli" });
+  const closed = new Promise<void>((resolve) => runner.on("close", () => resolve()));
+  await runner.start(rawPrompt, { model: "opus" });
+  await closed;
+
+  assert.ok(captured, "execute received a ctx");
+  const ctx = captured!;
+  // The verbatim prompt (delimiters intact) reaches the non-templated context section.
+  assert.equal((ctx.context as Record<string, unknown>).paperclipTaskMarkdown, rawPrompt);
+  // promptTemplate must be non-empty (empty => default Paperclip agent instructions) but not the raw prompt.
+  assert.notEqual(ctx.config.promptTemplate, rawPrompt);
+  assert.ok(
+    typeof ctx.config.promptTemplate === "string" && ctx.config.promptTemplate.length > 0,
+    "promptTemplate stays non-empty to avoid the default template fallback",
+  );
+  // Stateless (Option 1): Claude must not persist a transcript per run.
+  assert.ok(
+    Array.isArray(ctx.config.extraArgs) && ctx.config.extraArgs.includes("--no-session-persistence"),
+    "extraArgs forwards --no-session-persistence to the Claude CLI",
+  );
 });
 
 test("emits error and close(1) when execute rejects", async () => {

@@ -17,6 +17,13 @@ import { getBgWaitCeilingMs } from "../config.js";
 
 export type AdapterExecute = (ctx: AdapterExecutionContext) => Promise<AdapterExecutionResult>;
 
+// The adapter runs config.promptTemplate through renderTemplate(), which substitutes/strips
+// any {{ path }} delimiters. It also falls back to the default Paperclip agent instructions
+// when promptTemplate is empty. So we keep promptTemplate non-empty but rendering to nothing
+// (an unknown placeholder resolves to "") and send the raw user prompt through the
+// non-templated task-context section instead. See src/adapter/paperclip-runner.test.ts.
+const EMPTY_RENDERING_PROMPT_TEMPLATE = "{{__collavre_raw_prompt_via_context__}}";
+
 export interface AgentRunner extends EventEmitter {
   start(prompt: string, options: SubprocessOptions): Promise<void>;
   kill(signal?: NodeJS.Signals): void;
@@ -42,7 +49,10 @@ export class PaperclipRunner extends EventEmitter implements AgentRunner {
     // ms (0 = unbounded) -> seconds (0 = adapter default/unbounded)
     const timeoutSec = options.timeout && options.timeout > 0 ? Math.ceil(options.timeout / 1000) : 0;
 
-    const extraArgs: string[] = ["--include-partial-messages"];
+    // --no-session-persistence mirrors the direct Claude path (subprocess/manager.ts): without it
+    // the CLI writes a transcript per run under the user's Claude config, growing unbounded and
+    // contradicting Option 1's stateless contract.
+    const extraArgs: string[] = ["--include-partial-messages", "--no-session-persistence"];
     if (options.systemPrompt) extraArgs.push("--append-system-prompt", options.systemPrompt);
 
     const ctx: AdapterExecutionContext = {
@@ -53,14 +63,16 @@ export class PaperclipRunner extends EventEmitter implements AgentRunner {
         ...this.baseConfig,
         engine: "cli", // MUST pin CLI lane (adapter defaults to ACP)
         cwd: this.cwd,
-        promptTemplate: prompt, // raw prompt becomes the entire stdin
+        promptTemplate: EMPTY_RENDERING_PROMPT_TEMPLATE, // renders to ""; raw prompt goes via context below
         model: options.model,
         dangerouslySkipPermissions: true,
         timeoutSec,
         extraArgs,
         env: { CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS: String(getBgWaitCeilingMs()) },
       },
-      context: {},
+      // paperclipTaskMarkdown is appended verbatim (not run through renderTemplate), so the
+      // user's prompt reaches Claude with any {{ }} delimiters intact.
+      context: { paperclipTaskMarkdown: prompt },
       onLog: async (stream: "stdout" | "stderr", chunk: string) => {
         if (stream === "stdout") {
           parser.push(chunk);
