@@ -306,6 +306,39 @@ test("emits error and close(1) when execute rejects", async () => {
   assert.equal(code, 1);
 });
 
+test("stream-json mode surfaces an is_error terminal result as error, not a success result", async () => {
+  // The claude stream-json path can deliver a well-formed terminal ClaudeCliResult
+  // marked is_error/subtype:"error" (e.g. max-turns reached, execution error) without
+  // throwing. routes.ts treats any `result` event as a 200 success, so a failed
+  // claude_local run must surface as `error` — otherwise the client gets a 200 with
+  // the (often empty/partial) error text instead of an adapter error.
+  const errorResultLine = JSON.stringify({
+    type: "result", subtype: "error", is_error: true, result: "",
+    session_id: "s", total_cost_usd: 0, duration_ms: 1, duration_api_ms: 1,
+    num_turns: 1, usage: { input_tokens: 5, output_tokens: 0 }, modelUsage: {},
+  }) + "\n";
+  const failingExecute: AdapterExecute = async (ctx) => {
+    await ctx.onLog("stdout", errorResultLine);
+    return { exitCode: 0, signal: null, timedOut: false, sessionId: "s",
+      usage: { inputTokens: 5, outputTokens: 0 } };
+  };
+  const runner = new PaperclipRunner(failingExecute, { engine: "cli", command: "claude" });
+  const results: ClaudeCliResult[] = [];
+  let errored = false;
+  const closeCode = new Promise<number | null>((resolve) => {
+    runner.on("result", (r: ClaudeCliResult) => { results.push(r); });
+    runner.on("error", () => { errored = true; });
+    runner.on("close", (code: number | null) => resolve(code));
+  });
+
+  await runner.start("hi", { model: "opus" });
+  const code = await closeCode;
+
+  assert.equal(results.length, 0, "an is_error terminal result must NOT be emitted as a success result event");
+  assert.ok(errored, "the failed run surfaces via the error event");
+  assert.notEqual(code, 0, "close code reflects the failure");
+});
+
 test("signals a child spawned after a pre-spawn kill() (disconnect before onSpawn)", async () => {
   // routes.ts wires kill() to client disconnect, and start() resolves immediately
   // while execute runs in the background. If the client disconnects before the

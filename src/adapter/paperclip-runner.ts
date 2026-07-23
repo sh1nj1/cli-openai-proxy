@@ -64,6 +64,7 @@ export class PaperclipRunner extends EventEmitter implements AgentRunner {
   private isKilled = false;
   private killSignal: NodeJS.Signals = "SIGTERM";
   private cwd: string | null = null;
+  private streamErrored = false;
 
   private readonly promptInjection: PromptInjection;
   private readonly outputMode: OutputMode;
@@ -187,7 +188,11 @@ export class PaperclipRunner extends EventEmitter implements AgentRunner {
           parser.flush();
         }
         this.cleanupCwd();
-        this.emit("close", result.exitCode ?? (result.timedOut ? 124 : 0));
+        // A stream-json terminal result marked is_error surfaces as `error` (below),
+        // but the adapter can still resolve exitCode 0 (claude reports the failure
+        // in-band). Force a nonzero close so the failure is reflected in the close code.
+        const closeCode = result.exitCode ?? (result.timedOut ? 124 : 0);
+        this.emit("close", this.streamErrored && closeCode === 0 ? 1 : closeCode);
       })
       .catch((err: unknown) => {
         parser.flush();
@@ -261,6 +266,17 @@ export class PaperclipRunner extends EventEmitter implements AgentRunner {
         const usage = result.usage;
         if (usage) {
           console.error(`[PaperclipRunner] Tokens: in=${usage.input_tokens || 0} out=${usage.output_tokens || 0}`);
+        }
+        // The claude stream-json path can deliver a well-formed terminal result
+        // marked is_error/subtype:"error" (e.g. max-turns reached, execution error)
+        // without throwing. routes.ts treats any `result` event as a 200 success, so
+        // a failed run must surface as `error` — otherwise the client gets a 200 with
+        // the (often empty/partial) error text instead of an adapter error.
+        if (result.is_error === true || result.subtype === "error") {
+          this.streamErrored = true;
+          const text = (result.result ?? "").toString().trim();
+          this.emit("error", new Error(text || `Paperclip adapter run failed (subtype: ${result.subtype})`));
+          return;
         }
         this.emit("result", message);
       },
