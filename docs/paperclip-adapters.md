@@ -26,17 +26,24 @@ All adapters run `engine: "cli"`. Option 1 is **stateless** (no session resume).
   normalized `result.summary` and emitted as a single content delta on
   completion. `--stream` requests still terminate correctly (`finish_reason` +
   `[DONE]`), just without incremental tokens.
-- **codex renders `promptTemplate`**, so a prompt containing `{{ … }}` template
-  delimiters is substituted/stripped by the adapter (unlike `claude_local`,
-  which receives the prompt verbatim through a non-templated section). This is
-  codex's own prompt contract, not something the proxy can bypass.
-- A transitive dependency of the ACP lane (`@agentclientprotocol/claude-agent-acp`)
-  declares `engines.node >= 22`. This proxy's floor stays Node `>=20` and there
-  is no `engine-strict`, so `npm install` on Node 20 only emits an `EBADENGINE`
-  warning; the ACP lane is never exercised (`engine: "cli"` always wins).
-- Client disconnect mid-run is honored once the adapter has spawned its child;
-  a disconnect in the brief window before spawn does not yet cancel the run
-  (tracked follow-up — resolved holistically by the Option 2 cancellation work).
+- **codex renders `promptTemplate`, but the raw prompt reaches it verbatim.**
+  A prompt containing `{{ … }}` template delimiters is preserved (unlike a naive
+  assignment, where the adapter's `renderTemplate()` would substitute/strip
+  them). The runner puts the raw prompt in a context variable and sets
+  `promptTemplate = "{{context.collavreRawPrompt}}"`; because `renderTemplate` is
+  single-pass and never re-scans the resolved value, the user's own `{{ … }}`
+  survive — the same guarantee `claude_local` gets via its non-templated
+  `paperclipTaskMarkdown` section.
+- The Paperclip packages pull transitive dependencies whose highest floor is
+  `acpx@0.12.0` (`engines.node >= 22.13.0`; `@agentclientprotocol/claude-agent-acp`
+  requires `>= 22`), so this proxy declares `engines.node >= 22.13.0` to match the
+  real install requirement. The ACP lane itself is never exercised at runtime
+  (`engine: "cli"` always wins), but the packages are still installed, so the
+  engine declaration must reflect them.
+- Client disconnect mid-run is honored even in the brief window before the
+  adapter spawns its child: `kill()` records the requested signal, and once
+  `onSpawn` reports the child identifiers the runner immediately signals the
+  just-spawned process/group.
 
 ## How it works
 
@@ -60,7 +67,7 @@ applies:
 
 | Seam            | `claude_local`                          | `codex_local`                              |
 |-----------------|-----------------------------------------|--------------------------------------------|
-| Prompt input    | `task-context` — raw prompt via non-templated `context.paperclipTaskMarkdown` (delimiters survive) | `prompt-template` — raw prompt into `config.promptTemplate` (rendered) |
+| Prompt input    | `task-context` — raw prompt via non-templated `context.paperclipTaskMarkdown` (delimiters survive) | `prompt-template` — raw prompt in `context.collavreRawPrompt`, referenced once as `{{context.collavreRawPrompt}}` (single-pass render, delimiters survive) |
 | CLI base flags  | `--include-partial-messages`, `--no-session-persistence` (+ `--append-system-prompt`) | none — codex rejects claude flags (its arg builder appends `extraArgs` verbatim) |
 | Output          | `stream-json` — `onLog` stdout teed through `StreamJsonParser` (token deltas) | `summary` — stdout is codex JSONL; final text synthesized from `result.summary` |
 
