@@ -25,7 +25,7 @@ test("returns null for non-paperclip models", () => {
 test("resolves paperclip/codex_local to the codex adapter with per-adapter strategies", () => {
   // codex diverges from claude on all three seams: its prompt comes from a
   // rendered promptTemplate (not paperclipTaskMarkdown), it rejects claude-only
-  // CLI flags, and it emits its own JSONL so the final text comes from summary.
+  // CLI flags, and it emits its own JSONL that the runner parses live (codex-jsonl).
   const spec = resolvePaperclipModel("paperclip/codex_local");
   assert.ok(spec);
   assert.equal(spec!.adapterType, "codex_local");
@@ -34,7 +34,7 @@ test("resolves paperclip/codex_local to the codex adapter with per-adapter strat
   // codex reads its own bypass key (claude's dangerouslySkipPermissions is ignored).
   assert.equal(spec!.baseConfig.dangerouslyBypassApprovalsAndSandbox, true);
   assert.equal(spec!.promptInjection, "prompt-template");
-  assert.equal(spec!.outputMode, "summary");
+  assert.equal(spec!.outputMode, "codex-jsonl");
   // No claude-only flags, but codex needs --skip-git-repo-check because the runner
   // executes it in a fresh non-git /tmp dir (buildCodexExecArgs only self-adds it for
   // its sandbox lane, not for local `codex exec`).

@@ -14,6 +14,8 @@ import type { AdapterExecutionContext, AdapterExecutionResult } from "@paperclip
 import type { SubprocessOptions } from "../subprocess/manager.js";
 import type { ClaudeCliResult, ClaudeCliStreamEvent } from "../types/claude-cli.js";
 import { StreamJsonParser, type StreamJsonSink } from "./stream-json-parser.js";
+import { CodexJsonlParser } from "./codex-jsonl-parser.js";
+import { adapterRunError } from "./adapter-error.js";
 import { getBgWaitCeilingMs } from "../config.js";
 
 export type AdapterExecute = (ctx: AdapterExecutionContext) => Promise<AdapterExecutionResult>;
@@ -38,11 +40,12 @@ const CLAUDE_CLI_FLAGS = ["--include-partial-messages", "--no-session-persistenc
  * How a given adapter receives the raw user prompt, and how it reports output.
  * These diverge per adapter — claude-local reads the prompt from a non-templated
  * task-context section and streams claude stream-json; codex-local reads the
- * prompt from a rendered promptTemplate and emits its own JSONL (so the final
- * text must come from the normalized result.summary instead).
+ * prompt from a rendered promptTemplate and emits its own `codex exec --json`
+ * NDJSON, which we parse live (message-block granularity) with result.summary as
+ * the terminal/fallback text.
  */
 export type PromptInjection = "task-context" | "prompt-template";
-export type OutputMode = "stream-json" | "summary";
+export type OutputMode = "stream-json" | "codex-jsonl";
 
 export interface PaperclipRunnerOptions {
   /** Default "task-context" (claude-local). */
@@ -65,6 +68,13 @@ export class PaperclipRunner extends EventEmitter implements AgentRunner {
   private killSignal: NodeJS.Signals = "SIGTERM";
   private cwd: string | null = null;
   private streamErrored = false;
+  // In-band failure text from a claude stream-json is_error terminal result, held
+  // (not emitted) until resolve so the classified AdapterExecutionResult can carry it.
+  private streamErrorText = "";
+  // codex-jsonl mode: true once at least one agent_message block streamed live, so
+  // the terminal emit skips a duplicate content delta (the answer is already on the
+  // wire) yet still falls back to a synthesized delta when nothing streamed.
+  private codexStreamed = false;
 
   private readonly promptInjection: PromptInjection;
   private readonly outputMode: OutputMode;
@@ -82,7 +92,13 @@ export class PaperclipRunner extends EventEmitter implements AgentRunner {
   }
 
   async start(prompt: string, options: SubprocessOptions): Promise<void> {
-    const parser = new StreamJsonParser(this.buildSink());
+    // Each adapter emits a different stdout dialect: claude speaks stream-json
+    // (per-token deltas), codex speaks `codex exec --json` NDJSON (per-message
+    // blocks). Pick the matching live parser; both expose push()/flush().
+    const parser =
+      this.outputMode === "stream-json"
+        ? new StreamJsonParser(this.buildSink())
+        : new CodexJsonlParser(this.buildCodexSink());
     this.cwd = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-run-"));
 
     // ms (0 = unbounded) -> seconds (0 = adapter default/unbounded)
@@ -142,11 +158,10 @@ export class PaperclipRunner extends EventEmitter implements AgentRunner {
       },
       context,
       onLog: async (stream: "stdout" | "stderr", chunk: string) => {
-        // Only the stream-json path feeds the parser; a summary-mode adapter emits
-        // its own (non-claude) JSONL, so its stdout is not parseable here — the
-        // authoritative text comes from result.summary on resolve.
+        // Feed the mode-matched live parser: stream-json emits per-token deltas,
+        // codex-jsonl emits a content delta per completed agent_message block.
         if (stream === "stdout") {
-          if (this.outputMode === "stream-json") parser.push(chunk);
+          parser.push(chunk);
         } else if (chunk.trim()) {
           console.error("[PaperclipRunner stderr]:", chunk.trim());
         }
@@ -165,34 +180,32 @@ export class PaperclipRunner extends EventEmitter implements AgentRunner {
     // Resolve immediately (like ClaudeSubprocess.start); drive execute in the background.
     void this.execute(ctx)
       .then((result) => {
-        if (this.outputMode === "summary") {
-          // Summary-mode adapters (e.g. codex) resolve normal CLI failures as an
-          // AdapterExecutionResult carrying errorMessage/nonzero exitCode instead
-          // of throwing. routes.ts treats any `result` event as success (it never
-          // inspects is_error), so a failed run must surface as `error` — otherwise
-          // missing creds / bad args / timeouts return a 200 with empty output.
-          if (this.isErrorResult(result)) {
-            this.cleanupCwd();
-            const message = result.errorMessage
-              || (result.timedOut
-                ? "Paperclip adapter run timed out"
-                : result.signal != null
-                  ? `Paperclip adapter run terminated by signal ${result.signal}`
-                  : `Paperclip adapter run failed (exit code ${result.exitCode})`);
-            this.emit("error", new Error(message));
-            this.emit("close", result.exitCode ?? (result.timedOut ? 124 : 1));
-            return;
-          }
-          this.emitSummary(result);
-        } else {
-          parser.flush();
+        // Emit any buffered newline-less trailing line (e.g. a final codex
+        // agent_message with no trailing newline) before deciding the terminal state.
+        parser.flush();
+
+        // Both adapters resolve normal CLI failures as an AdapterExecutionResult
+        // (errorMessage/nonzero exit/timeout/signal) rather than throwing, and the
+        // claude stream-json path can additionally report a failure in-band via an
+        // is_error terminal result (recorded in streamErrored/streamErrorText). routes.ts
+        // treats any `result` event as a 200 success (it never inspects is_error), so
+        // every failure must surface as an `error` carrying the verbatim CLI message +
+        // OpenAI classification — otherwise usage limits, auth prompts, and timeouts
+        // return a 200 with empty/partial output instead of the 429/401/500 the OpenAI
+        // contract expects.
+        const failed = this.streamErrored || this.isErrorResult(result);
+        if (this.outputMode === "codex-jsonl" && !failed) {
+          // codex's final answer lives in result.summary; synthesize it only for a
+          // successful run (a failure falls through to the shared handling below).
+          this.emitCodexTerminal(result);
         }
         this.cleanupCwd();
-        // A stream-json terminal result marked is_error surfaces as `error` (below),
-        // but the adapter can still resolve exitCode 0 (claude reports the failure
-        // in-band). Force a nonzero close so the failure is reflected in the close code.
-        const closeCode = result.exitCode ?? (result.timedOut ? 124 : 0);
-        this.emit("close", this.streamErrored && closeCode === 0 ? 1 : closeCode);
+        if (failed) {
+          this.emit("error", adapterRunError(this.failureMessage(result), result));
+          this.emit("close", this.failureCloseCode(result));
+          return;
+        }
+        this.emit("close", result.exitCode ?? (result.timedOut ? 124 : 0));
       })
       .catch((err: unknown) => {
         parser.flush();
@@ -202,16 +215,45 @@ export class PaperclipRunner extends EventEmitter implements AgentRunner {
       });
   }
 
+  /** Live sink for codex-jsonl mode: each completed agent_message block streams as a
+   * content delta so agentic turns render block-by-block. The terminal result is
+   * sourced from result.summary (codex's final answer), not these live blocks. */
+  private buildCodexSink() {
+    return {
+      onAgentMessage: (text: string) => {
+        if (!text) return;
+        // Separate distinct message blocks so multi-block agentic turns render
+        // readably on the live wire.
+        const chunk = this.codexStreamed ? `\n\n${text}` : text;
+        this.codexStreamed = true;
+        const delta: ClaudeCliStreamEvent = {
+          type: "stream_event",
+          event: { type: "content_block_delta", delta: { type: "text_delta", text: chunk } },
+          session_id: "",
+          uuid: "",
+        };
+        this.emit("content_delta", delta);
+      },
+      onRaw: (line: string) => this.emit("raw", line),
+    };
+  }
+
   /**
-   * Synthesize the events routes.ts consumes from a normalized
-   * AdapterExecutionResult, for adapters whose live stdout is not claude
-   * stream-json (e.g. codex JSONL). result.summary is the authoritative final
-   * text; we stream it as one content delta (for --stream) and emit a result
-   * event carrying the same text (for the non-streaming path, which reads
-   * result.result). Token-by-token streaming is intentionally not attempted
-   * here — it would require a per-adapter live parser.
+   * Terminal emit for codex-jsonl mode. If agent_message blocks streamed live, the
+   * answer is already on the wire — emit only the terminal `result` (usage/cost) and
+   * skip re-emitting a content delta (that would duplicate the answer for streaming
+   * clients). Either way result.result carries result.summary, codex's final
+   * agent_message: the non-streaming path (and streaming JSON mode) run result.result
+   * through extractJsonFromText, which returns the FIRST JSON object — so concatenating
+   * intermediate blocks would let a status object win over the real answer.
+   * If nothing streamed (the adapter's ACP fallback puts the text only in
+   * result.summary), synthesize it as one delta, preserving the pre-streaming behavior.
    */
-  /** A summary-mode adapter result that represents a failed run (not a throw). */
+  private emitCodexTerminal(result: AdapterExecutionResult): void {
+    this.emitSummary(result, { skipContentDelta: this.codexStreamed });
+  }
+
+  /** A codex adapter result that represents a failed run (not a throw). */
   private isErrorResult(result: AdapterExecutionResult): boolean {
     // A signal-terminated child (SIGKILL from OOM, operator/system SIGTERM)
     // resolves with exitCode: null + signal set, and codex normalization only
@@ -225,10 +267,42 @@ export class PaperclipRunner extends EventEmitter implements AgentRunner {
     );
   }
 
-  private emitSummary(result: AdapterExecutionResult): void {
+  /**
+   * The verbatim failure message to surface. Prefer the adapter's classified
+   * errorMessage (usage limit / auth prompt / CLI stderr), then any in-band
+   * stream-json error text, then a shape-derived fallback.
+   */
+  private failureMessage(result: AdapterExecutionResult): string {
+    return (result.errorMessage?.trim())
+      || this.streamErrorText
+      || (result.timedOut
+        ? "Paperclip adapter run timed out"
+        : result.signal != null
+          ? `Paperclip adapter run terminated by signal ${result.signal}`
+          : `Paperclip adapter run failed (exit code ${result.exitCode})`);
+  }
+
+  /**
+   * A failed run must close nonzero even when the adapter resolves exitCode 0
+   * (claude can report a usage limit / in-band error while exiting cleanly).
+   */
+  private failureCloseCode(result: AdapterExecutionResult): number {
+    if (result.exitCode != null && result.exitCode !== 0) return result.exitCode;
+    return result.timedOut ? 124 : 1;
+  }
+
+  /**
+   * Synthesize the events routes.ts consumes from a normalized
+   * AdapterExecutionResult. result.summary is the final answer; `opts.skipContentDelta`
+   * omits the synthesized delta when that text already streamed live (codex-jsonl).
+   */
+  private emitSummary(
+    result: AdapterExecutionResult,
+    opts: { skipContentDelta?: boolean } = {},
+  ): void {
     const text = (result.summary ?? "").toString();
     const sessionId = result.sessionId ?? "";
-    if (text) {
+    if (text && !opts.skipContentDelta) {
       const delta: ClaudeCliStreamEvent = {
         type: "stream_event",
         event: { type: "content_block_delta", delta: { type: "text_delta", text } },
@@ -270,12 +344,14 @@ export class PaperclipRunner extends EventEmitter implements AgentRunner {
         // The claude stream-json path can deliver a well-formed terminal result
         // marked is_error/subtype:"error" (e.g. max-turns reached, execution error)
         // without throwing. routes.ts treats any `result` event as a 200 success, so
-        // a failed run must surface as `error` — otherwise the client gets a 200 with
-        // the (often empty/partial) error text instead of an adapter error.
+        // this must NOT surface as a success result. Record the failure (with its
+        // in-band text) and let the shared error handling on resolve emit it — the
+        // resolved AdapterExecutionResult carries the errorCode/errorFamily needed to
+        // classify it (429/401/…) that this event alone lacks.
         if (result.is_error === true || result.subtype === "error") {
           this.streamErrored = true;
-          const text = (result.result ?? "").toString().trim();
-          this.emit("error", new Error(text || `Paperclip adapter run failed (subtype: ${result.subtype})`));
+          this.streamErrorText = (result.result ?? "").toString().trim()
+            || `Paperclip adapter run failed (subtype: ${result.subtype})`;
           return;
         }
         this.emit("result", message);

@@ -44,9 +44,18 @@ function fakeRes(): Response & { body: string; ended: boolean; headers: Record<s
   res.setHeader = (k: string, v: string) => { res.headers[k] = v; };
   res.flushHeaders = () => { res.headersSent = true; };
   res.write = (chunk: string) => { res.body += chunk; return true; };
-  res.end = () => { res.ended = true; res.writableEnded = true; emitter.emit("close"); };
+  // Mirror Express: sending a response commits headers and ends the writable side,
+  // so the route's post-send guards (!res.headersSent / res.writable) see it as done.
+  res.end = () => {
+    res.ended = true; res.writableEnded = true; res.writable = false; res.headersSent = true;
+    emitter.emit("close");
+  };
   res.status = () => res;
-  res.json = (obj: unknown) => { res.body += JSON.stringify(obj); res.ended = true; return res; };
+  res.json = (obj: unknown) => {
+    res.body += JSON.stringify(obj);
+    res.ended = true; res.writableEnded = true; res.writable = false; res.headersSent = true;
+    return res;
+  };
   return res;
 }
 
@@ -70,6 +79,99 @@ test("paperclip/* model streams SSE deltas through the real route handler", asyn
     await handleChatCompletions(req, res);
     assert.match(res.body, /"content":"Yo"/, "streamed delta present in SSE body");
     assert.match(res.body, /data: \[DONE\]/, "terminated with [DONE]");
+  } finally {
+    runnerFactory.create = orig;
+  }
+});
+
+const codexAgentMessage = (text: string) =>
+  JSON.stringify({ type: "item.completed", item: { type: "agent_message", text } }) + "\n";
+
+test("streaming JSON mode extracts the final codex answer, not an intermediate JSON block", async () => {
+  // codex-jsonl streams one delta per agent_message block, so the client-side
+  // jsonBuffer concatenates every block. When an intermediate block is itself
+  // valid JSON, extractJsonFromText (first-match) must NOT return it: the final
+  // answer (result.result = result.summary) is authoritative.
+  const fakeExecute: AdapterExecute = async (ctx) => {
+    await ctx.onLog("stdout", codexAgentMessage('{"status":"working"}'));
+    await ctx.onLog("stdout", codexAgentMessage('{"answer":42}'));
+    return { exitCode: 0, signal: null, timedOut: false, sessionId: "s",
+      summary: '{"answer":42}', usage: { inputTokens: 3, outputTokens: 2 } };
+  };
+  const orig = runnerFactory.create;
+  runnerFactory.create = (model: string) =>
+    model.startsWith("paperclip/")
+      ? new PaperclipRunner(fakeExecute, { engine: "cli", command: "codex" },
+        { promptInjection: "prompt-template", outputMode: "codex-jsonl", cliFlags: [] })
+      : orig(model);
+
+  try {
+    const req = { body: { model: "paperclip/codex_local", stream: true,
+      response_format: { type: "json_object" },
+      messages: [{ role: "user", content: "hi" }] } } as unknown as Request;
+    const res = fakeRes();
+    await handleChatCompletions(req, res);
+    assert.match(res.body, /"content":"\{\\"answer\\":42\}"/, "final answer JSON is emitted");
+    assert.doesNotMatch(res.body, /"content":"\{\\"status\\":\\"working\\"\}"/,
+      "the intermediate JSON status block is NOT what the client receives");
+    assert.match(res.body, /data: \[DONE\]/, "terminated with [DONE]");
+  } finally {
+    runnerFactory.create = orig;
+  }
+});
+
+test("usage-limit failure returns 429 insufficient_quota with the verbatim message (non-streaming)", async () => {
+  // A Claude Max usage limit must reach the client as a 429 carrying the CLI's own
+  // message, matching how the OpenAI endpoint reports quota exhaustion.
+  const limitMsg = "Claude AI usage limit reached. Resets at 3pm.";
+  const quotaExecute: AdapterExecute = async () => ({
+    exitCode: 1, signal: null, timedOut: false,
+    errorMessage: limitMsg, errorCode: "provider_quota", errorFamily: "provider_quota",
+  });
+  const orig = runnerFactory.create;
+  runnerFactory.create = (model: string) =>
+    model.startsWith("paperclip/")
+      ? new PaperclipRunner(quotaExecute, { engine: "cli" })
+      : orig(model);
+
+  try {
+    const req = { body: { model: "paperclip/claude_local", stream: false,
+      messages: [{ role: "user", content: "hi" }] } } as unknown as Request;
+    const res = fakeRes();
+    let statusCode = 0;
+    res.status = (code: number) => { statusCode = code; return res; };
+
+    await handleChatCompletions(req, res);
+
+    assert.equal(statusCode, 429, "usage limit -> HTTP 429");
+    assert.match(res.body, /"type":"insufficient_quota"/, "OpenAI insufficient_quota type");
+    assert.match(res.body, /Claude AI usage limit reached\. Resets at 3pm\./, "verbatim CLI message");
+  } finally {
+    runnerFactory.create = orig;
+  }
+});
+
+test("usage-limit failure streams the verbatim error in-band (streaming)", async () => {
+  const limitMsg = "Claude AI usage limit reached. Resets at 3pm.";
+  const quotaExecute: AdapterExecute = async () => ({
+    exitCode: 1, signal: null, timedOut: false,
+    errorMessage: limitMsg, errorCode: "provider_quota", errorFamily: "provider_quota",
+  });
+  const orig = runnerFactory.create;
+  runnerFactory.create = (model: string) =>
+    model.startsWith("paperclip/")
+      ? new PaperclipRunner(quotaExecute, { engine: "cli" })
+      : orig(model);
+
+  try {
+    const req = { body: { model: "paperclip/claude_local", stream: true,
+      messages: [{ role: "user", content: "hi" }] } } as unknown as Request;
+    const res = fakeRes();
+    await handleChatCompletions(req, res);
+
+    assert.match(res.body, /"type":"insufficient_quota"/, "in-band OpenAI error type");
+    assert.match(res.body, /Claude AI usage limit reached\. Resets at 3pm\./, "verbatim message in the stream");
+    assert.doesNotMatch(res.body, /"content":"/, "no empty success delta precedes the error");
   } finally {
     runnerFactory.create = orig;
   }

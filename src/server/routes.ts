@@ -10,6 +10,7 @@ import { runnerFactory, PAPERCLIP_MODEL_IDS, UnknownPaperclipModelError } from "
 import type { AgentRunner } from "../adapter/paperclip-runner.js";
 import { openaiToCli } from "../adapter/openai-to-cli.js";
 import { materializeImages, ImageValidationError } from "../adapter/image-materializer.js";
+import { openaiErrorFromError } from "../adapter/adapter-error.js";
 import {
   cliResultToOpenai,
   createDoneChunk,
@@ -233,8 +234,15 @@ async function handleStreamingResponse(
       });
 
       if (!res.writableEnded) {
-        if (jsonMode && jsonBuffer) {
-          const extracted = extractJsonFromText(jsonBuffer);
+        // Extract from the terminal answer, not the raw delta buffer: codex-jsonl
+        // streams one delta per agent_message block, so jsonBuffer concatenates
+        // intermediate blocks and extractJsonFromText (first-match) could return an
+        // intermediate status object. result.result is the canonical final answer
+        // (codex: final agent_message; claude: full result text) and equals jsonBuffer
+        // for single-block turns.
+        const jsonSource = result.result || jsonBuffer;
+        if (jsonMode && jsonSource) {
+          const extracted = extractJsonFromText(jsonSource);
           const chunk = {
             id: `chatcmpl-${requestId}`,
             object: "chat.completion.chunk",
@@ -270,10 +278,14 @@ async function handleStreamingResponse(
         success: false,
       });
 
+      // Streaming already flushed a 200 header (keepalive), so the HTTP status can't
+      // change — deliver the classified error in-band with the verbatim message so an
+      // OpenAI client parses type/code (e.g. insufficient_quota) from the SSE stream.
+      const { type, code, message } = openaiErrorFromError(error);
       if (!res.writableEnded) {
         res.write(
           `data: ${JSON.stringify({
-            error: { message: error.message, type: "server_error", code: null },
+            error: { message, type, code },
           })}\n\n`
         );
         res.end();
@@ -353,13 +365,14 @@ async function handleNonStreamingResponse(
         success: false,
       });
 
-      res.status(500).json({
-        error: {
-          message: error.message,
-          type: "server_error",
-          code: null,
-        },
-      });
+      // A classified adapter failure (usage limit / auth / unknown model) carries the
+      // OpenAI status + type + code; a plain Error is an internal 500. Either way the
+      // verbatim message is passed through unchanged.
+      const { status, type, code, message, retryAfterSeconds } = openaiErrorFromError(error);
+      if (res.writable) {
+        if (retryAfterSeconds != null) res.setHeader("Retry-After", String(retryAfterSeconds));
+        res.status(status).json({ error: { message, type, code } });
+      }
       resolve();
     });
 
