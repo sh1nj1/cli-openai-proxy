@@ -57,6 +57,7 @@ export class PaperclipRunner extends EventEmitter implements AgentRunner {
   private pid: number | null = null;
   private processGroupId: number | null = null;
   private isKilled = false;
+  private killSignal: NodeJS.Signals = "SIGTERM";
   private cwd: string | null = null;
 
   private readonly promptInjection: PromptInjection;
@@ -141,6 +142,11 @@ export class PaperclipRunner extends EventEmitter implements AgentRunner {
       onSpawn: async (meta: { pid: number; processGroupId: number | null; startedAt: string }) => {
         this.pid = meta.pid;
         this.processGroupId = meta.processGroupId;
+        // A disconnect can call kill() before the adapter reports onSpawn — at that
+        // point pid/pgid are null, so kill() only set isKilled and signaled nothing.
+        // Now that the child identifiers exist, honor the pending kill immediately;
+        // otherwise the orphaned run keeps going with no client until it completes.
+        if (this.isKilled) this.signalProcess(this.killSignal);
       },
     };
 
@@ -262,6 +268,12 @@ export class PaperclipRunner extends EventEmitter implements AgentRunner {
   kill(signal: NodeJS.Signals = "SIGTERM"): void {
     if (this.isKilled) return;
     this.isKilled = true;
+    this.killSignal = signal; // remembered so a late onSpawn can honor this kill
+    this.signalProcess(signal);
+  }
+
+  /** Signal the child's own process group (preferred) or pid. No-op until onSpawn. */
+  private signalProcess(signal: NodeJS.Signals): void {
     if (this.processGroupId != null) {
       try { process.kill(-this.processGroupId, signal); return; } catch { /* fall through */ }
     }

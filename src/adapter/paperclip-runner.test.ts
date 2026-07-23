@@ -277,3 +277,48 @@ test("emits error and close(1) when execute rejects", async () => {
   assert.match(errMsg, /adapter blew up/);
   assert.equal(code, 1);
 });
+
+test("signals a child spawned after a pre-spawn kill() (disconnect before onSpawn)", async () => {
+  // routes.ts wires kill() to client disconnect, and start() resolves immediately
+  // while execute runs in the background. If the client disconnects before the
+  // adapter reports onSpawn, kill() runs while pid/pgid are still null (a no-op) —
+  // onSpawn must notice the pending kill and immediately signal the spawned child,
+  // otherwise the orphaned run keeps going with no client until completion/timeout.
+  type SpawnMeta = { pid: number; processGroupId: number | null; startedAt: string };
+  let capturedOnSpawn: ((meta: SpawnMeta) => Promise<void>) | undefined;
+  let release!: () => void;
+  const gate = new Promise<void>((r) => { release = r; });
+  const fakeExecute: AdapterExecute = async (ctx) => {
+    capturedOnSpawn = ctx.onSpawn as (meta: SpawnMeta) => Promise<void>;
+    await gate; // hold execute open so the runner stays mid-flight
+    return { exitCode: 0, signal: null, timedOut: false, sessionId: "s",
+      usage: { inputTokens: 1, outputTokens: 1 } };
+  };
+
+  const killed: Array<{ target: number; signal: NodeJS.Signals | number }> = [];
+  const realKill = process.kill;
+  (process as unknown as { kill: typeof process.kill }).kill =
+    ((target: number, signal?: NodeJS.Signals | number) => {
+      killed.push({ target, signal: signal ?? 0 });
+      return true;
+    }) as typeof process.kill;
+
+  try {
+    const runner = new PaperclipRunner(fakeExecute, { engine: "cli", command: "claude" });
+    await runner.start("p", { model: "opus" });
+    assert.ok(capturedOnSpawn, "execute started and exposed onSpawn");
+
+    // Disconnect before onSpawn: pid/pgid are still null, so kill() cannot signal yet.
+    runner.kill("SIGTERM");
+    assert.equal(killed.length, 0, "no process to signal before onSpawn");
+
+    // The adapter now reports the spawned child; the pending kill must fire.
+    await capturedOnSpawn!({ pid: 4321, processGroupId: 4321, startedAt: "now" });
+    assert.equal(killed.length, 1, "onSpawn signals the pending kill");
+    assert.equal(killed[0].target, -4321, "targets the child's own process group");
+    assert.equal(killed[0].signal, "SIGTERM", "reuses the signal kill() requested");
+  } finally {
+    (process as unknown as { kill: typeof process.kill }).kill = realKill;
+    release();
+  }
+});
