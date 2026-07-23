@@ -6,6 +6,7 @@
  * Option 1 (stateless): each run is fresh — no session resume.
  */
 import { EventEmitter } from "events";
+import { randomUUID } from "crypto";
 import os from "os";
 import fs from "fs/promises";
 import path from "path";
@@ -56,7 +57,10 @@ export class PaperclipRunner extends EventEmitter implements AgentRunner {
     if (options.systemPrompt) extraArgs.push("--append-system-prompt", options.systemPrompt);
 
     const ctx: AdapterExecutionContext = {
-      runId: `run-${Date.now()}-${process.pid}`,
+      // randomUUID (not Date.now()+pid): Paperclip keys per-run bookkeeping
+      // (runningProcesses map, ${runId}.log) on runId, so concurrent runs in the
+      // same process/millisecond must not collide.
+      runId: `run-${randomUUID()}`,
       agent: { id: "claude-max-proxy", companyId: "local", name: "proxy", adapterType: null, adapterConfig: null },
       runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null, taskKey: null },
       config: {

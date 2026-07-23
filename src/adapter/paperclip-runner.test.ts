@@ -78,6 +78,26 @@ test("preserves {{ }} template delimiters verbatim and disables session persiste
   );
 });
 
+test("assigns a unique runId per run even within the same millisecond/process", async () => {
+  // Paperclip keys child-process bookkeeping (runningProcesses map, ${runId}.log)
+  // on ctx.runId; Date.now()+pid collides for concurrent runs in one process.
+  const runIds: string[] = [];
+  const capture: AdapterExecute = async (ctx) => {
+    runIds.push(ctx.runId);
+    return { exitCode: 0, signal: null, timedOut: false, sessionId: "s",
+      usage: { inputTokens: 1, outputTokens: 1 } };
+  };
+  const run = () => {
+    const runner = new PaperclipRunner(capture, { engine: "cli" });
+    const closed = new Promise<void>((resolve) => runner.on("close", () => resolve()));
+    return runner.start("p", { model: "opus" }).then(() => closed);
+  };
+  await Promise.all([run(), run(), run()]);
+
+  assert.equal(runIds.length, 3);
+  assert.equal(new Set(runIds).size, 3, "each run must get a distinct runId");
+});
+
 test("emits error and close(1) when execute rejects", async () => {
   const boom: AdapterExecute = async () => { throw new Error("adapter blew up"); };
   const runner = new PaperclipRunner(boom, { engine: "cli" });
