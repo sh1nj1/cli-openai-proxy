@@ -158,7 +158,9 @@ export class PaperclipRunner extends EventEmitter implements AgentRunner {
             const message = result.errorMessage
               || (result.timedOut
                 ? "Paperclip adapter run timed out"
-                : `Paperclip adapter run failed (exit code ${result.exitCode})`);
+                : result.signal != null
+                  ? `Paperclip adapter run terminated by signal ${result.signal}`
+                  : `Paperclip adapter run failed (exit code ${result.exitCode})`);
             this.emit("error", new Error(message));
             this.emit("close", result.exitCode ?? (result.timedOut ? 124 : 1));
             return;
@@ -189,7 +191,16 @@ export class PaperclipRunner extends EventEmitter implements AgentRunner {
    */
   /** A summary-mode adapter result that represents a failed run (not a throw). */
   private isErrorResult(result: AdapterExecutionResult): boolean {
-    return Boolean(result.errorMessage) || result.timedOut === true || (result.exitCode ?? 0) !== 0;
+    // A signal-terminated child (SIGKILL from OOM, operator/system SIGTERM)
+    // resolves with exitCode: null + signal set, and codex normalization only
+    // sets errorMessage when (exitCode ?? 0) is nonzero — so the exitCode/
+    // errorMessage checks alone miss it. Treat any set signal as a failure.
+    return (
+      Boolean(result.errorMessage)
+      || result.timedOut === true
+      || result.signal != null
+      || (result.exitCode ?? 0) !== 0
+    );
   }
 
   private emitSummary(result: AdapterExecutionResult): void {

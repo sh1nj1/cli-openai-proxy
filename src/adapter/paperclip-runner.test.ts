@@ -233,6 +233,37 @@ test("summary mode surfaces a timed-out adapter result as error", async () => {
   assert.ok(errored, "timeout surfaces via the error event");
 });
 
+test("summary mode surfaces a signal-terminated adapter result as error", async () => {
+  // A child killed by a signal (SIGKILL from OOM, operator/system SIGTERM)
+  // resolves with exitCode: null + signal set, and codex normalization only
+  // sets errorMessage when (exitCode ?? 0) is nonzero — so this result carries
+  // NO errorMessage and is not timedOut. It must still surface as an error, not
+  // a 200/empty success completion.
+  const signaledExecute: AdapterExecute = async () => ({
+    exitCode: null, signal: "SIGKILL", timedOut: false, sessionId: "s",
+    summary: "",
+  });
+  const runner = new PaperclipRunner(
+    signaledExecute,
+    { engine: "cli", command: "codex" },
+    { promptInjection: "prompt-template", outputMode: "summary", cliFlags: [] },
+  );
+  const results: ClaudeCliResult[] = [];
+  let errMsg = "";
+  const closeCode = new Promise<number | null>((resolve) => {
+    runner.on("result", (r: ClaudeCliResult) => { results.push(r); });
+    runner.on("error", (e: Error) => { errMsg = e.message; });
+    runner.on("close", (code: number | null) => resolve(code));
+  });
+
+  await runner.start("hi", { model: "gpt-5" });
+  const code = await closeCode;
+
+  assert.equal(results.length, 0, "a signal-terminated result must NOT be emitted as a success result event");
+  assert.match(errMsg, /SIGKILL/, "the terminating signal surfaces in the error message");
+  assert.notEqual(code, 0, "close code reflects the signal failure");
+});
+
 test("emits error and close(1) when execute rejects", async () => {
   const boom: AdapterExecute = async () => { throw new Error("adapter blew up"); };
   const runner = new PaperclipRunner(boom, { engine: "cli" });
