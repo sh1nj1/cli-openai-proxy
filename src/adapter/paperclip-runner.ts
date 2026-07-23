@@ -148,6 +148,21 @@ export class PaperclipRunner extends EventEmitter implements AgentRunner {
     void this.execute(ctx)
       .then((result) => {
         if (this.outputMode === "summary") {
+          // Summary-mode adapters (e.g. codex) resolve normal CLI failures as an
+          // AdapterExecutionResult carrying errorMessage/nonzero exitCode instead
+          // of throwing. routes.ts treats any `result` event as success (it never
+          // inspects is_error), so a failed run must surface as `error` — otherwise
+          // missing creds / bad args / timeouts return a 200 with empty output.
+          if (this.isErrorResult(result)) {
+            this.cleanupCwd();
+            const message = result.errorMessage
+              || (result.timedOut
+                ? "Paperclip adapter run timed out"
+                : `Paperclip adapter run failed (exit code ${result.exitCode})`);
+            this.emit("error", new Error(message));
+            this.emit("close", result.exitCode ?? (result.timedOut ? 124 : 1));
+            return;
+          }
           this.emitSummary(result);
         } else {
           parser.flush();
@@ -172,6 +187,11 @@ export class PaperclipRunner extends EventEmitter implements AgentRunner {
    * result.result). Token-by-token streaming is intentionally not attempted
    * here — it would require a per-adapter live parser.
    */
+  /** A summary-mode adapter result that represents a failed run (not a throw). */
+  private isErrorResult(result: AdapterExecutionResult): boolean {
+    return Boolean(result.errorMessage) || result.timedOut === true || (result.exitCode ?? 0) !== 0;
+  }
+
   private emitSummary(result: AdapterExecutionResult): void {
     const text = (result.summary ?? "").toString();
     const sessionId = result.sessionId ?? "";

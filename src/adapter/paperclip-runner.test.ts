@@ -179,6 +179,60 @@ test("summary output mode synthesizes content_delta + result from result.summary
   assert.equal(code, 0);
 });
 
+test("summary mode surfaces a failed adapter result as error, not a success result", async () => {
+  // Summary-mode adapters (e.g. codex) resolve normal CLI failures as an
+  // AdapterExecutionResult with errorMessage/nonzero exitCode instead of
+  // throwing. Emitting `result` here makes routes.ts report a 200 success, so a
+  // failed run (missing creds, bad args, timeout) must emit `error` instead.
+  const failedExecute: AdapterExecute = async () => ({
+    exitCode: 1, signal: null, timedOut: false, sessionId: "s",
+    errorMessage: "codex: missing credentials",
+    summary: "",
+  });
+  const runner = new PaperclipRunner(
+    failedExecute,
+    { engine: "cli", command: "codex" },
+    { promptInjection: "prompt-template", outputMode: "summary", cliFlags: [] },
+  );
+  const results: ClaudeCliResult[] = [];
+  let errMsg = "";
+  const closeCode = new Promise<number | null>((resolve) => {
+    runner.on("result", (r: ClaudeCliResult) => { results.push(r); });
+    runner.on("error", (e: Error) => { errMsg = e.message; });
+    runner.on("close", (code: number | null) => resolve(code));
+  });
+
+  await runner.start("hi", { model: "gpt-5" });
+  const code = await closeCode;
+
+  assert.equal(results.length, 0, "a failed result must NOT be emitted as a success result event");
+  assert.match(errMsg, /missing credentials/, "the adapter error message surfaces via the error event");
+  assert.notEqual(code, 0, "close code reflects the failure");
+});
+
+test("summary mode surfaces a timed-out adapter result as error", async () => {
+  const timedOutExecute: AdapterExecute = async () => ({
+    exitCode: 0, signal: null, timedOut: true, sessionId: "s", summary: "",
+  });
+  const runner = new PaperclipRunner(
+    timedOutExecute,
+    { engine: "cli", command: "codex" },
+    { promptInjection: "prompt-template", outputMode: "summary", cliFlags: [] },
+  );
+  const results: ClaudeCliResult[] = [];
+  let errored = false;
+  const closed = new Promise<void>((resolve) => {
+    runner.on("result", (r: ClaudeCliResult) => { results.push(r); });
+    runner.on("error", () => { errored = true; });
+    runner.on("close", () => resolve());
+  });
+  await runner.start("hi", { model: "gpt-5" });
+  await closed;
+
+  assert.equal(results.length, 0, "a timed-out result must not be a success result event");
+  assert.ok(errored, "timeout surfaces via the error event");
+});
+
 test("emits error and close(1) when execute rejects", async () => {
   const boom: AdapterExecute = async () => { throw new Error("adapter blew up"); };
   const runner = new PaperclipRunner(boom, { engine: "cli" });

@@ -35,7 +35,11 @@ test("resolves paperclip/codex_local to the codex adapter with per-adapter strat
   assert.equal(spec!.baseConfig.dangerouslyBypassApprovalsAndSandbox, true);
   assert.equal(spec!.promptInjection, "prompt-template");
   assert.equal(spec!.outputMode, "summary");
-  assert.deepEqual(spec!.cliFlags, [], "no claude-only flags for codex");
+  // No claude-only flags, but codex needs --skip-git-repo-check because the runner
+  // executes it in a fresh non-git /tmp dir (buildCodexExecArgs only self-adds it for
+  // its sandbox lane, not for local `codex exec`).
+  assert.deepEqual(spec!.cliFlags, ["--skip-git-repo-check"], "codex gets git-repo bypass, no claude flags");
+  assert.ok(!spec!.cliFlags.includes("--include-partial-messages"), "no claude-only flags for codex");
 });
 
 test("createRunner returns PaperclipRunner for paperclip models, ClaudeSubprocess otherwise", () => {

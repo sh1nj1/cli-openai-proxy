@@ -45,7 +45,11 @@ const REGISTRY: Record<string, PaperclipModelSpec> = {
     // rejects claude-only flags, and streams its own JSONL (text via result.summary).
     promptInjection: "prompt-template",
     outputMode: "summary",
-    cliFlags: [],
+    // PaperclipRunner runs every adapter in a fresh /tmp/paperclip-run-* dir, which
+    // is deliberately not a git repo. buildCodexExecArgs only adds --skip-git-repo-check
+    // for its own sandbox lane, not for local `codex exec`, so declare it here (codex
+    // appends extraArgs verbatim) to keep local runs from tripping the git-repo guard.
+    cliFlags: ["--skip-git-repo-check"],
   },
 };
 
