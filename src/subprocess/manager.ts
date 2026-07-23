@@ -11,10 +11,9 @@ import type {
   ClaudeCliMessage,
   ClaudeCliAssistant,
   ClaudeCliResult,
-  ClaudeCliStreamEvent,
 } from "../types/claude-cli.js";
-import { isAssistantMessage, isResultMessage, isContentDelta } from "../types/claude-cli.js";
 import type { ClaudeModel } from "../adapter/openai-to-cli.js";
+import { StreamJsonParser, type StreamJsonSink } from "../adapter/stream-json-parser.js";
 import { DEFAULT_TIMEOUT_MS, getBgWaitCeilingMs } from "../config.js";
 
 export interface SubprocessOptions {
@@ -47,9 +46,9 @@ export interface SubprocessEvents {
 
 export class ClaudeSubprocess extends EventEmitter {
   private process: ChildProcess | null = null;
-  private buffer: string = "";
   private timeoutId: NodeJS.Timeout | null = null;
   private isKilled: boolean = false;
+  private parser: StreamJsonParser | null = null;
 
   /**
    * Start the Claude CLI subprocess with the given prompt
@@ -106,9 +105,7 @@ export class ClaudeSubprocess extends EventEmitter {
 
         // Parse JSON stream from stdout
         this.process.stdout?.on("data", (chunk: Buffer) => {
-          const data = chunk.toString();
-          this.buffer += data;
-          this.processBuffer();
+          this.processChunk(chunk.toString());
         });
 
         // Capture stderr for debugging
@@ -127,10 +124,11 @@ export class ClaudeSubprocess extends EventEmitter {
             console.error(`[Subprocess] Process closed with code: ${code}`);
           }
           this.clearTimeout();
-          // Process any remaining buffer
-          if (this.buffer.trim()) {
-            this.processBuffer();
-          }
+          // Flush any buffered partial line. Intentional behavior change: a
+          // final stream-json line with no trailing newline (possible on
+          // subprocess kill/timeout/disconnect) is now parsed and emitted,
+          // whereas the pre-refactor split/pop buffering silently dropped it.
+          this.parser?.flush();
           this.emit("close", code);
         });
 
@@ -178,29 +176,19 @@ export class ClaudeSubprocess extends EventEmitter {
   }
 
   /**
-   * Process the buffer and emit parsed messages
+   * Feed a stdout chunk through the shared stream-json parser and emit events.
    */
-  private processBuffer(): void {
-    const lines = this.buffer.split("\n");
-    this.buffer = lines.pop() || ""; // Keep incomplete line
-
-    for (const line of lines) {
-      const trimmed = line.trim();
-      if (!trimmed) continue;
-
-      try {
-        const message: ClaudeCliMessage = JSON.parse(trimmed);
-        this.emit("message", message);
-
-        if (isContentDelta(message)) {
-          const delta = (message as ClaudeCliStreamEvent).event?.delta;
-          if (delta?.text) {
-            process.stderr.write(delta.text);
-          }
-          this.emit("content_delta", message as ClaudeCliStreamEvent);
-        } else if (isAssistantMessage(message)) {
-          this.emit("assistant", message);
-        } else if (isResultMessage(message)) {
+  private processChunk(chunk: string): void {
+    if (!this.parser) {
+      const sink: StreamJsonSink = {
+        onMessage: (message) => this.emit("message", message),
+        onContentDelta: (event) => {
+          const text = event.event.delta?.text;
+          if (text) process.stderr.write(text);
+          this.emit("content_delta", event);
+        },
+        onAssistant: (message) => this.emit("assistant", message),
+        onResult: (message) => {
           const result = message as ClaudeCliResult;
           if (result.is_error || result.subtype === "error") {
             console.error(`\n[Subprocess] Error: ${result.result}`);
@@ -210,13 +198,15 @@ export class ClaudeSubprocess extends EventEmitter {
             console.error(`[Subprocess] Tokens: in=${usage.input_tokens || 0} out=${usage.output_tokens || 0} cache_read=${usage.cache_read_input_tokens || 0} cache_write=${usage.cache_creation_input_tokens || 0}`);
           }
           this.emit("result", message);
-        }
-      } catch {
-        // Non-JSON output, emit as raw
-        console.error("[Subprocess raw]:", trimmed);
-        this.emit("raw", trimmed);
-      }
+        },
+        onRaw: (line) => {
+          console.error("[Subprocess raw]:", line);
+          this.emit("raw", line);
+        },
+      };
+      this.parser = new StreamJsonParser(sink);
     }
+    this.parser.push(chunk);
   }
 
   /**
