@@ -15,6 +15,7 @@ import type { SubprocessOptions } from "../subprocess/manager.js";
 import type { ClaudeCliResult, ClaudeCliStreamEvent } from "../types/claude-cli.js";
 import { StreamJsonParser, type StreamJsonSink } from "./stream-json-parser.js";
 import { CodexJsonlParser } from "./codex-jsonl-parser.js";
+import { adapterRunError } from "./adapter-error.js";
 import { getBgWaitCeilingMs } from "../config.js";
 
 export type AdapterExecute = (ctx: AdapterExecutionContext) => Promise<AdapterExecutionResult>;
@@ -67,6 +68,9 @@ export class PaperclipRunner extends EventEmitter implements AgentRunner {
   private killSignal: NodeJS.Signals = "SIGTERM";
   private cwd: string | null = null;
   private streamErrored = false;
+  // In-band failure text from a claude stream-json is_error terminal result, held
+  // (not emitted) until resolve so the classified AdapterExecutionResult can carry it.
+  private streamErrorText = "";
   // codex-jsonl mode: true once at least one agent_message block streamed live, so
   // the terminal emit skips a duplicate content delta (the answer is already on the
   // wire) yet still falls back to a synthesized delta when nothing streamed.
@@ -179,32 +183,29 @@ export class PaperclipRunner extends EventEmitter implements AgentRunner {
         // Emit any buffered newline-less trailing line (e.g. a final codex
         // agent_message with no trailing newline) before deciding the terminal state.
         parser.flush();
-        if (this.outputMode === "codex-jsonl") {
-          // codex resolves normal CLI failures as an AdapterExecutionResult carrying
-          // errorMessage/nonzero exitCode instead of throwing. routes.ts treats any
-          // `result` event as success (it never inspects is_error), so a failed run
-          // must surface as `error` — otherwise missing creds / bad args / timeouts
-          // return a 200 with empty output.
-          if (this.isErrorResult(result)) {
-            this.cleanupCwd();
-            const message = result.errorMessage
-              || (result.timedOut
-                ? "Paperclip adapter run timed out"
-                : result.signal != null
-                  ? `Paperclip adapter run terminated by signal ${result.signal}`
-                  : `Paperclip adapter run failed (exit code ${result.exitCode})`);
-            this.emit("error", new Error(message));
-            this.emit("close", result.exitCode ?? (result.timedOut ? 124 : 1));
-            return;
-          }
+
+        // Both adapters resolve normal CLI failures as an AdapterExecutionResult
+        // (errorMessage/nonzero exit/timeout/signal) rather than throwing, and the
+        // claude stream-json path can additionally report a failure in-band via an
+        // is_error terminal result (recorded in streamErrored/streamErrorText). routes.ts
+        // treats any `result` event as a 200 success (it never inspects is_error), so
+        // every failure must surface as an `error` carrying the verbatim CLI message +
+        // OpenAI classification — otherwise usage limits, auth prompts, and timeouts
+        // return a 200 with empty/partial output instead of the 429/401/500 the OpenAI
+        // contract expects.
+        const failed = this.streamErrored || this.isErrorResult(result);
+        if (this.outputMode === "codex-jsonl" && !failed) {
+          // codex's final answer lives in result.summary; synthesize it only for a
+          // successful run (a failure falls through to the shared handling below).
           this.emitCodexTerminal(result);
         }
         this.cleanupCwd();
-        // A stream-json terminal result marked is_error surfaces as `error` (below),
-        // but the adapter can still resolve exitCode 0 (claude reports the failure
-        // in-band). Force a nonzero close so the failure is reflected in the close code.
-        const closeCode = result.exitCode ?? (result.timedOut ? 124 : 0);
-        this.emit("close", this.streamErrored && closeCode === 0 ? 1 : closeCode);
+        if (failed) {
+          this.emit("error", adapterRunError(this.failureMessage(result), result));
+          this.emit("close", this.failureCloseCode(result));
+          return;
+        }
+        this.emit("close", result.exitCode ?? (result.timedOut ? 124 : 0));
       })
       .catch((err: unknown) => {
         parser.flush();
@@ -267,6 +268,30 @@ export class PaperclipRunner extends EventEmitter implements AgentRunner {
   }
 
   /**
+   * The verbatim failure message to surface. Prefer the adapter's classified
+   * errorMessage (usage limit / auth prompt / CLI stderr), then any in-band
+   * stream-json error text, then a shape-derived fallback.
+   */
+  private failureMessage(result: AdapterExecutionResult): string {
+    return (result.errorMessage?.trim())
+      || this.streamErrorText
+      || (result.timedOut
+        ? "Paperclip adapter run timed out"
+        : result.signal != null
+          ? `Paperclip adapter run terminated by signal ${result.signal}`
+          : `Paperclip adapter run failed (exit code ${result.exitCode})`);
+  }
+
+  /**
+   * A failed run must close nonzero even when the adapter resolves exitCode 0
+   * (claude can report a usage limit / in-band error while exiting cleanly).
+   */
+  private failureCloseCode(result: AdapterExecutionResult): number {
+    if (result.exitCode != null && result.exitCode !== 0) return result.exitCode;
+    return result.timedOut ? 124 : 1;
+  }
+
+  /**
    * Synthesize the events routes.ts consumes from a normalized
    * AdapterExecutionResult. result.summary is the final answer; `opts.skipContentDelta`
    * omits the synthesized delta when that text already streamed live (codex-jsonl).
@@ -319,12 +344,14 @@ export class PaperclipRunner extends EventEmitter implements AgentRunner {
         // The claude stream-json path can deliver a well-formed terminal result
         // marked is_error/subtype:"error" (e.g. max-turns reached, execution error)
         // without throwing. routes.ts treats any `result` event as a 200 success, so
-        // a failed run must surface as `error` — otherwise the client gets a 200 with
-        // the (often empty/partial) error text instead of an adapter error.
+        // this must NOT surface as a success result. Record the failure (with its
+        // in-band text) and let the shared error handling on resolve emit it — the
+        // resolved AdapterExecutionResult carries the errorCode/errorFamily needed to
+        // classify it (429/401/…) that this event alone lacks.
         if (result.is_error === true || result.subtype === "error") {
           this.streamErrored = true;
-          const text = (result.result ?? "").toString().trim();
-          this.emit("error", new Error(text || `Paperclip adapter run failed (subtype: ${result.subtype})`));
+          this.streamErrorText = (result.result ?? "").toString().trim()
+            || `Paperclip adapter run failed (subtype: ${result.subtype})`;
           return;
         }
         this.emit("result", message);

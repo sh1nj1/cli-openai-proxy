@@ -1,6 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { PaperclipRunner, type AdapterExecute } from "./paperclip-runner.js";
+import { AdapterRunError } from "./adapter-error.js";
 import type { ClaudeCliStreamEvent, ClaudeCliResult } from "../types/claude-cli.js";
 
 const deltaLine = JSON.stringify({
@@ -421,6 +422,58 @@ test("stream-json mode surfaces an is_error terminal result as error, not a succ
   assert.equal(results.length, 0, "an is_error terminal result must NOT be emitted as a success result event");
   assert.ok(errored, "the failed run surfaces via the error event");
   assert.notEqual(code, 0, "close code reflects the failure");
+});
+
+test("stream-json mode surfaces a usage-limit failure (no terminal result) verbatim as a 429 error", async () => {
+  // A Claude Max usage limit commonly exits the CLI with the message on stderr and
+  // NO parseable stream-json result, so the adapter resolves with errorMessage +
+  // errorCode "provider_quota" and produces no `result` event. The runner must
+  // surface that verbatim message as an `error` (not a silent close), classified
+  // 429 insufficient_quota, so routes.ts can answer like the OpenAI endpoint.
+  const limitMsg = "Claude AI usage limit reached. Resets at 3pm.";
+  const quotaExecute: AdapterExecute = async () => ({
+    exitCode: 1, signal: null, timedOut: false,
+    errorMessage: limitMsg, errorCode: "provider_quota", errorFamily: "provider_quota",
+  });
+  const runner = new PaperclipRunner(quotaExecute, { engine: "cli", command: "claude" });
+  const results: ClaudeCliResult[] = [];
+  let err: Error | undefined;
+  const closeCode = new Promise<number | null>((resolve) => {
+    runner.on("result", (r: ClaudeCliResult) => { results.push(r); });
+    runner.on("error", (e: Error) => { err = e; });
+    runner.on("close", (code: number | null) => resolve(code));
+  });
+
+  await runner.start("hi", { model: "opus" });
+  const code = await closeCode;
+
+  assert.equal(results.length, 0, "a failed run must not emit a success result event");
+  assert.ok(err, "the usage-limit failure surfaces via the error event");
+  assert.equal(err!.message, limitMsg, "the CLI usage-limit message passes through verbatim");
+  assert.ok(err instanceof AdapterRunError, "the error carries OpenAI classification");
+  assert.equal((err as AdapterRunError).openai.status, 429, "usage limit maps to HTTP 429");
+  assert.equal((err as AdapterRunError).openai.type, "insufficient_quota");
+  assert.notEqual(code, 0, "close code reflects the failure");
+});
+
+test("stream-json mode surfaces an auth-required failure verbatim as a 401 error", async () => {
+  const authMsg = "Invalid API key. Please run /login to authenticate.";
+  const authExecute: AdapterExecute = async () => ({
+    exitCode: 1, signal: null, timedOut: false,
+    errorMessage: authMsg, errorCode: "claude_auth_required",
+  });
+  const runner = new PaperclipRunner(authExecute, { engine: "cli", command: "claude" });
+  let err: Error | undefined;
+  const closed = new Promise<void>((resolve) => {
+    runner.on("error", (e: Error) => { err = e; });
+    runner.on("close", () => resolve());
+  });
+  await runner.start("hi", { model: "opus" });
+  await closed;
+
+  assert.ok(err instanceof AdapterRunError, "auth failure surfaces as a classified error");
+  assert.equal(err!.message, authMsg, "the auth message passes through verbatim");
+  assert.equal((err as AdapterRunError).openai.status, 401, "auth failure maps to HTTP 401");
 });
 
 test("signals a child spawned after a pre-spawn kill() (disconnect before onSpawn)", async () => {
