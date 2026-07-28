@@ -21,6 +21,7 @@ import {
   initAuthAdmin,
 } from "./auth-routes.js";
 import { getTimeoutMs } from "../config.js";
+import { resetSessions } from "../auth/session-manager.js";
 
 export interface ServerConfig {
   port: number;
@@ -174,6 +175,13 @@ export async function startServer(config: ServerConfig): Promise<Server> {
  * Stop the HTTP server
  */
 export async function stopServer(): Promise<void> {
+  // Before the early return and before close(): auth sessions live in module
+  // state, not on the listener, so a pending paste-code session would keep its
+  // pty child alive until its TTL and stay submittable after the next
+  // startServer(). Cancelling first also unblocks an in-flight submit, which
+  // close() would otherwise wait on.
+  resetSessions();
+
   if (!serverInstance) {
     return;
   }

@@ -68,7 +68,7 @@ Two consequences worth knowing:
 - The CLI only renders that UI on a real terminal, so the proxy drives it under a
   pty (`node-pty`) and holds the child process alive between the start and submit
   requests. An abandoned session is therefore a live process — hence the TTL
-  reaper and the one-session-per-engine rule.
+  reaper, the one-session-per-engine rule, and the cleanup on server shutdown.
 - `setup-token` **does not persist anything**. It prints the token and expects
   the caller to export `CLAUDE_CODE_OAUTH_TOKEN`. The proxy holds that token **in
   memory only** and injects it into runs **of that engine alone** — a credential
@@ -192,7 +192,10 @@ this code as "check the host".
   the proxy holds a single provisioned credential per engine. Every caller shares
   one identity per engine. Treat one proxy as one identity.
 - **`paste-code` sessions do not survive a restart**, by design — nothing is
-  persisted. The client restarts the flow.
+  persisted. The client restarts the flow. `stopServer()` cancels every pending
+  session and kills the child it holds, so this holds for an in-process restart
+  too: the sessions live in module state, not on the listener, and would
+  otherwise stay resolvable and submittable against the next server.
 - The proxy passes `BROWSER=none` to `claude setup-token`: this flow
   authenticates a *remote* user, and on a host with a logged-in browser session a
   locally opened browser can approve the request before that user ever sees the

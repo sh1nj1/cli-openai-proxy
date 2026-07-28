@@ -4,10 +4,13 @@
  * The "paste-code" flow holds a live CLI child between the start and submit
  * requests, so an abandoned session is a leaked process. Two invariants keep
  * that bounded: at most one session per engine (a new start cancels the old),
- * and every session is reaped after a TTL.
+ * every session is reaped after a TTL, and server shutdown drops them all.
  *
  * Sessions are not persisted. A proxy restart drops them and the caller simply
- * restarts the flow — the same trade-off as the memory-only token store.
+ * restarts the flow — the same trade-off as the memory-only token store. That
+ * holds for an in-process restart only because `stopServer()` calls
+ * `resetSessions()`: these maps are module state, so without it a session would
+ * outlive the server that created it and stay submittable after the next start.
  */
 
 import { randomUUID } from "crypto";
@@ -232,7 +235,13 @@ export function cancelSession(engine: string, sessionId: string): SessionView {
   return cancelled;
 }
 
-/** Test-only: drop every session (and kill held children). */
+/**
+ * Drop every session, killing any child it holds.
+ *
+ * Called by `stopServer()` as well as by tests: a pending paste-code session owns
+ * a pty child that no route can reach once the listener is gone, so leaving it to
+ * the TTL leaks a login for up to ten minutes past shutdown.
+ */
 export function resetSessions(): void {
   for (const record of [...byId.values()]) dispose(record, "cancelled");
   for (const [engine, reservation] of [...starting.entries()]) {
