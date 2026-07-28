@@ -35,6 +35,11 @@ That matters because those children run with permissions skipped: anything left
 in their environment is readable by whoever wrote the prompt, and an ordinary
 completion caller could otherwise recover the admin key and use these endpoints.
 
+The captured values persist for the life of the process, so restarting the server
+in-process (`stopServer()` then `startServer()`) re-initializes from them rather
+than from the environment they were removed from. Re-setting the variable before a
+restart still wins, which is how you rotate keys without a new process.
+
 | Env | Meaning |
 | --- | --- |
 | `AUTH_ADMIN_KEYS` | Comma-separated admin keys. Unset = feature off. |

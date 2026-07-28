@@ -9,6 +9,7 @@ import {
   takeProxySecret,
   stripProxySecrets,
   blankedProxySecrets,
+  resetCapturedProxySecrets,
 } from "./config.js";
 
 const ENV_KEY = "CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS";
@@ -94,6 +95,9 @@ describe("proxy-only secrets", () => {
 
   beforeEach(() => {
     for (const key of PROXY_ONLY_SECRET_VARS) saved[key] = process.env[key];
+    // The capture is module state and now outlives a take; without this a case
+    // would read the value a previous one captured.
+    resetCapturedProxySecrets();
   });
 
   afterEach(() => {
@@ -101,6 +105,7 @@ describe("proxy-only secrets", () => {
       if (saved[key] === undefined) delete process.env[key];
       else process.env[key] = saved[key];
     }
+    resetCapturedProxySecrets();
   });
 
   it("takeProxySecret returns the value and removes it from the environment", () => {
@@ -116,6 +121,27 @@ describe("proxy-only secrets", () => {
   it("takeProxySecret is a no-op for an unset variable", () => {
     delete process.env.API_KEYS;
     assert.equal(takeProxySecret("API_KEYS"), undefined);
+  });
+
+  it("takeProxySecret answers from the capture once the variable is gone", () => {
+    process.env.API_KEYS = "sk-one";
+    takeProxySecret("API_KEYS");
+
+    assert.equal(
+      takeProxySecret("API_KEYS"),
+      "sk-one",
+      "a re-init must not see nothing merely because the first init removed the variable",
+    );
+    assert.equal("API_KEYS" in process.env, false, "and it must stay out of the environment");
+  });
+
+  it("takeProxySecret prefers a value re-set after the capture", () => {
+    process.env.API_KEYS = "sk-one";
+    takeProxySecret("API_KEYS");
+
+    process.env.API_KEYS = "sk-two";
+    assert.equal(takeProxySecret("API_KEYS"), "sk-two", "an operator re-setting the variable means to change the keys");
+    assert.equal(takeProxySecret("API_KEYS"), "sk-two", "and the capture now holds the newer value");
   });
 
   it("stripProxySecrets copies without the proxy-only keys and without mutating the source", () => {

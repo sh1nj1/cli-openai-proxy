@@ -42,6 +42,9 @@ export function getTimeoutMs(): number {
  */
 export const PROXY_ONLY_SECRET_VARS = ["API_KEYS", "AUTH_ADMIN_KEYS"] as const;
 
+/** What each secret was at boot, so a re-init survives its own removal from the env. */
+const captured = new Map<string, string>();
+
 /**
  * Read a proxy-only secret and remove it from the process environment.
  *
@@ -51,11 +54,28 @@ export const PROXY_ONLY_SECRET_VARS = ["API_KEYS", "AUTH_ADMIN_KEYS"] as const;
  * remember to filter. Both values are captured into module state at boot, so the
  * variable is dead weight afterwards — deleting it is what makes the guarantee
  * hold for every spawn, present and future.
+ *
+ * Repeat calls answer from the capture, so initialization is idempotent. A value
+ * present in the environment still wins: an operator who re-sets the variable
+ * between two inits means to change the keys, and honouring that costs nothing.
  */
 export function takeProxySecret(name: (typeof PROXY_ONLY_SECRET_VARS)[number]): string | undefined {
-  const value = process.env[name];
-  delete process.env[name];
-  return value;
+  const fromEnv = process.env[name];
+  if (fromEnv !== undefined) {
+    delete process.env[name];
+    captured.set(name, fromEnv);
+    return fromEnv;
+  }
+  // Deleting makes the variable unreadable to the *next* take as well, so an
+  // in-process restart (startServer → stopServer → startServer) would otherwise
+  // re-init from an environment this function itself emptied — silently
+  // disabling completion auth. The capture is the value from here on.
+  return captured.get(name);
+}
+
+/** Forget captured secrets. Tests only — nothing in a running proxy un-configures a key. */
+export function resetCapturedProxySecrets(): void {
+  captured.clear();
 }
 
 /**
