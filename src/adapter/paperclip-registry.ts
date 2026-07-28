@@ -24,6 +24,8 @@ export interface PaperclipModelSpec {
   outputMode: OutputMode;
   /** Adapter base CLI flags. claude-code flags for claude; [] for adapters that reject them. */
   cliFlags: string[];
+  /** Engine id in the /v1/auth registry, so an auth failure names the login flow to run. */
+  authEngine: string;
 }
 
 const REGISTRY: Record<string, PaperclipModelSpec> = {
@@ -34,6 +36,7 @@ const REGISTRY: Record<string, PaperclipModelSpec> = {
     promptInjection: "task-context",
     outputMode: "stream-json",
     cliFlags: ["--include-partial-messages", "--no-session-persistence"],
+    authEngine: "claude",
   },
   "paperclip/codex_local": {
     adapterType: "codex_local",
@@ -51,6 +54,7 @@ const REGISTRY: Record<string, PaperclipModelSpec> = {
     // for its own sandbox lane, not for local `codex exec`, so declare it here (codex
     // appends extraArgs verbatim) to keep local runs from tripping the git-repo guard.
     cliFlags: ["--skip-git-repo-check"],
+    authEngine: "codex",
   },
 };
 
@@ -94,6 +98,7 @@ export function createRunner(model: string): AgentRunner {
       promptInjection: spec.promptInjection,
       outputMode: spec.outputMode,
       cliFlags: spec.cliFlags,
+      engine: spec.authEngine,
     });
   }
   if (model.startsWith(PAPERCLIP_MODEL_PREFIX)) {

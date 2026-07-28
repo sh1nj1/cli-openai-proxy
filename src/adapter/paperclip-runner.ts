@@ -17,6 +17,7 @@ import { StreamJsonParser, type StreamJsonSink } from "./stream-json-parser.js";
 import { CodexJsonlParser } from "./codex-jsonl-parser.js";
 import { adapterRunError } from "./adapter-error.js";
 import { getBgWaitCeilingMs } from "../config.js";
+import { getProvisionedAuthEnv } from "../auth/token-store.js";
 
 export type AdapterExecute = (ctx: AdapterExecutionContext) => Promise<AdapterExecutionResult>;
 
@@ -54,6 +55,9 @@ export interface PaperclipRunnerOptions {
   outputMode?: OutputMode;
   /** Adapter base CLI flags. Default = claude-code flags; pass [] for others. */
   cliFlags?: string[];
+  /** Engine id for /v1/auth (e.g. "claude", "codex"); rides an auth failure so a
+   *  caller knows which login flow to open. */
+  engine?: string;
 }
 
 export interface AgentRunner extends EventEmitter {
@@ -79,6 +83,7 @@ export class PaperclipRunner extends EventEmitter implements AgentRunner {
   private readonly promptInjection: PromptInjection;
   private readonly outputMode: OutputMode;
   private readonly cliFlags: string[];
+  private readonly engine?: string;
 
   constructor(
     private readonly execute: AdapterExecute,
@@ -89,6 +94,7 @@ export class PaperclipRunner extends EventEmitter implements AgentRunner {
     this.promptInjection = options.promptInjection ?? "task-context";
     this.outputMode = options.outputMode ?? "stream-json";
     this.cliFlags = options.cliFlags ?? CLAUDE_CLI_FLAGS;
+    this.engine = options.engine;
   }
 
   async start(prompt: string, options: SubprocessOptions): Promise<void> {
@@ -154,7 +160,12 @@ export class PaperclipRunner extends EventEmitter implements AgentRunner {
         dangerouslySkipPermissions: true,
         timeoutSec,
         extraArgs,
-        env: { CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS: String(getBgWaitCeilingMs()) },
+        env: {
+          CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS: String(getBgWaitCeilingMs()),
+          // Credentials provisioned through /v1/auth live in memory only, so env
+          // is the sole channel that reaches the adapter's CLI child.
+          ...getProvisionedAuthEnv(),
+        },
       },
       context,
       onLog: async (stream: "stdout" | "stderr", chunk: string) => {
@@ -201,7 +212,7 @@ export class PaperclipRunner extends EventEmitter implements AgentRunner {
         }
         this.cleanupCwd();
         if (failed) {
-          this.emit("error", adapterRunError(this.failureMessage(result), result));
+          this.emit("error", adapterRunError(this.failureMessage(result), result, this.engine));
           this.emit("close", this.failureCloseCode(result));
           return;
         }

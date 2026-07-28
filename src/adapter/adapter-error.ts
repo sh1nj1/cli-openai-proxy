@@ -20,6 +20,12 @@ export interface OpenAIErrorShape {
   code: string | null;
   /** Seconds to advertise via Retry-After, when the adapter reported a reset time. */
   retryAfterSeconds?: number;
+  /**
+   * Engine whose CLI is unauthenticated, set only for `engine_unauthenticated`.
+   * A caller (e.g. Collavre) needs to know WHICH CLI to re-authenticate before it
+   * can open the matching /v1/auth flow, and the message alone is not machine-readable.
+   */
+  engine?: string;
 }
 
 export class AdapterRunError extends Error {
@@ -38,14 +44,17 @@ export class AdapterRunError extends Error {
  * so a run classified only at the family level still surfaces as a 429 rather
  * than a generic 500.
  */
-function mapToOpenAI(result: AdapterExecutionResult): OpenAIErrorShape {
+function mapToOpenAI(result: AdapterExecutionResult, engine?: string): OpenAIErrorShape {
   const code = result.errorCode ?? null;
   const family = result.errorFamily ?? null;
 
   let shape: OpenAIErrorShape;
   if (code === "claude_auth_required") {
-    // No usable credentials — OpenAI answers 401 for auth problems.
-    shape = { status: 401, type: "invalid_request_error", code: "invalid_api_key" };
+    // The CLI itself has no usable credentials — distinct from the proxy rejecting
+    // the caller's own API key (`invalid_api_key`). A dedicated code plus `engine`
+    // lets a caller react by driving POST /v1/auth/{engine}/sessions instead of
+    // re-checking its own key. Still 401: OpenAI answers 401 for auth problems.
+    shape = { status: 401, type: "invalid_request_error", code: "engine_unauthenticated", engine };
   } else if (code === "model_not_found") {
     shape = { status: 404, type: "invalid_request_error", code: "model_not_found" };
   } else if (code === "provider_quota" || family === "provider_quota") {
@@ -69,8 +78,12 @@ function mapToOpenAI(result: AdapterExecutionResult): OpenAIErrorShape {
 }
 
 /** Build an AdapterRunError carrying the verbatim message and OpenAI classification. */
-export function adapterRunError(message: string, result: AdapterExecutionResult): AdapterRunError {
-  return new AdapterRunError(message, mapToOpenAI(result));
+export function adapterRunError(
+  message: string,
+  result: AdapterExecutionResult,
+  engine?: string,
+): AdapterRunError {
+  return new AdapterRunError(message, mapToOpenAI(result, engine));
 }
 
 /**

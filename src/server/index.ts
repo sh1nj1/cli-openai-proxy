@@ -8,6 +8,18 @@ import express, { Express, Request, Response, NextFunction } from "express";
 import { createServer, Server } from "http";
 import { handleChatCompletions, handleModels, handleHealth, handleUsage, handleUsageRecent } from "./routes.js";
 import { initAuth, authMiddleware } from "./auth.js";
+import {
+  AUTH_PROVISIONING_PREFIX,
+  authAdminMiddleware,
+  handleAuthEngines,
+  handleAuthStatus,
+  handleCancelAuthSession,
+  handleCreateAuthSession,
+  handleForgetCredential,
+  handleGetAuthSession,
+  handleSubmitAuthSession,
+  initAuthAdmin,
+} from "./auth-routes.js";
 import { getTimeoutMs } from "../config.js";
 
 export interface ServerConfig {
@@ -28,6 +40,12 @@ export function createApp(): Express {
   if (authStatus.enabled) {
     console.log(`[Server] API key auth enabled (${authStatus.keyCount} key(s))`);
   }
+  const adminStatus = initAuthAdmin();
+  console.log(
+    adminStatus.enabled
+      ? `[Server] CLI auth provisioning enabled (${adminStatus.keyCount} admin key(s))`
+      : "[Server] CLI auth provisioning disabled (set AUTH_ADMIN_KEYS to enable)",
+  );
 
   // Request logging (debug mode)
   app.use((req: Request, _res: Response, next: NextFunction) => {
@@ -40,7 +58,7 @@ export function createApp(): Express {
   // CORS headers for local development
   app.use((_req: Request, res: Response, next: NextFunction) => {
     res.setHeader("Access-Control-Allow-Origin", "*");
-    res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+    res.setHeader("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS");
     res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
     next();
   });
@@ -56,6 +74,10 @@ export function createApp(): Express {
   // so preflight requests — which carry no Authorization header — still succeed.
   app.use(authMiddleware);
 
+  // Same reason, for the auth-provisioning surface: reject a request carrying the
+  // wrong admin key (or one sent while the feature is off) before its body is buffered.
+  app.use(AUTH_PROVISIONING_PREFIX, authAdminMiddleware);
+
   // Body parsing. 30mb accommodates the 20MB decoded-image ceiling plus base64
   // (~33%) overhead and surrounding text, so oversized images hit the clean 400
   // in the image materializer rather than a raw 413 from the body parser.
@@ -67,6 +89,15 @@ export function createApp(): Express {
   app.post("/v1/chat/completions", handleChatCompletions);
   app.get("/v1/usage", handleUsage);
   app.get("/v1/usage/recent", handleUsageRecent);
+
+  // CLI auth provisioning (gated above, before the body parser)
+  app.get(`${AUTH_PROVISIONING_PREFIX}/engines`, handleAuthEngines);
+  app.get(`${AUTH_PROVISIONING_PREFIX}/:engine/status`, handleAuthStatus);
+  app.post(`${AUTH_PROVISIONING_PREFIX}/:engine/sessions`, handleCreateAuthSession);
+  app.get(`${AUTH_PROVISIONING_PREFIX}/:engine/sessions/:sessionId`, handleGetAuthSession);
+  app.post(`${AUTH_PROVISIONING_PREFIX}/:engine/sessions/:sessionId`, handleSubmitAuthSession);
+  app.delete(`${AUTH_PROVISIONING_PREFIX}/:engine/sessions/:sessionId`, handleCancelAuthSession);
+  app.delete(`${AUTH_PROVISIONING_PREFIX}/:engine/credential`, handleForgetCredential);
 
   // 404 handler
   app.use((_req: Request, res: Response) => {

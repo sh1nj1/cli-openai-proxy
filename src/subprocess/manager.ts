@@ -15,6 +15,7 @@ import type {
 import type { ClaudeModel } from "../adapter/openai-to-cli.js";
 import { StreamJsonParser, type StreamJsonSink } from "../adapter/stream-json-parser.js";
 import { DEFAULT_TIMEOUT_MS, getBgWaitCeilingMs } from "../config.js";
+import { getProvisionedAuthEnv } from "../auth/token-store.js";
 
 export interface SubprocessOptions {
   // ClaudeModel literals keep autocomplete for the direct Claude path; the
@@ -71,6 +72,10 @@ export class ClaudeSubprocess extends EventEmitter {
             // Keep `claude -p` alive until background subagents finish instead of
             // exiting at the CLI's 10-minute default cap (see config.ts).
             CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS: String(getBgWaitCeilingMs()),
+            // A credential provisioned through /v1/auth is held in memory only, so
+            // env is the sole channel that reaches the CLI. Applied last: an
+            // explicitly provisioned credential wins over a stale inherited one.
+            ...getProvisionedAuthEnv(),
           },
           stdio: ["pipe", "pipe", "pipe"],
         });

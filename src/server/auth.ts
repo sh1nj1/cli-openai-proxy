@@ -9,6 +9,7 @@
  */
 
 import type { Request, Response, NextFunction } from "express";
+import { AUTH_PROVISIONING_PREFIX } from "./auth-routes.js";
 
 let validKeys: Set<string> | null = null;
 
@@ -40,6 +41,14 @@ export function authMiddleware(req: Request, res: Response, next: NextFunction):
 
   // Skip auth for health check
   if (req.path === "/health") {
+    next();
+    return;
+  }
+
+  // Auth-provisioning routes carry an auth-admin key, not a completion key, so
+  // checking them here would reject the correct credential. They are gated by
+  // their own fail-closed middleware (disabled entirely without AUTH_ADMIN_KEYS).
+  if (req.path.startsWith(AUTH_PROVISIONING_PREFIX)) {
     next();
     return;
   }

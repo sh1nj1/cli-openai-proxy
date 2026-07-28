@@ -120,6 +120,30 @@ curl http://localhost:3456/v1/chat/completions \
 
 When `API_KEYS` is not set, auth is disabled (backwards compatible).
 
+## Remote CLI Auth Provisioning
+
+Log the underlying `claude` / `codex` CLIs in over HTTP instead of shelling into
+the host — so a remote UI can recover from an auth failure on its own. Off unless
+`AUTH_ADMIN_KEYS` is set (its own key set, separate from `API_KEYS`):
+
+```bash
+API_KEYS=sk-team-abc123 AUTH_ADMIN_KEYS=sk-admin-xyz789 claude-max-api
+
+# codex: submit an API key
+curl -X POST -H "Authorization: Bearer sk-admin-xyz789" \
+  http://localhost:3456/v1/auth/codex/sessions
+
+# claude: get an OAuth URL back, then submit the code from it
+curl -X POST -H "Authorization: Bearer sk-admin-xyz789" \
+  http://localhost:3456/v1/auth/claude/sessions
+```
+
+A completion whose CLI is unauthenticated answers `401` with
+`code: "engine_unauthenticated"` and the `engine` to re-authenticate, so a client
+can trigger the right flow automatically.
+
+See [docs/cli-auth-provisioning.md](docs/cli-auth-provisioning.md).
+
 ## API Endpoints
 
 | Endpoint | Method | Description |
@@ -129,6 +153,11 @@ When `API_KEYS` is not set, auth is disabled (backwards compatible).
 | `/v1/chat/completions` | POST | Chat completions (streaming & non-streaming) |
 | `/v1/usage` | GET | Usage stats and cost savings |
 | `/v1/usage/recent` | GET | Recent request log |
+| `/v1/auth/engines` | GET | Auth flow per engine (needs `AUTH_ADMIN_KEYS`) |
+| `/v1/auth/{engine}/status` | GET | Whether that CLI is authenticated |
+| `/v1/auth/{engine}/sessions` | POST | Start a login flow |
+| `/v1/auth/{engine}/sessions/{id}` | GET / POST / DELETE | Poll / submit / abandon |
+| `/v1/auth/{engine}/credential` | DELETE | Forget a provisioned credential |
 
 ## Models
 
