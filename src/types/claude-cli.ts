@@ -82,6 +82,8 @@ export interface ClaudeCliResult {
     outputTokens: number;
     costUSD: number;
   }>;
+  /** Diagnostics the CLI attaches to a failed run; `result` is often empty then. */
+  errors?: string[];
 }
 
 export interface ClaudeCliSystemMessage {

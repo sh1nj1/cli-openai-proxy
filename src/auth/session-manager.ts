@@ -13,7 +13,12 @@
 import { randomUUID } from "crypto";
 import { resolveEngine } from "./registry.js";
 import { setCredential } from "./token-store.js";
-import { AuthProvisioningError, type AuthFlow, type EngineAuthSession } from "./types.js";
+import {
+  AuthProvisioningError,
+  type AuthFlow,
+  type AuthStartResult,
+  type EngineAuthSession,
+} from "./types.js";
 
 export type SessionStatus = "pending" | "authorized" | "failed" | "cancelled";
 
@@ -38,6 +43,18 @@ const DEFAULT_TTL_MS = 10 * 60_000;
 
 const byId = new Map<string, SessionRecord>();
 const byEngine = new Map<string, string>();
+
+/**
+ * Engines whose start() is still in flight, keyed by engine.
+ *
+ * `byEngine` is only written once the CLI has handed back its verification URL,
+ * which for paste-code takes as long as the user's CLI needs to print it. Two
+ * overlapping starts would both find `byEngine` empty and both launch a child,
+ * leaving one orphaned (nothing disposes it) and two live sessions racing to
+ * overwrite the same credential. Reserving the engine here — before the await —
+ * makes the one-session-per-engine invariant hold DURING start, not just after.
+ */
+const starting = new Map<string, { handle: EngineAuthSession }>();
 
 function ttlMs(): number {
   const raw = Number(process.env.AUTH_SESSION_TTL_MS);
@@ -74,9 +91,35 @@ export async function createSession(engine: string): Promise<SessionView> {
     const existing = byId.get(existingId);
     if (existing) dispose(existing, "cancelled");
   }
+  // Supersede a start that has not registered yet, killing its child now rather
+  // than leaving two logins alive until one of them times out.
+  const superseded = starting.get(engine);
+  if (superseded) {
+    starting.delete(engine);
+    superseded.handle.cancel();
+  }
 
   const handle = descriptor.createSession();
-  const started = await handle.start();
+  const reservation = { handle };
+  starting.set(engine, reservation);
+
+  let started: AuthStartResult;
+  try {
+    started = await handle.start();
+  } finally {
+    // Only clear our own reservation: a later start may already own the slot.
+    if (starting.get(engine) === reservation) starting.delete(engine);
+  }
+
+  // A later start took the slot while we were waiting, and already cancelled this
+  // handle. Registering now would resurrect the session it just superseded.
+  if (starting.get(engine) !== undefined || byEngine.get(engine) !== undefined) {
+    handle.cancel();
+    throw new AuthProvisioningError(
+      `A newer authentication attempt for "${engine}" superseded this one`,
+      "session_superseded",
+    );
+  }
 
   const sessionId = randomUUID();
   const expiresAt = Date.now() + ttlMs();
@@ -156,4 +199,8 @@ export function cancelSession(engine: string, sessionId: string): SessionView {
 /** Test-only: drop every session (and kill held children). */
 export function resetSessions(): void {
   for (const record of [...byId.values()]) dispose(record, "cancelled");
+  for (const [engine, reservation] of [...starting.entries()]) {
+    starting.delete(engine);
+    reservation.handle.cancel();
+  }
 }

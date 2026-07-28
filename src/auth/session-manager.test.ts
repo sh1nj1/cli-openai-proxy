@@ -7,6 +7,7 @@ import {
   getSession,
   resetSessions,
   submitSession,
+  type SessionView,
 } from "./session-manager.js";
 import { clearAllCredentials, getProvisionedAuthEnv } from "./token-store.js";
 import { AuthProvisioningError, type EngineAuthDescriptor, type EngineAuthSession } from "./types.js";
@@ -15,9 +16,15 @@ import { AuthProvisioningError, type EngineAuthDescriptor, type EngineAuthSessio
 class FakeSession implements EngineAuthSession {
   cancelled = false;
   submitted: string[] = [];
-  constructor(private readonly behavior: { failSubmit?: boolean; credential?: boolean } = {}) {}
+  constructor(
+    private readonly behavior: { failSubmit?: boolean; credential?: boolean; startDelayMs?: number } = {},
+  ) {}
 
   async start() {
+    // Models the real gap between spawning the CLI and it printing its URL.
+    if (this.behavior.startDelayMs) {
+      await new Promise((r) => setTimeout(r, this.behavior.startDelayMs));
+    }
     return { verificationUrl: "https://example.test/authorize", instructions: "open it" };
   }
   async submit(input: string) {
@@ -31,7 +38,7 @@ class FakeSession implements EngineAuthSession {
 }
 
 let created: FakeSession[] = [];
-let behavior: { failSubmit?: boolean; credential?: boolean } = {};
+let behavior: { failSubmit?: boolean; credential?: boolean; startDelayMs?: number } = {};
 const realResolve = engineRegistry.resolve;
 
 const fakeDescriptor: EngineAuthDescriptor = {
@@ -85,6 +92,31 @@ describe("session-manager", () => {
       assert.strictEqual(err.code, "unknown_session");
       return true;
     });
+  });
+
+  // The engine slot is only claimed once start() resolves, so two overlapping
+  // starts used to both launch a CLI child: one was left orphaned (nothing could
+  // dispose it) and both remained submittable, racing to set the credential.
+  test("overlapping starts for one engine leave exactly one live session", async () => {
+    behavior = { startDelayMs: 30 };
+    const [first, second] = await Promise.allSettled([createSession("fake"), createSession("fake")]);
+
+    const winners = [first, second].filter((r) => r.status === "fulfilled");
+    assert.strictEqual(winners.length, 1, "only one start may register a session");
+
+    const loser = [first, second].find((r) => r.status === "rejected");
+    assert.strictEqual((loser as PromiseRejectedResult).reason.code, "session_superseded");
+
+    assert.strictEqual(created.length, 2, "both attempts created a session object");
+    assert.strictEqual(
+      created.filter((s) => !s.cancelled).length,
+      1,
+      "the superseded attempt's child must be killed, not orphaned",
+    );
+
+    // The surviving session is the one the caller was handed.
+    const view = (winners[0] as PromiseFulfilledResult<SessionView>).value;
+    assert.strictEqual(getSession("fake", view.sessionId).status, "pending");
   });
 
   test("a successful submit stores the credential and releases the session", async () => {

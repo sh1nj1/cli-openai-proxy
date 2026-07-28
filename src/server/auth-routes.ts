@@ -66,7 +66,14 @@ function engineOf(req: Request, res: Response): string | null {
 /** Map a thrown provisioning error onto the OpenAI-style envelope. */
 function sendError(res: Response, err: unknown): void {
   if (err instanceof AuthProvisioningError) {
-    const status = err.code === "unknown_engine" || err.code === "unknown_session" ? 404 : 400;
+    // 409 for a superseded start: the request was well-formed, it just lost a race
+    // with a concurrent one for the engine's single session slot — retryable.
+    const status =
+      err.code === "unknown_engine" || err.code === "unknown_session"
+        ? 404
+        : err.code === "session_superseded"
+          ? 409
+          : 400;
     fail(res, status, err.message, err.code);
     return;
   }

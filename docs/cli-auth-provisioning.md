@@ -90,6 +90,11 @@ therefore definitive.
 
 Starts an attempt, superseding any existing one for that engine.
 
+The engine's single session slot is claimed before the CLI is asked for its URL,
+so two overlapping starts cannot both take it. The loser is answered `409
+session_superseded` and its CLI child is killed immediately — retry to get the
+slot back.
+
 ```json
 {
   "sessionId": "9ceb7f66-…",
@@ -151,6 +156,15 @@ A run whose CLI has no usable credentials answers `401` with:
 means the *caller's* key is wrong), and `engine` names which flow to open. In
 streaming mode the same object arrives in-band on the SSE stream, since the 200
 header has already been flushed.
+
+Both run paths emit it. `paperclip/*` models get the classification from the
+adapter (`errorCode: "claude_auth_required"`); the default `claude-*` models run
+the CLI directly, with no adapter, so the proxy matches the CLI's own
+"please log in" wording — but only on a run that already failed (`is_error`, or a
+nonzero exit), so an ordinary answer that discusses logins is never turned into a
+401. A failure whose wording is not recognised keeps its previous shape rather
+than being guessed at, so a client should still treat a repeated failure without
+this code as "check the host".
 
 ## Scope and limits
 
