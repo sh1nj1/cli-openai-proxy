@@ -87,7 +87,9 @@ export class ClaudeSubprocess extends EventEmitter {
             // A credential provisioned through /v1/auth is held in memory only, so
             // env is the sole channel that reaches the CLI. Applied last: an
             // explicitly provisioned credential wins over a stale inherited one.
-            ...getProvisionedAuthEnv(),
+            // "claude" by name — this runner only ever spawns the claude CLI, and
+            // another engine's credential has no business in its environment.
+            ...getProvisionedAuthEnv("claude"),
           },
           stdio: ["pipe", "pipe", "pipe"],
         });

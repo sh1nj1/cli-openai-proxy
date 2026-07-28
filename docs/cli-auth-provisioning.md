@@ -60,8 +60,10 @@ Two consequences worth knowing:
   reaper and the one-session-per-engine rule.
 - `setup-token` **does not persist anything**. It prints the token and expects
   the caller to export `CLAUDE_CODE_OAUTH_TOKEN`. The proxy holds that token **in
-  memory only** and injects it into every CLI run. Nothing is written to disk, and
-  a proxy restart drops it — re-running the flow is the recovery path.
+  memory only** and injects it into runs **of that engine alone** — a credential
+  is one vendor's secret, so the codex CLI is never launched holding a Claude
+  token, and vice versa. Nothing is written to disk, and a proxy restart drops it
+  — re-running the flow is the recovery path.
 
 ## Endpoints
 
@@ -92,8 +94,8 @@ Starts an attempt, superseding any existing one for that engine.
 
 The engine's single session slot is claimed before the CLI is asked for its URL,
 so two overlapping starts cannot both take it. The loser is answered `409
-session_superseded` and its CLI child is killed immediately — retry to get the
-slot back.
+session_superseded` as soon as it is superseded — not after its own URL wait
+expires — and its CLI child is killed immediately. Retry to get the slot back.
 
 ```json
 {

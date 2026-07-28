@@ -163,8 +163,10 @@ export class PaperclipRunner extends EventEmitter implements AgentRunner {
         env: {
           CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS: String(getBgWaitCeilingMs()),
           // Credentials provisioned through /v1/auth live in memory only, so env
-          // is the sole channel that reaches the adapter's CLI child.
-          ...getProvisionedAuthEnv(),
+          // is the sole channel that reaches the adapter's CLI child. Scoped to
+          // THIS adapter's engine: every adapter spawns a different vendor's CLI,
+          // so an unscoped merge would hand one vendor's token to another's process.
+          ...getProvisionedAuthEnv(this.engine),
         },
       },
       context,

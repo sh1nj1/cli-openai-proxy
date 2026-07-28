@@ -75,6 +75,13 @@ function dispose(record: SessionRecord, status: SessionStatus): void {
   if (byEngine.get(record.engine) === record.sessionId) byEngine.delete(record.engine);
 }
 
+function supersededError(engine: string): AuthProvisioningError {
+  return new AuthProvisioningError(
+    `A newer authentication attempt for "${engine}" superseded this one`,
+    "session_superseded",
+  );
+}
+
 /**
  * Start a new attempt for `engine`, superseding any existing one. Rejects with
  * AuthProvisioningError for an unknown engine or a flow that fails to start —
@@ -103,9 +110,19 @@ export async function createSession(engine: string): Promise<SessionView> {
   const reservation = { handle };
   starting.set(engine, reservation);
 
+  // Our reservation is only ever removed by a later start taking the slot (or by
+  // the `finally` below, which has not run yet at the point this is consulted).
+  const lostTheSlot = () => starting.get(engine) !== reservation;
+
   let started: AuthStartResult;
   try {
     started = await handle.start();
+  } catch (err) {
+    // Superseding cancels this handle mid-start, so whatever start() reports is a
+    // description of that cancellation, not of the caller's request. Report the
+    // race the caller actually lost instead of leaking the adapter's reason.
+    if (lostTheSlot()) throw supersededError(engine);
+    throw err;
   } finally {
     // Only clear our own reservation: a later start may already own the slot.
     if (starting.get(engine) === reservation) starting.delete(engine);
@@ -115,10 +132,7 @@ export async function createSession(engine: string): Promise<SessionView> {
   // handle. Registering now would resurrect the session it just superseded.
   if (starting.get(engine) !== undefined || byEngine.get(engine) !== undefined) {
     handle.cancel();
-    throw new AuthProvisioningError(
-      `A newer authentication attempt for "${engine}" superseded this one`,
-      "session_superseded",
-    );
+    throw supersededError(engine);
   }
 
   const sessionId = randomUUID();

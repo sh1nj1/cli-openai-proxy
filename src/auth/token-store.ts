@@ -30,16 +30,20 @@ export function clearAllCredentials(): void {
 }
 
 /**
- * Env vars to merge into every agent run. Provisioned credentials must reach the
- * CLI subprocess somehow, and env is the only channel that works for a CLI which
- * does not persist its own token — so this is applied on BOTH run paths (direct
- * ClaudeSubprocess and PaperclipRunner). Empty when nothing was provisioned, so
- * a host already logged in through the CLI keeps its existing behavior.
+ * Env vars to merge into a run of `engine`. Provisioned credentials must reach
+ * the CLI subprocess somehow, and env is the only channel that works for a CLI
+ * which does not persist its own token — so this is applied on BOTH run paths
+ * (direct ClaudeSubprocess and PaperclipRunner).
+ *
+ * Scoped to one engine, never merged across them: a credential is a secret owned
+ * by one vendor's CLI, and returning all of them would launch e.g. the codex
+ * child with CLAUDE_CODE_OAUTH_TOKEN in its environment. A caller that cannot
+ * name its engine gets nothing rather than a guess.
+ *
+ * Empty when nothing was provisioned, so a host already logged in through the
+ * CLI keeps its existing behavior.
  */
-export function getProvisionedAuthEnv(): Record<string, string> {
-  const env: Record<string, string> = {};
-  for (const cred of credentials.values()) {
-    env[cred.envVar] = cred.value;
-  }
-  return env;
+export function getProvisionedAuthEnv(engine: string | undefined): Record<string, string> {
+  const cred = engine ? credentials.get(engine) : undefined;
+  return cred ? { [cred.envVar]: cred.value } : {};
 }

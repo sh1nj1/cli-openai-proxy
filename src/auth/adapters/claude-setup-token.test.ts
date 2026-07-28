@@ -90,6 +90,39 @@ describe("ClaudeSetupTokenSession", () => {
     assert.strictEqual(pty.killed, true, "an abandoned pty child must not be left running");
   });
 
+  // cancel() only wakes the waiter; with an empty buffer it would find no URL and
+  // wait again, so the caller that lost the race sat out the whole URL timeout.
+  test("cancelling a pending start fails it at once rather than at the URL timeout", async () => {
+    const pty = new FakePty();
+    const session = sessionWith(pty, { urlTimeoutMs: 5_000 });
+    const started = session.start();
+    const begin = Date.now();
+    setTimeout(() => session.cancel(), 5);
+
+    await assert.rejects(started, (err: AuthProvisioningError) => {
+      assert.strictEqual(err.code, "session_cancelled");
+      return true;
+    });
+    assert.ok(Date.now() - begin < 1_000, "must not wait out the 5s URL timeout");
+    assert.strictEqual(pty.killed, true);
+  });
+
+  // Same stall, different cause: a CLI that dies before printing anything.
+  test("start fails as soon as the CLI exits without an authorization URL", async () => {
+    const pty = new FakePty();
+    const session = sessionWith(pty, { urlTimeoutMs: 5_000 });
+    const started = session.start();
+    const begin = Date.now();
+    setTimeout(() => { pty.emit("not logged in\r\n"); pty.exit(1); }, 5);
+
+    await assert.rejects(started, (err: AuthProvisioningError) => {
+      assert.strictEqual(err.code, "session_closed");
+      assert.match(err.message, /not logged in/);
+      return true;
+    });
+    assert.ok(Date.now() - begin < 1_000, "must not wait out the 5s URL timeout");
+  });
+
   test("submit writes the code with a carriage return and returns the token", async () => {
     const pty = new FakePty();
     const session = sessionWith(pty);

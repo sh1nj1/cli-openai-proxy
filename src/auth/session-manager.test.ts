@@ -16,14 +16,18 @@ import { AuthProvisioningError, type EngineAuthDescriptor, type EngineAuthSessio
 class FakeSession implements EngineAuthSession {
   cancelled = false;
   submitted: string[] = [];
-  constructor(
-    private readonly behavior: { failSubmit?: boolean; credential?: boolean; startDelayMs?: number } = {},
-  ) {}
+  private abortStart: ((err: Error) => void) | null = null;
+  constructor(private readonly behavior: Behavior = {}) {}
 
   async start() {
     // Models the real gap between spawning the CLI and it printing its URL.
     if (this.behavior.startDelayMs) {
-      await new Promise((r) => setTimeout(r, this.behavior.startDelayMs));
+      await new Promise<void>((resolve, reject) => {
+        // Like the pty adapter, a cancelled start fails rather than resolving:
+        // the child it was waiting on is gone.
+        if (this.behavior.startFailsOnCancel) this.abortStart = reject;
+        setTimeout(resolve, this.behavior.startDelayMs);
+      });
     }
     return { verificationUrl: "https://example.test/authorize", instructions: "open it" };
   }
@@ -34,11 +38,22 @@ class FakeSession implements EngineAuthSession {
       ? { credential: { envVar: "FAKE_TOKEN", value: `tok-${input}` } }
       : {};
   }
-  cancel() { this.cancelled = true; }
+  cancel() {
+    this.cancelled = true;
+    this.abortStart?.(new AuthProvisioningError("waiter gave up", "verification_url_timeout"));
+    this.abortStart = null;
+  }
+}
+
+interface Behavior {
+  failSubmit?: boolean;
+  credential?: boolean;
+  startDelayMs?: number;
+  startFailsOnCancel?: boolean;
 }
 
 let created: FakeSession[] = [];
-let behavior: { failSubmit?: boolean; credential?: boolean; startDelayMs?: number } = {};
+let behavior: Behavior = {};
 const realResolve = engineRegistry.resolve;
 
 const fakeDescriptor: EngineAuthDescriptor = {
@@ -119,13 +134,26 @@ describe("session-manager", () => {
     assert.strictEqual(getSession("fake", view.sessionId).status, "pending");
   });
 
+  // The real paste-code adapter does not resolve a cancelled start — its waiter
+  // fails. Reporting that failure verbatim would answer 400 verification_url_timeout
+  // for a request whose only problem was losing a race.
+  test("a start cancelled by a newer one reports the race, not the adapter's reason", async () => {
+    behavior = { startDelayMs: 60, startFailsOnCancel: true };
+    const [first, second] = await Promise.allSettled([createSession("fake"), createSession("fake")]);
+
+    const loser = [first, second].find((r) => r.status === "rejected") as PromiseRejectedResult;
+    assert.ok(loser, "one of two overlapping starts must lose the slot");
+    assert.strictEqual(loser.reason.code, "session_superseded");
+    assert.strictEqual([first, second].filter((r) => r.status === "fulfilled").length, 1);
+  });
+
   test("a successful submit stores the credential and releases the session", async () => {
     behavior = { credential: true };
     const view = await createSession("fake");
     const result = await submitSession("fake", view.sessionId, "code-1");
 
     assert.strictEqual(result.status, "authorized");
-    assert.deepStrictEqual(getProvisionedAuthEnv(), { FAKE_TOKEN: "tok-code-1" });
+    assert.deepStrictEqual(getProvisionedAuthEnv("fake"), { FAKE_TOKEN: "tok-code-1" });
     assert.strictEqual(created[0].cancelled, true);
   });
 
@@ -137,7 +165,7 @@ describe("session-manager", () => {
 
     assert.strictEqual(result.status, "failed");
     assert.deepStrictEqual(result.error, { message: "nope", code: "code_rejected" });
-    assert.deepStrictEqual(getProvisionedAuthEnv(), {});
+    assert.deepStrictEqual(getProvisionedAuthEnv("fake"), {});
   });
 
   test("a session cannot be submitted twice", async () => {

@@ -32,6 +32,12 @@ const DEFAULT_SUBMIT_TIMEOUT_MS = 120_000;
 /** Only an OAuth authorize URL is a verification URL; other links the CLI prints are not. */
 const isAuthorizeUrl = (url: string): boolean => url.includes("/oauth/authorize");
 
+/** Why a wait was given up on, carried into the AuthProvisioningError. */
+interface AbortReason {
+  message: string;
+  code: string;
+}
+
 export interface ClaudeSetupTokenOptions {
   spawn?: typeof ptySpawner.spawn;
   urlTimeoutMs?: number;
@@ -42,6 +48,7 @@ export class ClaudeSetupTokenSession implements EngineAuthSession {
   private pty: PtyProcess | null = null;
   private buffer = "";
   private exited = false;
+  private cancelled = false;
   private waiters: Array<() => void> = [];
 
   constructor(private readonly options: ClaudeSetupTokenOptions = {}) {}
@@ -69,6 +76,11 @@ export class ClaudeSetupTokenSession implements EngineAuthSession {
       this.options.urlTimeoutMs ?? DEFAULT_URL_TIMEOUT_MS,
       "Timed out waiting for the Claude authorization URL",
       "verification_url_timeout",
+      // Without an abort the waiter would sit out the full URL timeout after its
+      // child is gone: cancel() only wakes it, and a woken waiter with an empty
+      // buffer just waits again. A superseded start must fail now, not in a minute.
+      () =>
+        this.abortReason("Claude login exited before printing an authorization URL", "session_closed"),
     );
 
     return {
@@ -99,9 +111,7 @@ export class ClaudeSetupTokenSession implements EngineAuthSession {
       "token_timeout",
       // A rejected code makes the CLI exit without printing a token; surface that
       // immediately instead of stalling the caller until the timeout.
-      () => this.exited,
-      "Claude rejected the authorization code",
-      "code_rejected",
+      () => this.abortReason("Claude rejected the authorization code", "code_rejected"),
     );
 
     this.cancel();
@@ -111,6 +121,7 @@ export class ClaudeSetupTokenSession implements EngineAuthSession {
   cancel(): void {
     const pty = this.pty;
     this.pty = null;
+    this.cancelled = true;
     // Drop captured output: it contains the OAuth token verbatim, and a cancelled
     // session has no further use for it.
     this.buffer = "";
@@ -119,17 +130,28 @@ export class ClaudeSetupTokenSession implements EngineAuthSession {
   }
 
   /**
+   * Why the current wait can no longer succeed, or null to keep waiting.
+   * Cancellation is checked first: killing the child also makes it exit, and
+   * "cancelled" is the more truthful reason of the two.
+   */
+  private abortReason(exitMessage: string, exitCode: string): AbortReason | null {
+    if (this.cancelled) {
+      return { message: "Claude login was cancelled", code: "session_cancelled" };
+    }
+    if (this.exited) return { message: exitMessage, code: exitCode };
+    return null;
+  }
+
+  /**
    * Resolve once `probe` yields a value, reject on timeout or (optionally) once
-   * `abort` trips. Wakes on pty data/exit rather than polling.
+   * `abort` names a reason. Wakes on pty data/exit rather than polling.
    */
   private async waitFor<T>(
     probe: () => T | null,
     timeoutMs: number,
     timeoutMessage: string,
     timeoutCode: string,
-    abort?: () => boolean,
-    abortMessage?: string,
-    abortCode?: string,
+    abort?: () => AbortReason | null,
   ): Promise<T> {
     const deadline = Date.now() + timeoutMs;
     for (;;) {
@@ -137,10 +159,14 @@ export class ClaudeSetupTokenSession implements EngineAuthSession {
       if (found != null) return found;
       // Checked after probe(): the CLI can print its result and exit in the same
       // tick, and that is a success, not an abort.
-      if (abort?.()) {
+      const reason = abort?.();
+      if (reason) {
         const detail = this.tail(); // captured before cancel() drops the buffer
         this.cancel();
-        throw new AuthProvisioningError(`${abortMessage}: ${detail}`, abortCode ?? "aborted");
+        throw new AuthProvisioningError(
+          detail ? `${reason.message}: ${detail}` : reason.message,
+          reason.code,
+        );
       }
       const remaining = deadline - Date.now();
       if (remaining <= 0) {

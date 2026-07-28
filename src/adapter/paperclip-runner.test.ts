@@ -520,3 +520,33 @@ test("signals a child spawned after a pre-spawn kill() (disconnect before onSpaw
     release();
   }
 });
+
+// A provisioned credential is one vendor's secret. Every adapter spawns a
+// different vendor's CLI, so it must only reach the engine it was issued for.
+test("a provisioned credential reaches its own engine's adapter and no other", async () => {
+  const { setCredential, clearAllCredentials } = await import("../auth/token-store.js");
+  const envOf = async (engine: string | undefined): Promise<Record<string, string>> => {
+    let captured: Record<string, string> = {};
+    const fakeExecute: AdapterExecute = async (ctx) => {
+      captured = (ctx.config.env ?? {}) as Record<string, string>;
+      return { exitCode: 0, signal: null, timedOut: false, sessionId: "s",
+        usage: { inputTokens: 1, outputTokens: 1 } };
+    };
+    const runner = new PaperclipRunner(fakeExecute, { engine: "cli" }, { engine });
+    await runner.start("p", { model: "opus" });
+    return captured;
+  };
+
+  setCredential("claude", { envVar: "CLAUDE_CODE_OAUTH_TOKEN", value: "sk-ant-oat01-secret" });
+  try {
+    assert.equal((await envOf("claude")).CLAUDE_CODE_OAUTH_TOKEN, "sk-ant-oat01-secret");
+    assert.equal(
+      (await envOf("codex")).CLAUDE_CODE_OAUTH_TOKEN,
+      undefined,
+      "the codex CLI must not be launched holding a Claude credential",
+    );
+    assert.equal((await envOf(undefined)).CLAUDE_CODE_OAUTH_TOKEN, undefined);
+  } finally {
+    clearAllCredentials();
+  }
+});
