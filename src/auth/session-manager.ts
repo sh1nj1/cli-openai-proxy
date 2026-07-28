@@ -14,6 +14,7 @@
  */
 
 import { randomUUID } from "crypto";
+import { TRUST_COMPLETION_CALLERS_VAR, trustsCompletionCallers } from "../config.js";
 import { resolveEngine } from "./registry.js";
 import { setCredential } from "./token-store.js";
 import {
@@ -100,6 +101,17 @@ export async function createSession(engine: string): Promise<SessionView> {
   const descriptor = resolveEngine(engine);
   if (!descriptor) {
     throw new AuthProvisioningError(`Unknown engine "${engine}"`, "unknown_engine");
+  }
+  // Refused before the flow starts, not after: the caller would otherwise mint a
+  // real token through the OAuth dance and only then learn we will not use it.
+  if (descriptor.injectsCredential && !trustsCompletionCallers()) {
+    throw new AuthProvisioningError(
+      `Provisioning "${engine}" is refused: its credential can only reach the CLI through a ` +
+        `completion child's environment, which any completion caller can read. Set ` +
+        `${TRUST_COMPLETION_CALLERS_VAR}=1 to declare that every completion caller is as ` +
+        `trusted as this admin key.`,
+      "caller_trust_not_declared",
+    );
   }
 
   const existingId = byEngine.get(engine);

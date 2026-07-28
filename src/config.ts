@@ -100,6 +100,32 @@ export function blankedProxySecrets(): Record<string, string> {
   return Object.fromEntries(PROXY_ONLY_SECRET_VARS.map((name) => [name, ""]));
 }
 
+/** Operator's declaration that completion callers may read provisioned credentials. */
+export const TRUST_COMPLETION_CALLERS_VAR = "AUTH_TRUST_COMPLETION_CALLERS";
+
+/**
+ * Whether the operator has declared completion callers to be inside the same
+ * trust boundary as the admin who provisions credentials.
+ *
+ * A credential we hold can only reach its CLI through the child's environment,
+ * and that environment is readable by whoever wrote the prompt: the CLI runs with
+ * `--dangerously-skip-permissions`, and even though it scrubs its own token from
+ * the environment it gives its tools, `ps` reports the environment a process was
+ * *exec'd* with, which no runtime deletion undoes. So an ordinary completion
+ * caller can recover a provisioned token, and no amount of filtering here changes
+ * that. The exposure is real and unavoidable — it is therefore a decision for the
+ * operator to make explicitly rather than one to inherit by upgrading.
+ *
+ * Unset means "not declared", not "false": defaulting to open would hand every
+ * caller a reusable OAuth credential on the strength of an env var nobody set.
+ */
+export function trustsCompletionCallers(): boolean {
+  const raw = process.env[TRUST_COMPLETION_CALLERS_VAR];
+  if (raw === undefined) return false;
+  const value = raw.trim().toLowerCase();
+  return value === "1" || value === "true" || value === "yes";
+}
+
 // Ceiling passed to the CLI as CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS.
 // A user-set env value wins; otherwise default to no ceiling (0). Note 0 is a
 // valid value (unlimited), so the guard is >= 0, not > 0.

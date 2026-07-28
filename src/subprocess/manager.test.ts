@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { ClaudeSubprocess, isValidSessionId } from "./manager.js";
 import { openaiErrorFromError } from "../adapter/adapter-error.js";
-import { PROXY_ONLY_SECRET_VARS } from "../config.js";
+import { PROXY_ONLY_SECRET_VARS, TRUST_COMPLETION_CALLERS_VAR } from "../config.js";
 
 describe("isValidSessionId", () => {
   it("accepts canonical UUIDs", () => {
@@ -210,5 +210,50 @@ describe("ClaudeSubprocess child environment", () => {
     assert.ok(!childEnv.includes("caller-key-should-not-leak"), "API_KEYS must not reach the CLI");
     // Guards against the assertion passing because nothing was captured at all.
     assert.ok(/^PATH=/m.test(childEnv), "the child environment was actually captured");
+  });
+
+  /**
+   * The seam the review names. This child runs with --dangerously-skip-permissions
+   * and its exec-time environment is readable by whoever wrote the prompt (`ps`
+   * reports it whatever the CLI later deletes), so an undeclared trust boundary
+   * must keep the provisioned token out of it entirely.
+   */
+  test("a provisioned token stays out of the CLI environment until callers are declared trusted", async () => {
+    const { setCredential, clearAllCredentials } = await import("../auth/token-store.js");
+    const runWithEnvDump = async (name: string): Promise<string> => {
+      const envDump = join(binDir, name);
+      const stub = join(binDir, "claude");
+      writeFileSync(stub, `#!/bin/sh\ncat > /dev/null\nenv > "${envDump}"\n`);
+      chmodSync(stub, 0o755);
+      const proc = new ClaudeSubprocess();
+      await new Promise<void>((resolve) => {
+        proc.on("close", () => resolve());
+        void proc.start("hi", { model: "claude-haiku-4-5-20251001", timeout: 10_000 });
+      });
+      return readFileSync(envDump, "utf-8");
+    };
+
+    setCredential("claude", { envVar: "CLAUDE_CODE_OAUTH_TOKEN", value: "sk-ant-oat01-must-not-leak" });
+    try {
+      delete process.env[TRUST_COMPLETION_CALLERS_VAR];
+      const withheld = await runWithEnvDump("child-env-untrusted.txt");
+      assert.ok(/^PATH=/m.test(withheld), "the child environment was actually captured");
+      assert.ok(
+        !withheld.includes("sk-ant-oat01-must-not-leak"),
+        "an undeclared trust boundary must not publish the token to the agent's environment",
+      );
+
+      // Positive control: with the declaration the token does reach the CLI, so
+      // the assertion above cannot pass merely because injection never works.
+      process.env[TRUST_COMPLETION_CALLERS_VAR] = "1";
+      const injected = await runWithEnvDump("child-env-trusted.txt");
+      assert.ok(
+        injected.includes("sk-ant-oat01-must-not-leak"),
+        "a declared trust boundary must still authenticate the CLI",
+      );
+    } finally {
+      clearAllCredentials();
+      delete process.env[TRUST_COMPLETION_CALLERS_VAR];
+    }
   });
 });

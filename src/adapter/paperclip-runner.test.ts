@@ -566,8 +566,14 @@ test("a provisioned credential reaches its own engine's adapter and no other", a
   };
 
   setCredential("claude", { envVar: "CLAUDE_CODE_OAUTH_TOKEN", value: "sk-ant-oat01-secret" });
+  const { TRUST_COMPLETION_CALLERS_VAR } = await import("../config.js");
+  process.env[TRUST_COMPLETION_CALLERS_VAR] = "1";
   try {
     assert.equal((await envOf("claude")).CLAUDE_CODE_OAUTH_TOKEN, "sk-ant-oat01-secret");
+    // Undeclared trust withholds it from the adapter env entirely.
+    delete process.env[TRUST_COMPLETION_CALLERS_VAR];
+    assert.equal((await envOf("claude")).CLAUDE_CODE_OAUTH_TOKEN, undefined);
+    process.env[TRUST_COMPLETION_CALLERS_VAR] = "1";
     assert.equal(
       (await envOf("codex")).CLAUDE_CODE_OAUTH_TOKEN,
       undefined,
@@ -576,5 +582,6 @@ test("a provisioned credential reaches its own engine's adapter and no other", a
     assert.equal((await envOf(undefined)).CLAUDE_CODE_OAUTH_TOKEN, undefined);
   } finally {
     clearAllCredentials();
+    delete process.env[TRUST_COMPLETION_CALLERS_VAR];
   }
 });

@@ -66,6 +66,14 @@ export interface EngineAuthStatus {
 export interface EngineAuthDescriptor {
   engine: string;
   flow: AuthFlow;
+  /**
+   * True when this engine hands its credential back for the proxy to inject into
+   * completion children (see StoredCredential) — which publishes it to whoever
+   * writes a prompt, so provisioning it requires the operator's explicit trust
+   * declaration. False for an engine whose CLI persists its own credential: that
+   * one never enters a child environment we build.
+   */
+  injectsCredential?: boolean;
   createSession(): EngineAuthSession;
   checkStatus(): Promise<EngineAuthStatus>;
 }

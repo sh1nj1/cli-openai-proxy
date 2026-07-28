@@ -72,12 +72,17 @@ function sendError(res: Response, err: unknown): void {
     // 409 for the race codes: the request was well-formed, it just lost to a
     // concurrent one for the engine's single session slot (session_superseded) or
     // for the session itself (session_submitting). Both are retryable.
+    // 403 for caller_trust_not_declared: the key is valid and the request is
+    // well-formed — the server refuses on policy, and retrying changes nothing
+    // until the operator declares the trust boundary.
     const status =
       err.code === "unknown_engine" || err.code === "unknown_session"
         ? 404
         : err.code === "session_superseded" || err.code === "session_submitting"
           ? 409
-          : 400;
+          : err.code === "caller_trust_not_declared"
+            ? 403
+            : 400;
     fail(res, status, err.message, err.code);
     return;
   }

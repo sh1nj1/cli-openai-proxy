@@ -51,6 +51,9 @@ const REGISTRY: Record<string, EngineAuthDescriptor> = {
   claude: {
     engine: "claude",
     flow: "paste-code",
+    // `claude setup-token` prints its token instead of persisting it, so the
+    // proxy must hold it and inject it into every run.
+    injectsCredential: true,
     createSession: () => new ClaudeSetupTokenSession(),
     checkStatus: claudeStatus,
   },

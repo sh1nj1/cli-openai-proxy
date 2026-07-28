@@ -8,6 +8,7 @@
  * credentials; engines that persist their own (codex) are unaffected.
  */
 
+import { trustsCompletionCallers } from "../config.js";
 import type { StoredCredential } from "./types.js";
 
 const credentials = new Map<string, StoredCredential>();
@@ -42,8 +43,16 @@ export function clearAllCredentials(): void {
  *
  * Empty when nothing was provisioned, so a host already logged in through the
  * CLI keeps its existing behavior.
+ *
+ * Also empty unless the operator declared completion callers trusted: the child
+ * this feeds runs with permissions skipped and its exec-time environment is
+ * readable via `ps`, so injecting here publishes the credential to whoever wrote
+ * the prompt (see trustsCompletionCallers). Enforced at the point of injection,
+ * not only at the point of provisioning, so the guarantee does not depend on
+ * every future path into the store remembering to ask.
  */
 export function getProvisionedAuthEnv(engine: string | undefined): Record<string, string> {
+  if (!trustsCompletionCallers()) return {};
   const cred = engine ? credentials.get(engine) : undefined;
   return cred ? { [cred.envVar]: cred.value } : {};
 }

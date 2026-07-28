@@ -1,5 +1,6 @@
 import { test, describe, beforeEach, afterEach } from "node:test";
 import assert from "node:assert";
+import { TRUST_COMPLETION_CALLERS_VAR } from "../config.js";
 import { engineRegistry } from "./registry.js";
 import {
   cancelSession,
@@ -65,6 +66,9 @@ const realResolve = engineRegistry.resolve;
 const fakeDescriptor: EngineAuthDescriptor = {
   engine: "fake",
   flow: "paste-code",
+  // Matches what this fake actually does: it hands a credential back, so like the
+  // real claude adapter it is gated on the operator's trust declaration.
+  injectsCredential: true,
   createSession: () => {
     const s = new FakeSession(behavior);
     created.push(s);
@@ -78,12 +82,40 @@ describe("session-manager", () => {
     created = [];
     behavior = {};
     clearAllCredentials();
+    process.env[TRUST_COMPLETION_CALLERS_VAR] = "1";
     engineRegistry.resolve = (engine) => (engine === "fake" ? fakeDescriptor : realResolve(engine));
   });
 
   afterEach(() => {
     resetSessions();
+    delete process.env[TRUST_COMPLETION_CALLERS_VAR];
     engineRegistry.resolve = realResolve;
+  });
+
+  // Refused up front rather than after the caller has completed a real OAuth
+  // dance and minted a token the proxy would then decline to use.
+  test("provisioning an injecting engine is refused until callers are declared trusted", async () => {
+    delete process.env[TRUST_COMPLETION_CALLERS_VAR];
+    await assert.rejects(
+      () => createSession("fake"),
+      (err: AuthProvisioningError) => {
+        assert.strictEqual(err.code, "caller_trust_not_declared");
+        assert.match(err.message, new RegExp(TRUST_COMPLETION_CALLERS_VAR));
+        return true;
+      },
+    );
+    // No child was started, so the refusal leaves nothing to reap.
+    assert.strictEqual(created.length, 0);
+  });
+
+  // codex persists its own credential; nothing of its is injected into a
+  // completion child, so it is not gated.
+  test("an engine that injects nothing is provisioned without a trust declaration", async () => {
+    delete process.env[TRUST_COMPLETION_CALLERS_VAR];
+    engineRegistry.resolve = (engine) =>
+      engine === "fake" ? { ...fakeDescriptor, injectsCredential: false } : realResolve(engine);
+    const view = await createSession("fake");
+    assert.strictEqual(view.status, "pending");
   });
 
   test("create returns the flow and verification URL from the adapter", async () => {
