@@ -6,6 +6,7 @@ import {
   clearCredential,
   getProvisionedAuthEnv,
   hasCredential,
+  hasInjectableCredential,
   setCredential,
 } from "./token-store.js";
 
@@ -27,6 +28,7 @@ describe("token-store", () => {
   test("a stored credential is exposed as the env var its engine reads", () => {
     setCredential("claude", { envVar: "CLAUDE_CODE_OAUTH_TOKEN", value: "sk-ant-oat01-xyz" });
     assert.strictEqual(hasCredential("claude"), true);
+    assert.strictEqual(hasInjectableCredential("claude"), true);
     assert.deepStrictEqual(getProvisionedAuthEnv("claude"), {
       CLAUDE_CODE_OAUTH_TOKEN: "sk-ant-oat01-xyz",
     });
@@ -61,6 +63,7 @@ describe("token-store", () => {
     assert.deepStrictEqual(getProvisionedAuthEnv("claude"), {});
     // Still stored — the credential is withheld from children, not discarded.
     assert.strictEqual(hasCredential("claude"), true);
+    assert.strictEqual(hasInjectableCredential("claude"), false);
   });
 
   test("only an affirmative declaration opens injection", () => {

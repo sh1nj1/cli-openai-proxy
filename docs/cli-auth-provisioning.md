@@ -136,6 +136,13 @@ client into a login flow it does not need. `codex` exposes a real check and is
 therefore definitive when the CLI answers; a timed-out or externally terminated
 check returns `unknown` because it produced no authentication verdict.
 
+A stored Claude token counts as `authenticated` only while
+`AUTH_TRUST_COMPLETION_CALLERS` is affirmative. If the operator removes that
+declaration, the token remains in memory but is withheld from completion
+children, and status returns `unknown` rather than claiming a credential that
+runs cannot use. An explicit host credential can still make the status
+`authenticated`.
+
 ### `POST /v1/auth/{engine}/sessions` → `201`
 
 Starts an attempt, superseding any existing one for that engine.

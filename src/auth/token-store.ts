@@ -21,6 +21,18 @@ export function hasCredential(engine: string): boolean {
   return credentials.has(engine);
 }
 
+/**
+ * Whether a stored credential can currently reach its engine.
+ *
+ * A stored Claude token is not usable merely because it exists: removing the
+ * completion-caller trust declaration withholds it from child processes. Keep
+ * status checks and environment injection on this same predicate so the API
+ * never reports a credential that runs cannot consume.
+ */
+export function hasInjectableCredential(engine: string): boolean {
+  return trustsCompletionCallers() && credentials.has(engine);
+}
+
 export function clearCredential(engine: string): boolean {
   return credentials.delete(engine);
 }
@@ -52,7 +64,7 @@ export function clearAllCredentials(): void {
  * every future path into the store remembering to ask.
  */
 export function getProvisionedAuthEnv(engine: string | undefined): Record<string, string> {
-  if (!trustsCompletionCallers()) return {};
-  const cred = engine ? credentials.get(engine) : undefined;
+  if (!engine || !hasInjectableCredential(engine)) return {};
+  const cred = credentials.get(engine);
   return cred ? { [cred.envVar]: cred.value } : {};
 }

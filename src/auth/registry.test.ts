@@ -1,10 +1,19 @@
-import { test, describe, afterEach } from "node:test";
+import { test, describe, beforeEach, afterEach } from "node:test";
 import assert from "node:assert";
+import { TRUST_COMPLETION_CALLERS_VAR } from "../config.js";
 import { resolveEngine } from "./registry.js";
 import { commandRunner, runCommand, type CommandResult, type RunCommandFn } from "./adapters/codex-api-key.js";
+import { clearAllCredentials, getProvisionedAuthEnv, setCredential } from "./token-store.js";
 import { AuthProvisioningError } from "./types.js";
 
 const codexStatus = () => resolveEngine("codex")!.checkStatus();
+const claudeStatus = () => resolveEngine("claude")!.checkStatus();
+const CLAUDE_STATUS_ENV_VARS = [
+  TRUST_COMPLETION_CALLERS_VAR,
+  "CLAUDE_CODE_OAUTH_TOKEN",
+  "ANTHROPIC_API_KEY",
+] as const;
+let savedClaudeStatusEnv: Record<string, string | undefined>;
 
 function stubRunner(result: CommandResult | Error): void {
   const run: RunCommandFn = async () => {
@@ -13,6 +22,55 @@ function stubRunner(result: CommandResult | Error): void {
   };
   commandRunner.run = run;
 }
+
+describe("claude auth status", () => {
+  beforeEach(() => {
+    clearAllCredentials();
+    savedClaudeStatusEnv = Object.fromEntries(
+      CLAUDE_STATUS_ENV_VARS.map((name) => [name, process.env[name]]),
+    );
+    for (const name of CLAUDE_STATUS_ENV_VARS) delete process.env[name];
+  });
+
+  afterEach(() => {
+    clearAllCredentials();
+    for (const name of CLAUDE_STATUS_ENV_VARS) {
+      const value = savedClaudeStatusEnv[name];
+      if (value === undefined) delete process.env[name];
+      else process.env[name] = value;
+    }
+  });
+
+  test("a provisioned credential is authenticated only while it can be injected", async () => {
+    process.env[TRUST_COMPLETION_CALLERS_VAR] = "1";
+    setCredential("claude", { envVar: "CLAUDE_CODE_OAUTH_TOKEN", value: "stored-token" });
+
+    assert.deepStrictEqual(await claudeStatus(), {
+      state: "authenticated",
+      source: "provisioned",
+    });
+    assert.deepStrictEqual(getProvisionedAuthEnv("claude"), {
+      CLAUDE_CODE_OAUTH_TOKEN: "stored-token",
+    });
+
+    delete process.env[TRUST_COMPLETION_CALLERS_VAR];
+
+    const withheld = await claudeStatus();
+    assert.strictEqual(withheld.state, "unknown");
+    assert.deepStrictEqual(getProvisionedAuthEnv("claude"), {});
+  });
+
+  test("an explicit host credential remains authenticated when a stored token is withheld", async () => {
+    setCredential("claude", { envVar: "CLAUDE_CODE_OAUTH_TOKEN", value: "stored-token" });
+    process.env.ANTHROPIC_API_KEY = "host-key";
+
+    assert.deepStrictEqual(await claudeStatus(), {
+      state: "authenticated",
+      source: "host",
+      detail: "credential supplied via environment",
+    });
+  });
+});
 
 describe("codex auth status", () => {
   afterEach(() => {

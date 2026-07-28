@@ -6,7 +6,7 @@
 
 import { CodexApiKeySession, commandRunner } from "./adapters/codex-api-key.js";
 import { CLAUDE_OAUTH_TOKEN_ENV, ClaudeSetupTokenSession } from "./adapters/claude-setup-token.js";
-import { hasCredential } from "./token-store.js";
+import { hasInjectableCredential } from "./token-store.js";
 import type { EngineAuthDescriptor, EngineAuthStatus } from "./types.js";
 
 const STATUS_TIMEOUT_MS = 15_000;
@@ -19,7 +19,7 @@ const firstLine = (text: string): string => text.trim().split("\n")[0]?.trim() ?
  * Everything else is reported as unknown rather than guessed — see EngineAuthStatus.
  */
 async function claudeStatus(): Promise<EngineAuthStatus> {
-  if (hasCredential("claude")) {
+  if (hasInjectableCredential("claude")) {
     return { state: "authenticated", source: "provisioned" };
   }
   if (process.env[CLAUDE_OAUTH_TOKEN_ENV] || process.env.ANTHROPIC_API_KEY) {
