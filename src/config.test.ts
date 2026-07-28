@@ -1,6 +1,15 @@
 import { describe, it, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
-import { getBgWaitCeilingMs, DEFAULT_BG_WAIT_CEILING_MS, getTimeoutMs, DEFAULT_TIMEOUT_MS } from "./config.js";
+import {
+  getBgWaitCeilingMs,
+  DEFAULT_BG_WAIT_CEILING_MS,
+  getTimeoutMs,
+  DEFAULT_TIMEOUT_MS,
+  PROXY_ONLY_SECRET_VARS,
+  takeProxySecret,
+  stripProxySecrets,
+  blankedProxySecrets,
+} from "./config.js";
 
 const ENV_KEY = "CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS";
 
@@ -72,5 +81,53 @@ describe("getTimeoutMs", () => {
     assert.equal(getTimeoutMs(), DEFAULT_TIMEOUT_MS);
     process.env.TIMEOUT = "not-a-number";
     assert.equal(getTimeoutMs(), DEFAULT_TIMEOUT_MS);
+  });
+});
+
+/**
+ * The keys that authenticate callers TO the proxy must not be inherited by the
+ * CLI children a completion spawns: those run with permissions skipped, so a
+ * caller can simply ask the model to print its environment.
+ */
+describe("proxy-only secrets", () => {
+  const saved: Record<string, string | undefined> = {};
+
+  beforeEach(() => {
+    for (const key of PROXY_ONLY_SECRET_VARS) saved[key] = process.env[key];
+  });
+
+  afterEach(() => {
+    for (const key of PROXY_ONLY_SECRET_VARS) {
+      if (saved[key] === undefined) delete process.env[key];
+      else process.env[key] = saved[key];
+    }
+  });
+
+  it("takeProxySecret returns the value and removes it from the environment", () => {
+    process.env.AUTH_ADMIN_KEYS = "admin-1,admin-2";
+    assert.equal(takeProxySecret("AUTH_ADMIN_KEYS"), "admin-1,admin-2");
+    assert.equal(
+      "AUTH_ADMIN_KEYS" in process.env,
+      false,
+      "the variable must be gone, not merely emptied — a child inherits either way",
+    );
+  });
+
+  it("takeProxySecret is a no-op for an unset variable", () => {
+    delete process.env.API_KEYS;
+    assert.equal(takeProxySecret("API_KEYS"), undefined);
+  });
+
+  it("stripProxySecrets copies without the proxy-only keys and without mutating the source", () => {
+    const source = { API_KEYS: "sk-caller", AUTH_ADMIN_KEYS: "admin", PATH: "/usr/bin" };
+    const stripped = stripProxySecrets(source);
+
+    assert.deepEqual(stripped, { PATH: "/usr/bin" });
+    assert.equal(source.API_KEYS, "sk-caller", "the process environment must be left intact");
+  });
+
+  it("blankedProxySecrets shadows every proxy-only key with an empty value", () => {
+    const blanked = blankedProxySecrets();
+    for (const key of PROXY_ONLY_SECRET_VARS) assert.equal(blanked[key], "");
   });
 });

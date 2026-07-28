@@ -131,6 +131,29 @@ describe("auth-routes", () => {
     initAuth();
   });
 
+  /**
+   * Both inits keep their keys in module state, so the process variable is dead
+   * weight afterwards — and dead weight that every CLI child would inherit. The
+   * Paperclip adapters build the child env inside a dependency, so removing it at
+   * the source is what makes the guarantee hold for run paths this repo cannot filter.
+   */
+  test("the inits take their keys out of the process environment", () => {
+    process.env.AUTH_ADMIN_KEYS = "admin-1";
+    process.env.API_KEYS = "sk-completion";
+    assert.equal(initAuthAdmin().keyCount, 1);
+    assert.equal(initAuth().keyCount, 1);
+
+    assert.equal("AUTH_ADMIN_KEYS" in process.env, false);
+    assert.equal("API_KEYS" in process.env, false);
+
+    // Still enforced from module state, so removal costs nothing at the gate.
+    const res = fakeRes();
+    let nexted = false;
+    authAdminMiddleware(fakeReq({ headers: { authorization: "Bearer admin-1" } }), res, () => { nexted = true; });
+    assert.equal(nexted, true);
+    initAuth();
+  });
+
   test("a valid admin key passes the gate", () => {
     process.env.AUTH_ADMIN_KEYS = " admin-1 , admin-2 ";
     assert.equal(initAuthAdmin().keyCount, 2);

@@ -33,6 +33,11 @@ class FakeSession implements EngineAuthSession {
   }
   async submit(input: string) {
     this.submitted.push(input);
+    // Models the real gap between handing the credential to the CLI and the CLI
+    // finishing with it — the window two overlapping POSTs would both enter.
+    if (this.behavior.submitDelayMs) {
+      await new Promise((resolve) => setTimeout(resolve, this.behavior.submitDelayMs));
+    }
     if (this.behavior.failSubmit) throw new AuthProvisioningError("nope", "code_rejected");
     return this.behavior.credential
       ? { credential: { envVar: "FAKE_TOKEN", value: `tok-${input}` } }
@@ -50,6 +55,7 @@ interface Behavior {
   credential?: boolean;
   startDelayMs?: number;
   startFailsOnCancel?: boolean;
+  submitDelayMs?: number;
 }
 
 let created: FakeSession[] = [];
@@ -145,6 +151,40 @@ describe("session-manager", () => {
     assert.ok(loser, "one of two overlapping starts must lose the slot");
     assert.strictEqual(loser.reason.code, "session_superseded");
     assert.strictEqual([first, second].filter((r) => r.status === "fulfilled").length, 1);
+  });
+
+  // `status` stays "pending" until submit() resolves, so it cannot gate this on
+  // its own: both requests would drive the same session — two codes into one pty,
+  // or two `codex login` runs racing to replace the host credential.
+  test("overlapping submits for one session drive the handle exactly once", async () => {
+    behavior = { credential: true, submitDelayMs: 50 };
+    const view = await createSession("fake");
+    const [first, second] = await Promise.allSettled([
+      submitSession("fake", view.sessionId, "code-first"),
+      submitSession("fake", view.sessionId, "code-second"),
+    ]);
+
+    const loser = [first, second].find((r) => r.status === "rejected") as PromiseRejectedResult;
+    assert.ok(loser, "one of two overlapping submits must be refused");
+    assert.strictEqual(loser.reason.code, "session_submitting");
+
+    const winners = [first, second].filter((r) => r.status === "fulfilled") as PromiseFulfilledResult<SessionView>[];
+    assert.strictEqual(winners.length, 1);
+    assert.strictEqual(winners[0].value.status, "authorized");
+    assert.deepStrictEqual(created[0].submitted, ["code-first"], "only one credential reaches the CLI");
+    // Whichever ran, the stored credential must be the one that was reported.
+    assert.deepStrictEqual(getProvisionedAuthEnv("fake"), { FAKE_TOKEN: "tok-code-first" });
+  });
+
+  // The in-progress flag is a race guard, not session state: an observer polling
+  // GET must not see a status the documented vocabulary does not contain.
+  test("an in-progress submit is not visible as a new session status", async () => {
+    behavior = { submitDelayMs: 50 };
+    const view = await createSession("fake");
+    const inFlight = submitSession("fake", view.sessionId, "code");
+    assert.strictEqual(getSession("fake", view.sessionId).status, "pending");
+    assert.ok(!("submitting" in getSession("fake", view.sessionId)), "internal flag must not leak into the view");
+    await inFlight;
   });
 
   test("a successful submit stores the credential and releases the session", async () => {

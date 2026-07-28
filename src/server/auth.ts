@@ -9,6 +9,7 @@
  */
 
 import type { Request, Response, NextFunction } from "express";
+import { takeProxySecret } from "../config.js";
 import { AUTH_PROVISIONING_PREFIX } from "./auth-routes.js";
 
 let validKeys: Set<string> | null = null;
@@ -17,7 +18,9 @@ let validKeys: Set<string> | null = null;
  * Initialize auth from environment
  */
 export function initAuth(): { enabled: boolean; keyCount: number } {
-  const keysEnv = process.env.API_KEYS;
+  // Taken, not read: the value lives in `validKeys` from here on, and leaving it
+  // in process.env would inherit it into every CLI child (see takeProxySecret).
+  const keysEnv = takeProxySecret("API_KEYS");
   if (keysEnv) {
     const keys = keysEnv.split(",").map(k => k.trim()).filter(Boolean);
     if (keys.length > 0) {

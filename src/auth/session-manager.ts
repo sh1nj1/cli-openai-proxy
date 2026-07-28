@@ -37,6 +37,12 @@ interface SessionRecord extends Omit<SessionView, "expiresAt"> {
   expiresAt: number;
   handle: EngineAuthSession;
   timer: NodeJS.Timeout;
+  /**
+   * Set for the duration of submit(). Not part of SessionView: the session is
+   * still "pending" to an observer — nothing has been decided yet — and this only
+   * answers "is another request already driving it?".
+   */
+  submitting: boolean;
 }
 
 const DEFAULT_TTL_MS = 10 * 60_000;
@@ -62,7 +68,7 @@ function ttlMs(): number {
 }
 
 function view(record: SessionRecord): SessionView {
-  const { handle: _handle, timer: _timer, expiresAt, ...rest } = record;
+  const { handle: _handle, timer: _timer, submitting: _submitting, expiresAt, ...rest } = record;
   return { ...rest, expiresAt: new Date(expiresAt).toISOString() };
 }
 
@@ -154,6 +160,7 @@ export async function createSession(engine: string): Promise<SessionView> {
     expiresAt,
     handle,
     timer,
+    submitting: false,
   };
   byId.set(sessionId, record);
   byEngine.set(engine, sessionId);
@@ -182,6 +189,17 @@ export async function submitSession(
       "session_not_pending",
     );
   }
+  // `status` alone cannot gate this: it stays "pending" until submit() resolves,
+  // so two overlapping POSTs would both pass and both drive the same session —
+  // two codes written to one pty, or two `codex login` runs racing to replace the
+  // host credential, with both requests free to report "authorized".
+  if (record.submitting) {
+    throw new AuthProvisioningError(
+      "Another submission for this session is already in progress",
+      "session_submitting",
+    );
+  }
+  record.submitting = true;
 
   try {
     const result = await record.handle.submit(input);
@@ -196,6 +214,10 @@ export async function submitSession(
     const failed: SessionView = { ...view(record), status: "failed", error: { message, code } };
     dispose(record, "failed");
     return failed;
+  } finally {
+    // Both paths dispose, so the record is already unreachable; released anyway so
+    // the flag can never outlive the attempt that set it.
+    record.submitting = false;
   }
 }
 

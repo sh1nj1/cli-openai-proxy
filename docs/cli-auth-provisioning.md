@@ -29,6 +29,12 @@ With it unset, every `/v1/auth/*` route answers `404 auth_provisioning_disabled`
 — upgrading the proxy never exposes a login endpoint by itself. A completion key
 is not accepted here, and an admin key is not accepted for completions.
 
+Both key sets are read into memory at startup and **removed from the process
+environment**, so neither is inherited by the CLI children a completion spawns.
+That matters because those children run with permissions skipped: anything left
+in their environment is readable by whoever wrote the prompt, and an ordinary
+completion caller could otherwise recover the admin key and use these endpoints.
+
 | Env | Meaning |
 | --- | --- |
 | `AUTH_ADMIN_KEYS` | Comma-separated admin keys. Unset = feature off. |
@@ -126,6 +132,11 @@ credential is a completed attempt, not a transport error, so it is a `200`
 carrying `error: { message, code }` — only malformed requests (`400`) and unknown
 sessions/engines (`404`) are 4xx.
 
+One submission drives a session at a time: a second POST that arrives while the
+first is still with the CLI is answered `409 session_submitting` rather than
+writing a second code into the same pty, or starting a second `codex login` that
+races the first to replace the host credential. Retry once the first completes.
+
 ### `GET /v1/auth/{engine}/sessions/{sessionId}`
 
 Poll a pending session. Completed and cancelled sessions are forgotten, so they
@@ -133,7 +144,9 @@ answer `404 unknown_session`.
 
 ### `DELETE /v1/auth/{engine}/sessions/{sessionId}`
 
-Abandon, killing any held CLI child.
+Abandon, killing any held CLI child — including a `codex login` still running
+from a submission in flight, which would otherwise finish and overwrite whatever
+credential was installed after it. That submission answers `session_cancelled`.
 
 ### `DELETE /v1/auth/{engine}/credential`
 

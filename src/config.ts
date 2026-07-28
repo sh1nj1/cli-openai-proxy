@@ -30,6 +30,56 @@ export function getTimeoutMs(): number {
   return Number.isFinite(parsed) && parsed > 0 ? parsed : DEFAULT_TIMEOUT_MS;
 }
 
+/**
+ * Env vars that authenticate callers TO the proxy. They gate the proxy's own
+ * surface and mean nothing to the CLIs it spawns.
+ *
+ * Completion runs launch an agentic CLI with permissions skipped, so an ordinary
+ * caller can just ask the model to print its environment. Inherited, AUTH_ADMIN_KEYS
+ * would hand that caller the higher-privilege key gating the credential-mutating
+ * /v1/auth routes — defeating its separation from API_KEYS — and API_KEYS would
+ * hand it every other caller's completion key.
+ */
+export const PROXY_ONLY_SECRET_VARS = ["API_KEYS", "AUTH_ADMIN_KEYS"] as const;
+
+/**
+ * Read a proxy-only secret and remove it from the process environment.
+ *
+ * Filtering at each spawn site is not sufficient on its own: the Paperclip
+ * adapters build their child env as `{...process.env, ...config.env}` inside a
+ * dependency this repo does not control, and any future run path would have to
+ * remember to filter. Both values are captured into module state at boot, so the
+ * variable is dead weight afterwards — deleting it is what makes the guarantee
+ * hold for every spawn, present and future.
+ */
+export function takeProxySecret(name: (typeof PROXY_ONLY_SECRET_VARS)[number]): string | undefined {
+  const value = process.env[name];
+  delete process.env[name];
+  return value;
+}
+
+/**
+ * Copy of `env` without the proxy-only secrets, for a spawn site that builds its
+ * child environment here. Belt-and-braces over takeProxySecret: this holds even
+ * if the variable is set after boot, or if an embedder never calls the inits.
+ */
+export function stripProxySecrets(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  const copy = { ...env };
+  for (const name of PROXY_ONLY_SECRET_VARS) delete copy[name];
+  return copy;
+}
+
+/**
+ * Overrides that blank the proxy-only secrets, for a spawn site that does NOT
+ * build the child env itself. The Paperclip adapters merge `{...process.env,
+ * ...config.env}` internally, so the only way to reach that env from here is to
+ * shadow the inherited value. Blank rather than absent: `config.env` is typed
+ * Record<string, string>, and an empty value carries no secret either way.
+ */
+export function blankedProxySecrets(): Record<string, string> {
+  return Object.fromEntries(PROXY_ONLY_SECRET_VARS.map((name) => [name, ""]));
+}
+
 // Ceiling passed to the CLI as CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS.
 // A user-set env value wins; otherwise default to no ceiling (0). Note 0 is a
 // valid value (unlimited), so the guard is >= 0, not > 0.

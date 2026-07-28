@@ -8,6 +8,7 @@
  */
 
 import type { Request, Response, NextFunction } from "express";
+import { takeProxySecret } from "../config.js";
 import { engineRegistry, resolveEngine } from "../auth/registry.js";
 import {
   cancelSession,
@@ -24,7 +25,9 @@ export const AUTH_PROVISIONING_PREFIX = "/v1/auth";
 let adminKeys: Set<string> | null = null;
 
 export function initAuthAdmin(): { enabled: boolean; keyCount: number } {
-  const keys = (process.env.AUTH_ADMIN_KEYS ?? "")
+  // Taken, not read. This is the higher-privilege key; a completion caller who can
+  // make the model print its environment must not find it there (takeProxySecret).
+  const keys = (takeProxySecret("AUTH_ADMIN_KEYS") ?? "")
     .split(",")
     .map((k) => k.trim())
     .filter(Boolean);
@@ -66,12 +69,13 @@ function engineOf(req: Request, res: Response): string | null {
 /** Map a thrown provisioning error onto the OpenAI-style envelope. */
 function sendError(res: Response, err: unknown): void {
   if (err instanceof AuthProvisioningError) {
-    // 409 for a superseded start: the request was well-formed, it just lost a race
-    // with a concurrent one for the engine's single session slot — retryable.
+    // 409 for the race codes: the request was well-formed, it just lost to a
+    // concurrent one for the engine's single session slot (session_superseded) or
+    // for the session itself (session_submitting). Both are retryable.
     const status =
       err.code === "unknown_engine" || err.code === "unknown_session"
         ? 404
-        : err.code === "session_superseded"
+        : err.code === "session_superseded" || err.code === "session_submitting"
           ? 409
           : 400;
     fail(res, status, err.message, err.code);

@@ -16,7 +16,7 @@ import type { ClaudeCliResult, ClaudeCliStreamEvent } from "../types/claude-cli.
 import { StreamJsonParser, type StreamJsonSink } from "./stream-json-parser.js";
 import { CodexJsonlParser } from "./codex-jsonl-parser.js";
 import { adapterRunError } from "./adapter-error.js";
-import { getBgWaitCeilingMs } from "../config.js";
+import { blankedProxySecrets, getBgWaitCeilingMs } from "../config.js";
 import { getProvisionedAuthEnv } from "../auth/token-store.js";
 
 export type AdapterExecute = (ctx: AdapterExecutionContext) => Promise<AdapterExecutionResult>;
@@ -162,6 +162,10 @@ export class PaperclipRunner extends EventEmitter implements AgentRunner {
         extraArgs,
         env: {
           CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS: String(getBgWaitCeilingMs()),
+          // The adapter merges this over process.env, so shadowing is the only way
+          // to keep the keys that authenticate callers TO the proxy out of a child
+          // that runs with permissions skipped.
+          ...blankedProxySecrets(),
           // Credentials provisioned through /v1/auth live in memory only, so env
           // is the sole channel that reaches the adapter's CLI child. Scoped to
           // THIS adapter's engine: every adapter spawns a different vendor's CLI,

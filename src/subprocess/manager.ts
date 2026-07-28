@@ -14,7 +14,7 @@ import type {
 } from "../types/claude-cli.js";
 import type { ClaudeModel } from "../adapter/openai-to-cli.js";
 import { StreamJsonParser, type StreamJsonSink } from "../adapter/stream-json-parser.js";
-import { DEFAULT_TIMEOUT_MS, getBgWaitCeilingMs } from "../config.js";
+import { DEFAULT_TIMEOUT_MS, getBgWaitCeilingMs, stripProxySecrets } from "../config.js";
 import { getProvisionedAuthEnv } from "../auth/token-store.js";
 import { isClaudeAuthRequired } from "../adapter/claude-auth-detect.js";
 import { engineUnauthenticatedError } from "../adapter/adapter-error.js";
@@ -80,7 +80,10 @@ export class ClaudeSubprocess extends EventEmitter {
         this.process = spawn("claude", args, {
           cwd: options.cwd || process.cwd(),
           env: {
-            ...process.env,
+            // The keys that authenticate callers TO the proxy are not inherited:
+            // this child runs with permissions skipped, so anything in its env is
+            // readable by whoever wrote the prompt.
+            ...stripProxySecrets(process.env),
             // Keep `claude -p` alive until background subagents finish instead of
             // exiting at the CLI's 10-minute default cap (see config.ts).
             CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS: String(getBgWaitCeilingMs()),
