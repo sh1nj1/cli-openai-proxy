@@ -43,7 +43,43 @@ restart still wins, which is how you rotate keys without a new process.
 | Env | Meaning |
 | --- | --- |
 | `AUTH_ADMIN_KEYS` | Comma-separated admin keys. Unset = feature off. |
+| `AUTH_TRUST_COMPLETION_CALLERS` | Declares completion callers trusted with provisioned credentials. Required for `claude` — see below. |
 | `AUTH_SESSION_TTL_MS` | Session lifetime before reaping (default `600000`). |
+
+## A provisioned Claude credential is visible to completion callers
+
+`claude setup-token` prints its token instead of persisting it, so the proxy
+holds it and injects it into the CLI child of every completion. **That child's
+environment is readable by whoever wrote the prompt**, so a provisioned Claude
+token is recoverable by any caller who can reach `/v1/chat/completions`.
+
+This is not something the proxy can filter away:
+
+- The child runs with `--dangerously-skip-permissions`, so a prompt can run
+  arbitrary commands.
+- The CLI does scrub `CLAUDE_CODE_OAUTH_TOKEN` from the environment it hands its
+  own tools — but `ps` reports the environment a process was **exec'd** with, and
+  no runtime deletion changes that. Do not rely on the scrub.
+- Env is the only channel that reaches a CLI which does not persist its own
+  credential. Removing the injection removes the feature.
+
+So it is the operator's decision, made explicitly:
+
+```bash
+AUTH_TRUST_COMPLETION_CALLERS=1
+```
+
+Set it only when every holder of an `API_KEYS` entry is as trusted as the holder
+of `AUTH_ADMIN_KEYS` — on a single-operator proxy they are usually the same
+person. Without it, `POST /v1/auth/claude/sessions` answers `403
+caller_trust_not_declared` (refused before you complete a login, so no token is
+minted), and any credential already held is withheld from CLI children.
+
+`codex` is not gated: `codex login --with-api-key` persists to `~/.codex`
+itself, so nothing of its is injected into an environment this proxy builds.
+Note that the file it writes is still readable by a completion caller's shell —
+but that is the host's own pre-existing posture, identical to logging in at the
+console, and unchanged by this API.
 
 ## Flows
 
@@ -53,7 +89,7 @@ Each engine declares the shape of its login, so the client branches its UI on
 | Engine | `flow` | CLI command | Credential ends up |
 | --- | --- | --- | --- |
 | `codex` | `api-key` | `codex login --with-api-key` (key over stdin) | in `~/.codex`, written by the CLI |
-| `claude` | `paste-code` | `claude setup-token` | in proxy memory, injected per run |
+| `claude` | `paste-code` | `claude setup-token` | in proxy memory, injected per run — requires `AUTH_TRUST_COMPLETION_CALLERS` |
 
 **`api-key`** — no verification URL. Submit the key; the CLI stores it itself.
 
