@@ -75,7 +75,7 @@ model is named `paperclip/<adapterType>` (e.g. `paperclip/claude_local`). See
 - **Multiple models** — Opus, Sonnet, and Haiku
 - **Session management** — Conversation context across requests
 - **Auto-start** — macOS LaunchAgent for always-on service
-- **Secure** — Uses `spawn()` (no shell injection), no API keys stored
+- **Credential-aware** — Uses `spawn()` (no shell interpolation) and removes proxy access keys from CLI child environments
 
 ## Usage Tracking (New in v1.2)
 
@@ -127,7 +127,10 @@ the host — so a remote UI can recover from an auth failure on its own. Off unl
 `AUTH_ADMIN_KEYS` is set (its own key set, separate from `API_KEYS`):
 
 ```bash
-API_KEYS=sk-team-abc123 AUTH_ADMIN_KEYS=sk-admin-xyz789 claude-max-api
+API_KEYS=sk-team-abc123 \
+AUTH_ADMIN_KEYS=sk-admin-xyz789 \
+AUTH_TRUST_COMPLETION_CALLERS=1 \
+claude-max-api
 
 # codex: submit an API key
 curl -X POST -H "Authorization: Bearer sk-admin-xyz789" \
@@ -137,6 +140,11 @@ curl -X POST -H "Authorization: Bearer sk-admin-xyz789" \
 curl -X POST -H "Authorization: Bearer sk-admin-xyz789" \
   http://localhost:3456/v1/auth/claude/sessions
 ```
+
+`AUTH_TRUST_COMPLETION_CALLERS=1` is required only for Claude provisioning. It
+declares that every completion-key holder is trusted with the provisioned OAuth
+credential; without it, the Claude session request returns `403
+caller_trust_not_declared`.
 
 A completion whose CLI is unauthenticated answers `401` with
 `code: "engine_unauthenticated"` and the `engine` to re-authenticate, so a client
@@ -271,13 +279,20 @@ src/
 ## Security
 
 - `spawn()` instead of shell execution (no injection attacks)
-- No API keys stored or transmitted
-- All auth handled by Claude CLI's secure keychain
+- Completion and admin access keys are held in memory and removed from CLI child environments
+- Codex provisioning receives an API key over HTTP and forwards it to `codex login` over stdin; the CLI persists it in `~/.codex`
+- Claude provisioning extracts the `setup-token` OAuth credential, retains it in proxy memory, and injects it only when the completion-caller trust boundary is explicitly accepted
 - Optional API key auth for shared deployments
 
 ## Important Disclaimer
 
-This proxy uses the official Claude Code CLI (`claude --print`) as a subprocess. It does **not** extract OAuth tokens, reverse-engineer private APIs, or bypass authentication — it simply wraps the CLI you already have installed.
+Normal completions use the official Claude Code CLI (`claude --print`) as a
+subprocess; the proxy does not reverse-engineer private APIs or bypass
+authentication. The optional remote-auth API does handle credentials: it
+forwards Codex API keys to `codex login` and extracts Claude's `setup-token`
+OAuth credential for in-memory injection into later Claude runs. Review the
+[credential exposure and trust model](docs/cli-auth-provisioning.md#a-provisioned-claude-credential-is-visible-to-completion-callers)
+before enabling it.
 
 That said, please review [Anthropic's Terms of Service](https://www.anthropic.com/terms) before using this tool. Anthropic's policies on third-party tooling may change. Use at your own discretion and risk.
 
