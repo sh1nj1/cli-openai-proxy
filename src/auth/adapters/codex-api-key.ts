@@ -21,6 +21,11 @@ import {
 } from "../types.js";
 
 const DEFAULT_TIMEOUT_MS = 60_000;
+/**
+ * SIGTERM only asks. A CLI that traps it would otherwise leave this promise
+ * unsettled forever, so the "timeout" would bound nothing at all.
+ */
+const KILL_GRACE_MS = 2_000;
 
 export interface CommandResult {
   exitCode: number | null;
@@ -41,6 +46,10 @@ export type RunCommandFn = (
  *
  * `signal` kills the child: an abandoned `codex login` keeps writing to ~/.codex,
  * so cancelling the session has to reach the process, not just stop awaiting it.
+ *
+ * Resolves ONLY when the CLI reached a verdict of its own. A run we gave up on is
+ * rejected instead, because a killed child's exit code is not an answer about the
+ * credential and reads exactly like one.
  */
 export const runCommand: RunCommandFn = (file, args, stdin, timeoutMs, signal) =>
   new Promise((resolve, reject) => {
@@ -48,25 +57,79 @@ export const runCommand: RunCommandFn = (file, args, stdin, timeoutMs, signal) =
       reject(new AuthProvisioningError("Login was cancelled", "session_cancelled"));
       return;
     }
-    const child = spawn(file, args, { stdio: ["pipe", "pipe", "pipe"] });
+    // A separate POSIX process group lets timeout/cancel reach descendants too.
+    // Killing only a wrapper process can leave a CLI child holding these pipes
+    // open, which makes `close` (and therefore the old timeout) wait indefinitely.
+    const useProcessGroup = process.platform !== "win32";
+    const child = spawn(file, args, {
+      stdio: ["pipe", "pipe", "pipe"],
+      detached: useProcessGroup,
+    });
     let stdout = "";
     let stderr = "";
-    const timer = setTimeout(() => child.kill("SIGTERM"), timeoutMs);
-    const onAbort = () => child.kill("SIGTERM");
+    let settled = false;
+    let hardKill: NodeJS.Timeout | undefined;
+
+    const signalChild = (name: NodeJS.Signals) => {
+      if (useProcessGroup && child.pid != null) {
+	try {
+	  process.kill(-child.pid, name);
+	  return;
+	} catch {
+	  // The child may have exited before its process group was established.
+	}
+      }
+      child.kill(name);
+    };
+
+    const terminate = () => {
+      signalChild("SIGTERM");
+      hardKill ??= setTimeout(() => signalChild("SIGKILL"), KILL_GRACE_MS);
+    };
+
+    const cleanupWaiters = () => {
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", onAbort);
+    };
+
+    const rejectOnce = (err: unknown) => {
+      if (settled) return;
+      settled = true;
+      cleanupWaiters();
+      reject(err);
+    };
+
+    const timeoutError = () =>
+      new AuthProvisioningError(
+	// Safe to name the command: the key is fed over stdin precisely so it
+	// never appears in argv (see the module docstring).
+	`\`${[file, ...args].join(" ")}\` did not finish within ${timeoutMs}ms`,
+	"cli_timeout",
+      );
+
+    // Reject at the deadline; do not make the API wait for an uncooperative
+    // process to acknowledge SIGTERM. Cleanup continues in the background.
+    const timer = setTimeout(() => {
+      terminate();
+      rejectOnce(timeoutError());
+    }, timeoutMs);
+    const onAbort = () => {
+      terminate();
+      rejectOnce(new AuthProvisioningError("Login was cancelled", "session_cancelled"));
+    };
     signal?.addEventListener("abort", onAbort, { once: true });
-    const done = () => { clearTimeout(timer); signal?.removeEventListener("abort", onAbort); };
 
     child.stdout.on("data", (c) => { stdout += c.toString(); });
     child.stderr.on("data", (c) => { stderr += c.toString(); });
-    child.on("error", (err) => { done(); reject(err); });
+    child.on("error", (err) => {
+      if (hardKill) clearTimeout(hardKill);
+      rejectOnce(err);
+    });
     child.on("close", (code) => {
-      done();
-      // A killed child's exit code says nothing useful about the credential, and
-      // reporting it as a login failure would hide the reason the caller needs.
-      if (signal?.aborted) {
-        reject(new AuthProvisioningError("Login was cancelled", "session_cancelled"));
-        return;
-      }
+      if (hardKill) clearTimeout(hardKill);
+      if (settled) return;
+      settled = true;
+      cleanupWaiters();
       resolve({ exitCode: code, stdout, stderr });
     });
 

@@ -133,7 +133,8 @@ All require `Authorization: Bearer <AUTH_ADMIN_KEYS entry>`.
 keychain, which the proxy cannot read, so "not provisioned through this API" is
 no evidence of being logged out — reporting it as `unauthenticated` would send a
 client into a login flow it does not need. `codex` exposes a real check and is
-therefore definitive.
+therefore definitive when the CLI answers; a timed-out or externally terminated
+check returns `unknown` because it produced no authentication verdict.
 
 ### `POST /v1/auth/{engine}/sessions` → `201`
 

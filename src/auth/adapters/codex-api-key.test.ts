@@ -136,6 +136,40 @@ describe("CodexApiKeySession", () => {
     );
   });
 
+  test("a timed-out command rejects instead of resolving with a verdict-shaped result", async () => {
+    // Resolving here yielded { exitCode: null }, which every consumer reads as
+    // "the CLI said no" — a hung CLI became a definitive credential failure.
+    await assert.rejects(runCommand("sleep", ["30"], null, 300), (err: AuthProvisioningError) => {
+      assert.strictEqual(err.code, "cli_timeout");
+      assert.match(err.message, /did not finish within 300ms/);
+      return true;
+    });
+  });
+
+  test("the timeout still settles against a command that ignores SIGTERM", async () => {
+    const startedAt = Date.now();
+    await assert.rejects(
+      runCommand("sh", ["-c", 'trap "" TERM; sleep 30'], null, 300),
+      (err: AuthProvisioningError) => {
+	assert.strictEqual(err.code, "cli_timeout");
+	return true;
+      },
+    );
+    // Bounded by the SIGKILL escalation, not by `sleep 30` finishing on its own.
+    assert.ok(Date.now() - startedAt < 10_000, "must not wait out the child");
+  });
+
+  test("a submit whose CLI timed out is not reported as a rejected key", async () => {
+    const run: RunCommandFn = async () => {
+      throw new AuthProvisioningError("`codex login --with-api-key` did not finish within 60000ms", "cli_timeout");
+    };
+    await assert.rejects(new CodexApiKeySession({ run }).submit("sk-test"), (err: AuthProvisioningError) => {
+      // login_failed would send the caller off to fix a key that may be fine.
+      assert.strictEqual(err.code, "cli_timeout");
+      return true;
+    });
+  });
+
   test("an empty key is rejected before the CLI is invoked", async () => {
     const { calls, run } = recordingRunner(ok);
     await assert.rejects(new CodexApiKeySession({ run }).submit("   "), (err: AuthProvisioningError) => {

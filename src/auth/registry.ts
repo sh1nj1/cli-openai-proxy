@@ -33,15 +33,25 @@ async function claudeStatus(): Promise<EngineAuthStatus> {
   };
 }
 
-/** codex exposes a real check, so its status is definitive. */
+/**
+ * codex exposes a real check, so its status is definitive — but only when the CLI
+ * actually answered. A run that timed out or was killed produces no verdict, and
+ * reporting that as `unauthenticated` would send the caller through a login flow
+ * it may not need (the same reasoning as claudeStatus above).
+ */
 async function codexStatus(): Promise<EngineAuthStatus> {
   try {
     const result = await commandRunner.run("codex", ["login", "status"], null, STATUS_TIMEOUT_MS);
     // codex reports status on stderr in some versions, stdout in others.
     const detail = firstLine(result.stdout) || firstLine(result.stderr) || undefined;
-    return result.exitCode === 0
-      ? { state: "authenticated", source: "host", detail }
-      : { state: "unauthenticated", detail };
+    if (result.exitCode === 0) return { state: "authenticated", source: "host", detail };
+    // A null code means the CLI was signalled rather than exiting on its own, so
+    // it never reported anything. runCommand rejects the timeout it causes itself;
+    // this covers a kill from outside this process.
+    if (result.exitCode === null) {
+      return { state: "unknown", detail: detail ?? "`codex login status` was terminated before it reported" };
+    }
+    return { state: "unauthenticated", detail };
   } catch (err) {
     return { state: "unknown", detail: err instanceof Error ? err.message : String(err) };
   }
