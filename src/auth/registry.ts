@@ -78,7 +78,7 @@ const REGISTRY: Record<string, EngineAuthDescriptor> = {
 export const AUTH_ENGINE_IDS: string[] = Object.keys(REGISTRY);
 
 function lookup(engine: string): EngineAuthDescriptor | null {
-  return REGISTRY[engine] ?? null;
+  return Object.hasOwn(REGISTRY, engine) ? REGISTRY[engine]! : null;
 }
 
 /**

@@ -179,6 +179,18 @@ describe("auth-routes", () => {
     assert.equal(errorOf(res).code, "unknown_engine");
   });
 
+  test("inherited Object.prototype names answer unknown_engine on status and session routes", async () => {
+    const cases = ["toString", "constructor", "__proto__"].flatMap((engine) =>
+      [handleAuthStatus, handleCreateAuthSession].map((handler) => ({ engine, handler })),
+    );
+    for (const { engine, handler } of cases) {
+      const res = fakeRes();
+      await handler(fakeReq({ params: { engine } as any }), res);
+      assert.equal(res.statusCode, 404, `${engine} via ${handler.name}`);
+      assert.equal(errorOf(res).code, "unknown_engine", `${engine} via ${handler.name}`);
+    }
+  });
+
   test("creating a session answers 201 with the verification URL", async () => {
     const res = fakeRes();
     await handleCreateAuthSession(fakeReq({ params: { engine: "fake" } as any }), res);

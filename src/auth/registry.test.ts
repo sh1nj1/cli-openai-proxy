@@ -15,6 +15,12 @@ const CLAUDE_STATUS_ENV_VARS = [
 ] as const;
 let savedClaudeStatusEnv: Record<string, string | undefined>;
 
+test("engine lookup rejects inherited Object.prototype names", () => {
+  for (const engine of ["toString", "constructor", "__proto__"]) {
+    assert.strictEqual(resolveEngine(engine), null, engine);
+  }
+});
+
 function stubRunner(result: CommandResult | Error): void {
   const run: RunCommandFn = async () => {
     if (result instanceof Error) throw result;
