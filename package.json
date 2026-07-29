@@ -16,7 +16,7 @@
     "start": "node dist/server/standalone.js",
     "test": "find dist -name '*.test.js' -print0 | xargs -0 node --test",
     "clean": "rm -rf dist",
-    "prepublishOnly": "npm run build"
+    "prepublishOnly": "npm run build && node tools/check-package-contents.mjs"
   },
   "keywords": [
     "claude",
@@ -69,6 +69,7 @@
     "dist",
     "scripts",
     "docs",
+    "!docs/superpowers",
     "README.md",
     "CONTRIBUTING.md"
   ]

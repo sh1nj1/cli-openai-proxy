@@ -16,13 +16,18 @@ echo -e "${CYAN}═════════════════════�
 echo ""
 
 # Step 0: Build
-echo -e "${YELLOW}[1/4] Building...${NC}"
+echo -e "${YELLOW}[1/5] Building...${NC}"
 npm run build
 echo -e "${GREEN}  ✓ Build successful${NC}"
 echo ""
 
-# Step 1: GitHub auth
-echo -e "${YELLOW}[2/4] GitHub auth...${NC}"
+# Step 1: Fail before touching GitHub/npm if scratch files would ship
+echo -e "${YELLOW}[2/5] Checking package contents...${NC}"
+node tools/check-package-contents.mjs
+echo ""
+
+# Step 2: GitHub auth
+echo -e "${YELLOW}[3/5] GitHub auth...${NC}"
 if gh auth status &>/dev/null; then
   echo -e "${GREEN}  ✓ Already logged into GitHub${NC}"
 else
@@ -31,8 +36,8 @@ else
 fi
 echo ""
 
-# Step 2: Push to GitHub
-echo -e "${YELLOW}[3/4] Pushing to GitHub...${NC}"
+# Step 3: Push to GitHub
+echo -e "${YELLOW}[4/5] Pushing to GitHub...${NC}"
 REMOTE_URL=$(git remote get-url origin 2>/dev/null || echo "")
 if [ -z "$REMOTE_URL" ]; then
   echo -e "${CYAN}  Creating GitHub repo...${NC}"
@@ -43,8 +48,8 @@ fi
 echo -e "${GREEN}  ✓ Pushed to GitHub${NC}"
 echo ""
 
-# Step 3: Publish to npm
-echo -e "${YELLOW}[4/4] Publishing to npm...${NC}"
+# Step 4: Publish to npm
+echo -e "${YELLOW}[5/5] Publishing to npm...${NC}"
 if npm whoami &>/dev/null; then
   echo -e "${GREEN}  ✓ Already logged into npm${NC}"
 else
