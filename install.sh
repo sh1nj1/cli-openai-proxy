@@ -52,7 +52,7 @@ env_quote() {
 
 PROJECT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 ENTRYPOINT="$PROJECT_DIR/dist/server/standalone.js"
-CONFIG_HOME="$HOME/.config"
+CONFIG_HOME="${XDG_CONFIG_HOME:-$HOME/.config}"
 ENV_FILE="$CONFIG_HOME/claude-max-api-proxy.env"
 SYSTEMD_USER_DIR="$CONFIG_HOME/systemd/user"
 SERVICE_FILE="$SYSTEMD_USER_DIR/$SERVICE_NAME.service"
