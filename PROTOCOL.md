@@ -194,18 +194,36 @@ OpenAI client request (POST /v1/chat/completions)
 │ claude / codex            │
 └───────────────────────────┘
         │
-        ▼ stdout (JSON lines / NDJSON)
-┌───────────────────────────┐
-│ StreamJsonParser /        │
-│ CodexJsonlParser          │
-│ - filter system messages  │
-│ - emit content deltas     │
-│ - capture result stats    │
-└───────────────────────────┘
-        │
-        ▼ cli-to-openai
+        ├──▼ stdout (JSON lines / NDJSON)
+        │ ┌─────────────────────────────────┐
+        │ │ StreamJsonParser /              │
+        │ │ CodexJsonlParser                │
+        │ │ - filter system messages        │
+        │ │ - emit content deltas           │
+        │ │ - claude only: in-band terminal │
+        │ │   result (text + usage stats)   │
+        │ └─────────────────────────────────┘
+        │             │
+        └──▼ execute() resolves
+          ┌─────────────────────────────────┐
+          │ AdapterExecutionResult          │
+          │ (adapter-normalized)            │
+          │ - codex: final answer + usage   │
+          │ - both: errors/timeout/signal   │
+          └─────────────────────────────────┘
+                      │
+                      ▼ PaperclipRunner events → cli-to-openai
 OpenAI response (SSE chunks + [DONE], or one chat.completion)
 ```
+
+The parsers own live stdout only. For the Claude lane the terminal `result`
+message (final text + usage) arrives in-band through stdout, so
+`StreamJsonParser` surfaces it directly. For the Codex lane
+`CodexJsonlParser` surfaces only completed `agent_message` text; the terminal
+result, usage accounting, and error classification come from the adapter's
+normalized `AdapterExecutionResult`, which `PaperclipRunner` processes after
+`execute()` resolves (`emitCodexTerminal()`). Failure classification for both
+lanes is also driven by this resolved result.
 
 ## Important Notes
 
