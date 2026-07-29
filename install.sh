@@ -297,6 +297,9 @@ SUDO_BIN="$(trusted_command_path sudo)"
 ID_BIN="$(trusted_command_path id)"
 STAT_BIN="$(trusted_command_path stat)"
 REALPATH_BIN="$(trusted_command_path realpath)"
+MKTEMP_BIN="$(trusted_command_path mktemp)"
+MV_BIN="$(trusted_command_path mv)"
+RM_BIN="$(trusted_command_path rm)"
 
 [[ -n "$NODE_BIN" ]] || die "Node.js $MIN_NODE_VERSION or newer is required"
 [[ -n "$NPM_BIN" ]] || die "npm is required"
@@ -305,6 +308,9 @@ REALPATH_BIN="$(trusted_command_path realpath)"
 [[ -n "$ID_BIN" ]] || die "id is required"
 [[ -n "$STAT_BIN" ]] || die "stat is required (GNU coreutils)"
 [[ -n "$REALPATH_BIN" ]] || die "realpath is required (GNU coreutils)"
+[[ -n "$MKTEMP_BIN" ]] || die "mktemp is required (GNU coreutils)"
+[[ -n "$MV_BIN" ]] || die "mv is required (GNU coreutils)"
+[[ -n "$RM_BIN" ]] || die "rm is required (GNU coreutils)"
 service_executable_is_trusted "$NODE_BIN" \
   || die "Refusing Node.js executable with untrusted ownership or permissions: $NODE_BIN"
 service_path_is_trusted "$PROJECT_DIR" \
@@ -422,6 +428,16 @@ append_service_path "/usr/bin"
 append_service_path "/bin"
 
 log "Writing systemd user service: $SERVICE_FILE"
+if [[ -e "$SERVICE_FILE" || -L "$SERVICE_FILE" ]]; then
+  service_file_is_trusted "$SERVICE_FILE" \
+    || die "Refusing existing systemd unit with untrusted ownership or permissions: $SERVICE_FILE"
+fi
+SERVICE_FILE_TMP="$("$MKTEMP_BIN" "$SYSTEMD_USER_DIR/.${SERVICE_NAME}.service.XXXXXX")" \
+  || die "Failed to create temporary systemd unit in $SYSTEMD_USER_DIR"
+service_file_is_trusted "$SERVICE_FILE_TMP" || {
+  "$RM_BIN" -f -- "$SERVICE_FILE_TMP"
+  die "Temporary systemd unit has untrusted ownership or permissions: $SERVICE_FILE_TMP"
+}
 {
   printf '[Unit]\n'
   printf 'Description=CLI OpenAI Proxy\n'
@@ -443,7 +459,16 @@ log "Writing systemd user service: $SERVICE_FILE"
   printf '\n'
   printf '[Install]\n'
   printf 'WantedBy=default.target\n'
-} >"$SERVICE_FILE"
+} >"$SERVICE_FILE_TMP" || {
+  "$RM_BIN" -f -- "$SERVICE_FILE_TMP"
+  die "Failed to write temporary systemd unit: $SERVICE_FILE_TMP"
+}
+"$MV_BIN" -fT -- "$SERVICE_FILE_TMP" "$SERVICE_FILE" || {
+  "$RM_BIN" -f -- "$SERVICE_FILE_TMP"
+  die "Failed to replace systemd unit: $SERVICE_FILE"
+}
+service_file_is_trusted "$SERVICE_FILE" \
+  || die "Generated systemd unit has untrusted ownership or permissions: $SERVICE_FILE"
 
 LINGER="$("$LOGINCTL_BIN" show-user "$SERVICE_USER" --property=Linger --value 2>/dev/null || true)"
 if [[ "$LINGER" != "yes" ]]; then
