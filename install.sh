@@ -56,12 +56,54 @@ env_quote() {
   printf '"%s"' "$value"
 }
 
+service_path_is_trusted() {
+  "$NODE_BIN" -e '
+    const fs = require("node:fs");
+    const path = require("node:path");
+    const serviceUid = process.getuid();
+    const candidate = path.normalize(process.argv[1]);
+
+    const hasTrustedMetadata = (stats) =>
+      stats.isDirectory()
+      && (stats.uid === 0 || stats.uid === serviceUid)
+      && (stats.mode & 0o022) === 0;
+
+    const trustedExistingAncestors = (start) => {
+      let current = start;
+      while (true) {
+	try {
+	  if (!hasTrustedMetadata(fs.statSync(current))) process.exit(1);
+	} catch (error) {
+	  if (error.code !== "ENOENT") process.exit(1);
+	}
+	const parent = path.dirname(current);
+	if (parent === current) return;
+	current = parent;
+      }
+    };
+
+    trustedExistingAncestors(candidate);
+
+    let existing = candidate;
+    while (!fs.existsSync(existing)) {
+      const parent = path.dirname(existing);
+      if (parent === existing) process.exit(1);
+      existing = parent;
+    }
+    trustedExistingAncestors(fs.realpathSync(existing));
+  ' "$1"
+}
+
 append_service_path() {
   local directory="$1"
 
   [[ "$directory" == /* ]] || return
   [[ "$directory" != *:* && "$directory" != *$'\n'* && "$directory" != *$'\r'* ]] || return
   [[ ":$SERVICE_PATH:" != *":$directory:"* ]] || return
+  if ! service_path_is_trusted "$directory"; then
+    warn "Skipping service PATH directory writable by another user: $directory"
+    return
+  fi
   if [[ -n "$SERVICE_PATH" ]]; then
     SERVICE_PATH="$SERVICE_PATH:$directory"
   else
