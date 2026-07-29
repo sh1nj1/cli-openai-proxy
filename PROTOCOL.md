@@ -234,10 +234,14 @@ lanes is also driven by this resolved result.
 
 1. **Auth is the CLI's** (for ordinary local login): each CLI uses its own
    logged-in credential automatically and the proxy does not touch it. The
-   exception is the remote [auth provisioning flow](docs/cli-auth-provisioning.md):
-   a credential captured through `/v1/auth` is held in proxy memory and — only
-   when the operator sets `AUTH_TRUST_COMPLETION_CALLERS=1` — injected into the
-   completion subprocess environment.
+   exception is the remote [auth provisioning flow](docs/cli-auth-provisioning.md),
+   whose persistence model differs per engine: a Claude `setup-token`
+   credential captured through `/v1/auth` is held in proxy memory
+   (`token-store.ts`) and — only when the operator sets
+   `AUTH_TRUST_COMPLETION_CALLERS=1` — injected into the completion subprocess
+   environment; a Codex API key is instead forwarded to
+   `codex login --with-api-key`, which persists it under `~/.codex` itself, so
+   no in-memory holding or trust flag is involved.
 2. **Stateless**: no `--session-id`/`--resume` is used; every request is a
    fresh run in a fresh temp directory.
 3. **Tools**: the CLIs may invoke their own tools (Bash, Read, Edit, …) during
