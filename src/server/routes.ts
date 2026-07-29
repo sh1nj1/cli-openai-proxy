@@ -310,7 +310,6 @@ async function handleStreamingResponse(
 
     // Start the subprocess
     subprocess.start(cliInput.prompt, {
-      model: cliInput.model,
       systemPrompt: cliInput.systemPrompt,
       sessionId: cliInput.sessionId,
       timeout: getTimeoutMs(),
@@ -420,7 +419,6 @@ async function handleNonStreamingResponse(
     // Start the subprocess
     subprocess
       .start(cliInput.prompt, {
-        model: cliInput.model,
         systemPrompt: cliInput.systemPrompt,
         sessionId: cliInput.sessionId,
         timeout: getTimeoutMs(),

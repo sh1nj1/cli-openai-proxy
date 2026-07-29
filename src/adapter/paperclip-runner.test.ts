@@ -40,7 +40,7 @@ test("streams onLog stdout through the parser and emits events, then close(0)", 
     runner.on("close", (code: number | null) => resolve(code));
   });
 
-  await runner.start("hello prompt", { model: "opus" });
+  await runner.start("hello prompt", {});
   const code = await closeCode;
 
   assert.deepEqual(deltas, ["Hi"]);
@@ -59,7 +59,7 @@ test("preserves {{ }} template delimiters verbatim and disables session persiste
   };
   const runner = new PaperclipRunner(fakeExecute, { engine: "cli" });
   const closed = new Promise<void>((resolve) => runner.on("close", () => resolve()));
-  await runner.start(rawPrompt, { model: "opus" });
+  await runner.start(rawPrompt, {});
   await closed;
 
   assert.ok(captured, "execute received a ctx");
@@ -91,7 +91,7 @@ test("assigns a unique runId per run even within the same millisecond/process", 
   const run = () => {
     const runner = new PaperclipRunner(capture, { engine: "cli" });
     const closed = new Promise<void>((resolve) => runner.on("close", () => resolve()));
-    return runner.start("p", { model: "opus" }).then(() => closed);
+    return runner.start("p", {}).then(() => closed);
   };
   await Promise.all([run(), run(), run()]);
 
@@ -132,7 +132,7 @@ test("prompt-template injection routes the raw prompt through a context variable
     { promptInjection: "prompt-template", outputMode: "codex-jsonl", cliFlags: [] },
   );
   const closed = new Promise<void>((resolve) => runner.on("close", () => resolve()));
-  await runner.start(rawPrompt, { model: "gpt-5" });
+  await runner.start(rawPrompt, {});
   await closed;
 
   const ctx = captured!;
@@ -165,7 +165,7 @@ test("prompt-template injection prepends the system prompt to the prompt (render
     { promptInjection: "prompt-template", outputMode: "codex-jsonl", cliFlags: [] },
   );
   const closed = new Promise<void>((resolve) => runner.on("close", () => resolve()));
-  await runner.start("body", { model: "gpt-5", systemPrompt: "Be terse." });
+  await runner.start("body", { systemPrompt: "Be terse." });
   await closed;
 
   const ctx = captured!;
@@ -197,7 +197,7 @@ test("codex-jsonl mode with no live agent_message falls back to result.summary",
     runner.on("close", (code: number | null) => resolve(code));
   });
 
-  await runner.start("hi", { model: "gpt-5" });
+  await runner.start("hi", {});
   const code = await closeCode;
 
   assert.deepEqual(deltas, ["PAPERCLIP_CODEX_OK"], "summary streamed as one content delta");
@@ -238,7 +238,7 @@ test("codex-jsonl mode streams a content delta per live agent_message block", as
     runner.on("close", (code: number | null) => resolve(code));
   });
 
-  await runner.start("hi", { model: "gpt-5" });
+  await runner.start("hi", {});
   const code = await closeCode;
 
   // The live block is the only content delta — result.summary must NOT be re-emitted
@@ -273,7 +273,7 @@ test("codex-jsonl mode streams every agent_message block but reports the final a
     runner.on("close", () => resolve());
   });
 
-  await runner.start("hi", { model: "gpt-5" });
+  await runner.start("hi", {});
   await closed;
 
   // The live stream still shows every block (the feature), separated for readability.
@@ -315,7 +315,7 @@ test("codex-jsonl mode surfaces a failed adapter result as error, not a success 
     runner.on("close", (code: number | null) => resolve(code));
   });
 
-  await runner.start("hi", { model: "gpt-5" });
+  await runner.start("hi", {});
   const code = await closeCode;
 
   assert.equal(results.length, 0, "a failed result must NOT be emitted as a success result event");
@@ -339,7 +339,7 @@ test("codex-jsonl mode surfaces a timed-out adapter result as error", async () =
     runner.on("error", () => { errored = true; });
     runner.on("close", () => resolve());
   });
-  await runner.start("hi", { model: "gpt-5" });
+  await runner.start("hi", {});
   await closed;
 
   assert.equal(results.length, 0, "a timed-out result must not be a success result event");
@@ -369,7 +369,7 @@ test("codex-jsonl mode surfaces a signal-terminated adapter result as error", as
     runner.on("close", (code: number | null) => resolve(code));
   });
 
-  await runner.start("hi", { model: "gpt-5" });
+  await runner.start("hi", {});
   const code = await closeCode;
 
   assert.equal(results.length, 0, "a signal-terminated result must NOT be emitted as a success result event");
@@ -385,7 +385,7 @@ test("emits error and close(1) when execute rejects", async () => {
     runner.on("error", (e: Error) => { errMsg = e.message; });
     runner.on("close", (code: number | null) => resolve(code));
   });
-  await runner.start("p", { model: "opus" });
+  await runner.start("p", {});
   const code = await closed;
   assert.match(errMsg, /adapter blew up/);
   assert.equal(code, 1);
@@ -416,7 +416,7 @@ test("stream-json mode surfaces an is_error terminal result as error, not a succ
     runner.on("close", (code: number | null) => resolve(code));
   });
 
-  await runner.start("hi", { model: "opus" });
+  await runner.start("hi", {});
   const code = await closeCode;
 
   assert.equal(results.length, 0, "an is_error terminal result must NOT be emitted as a success result event");
@@ -444,7 +444,7 @@ test("stream-json mode surfaces a usage-limit failure (no terminal result) verba
     runner.on("close", (code: number | null) => resolve(code));
   });
 
-  await runner.start("hi", { model: "opus" });
+  await runner.start("hi", {});
   const code = await closeCode;
 
   assert.equal(results.length, 0, "a failed run must not emit a success result event");
@@ -468,7 +468,7 @@ test("stream-json mode surfaces an auth-required failure verbatim as a 401 error
     runner.on("error", (e: Error) => { err = e; });
     runner.on("close", () => resolve());
   });
-  await runner.start("hi", { model: "opus" });
+  await runner.start("hi", {});
   await closed;
 
   assert.ok(err instanceof AdapterRunError, "auth failure surfaces as a classified error");
@@ -503,7 +503,7 @@ test("signals a child spawned after a pre-spawn kill() (disconnect before onSpaw
 
   try {
     const runner = new PaperclipRunner(fakeExecute, { engine: "cli", command: "claude" });
-    await runner.start("p", { model: "opus" });
+    await runner.start("p", {});
     assert.ok(capturedOnSpawn, "execute started and exposed onSpawn");
 
     // Disconnect before onSpawn: pid/pgid are still null, so kill() cannot signal yet.
@@ -538,7 +538,7 @@ test("proxy-only keys are shadowed in the adapter's child environment", async ()
       return { exitCode: 0, signal: null, timedOut: false, sessionId: "s",
         usage: { inputTokens: 1, outputTokens: 1 } };
     };
-    await new PaperclipRunner(fakeExecute, { engine: "cli" }, { engine: "codex" }).start("p", { model: "opus" });
+    await new PaperclipRunner(fakeExecute, { engine: "cli" }, { engine: "codex" }).start("p", {});
 
     for (const key of PROXY_ONLY_SECRET_VARS) {
       assert.equal(captured[key], "", `${key} must be shadowed, not inherited`);
@@ -561,7 +561,7 @@ test("a provisioned credential reaches its own engine's adapter and no other", a
         usage: { inputTokens: 1, outputTokens: 1 } };
     };
     const runner = new PaperclipRunner(fakeExecute, { engine: "cli" }, { engine });
-    await runner.start("p", { model: "opus" });
+    await runner.start("p", {});
     return captured;
   };
 
@@ -584,4 +584,58 @@ test("a provisioned credential reaches its own engine's adapter and no other", a
     clearAllCredentials();
     delete process.env[TRUST_COMPLETION_CALLERS_VAR];
   }
+});
+
+test("forwards the configured model to a prompt-template adapter (codex) verbatim", async () => {
+  let captured: Record<string, unknown> | undefined;
+  const fakeExecute: AdapterExecute = async (ctx) => {
+    captured = ctx.config as Record<string, unknown>;
+    return { exitCode: 0, signal: null, timedOut: false, sessionId: "s",
+      usage: { inputTokens: 1, outputTokens: 1 } };
+  };
+  const runner = new PaperclipRunner(fakeExecute, { engine: "cli", command: "codex" }, {
+    model: "gpt-5.4-mini",
+    promptInjection: "prompt-template",
+    outputMode: "codex-jsonl",
+    cliFlags: [],
+  });
+  const closed = new Promise<void>((resolve) => runner.on("close", () => resolve()));
+  await runner.start("hi", {});
+  await closed;
+
+  assert.equal(captured!.model, "gpt-5.4-mini");
+});
+
+test("omits config.model entirely when no model is configured, so the CLI picks its default", async () => {
+  let captured: Record<string, unknown> | undefined;
+  const fakeExecute: AdapterExecute = async (ctx) => {
+    captured = ctx.config as Record<string, unknown>;
+    return { exitCode: 0, signal: null, timedOut: false, sessionId: "s",
+      usage: { inputTokens: 1, outputTokens: 1 } };
+  };
+  const runner = new PaperclipRunner(fakeExecute, { engine: "cli", command: "claude" });
+  const closed = new Promise<void>((resolve) => runner.on("close", () => resolve()));
+  await runner.start("hi", {});
+  await closed;
+
+  // Adapters omit --model on an empty value, but only when the key is absent:
+  // an explicit undefined still exists on config, so never write one.
+  assert.ok(!("model" in captured!), "config must not carry a model key at all");
+});
+
+test("forwards the configured model to a task-context adapter (claude)", async () => {
+  let captured: Record<string, unknown> | undefined;
+  const fakeExecute: AdapterExecute = async (ctx) => {
+    captured = ctx.config as Record<string, unknown>;
+    return { exitCode: 0, signal: null, timedOut: false, sessionId: "s",
+      usage: { inputTokens: 1, outputTokens: 1 } };
+  };
+  const runner = new PaperclipRunner(fakeExecute, { engine: "cli", command: "claude" }, {
+    model: "claude-opus-4-8",
+  });
+  const closed = new Promise<void>((resolve) => runner.on("close", () => resolve()));
+  await runner.start("hi", {});
+  await closed;
+
+  assert.equal(captured!.model, "claude-opus-4-8");
 });
