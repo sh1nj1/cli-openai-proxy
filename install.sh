@@ -8,6 +8,8 @@ PORT="${INSTALL_PORT:-3456}"
 HOST="${INSTALL_HOST:-127.0.0.1}"
 MIN_NODE_VERSION="22.13.0"
 READINESS_TIMEOUT="${INSTALL_READINESS_TIMEOUT:-30}"
+USER_PATH="${PATH:-}"
+BUILD_BIN_DIR=""
 
 log() {
   printf '[install] %s\n' "$*"
@@ -101,7 +103,7 @@ trusted_existing_directory_ancestors() {
     if [[ -e "$current" ]] && ! path_metadata_is_trusted "$current" directory; then
       return 1
     fi
-    parent="$(dirname -- "$current")"
+    parent="$("$DIRNAME_BIN" -- "$current")"
     [[ "$parent" != "$current" ]] || return 0
     current="$parent"
   done
@@ -119,7 +121,7 @@ service_path_is_trusted() {
   existing="$candidate"
   while [[ ! -e "$existing" ]]; do
     [[ ! -L "$existing" ]] || return 1
-    parent="$(dirname -- "$existing")"
+    parent="$("$DIRNAME_BIN" -- "$existing")"
     [[ "$parent" != "$existing" ]] || return 1
     existing="$parent"
   done
@@ -133,11 +135,11 @@ service_executable_is_trusted() {
   local resolved
 
   [[ "$executable" == /* && -f "$executable" && -x "$executable" ]] || return 1
-  service_path_is_trusted "$(dirname -- "$executable")" || return 1
+  service_path_is_trusted "$("$DIRNAME_BIN" -- "$executable")" || return 1
   resolved="$("$REALPATH_BIN" --canonicalize-existing -- "$executable" 2>/dev/null)" \
     || return 1
   [[ -x "$resolved" ]] || return 1
-  service_path_is_trusted "$(dirname -- "$resolved")" || return 1
+  service_path_is_trusted "$("$DIRNAME_BIN" -- "$resolved")" || return 1
   path_metadata_is_trusted "$resolved" file
 }
 
@@ -146,11 +148,79 @@ service_file_is_trusted() {
   local resolved
 
   [[ "$file" == /* && -f "$file" ]] || return 1
-  service_path_is_trusted "$(dirname -- "$file")" || return 1
+  service_path_is_trusted "$("$DIRNAME_BIN" -- "$file")" || return 1
   resolved="$("$REALPATH_BIN" --canonicalize-existing -- "$file" 2>/dev/null)" \
     || return 1
-  service_path_is_trusted "$(dirname -- "$resolved")" || return 1
+  service_path_is_trusted "$("$DIRNAME_BIN" -- "$resolved")" || return 1
   path_metadata_is_trusted "$resolved" file
+}
+
+project_build_inputs_are_trusted() {
+  local root="$1"
+  local file
+  local directory
+  local entry
+  local input_list
+  local result
+  local -a required_files=(
+    "package.json"
+    "package-lock.json"
+    "tsconfig.json"
+  )
+  local -a optional_files=(
+    ".npmrc"
+    "npm-shrinkwrap.json"
+  )
+  local -a input_directories=(
+    "src"
+    "scripts"
+    "tools"
+  )
+
+  for file in "${required_files[@]}"; do
+    entry="$root/$file"
+    [[ ! -L "$entry" ]] || return 1
+    path_metadata_is_trusted "$entry" file || return 1
+  done
+  for file in "${optional_files[@]}"; do
+    entry="$root/$file"
+    if [[ -e "$entry" || -L "$entry" ]]; then
+      [[ ! -L "$entry" ]] || return 1
+      path_metadata_is_trusted "$entry" file || return 1
+    fi
+  done
+  for directory in "${input_directories[@]}"; do
+    entry="$root/$directory"
+    [[ ! -L "$entry" ]] || return 1
+    path_metadata_is_trusted "$entry" directory || return 1
+    input_list="$("$MKTEMP_BIN" "$root/.install-inputs.XXXXXX")" || return 1
+    result=0
+    if ! "$FIND_BIN" "$entry" -mindepth 1 -print0 >"$input_list"; then
+      result=1
+    else
+      while IFS= read -r -d '' entry; do
+	if [[ -L "$entry" ]]; then
+	  result=1
+	  break
+	elif [[ -d "$entry" ]]; then
+	  path_metadata_is_trusted "$entry" directory || {
+	    result=1
+	    break
+	  }
+	elif [[ -f "$entry" ]]; then
+	  path_metadata_is_trusted "$entry" file || {
+	    result=1
+	    break
+	  }
+	else
+	  result=1
+	  break
+	fi
+      done <"$input_list"
+    fi
+    "$RM_BIN" -f -- "$input_list"
+    ((result == 0)) || return 1
+  done
 }
 
 prepare_trusted_directory() {
@@ -181,6 +251,51 @@ append_service_path() {
   else
     SERVICE_PATH="$directory"
   fi
+}
+
+validate_service_cli_resolution() {
+  local name="$1"
+  local discovered="$2"
+  local effective
+
+  effective="$(PATH="$SERVICE_PATH" command -v "$name" 2>/dev/null || true)"
+  [[ -n "$effective" ]] || return 0
+  service_executable_is_trusted "$effective" \
+    || die "Refusing $name selected by the service PATH with untrusted ownership or permissions: $effective"
+  if [[ -n "$discovered" && "$effective" != "$discovered" ]]; then
+    warn "Service PATH selects $effective for $name instead of $discovered"
+  fi
+}
+
+cleanup_build_bin() {
+  case "$BUILD_BIN_DIR" in
+  "$PROJECT_DIR"/.install-build-bin.*)
+    "$RM_BIN" -rf -- "$BUILD_BIN_DIR"
+    ;;
+  esac
+}
+
+run_npm() {
+  local name
+  local value
+  local -a build_env=(
+    "HOME=$HOME"
+    "PATH=$BUILD_PATH"
+  )
+
+  for name in HTTP_PROXY HTTPS_PROXY ALL_PROXY NO_PROXY http_proxy https_proxy all_proxy no_proxy; do
+    value="${!name-}"
+    if [[ -n "$value" ]]; then
+      build_env+=("$name=$value")
+    fi
+  done
+  "$ENV_BIN" -i \
+    "${build_env[@]}" \
+    "$NPM_BIN" \
+    "--userconfig=$NPM_USER_CONFIG" \
+    "--globalconfig=$NPM_GLOBAL_CONFIG" \
+    --script-shell=/bin/sh \
+    "$@"
 }
 
 health_check() {
@@ -270,7 +385,7 @@ read_effective_listener() {
     && ((EFFECTIVE_PORT >= 1 && EFFECTIVE_PORT <= 65535))
 }
 
-[[ "$(uname -s)" == "Linux" ]] || die "This installer supports Linux only"
+[[ "$OSTYPE" == linux* ]] || die "This installer supports Linux only"
 [[ "$EUID" -ne 0 ]] || die "Run this script as the service user, not with sudo"
 [[ "$SERVICE_NAME" =~ ^[A-Za-z0-9_.@-]+$ ]] || die "Invalid SERVICE_NAME: $SERVICE_NAME"
 [[ "$PORT" =~ ^[0-9]+$ ]] && ((PORT >= 1 && PORT <= 65535)) \
@@ -280,7 +395,11 @@ read_effective_listener() {
 [[ "$HOST" != *$'\n'* && "$HOST" != *$'\r'* ]] \
   || die "HOST must not contain newlines"
 
-PROJECT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+SCRIPT_DIR="${BASH_SOURCE[0]%/*}"
+[[ "$SCRIPT_DIR" != "${BASH_SOURCE[0]}" ]] || SCRIPT_DIR="."
+PROJECT_DIR="$(cd -- "$SCRIPT_DIR" && pwd -P)"
+[[ "$PROJECT_DIR" != *:* && "$PROJECT_DIR" != *$'\n'* && "$PROJECT_DIR" != *$'\r'* ]] \
+  || die "Project path must not contain a colon or newline: $PROJECT_DIR"
 ENTRYPOINT="$PROJECT_DIR/dist/server/standalone.js"
 CONFIG_HOME="${XDG_CONFIG_HOME:-$HOME/.config}"
 ENV_FILE="$CONFIG_HOME/claude-max-api-proxy.env"
@@ -291,7 +410,7 @@ SERVICE_FILE="$SYSTEMD_USER_DIR/$SERVICE_NAME.service"
 
 NODE_BIN="$(command_path node)"
 NPM_BIN="$(command_path npm)"
-SYSTEMCTL_BIN="$(command_path systemctl)"
+SYSTEMCTL_BIN="$(trusted_command_path systemctl)"
 LOGINCTL_BIN="$(trusted_command_path loginctl)"
 SUDO_BIN="$(trusted_command_path sudo)"
 ID_BIN="$(trusted_command_path id)"
@@ -300,6 +419,10 @@ REALPATH_BIN="$(trusted_command_path realpath)"
 MKTEMP_BIN="$(trusted_command_path mktemp)"
 MV_BIN="$(trusted_command_path mv)"
 RM_BIN="$(trusted_command_path rm)"
+FIND_BIN="$(trusted_command_path find)"
+DIRNAME_BIN="$(trusted_command_path dirname)"
+LN_BIN="$(trusted_command_path ln)"
+ENV_BIN="$(trusted_command_path env)"
 
 [[ -n "$NODE_BIN" ]] || die "Node.js $MIN_NODE_VERSION or newer is required"
 [[ -n "$NPM_BIN" ]] || die "npm is required"
@@ -311,8 +434,14 @@ RM_BIN="$(trusted_command_path rm)"
 [[ -n "$MKTEMP_BIN" ]] || die "mktemp is required (GNU coreutils)"
 [[ -n "$MV_BIN" ]] || die "mv is required (GNU coreutils)"
 [[ -n "$RM_BIN" ]] || die "rm is required (GNU coreutils)"
+[[ -n "$FIND_BIN" ]] || die "find is required (GNU findutils)"
+[[ -n "$DIRNAME_BIN" ]] || die "dirname is required (GNU coreutils)"
+[[ -n "$LN_BIN" ]] || die "ln is required (GNU coreutils)"
+[[ -n "$ENV_BIN" ]] || die "env is required (GNU coreutils)"
 service_executable_is_trusted "$NODE_BIN" \
   || die "Refusing Node.js executable with untrusted ownership or permissions: $NODE_BIN"
+service_executable_is_trusted "$NPM_BIN" \
+  || die "Refusing npm executable with untrusted ownership or permissions: $NPM_BIN"
 service_path_is_trusted "$PROJECT_DIR" \
   || die "Refusing project directory with untrusted ownership or permissions: $PROJECT_DIR"
 
@@ -328,8 +457,8 @@ SERVICE_USER="$("$ID_BIN" -un)"
 ' "$MIN_NODE_VERSION" \
   || die "Node.js $MIN_NODE_VERSION or newer is required (found $("$NODE_BIN" --version))"
 
-if [[ -z "$(command_path make)" || -z "$(command_path g++)" ]] \
-  || [[ -z "$(command_path python3)" && -z "$(command_path python)" ]]; then
+if [[ -z "$(trusted_command_path make)" || -z "$(trusted_command_path g++)" ]] \
+  || [[ -z "$(trusted_command_path python3)" && -z "$(trusted_command_path python)" ]]; then
   APT_GET_BIN="$(trusted_command_path apt-get)"
   [[ -n "$APT_GET_BIN" && -n "$SUDO_BIN" ]] \
     || die "Native build tools are required. On Ubuntu: sudo apt-get install -y build-essential python3"
@@ -354,11 +483,57 @@ else
     || die "Refusing Codex executable with untrusted ownership or permissions: $CODEX_BIN"
 fi
 
+PATH="/usr/bin:/bin"
+export PATH
+
+NODE_DIR="$("$DIRNAME_BIN" -- "$NODE_BIN")"
+CLAUDE_DIR=""
+if [[ -n "$CLAUDE_BIN" ]]; then
+  CLAUDE_DIR="$("$DIRNAME_BIN" -- "$CLAUDE_BIN")"
+fi
+CODEX_DIR=""
+if [[ -n "$CODEX_BIN" ]]; then
+  CODEX_DIR="$("$DIRNAME_BIN" -- "$CODEX_BIN")"
+fi
+SERVICE_PATH=""
+append_service_path "$NODE_DIR"
+append_service_path "$CLAUDE_DIR"
+append_service_path "$CODEX_DIR"
+append_service_path "$HOME/.local/bin"
+append_service_path "$HOME/bin"
+IFS=: read -r -a USER_PATH_DIRS <<<"$USER_PATH"
+for directory in "${USER_PATH_DIRS[@]}"; do
+  append_service_path "$directory"
+done
+append_service_path "/usr/local/bin"
+append_service_path "/usr/bin"
+append_service_path "/bin"
+
+project_build_inputs_are_trusted "$PROJECT_DIR" \
+  || die "Refusing project build inputs with untrusted ownership, permissions, or file types: $PROJECT_DIR"
+
+BUILD_BIN_DIR="$("$MKTEMP_BIN" -d "$PROJECT_DIR/.install-build-bin.XXXXXX")" \
+  || die "Failed to create a private build command directory"
+service_path_is_trusted "$BUILD_BIN_DIR" \
+  || die "Private build command directory has untrusted ownership or permissions: $BUILD_BIN_DIR"
+trap cleanup_build_bin EXIT
+"$LN_BIN" -s -- "$NODE_BIN" "$BUILD_BIN_DIR/node"
+"$LN_BIN" -s -- "$NPM_BIN" "$BUILD_BIN_DIR/npm"
+NPM_USER_CONFIG="$BUILD_BIN_DIR/user.npmrc"
+NPM_GLOBAL_CONFIG="$BUILD_BIN_DIR/global.npmrc"
+: >"$NPM_USER_CONFIG"
+: >"$NPM_GLOBAL_CONFIG"
+path_metadata_is_trusted "$NPM_USER_CONFIG" file \
+  || die "Private npm user config has untrusted ownership or permissions"
+path_metadata_is_trusted "$NPM_GLOBAL_CONFIG" file \
+  || die "Private npm global config has untrusted ownership or permissions"
+BUILD_PATH="$BUILD_BIN_DIR:/usr/bin:/bin"
+
 log "Installing dependencies"
-(cd "$PROJECT_DIR" && "$NPM_BIN" ci)
+(cd "$PROJECT_DIR" && run_npm ci)
 
 log "Building production files"
-(cd "$PROJECT_DIR" && "$NPM_BIN" run build)
+(cd "$PROJECT_DIR" && run_npm run build)
 [[ -f "$ENTRYPOINT" ]] || die "Build did not create $ENTRYPOINT"
 service_file_is_trusted "$ENTRYPOINT" \
   || die "Refusing application entrypoint with untrusted ownership or permissions: $ENTRYPOINT"
@@ -400,32 +575,12 @@ else
   log "Created configuration: $ENV_FILE"
 fi
 
-NODE_DIR="$(dirname -- "$NODE_BIN")"
-CLAUDE_DIR=""
-if [[ -n "$CLAUDE_BIN" ]]; then
-  CLAUDE_DIR="$(dirname -- "$CLAUDE_BIN")"
-fi
-CODEX_DIR=""
-if [[ -n "$CODEX_BIN" ]]; then
-  CODEX_DIR="$(dirname -- "$CODEX_BIN")"
-fi
-NPM_PREFIX="$("$NPM_BIN" prefix --global 2>/dev/null || true)"
-SERVICE_PATH=""
-append_service_path "$NODE_DIR"
-append_service_path "$CLAUDE_DIR"
-append_service_path "$CODEX_DIR"
-append_service_path "$HOME/.local/bin"
-append_service_path "$HOME/bin"
+NPM_PREFIX="$(run_npm prefix --global 2>/dev/null || true)"
 if [[ -n "$NPM_PREFIX" ]]; then
   append_service_path "$NPM_PREFIX/bin"
 fi
-IFS=: read -r -a USER_PATH_DIRS <<<"${PATH:-}"
-for directory in "${USER_PATH_DIRS[@]}"; do
-  append_service_path "$directory"
-done
-append_service_path "/usr/local/bin"
-append_service_path "/usr/bin"
-append_service_path "/bin"
+validate_service_cli_resolution claude "$CLAUDE_BIN"
+validate_service_cli_resolution codex "$CODEX_BIN"
 
 log "Writing systemd user service: $SERVICE_FILE"
 if [[ -e "$SERVICE_FILE" || -L "$SERVICE_FILE" ]]; then
