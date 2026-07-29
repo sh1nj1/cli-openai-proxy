@@ -6,7 +6,7 @@
 
 import type { Request, Response } from "express";
 import { v4 as uuidv4 } from "uuid";
-import { runnerFactory, PAPERCLIP_MODEL_IDS, UnknownPaperclipModelError } from "../adapter/paperclip-registry.js";
+import { runnerFactory, PAPERCLIP_MODEL_IDS, UnknownPaperclipModelError, DEFAULT_MODEL } from "../adapter/paperclip-registry.js";
 import type { AgentRunner } from "../adapter/agent-runner.js";
 import { openaiToCli } from "../adapter/openai-to-cli.js";
 import { materializeImages, ImageValidationError } from "../adapter/image-materializer.js";
@@ -34,7 +34,7 @@ export async function handleChatCompletions(
   const requestId = uuidv4().replace(/-/g, "").slice(0, 24);
   const body = req.body as OpenAIChatRequest;
   const stream = body.stream === true;
-  const requestedModel = body.model || "claude-opus-4";
+  const requestedModel = body.model || DEFAULT_MODEL;
   const startTime = Date.now();
 
   try {
@@ -407,7 +407,7 @@ async function handleNonStreamingResponse(
 
         res.status(500).json({
           error: {
-            message: `Claude CLI exited with code ${code} without response`,
+            message: `CLI exited with code ${code} without response`,
             type: "server_error",
             code: null,
           },

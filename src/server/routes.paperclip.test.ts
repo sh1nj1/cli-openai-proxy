@@ -225,3 +225,23 @@ test("an unauthenticated CLI returns 401 engine_unauthenticated naming the engin
     runnerFactory.create = orig;
   }
 });
+
+test("a model id outside the paperclip namespace is a 404 model_not_found", async () => {
+  // Uses the real runnerFactory.create: if a legacy claude-max/* alias ever comes
+  // back, this catches it.
+  const req = {
+    body: { model: "claude-max/claude-opus-4-6", messages: [{ role: "user", content: "hi" }] },
+  } as unknown as Request;
+  let status = 0;
+  let payload: any;
+  const res = {
+    headersSent: false,
+    status(code: number) { status = code; return this; },
+    json(obj: unknown) { payload = obj; return this; },
+  } as unknown as Response;
+
+  await handleChatCompletions(req, res);
+
+  assert.equal(status, 404);
+  assert.equal(payload.error.code, "model_not_found");
+});
