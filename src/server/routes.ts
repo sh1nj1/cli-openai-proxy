@@ -19,7 +19,7 @@ import {
 } from "../adapter/cli-to-openai.js";
 import type { OpenAIChatRequest } from "../types/openai.js";
 import type { ClaudeCliResult, ClaudeCliStreamEvent } from "../types/claude-cli.js";
-import { usageTracker } from "../usage/tracker.js";
+import { usageTracker, displayCostUsd } from "../usage/tracker.js";
 import { isAuthEnabled } from "./auth.js";
 import { PKG_VERSION, getTimeoutMs, KEEPALIVE_INTERVAL_MS } from "../config.js";
 
@@ -499,7 +499,12 @@ export function handleUsage(req: Request, res: Response): void {
 export function handleUsageRecent(req: Request, res: Response): void {
   const raw = req.query.limit ? parseInt(req.query.limit as string, 10) : 20;
   const limit = Math.min(Math.max(raw || 20, 1), 1000);
-  const records = usageTracker.getRecent(limit);
+  // Records hold the unrounded cost so totals do not drift; a reader gets it
+  // rounded, without the float dust a per-model sum can leave behind.
+  const records = usageTracker.getRecent(limit).map(record => ({
+    ...record,
+    estimatedApiCostUsd: displayCostUsd(record.estimatedApiCostUsd),
+  }));
 
   res.json({
     object: "list",

@@ -157,6 +157,48 @@ test("prices each model of a mixed run at its own rate", () => {
   assert.equal(billed.costUsd, 15 + 1.25);
 });
 
+test("keeps a sub-cent run at full precision", async () => {
+  // Rounding a run to the nearest microdollar is a third of what a short Haiku
+  // turn costs, and the error compounds across a workload of them: 10k such
+  // requests would read as $0.02 spent against $0.015 actually incurred.
+  const billed = billRun(
+    { modelUsage: { "claude-haiku-4-5": { inputTokens: 6, outputTokens: 0 } } },
+    RUN_TOTALS,
+  );
+  assert.equal(billed.costUsd, 0.0000015);
+
+  await withFakeHome(async (home) => {
+    const tracker = new UsageTracker(path.join(home, "usage"));
+    await tracker.load();
+
+    for (let i = 0; i < 10_000; i++) {
+      tracker.record({
+        model: "paperclip/claude_local",
+        modelUsage: { "claude-haiku-4-5": { inputTokens: 6, outputTokens: 0 } },
+        inputTokens: 6,
+        outputTokens: 0,
+        durationMs: 1,
+        stream: false,
+        success: true,
+      });
+    }
+
+    assert.equal(tracker.getSummary().estimatedApiCostSavedUsd, 0.015);
+  });
+});
+
+test("prices a cache-heavy run without float dust", () => {
+  // A rate of 0.1x is not binary-exact, so multiplying tokens by it leaves the
+  // dollars a ulp off (1.5000000000000002). Scaling the whole token count in
+  // one divide keeps the arithmetic exact instead of rounding the result after.
+  const billed = billRun(
+    { modelUsage: { "claude-opus-5": { inputTokens: 0, outputTokens: 0, cacheReadInputTokens: 3 } } },
+    RUN_TOTALS,
+  );
+
+  assert.equal(billed.costUsd, 0.0000045);
+});
+
 test("counts the tokens a subagent added", () => {
   // Verified against the real CLI: top-level `usage` covers the main chain only,
   // while `modelUsage` includes sidechains — pricing the main-chain totals drops

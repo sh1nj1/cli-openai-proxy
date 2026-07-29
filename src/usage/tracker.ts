@@ -49,9 +49,13 @@ const PRICING: Record<string, { input: number; output: number }> = {
   haiku:  { input: 0.25,  output: 1.25  },
 };
 
+const PER_MILLION = 1_000_000;
+
 // Cached prompt tokens are billed off the input rate, not free: a cache read
-// costs a tenth of it, writing the cache 1.25x (5-minute TTL).
-const CACHE_READ_RATE = 0.1;
+// costs a tenth of it, writing the cache 1.25x (5-minute TTL). The tenth is
+// applied as a divisor rather than a 0.1 multiplier because 0.1 is not
+// binary-exact — see cost().
+const CACHE_READ_DIVISOR = PER_MILLION * 10;
 const CACHE_WRITE_RATE = 1.25;
 
 /** Pricing family a model id belongs to. Unknown ids are priced as Sonnet. */
@@ -62,22 +66,27 @@ function pricingFamily(model: string): string {
   return "sonnet";
 }
 
+/**
+ * Token counts are integers and the per-million rates are binary-exact, so
+ * scaling each bucket by its rate first and dividing once keeps the dollars
+ * exact. Folding the buckets into a token subtotal via a 0.1 multiplier instead
+ * leaves a ulp of dust in every cached run.
+ */
 function cost(family: string, tokens: RunTokens): number {
   const pricing = PRICING[family];
-  const promptTokens = tokens.inputTokens
-    + tokens.cacheReadTokens * CACHE_READ_RATE
-    + tokens.cacheWriteTokens * CACHE_WRITE_RATE;
-  return (promptTokens / 1_000_000) * pricing.input
-    + (tokens.outputTokens / 1_000_000) * pricing.output;
+  return (tokens.inputTokens * pricing.input) / PER_MILLION
+    + (tokens.cacheReadTokens * pricing.input) / CACHE_READ_DIVISOR
+    + (tokens.cacheWriteTokens * pricing.input * CACHE_WRITE_RATE) / PER_MILLION
+    + (tokens.outputTokens * pricing.output) / PER_MILLION;
 }
 
 /**
- * Rates like 0.1x are not binary-exact, so a run's dollars carry float dust
- * (0.30000000000000004). Sub-cent precision is well past anything meaningful
- * for an estimate, and getSummary rounds harder still.
+ * Round a cost for a reader. Only ever applied on the way out: rounding what a
+ * run stores would bias the running total, since a short Haiku turn costs less
+ * than the increment being rounded to.
  */
-function roundUsd(usd: number): number {
-  return Math.round(usd * 1_000_000) / 1_000_000;
+export function displayCostUsd(usd: number): number {
+  return Math.round(usd * PER_MILLION) / PER_MILLION;
 }
 
 export type { ModelUsage };
@@ -132,7 +141,7 @@ export function billRun(
     return {
       model: family,
       ...tokens,
-      costUsd: roundUsd(cost(family, tokens)),
+      costUsd: cost(family, tokens),
     };
   }
 
@@ -172,7 +181,7 @@ export function billRun(
     cacheWriteTokens: tokens.cacheWriteTokens - pricedCacheWrite,
   });
 
-  return { model, ...tokens, costUsd: roundUsd(costUsd) };
+  return { model, ...tokens, costUsd };
 }
 
 export const DATA_DIR_NAME = ".cli-openai-proxy";
