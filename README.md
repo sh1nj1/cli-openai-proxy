@@ -1,4 +1,4 @@
-# Claude Max API Proxy
+# cli-openai-proxy
 
 **Turn your $200/mo Claude Max subscription into a full OpenAI-compatible API. Stop paying per token.**
 
@@ -20,10 +20,10 @@ Your Claude Max subscription includes unlimited* Claude usage through the CLI. T
 
 ```bash
 # Install globally
-npm install -g claude-max-api-proxy
+npm install -g cli-openai-proxy
 
 # Start the proxy (requires Claude CLI authenticated)
-claude-max-api &
+cli-openai-proxy &
 
 # Test it
 curl http://localhost:3456/v1/models
@@ -32,8 +32,8 @@ curl http://localhost:3456/v1/models
 Or clone and run:
 
 ```bash
-git clone https://github.com/sh1nj1/claude-max-api-proxy.git
-cd claude-max-api-proxy
+git clone https://github.com/sh1nj1/cli-openai-proxy.git
+cd cli-openai-proxy
 npm install && npm run build
 npm start
 ```
@@ -44,7 +44,7 @@ npm start
 Your App (any OpenAI client)
     |
     v
-Claude Max API Proxy (this)  <-- localhost:3456
+cli-openai-proxy (this)  <-- localhost:3456
     |
     v
 Claude Code CLI (subprocess)
@@ -109,7 +109,7 @@ Secure your proxy for team use:
 
 ```bash
 # Start with API keys
-API_KEYS=sk-team-abc123,sk-team-def456 claude-max-api
+API_KEYS=sk-team-abc123,sk-team-def456 cli-openai-proxy
 
 # Clients must include Bearer token
 curl http://localhost:3456/v1/chat/completions \
@@ -130,7 +130,7 @@ the host — so a remote UI can recover from an auth failure on its own. Off unl
 API_KEYS=sk-team-abc123 \
 AUTH_ADMIN_KEYS=sk-admin-xyz789 \
 AUTH_TRUST_COMPLETION_CALLERS=1 \
-claude-max-api
+cli-openai-proxy
 
 # codex: submit an API key
 curl -X POST -H "Authorization: Bearer sk-admin-xyz789" \
@@ -232,17 +232,17 @@ curl -N -X POST http://localhost:3456/v1/chat/completions \
 
 ```bash
 # Create LaunchAgent
-cat > ~/Library/LaunchAgents/com.claude-max-proxy.plist << 'EOF'
+cat > ~/Library/LaunchAgents/com.cli-openai-proxy.plist << 'EOF'
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
   <key>Label</key>
-  <string>com.claude-max-proxy</string>
+  <string>com.cli-openai-proxy</string>
   <key>ProgramArguments</key>
   <array>
     <string>/usr/local/bin/node</string>
-    <string>/path/to/claude-max-api-proxy/dist/server/standalone.js</string>
+    <string>/path/to/cli-openai-proxy/dist/server/standalone.js</string>
   </array>
   <key>RunAtLoad</key>
   <true/>
@@ -252,7 +252,7 @@ cat > ~/Library/LaunchAgents/com.claude-max-proxy.plist << 'EOF'
 </plist>
 EOF
 
-launchctl load ~/Library/LaunchAgents/com.claude-max-proxy.plist
+launchctl load ~/Library/LaunchAgents/com.cli-openai-proxy.plist
 ```
 
 ## Prerequisites

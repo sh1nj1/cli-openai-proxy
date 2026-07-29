@@ -1,22 +1,22 @@
 # macOS Auto-Start Setup
 
-This guide shows how to configure the Claude Code CLI Provider to start automatically when you log in.
+This guide shows how to configure cli-openai-proxy to start automatically when you log in.
 
 ## Create LaunchAgent
 
 1. Create the plist file:
 
 ```bash
-cat > ~/Library/LaunchAgents/com.claude-code-provider.plist << 'PLIST'
+cat > ~/Library/LaunchAgents/com.cli-openai-proxy.plist << 'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
   <dict>
     <key>Label</key>
-    <string>com.claude-code-provider</string>
+    <string>com.cli-openai-proxy</string>
     
     <key>Comment</key>
-    <string>Claude Code CLI Provider (uses Claude Max subscription)</string>
+    <string>cli-openai-proxy — agentic coding CLIs behind an OpenAI-compatible API</string>
     
     <key>RunAtLoad</key>
     <true/>
@@ -27,14 +27,14 @@ cat > ~/Library/LaunchAgents/com.claude-code-provider.plist << 'PLIST'
     <key>ProgramArguments</key>
     <array>
       <string>/opt/homebrew/bin/node</string>
-      <string>/path/to/claude-code-cli-provider/dist/server/standalone.js</string>
+      <string>/path/to/cli-openai-proxy/dist/server/standalone.js</string>
     </array>
     
     <key>StandardOutPath</key>
-    <string>/tmp/claude-provider.log</string>
+    <string>/tmp/cli-openai-proxy.log</string>
     
     <key>StandardErrorPath</key>
-    <string>/tmp/claude-provider.err.log</string>
+    <string>/tmp/cli-openai-proxy.err.log</string>
     
     <key>EnvironmentVariables</key>
     <dict>
@@ -49,7 +49,7 @@ PLIST
 ```
 
 2. **Important:** Edit the file and replace:
-   - `/path/to/claude-code-cli-provider` with your actual path
+   - `/path/to/cli-openai-proxy` with your actual path
    - `/Users/YOUR_USERNAME` with your actual username
    - Ensure the PATH includes the directory containing `claude` (check with `which claude`)
 
@@ -57,10 +57,10 @@ PLIST
 
 ```bash
 # Load and start the service
-launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.claude-code-provider.plist
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.cli-openai-proxy.plist
 
 # Verify it's running
-launchctl list | grep claude-code
+launchctl list | grep cli-openai-proxy
 curl http://localhost:3456/health
 ```
 
@@ -68,28 +68,28 @@ curl http://localhost:3456/health
 
 ```bash
 # Check status
-launchctl list | grep claude-code
+launchctl list | grep cli-openai-proxy
 
 # Restart the service
-launchctl kickstart -k gui/$(id -u)/com.claude-code-provider
+launchctl kickstart -k gui/$(id -u)/com.cli-openai-proxy
 
 # Stop the service (temporary)
-launchctl bootout gui/$(id -u)/com.claude-code-provider
+launchctl bootout gui/$(id -u)/com.cli-openai-proxy
 
 # Start the service again
-launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.claude-code-provider.plist
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.cli-openai-proxy.plist
 
 # View logs
-tail -f /tmp/claude-provider.log
-tail -f /tmp/claude-provider.err.log
+tail -f /tmp/cli-openai-proxy.log
+tail -f /tmp/cli-openai-proxy.err.log
 ```
 
 ## Uninstall
 
 ```bash
 # Stop and remove the service
-launchctl bootout gui/$(id -u)/com.claude-code-provider
-rm ~/Library/LaunchAgents/com.claude-code-provider.plist
+launchctl bootout gui/$(id -u)/com.cli-openai-proxy
+rm ~/Library/LaunchAgents/com.cli-openai-proxy.plist
 ```
 
 ## Troubleshooting
@@ -98,7 +98,7 @@ rm ~/Library/LaunchAgents/com.claude-code-provider.plist
 
 Check the error log:
 ```bash
-cat /tmp/claude-provider.err.log
+cat /tmp/cli-openai-proxy.err.log
 ```
 
 Common issues:

@@ -7,7 +7,7 @@
 **Body:**
 If you're paying $200/mo for Claude Max, you already have unlimited Claude access through the CLI. But what if you want to use it with Continue.dev, Cursor, custom apps, or any OpenAI client?
 
-`claude-max-api-proxy` wraps the official Claude Code CLI and exposes it as a standard OpenAI-compatible API on localhost. No OAuth extraction, no private API reverse-engineering — just the CLI you already have, wrapped in a REST endpoint.
+`cli-openai-proxy` wraps the official Claude Code CLI and exposes it as a standard OpenAI-compatible API on localhost. No OAuth extraction, no private API reverse-engineering — just the CLI you already have, wrapped in a REST endpoint.
 
 **What it does:**
 - OpenAI-compatible `/v1/chat/completions` (streaming + non-streaming)
@@ -17,13 +17,13 @@ If you're paying $200/mo for Claude Max, you already have unlimited Claude acces
 
 **Quick start:**
 ```
-npm install -g claude-max-api-proxy
-claude-max-api &
+npm install -g cli-openai-proxy
+cli-openai-proxy &
 curl http://localhost:3456/v1/models
 ```
 
 GitHub: [link]
-npm: `npm install -g claude-max-api-proxy`
+npm: `npm install -g cli-openai-proxy`
 
 ---
 
@@ -54,7 +54,7 @@ Claude Max is $200/mo flat.
 
 This proxy bridges the gap. Use your subscription with Continue, Cursor, custom apps — anything that speaks OpenAI.
 
-npm install -g claude-max-api-proxy
+npm install -g cli-openai-proxy
 
 **Tweet 4:**
 It even tracks your savings:
@@ -70,7 +70,7 @@ GitHub: [link]
 ## Discord (OpenClaw / AI Dev communities)
 
 **Short version:**
-Built `claude-max-api-proxy` — turns your Claude Max subscription into an OpenAI-compatible API. One npm install, runs on localhost:3456. Streaming, usage tracking, team auth. Uses the official CLI, no OAuth hacks. `npm i -g claude-max-api-proxy`
+Built `cli-openai-proxy` — turns your Claude Max subscription into an OpenAI-compatible API. One npm install, runs on localhost:3456. Streaming, usage tracking, team auth. Uses the official CLI, no OAuth hacks. `npm i -g cli-openai-proxy`
 
 ---
 

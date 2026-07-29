@@ -146,7 +146,7 @@ export class PaperclipRunner extends EventEmitter implements AgentRunner {
       // (runningProcesses map, ${runId}.log) on runId, so concurrent runs in the
       // same process/millisecond must not collide.
       runId: `run-${randomUUID()}`,
-      agent: { id: "claude-max-proxy", companyId: "local", name: "proxy", adapterType: null, adapterConfig: null },
+      agent: { id: "cli-openai-proxy", companyId: "local", name: "proxy", adapterType: null, adapterConfig: null },
       runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null, taskKey: null },
       config: {
         ...this.baseConfig,

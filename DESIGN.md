@@ -48,7 +48,7 @@ This plugin enables Clawdbot to use Claude Max subscription through the Claude C
 ### 1. Plugin Structure
 
 ```
-claude-code-cli-provider/
+cli-openai-proxy/
 ├── package.json
 ├── tsconfig.json
 ├── src/
@@ -794,7 +794,7 @@ interface PluginConfig {
 
 1. Build: `npm run build`
 2. Package: `npm pack`
-3. Install in Clawdbot: `clawdbot plugins install ./claude-code-cli-provider-1.0.0.tgz`
+3. Install in Clawdbot: `clawdbot plugins install ./cli-openai-proxy-<version>.tgz`
 4. Configure: `clawdbot models auth login --provider claude-code-cli`
 5. Set default model: Edit `~/.clawdbot/clawdbot.json`
 
