@@ -152,6 +152,29 @@ describe("ClaudeSetupTokenSession", () => {
     assert.strictEqual(pty.killed, true, "a completed session releases its child");
   });
 
+  // The delay exists so the CLI's paste handling settles before Enter arrives;
+  // if the default silently stopped applying, the original stall would return
+  // for every caller that does not configure the option.
+  test("submit falls back to the default Enter delay when none is configured", async () => {
+    const pty = new FakePty();
+    const session = sessionWith(pty, { enterDelayMs: undefined });
+    const started = session.start();
+    setTimeout(() => pty.emit(osc8(AUTHORIZE, "auth")), 5);
+    await started;
+
+    const writtenAt: Record<string, number> = {};
+    pty.onWrite = (data, p) => {
+      writtenAt[data] = Date.now();
+      if (data === "\r") setTimeout(() => p.emit("\r\nsk-ant-oat01-ABCdef_123\r\n"), 5);
+    };
+    await session.submit("code-123");
+
+    assert.ok(
+      writtenAt["\r"] - writtenAt["code-123"] >= 450,
+      "Enter must wait out the 500ms default paste-settle delay",
+    );
+  });
+
   // A rejected exchange does not exit the CLI: it prints an OAuth error and offers
   // "Press Enter to retry". Without spotting the error line, every bad code would
   // stall the caller until the full submit timeout.
