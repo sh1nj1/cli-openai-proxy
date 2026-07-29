@@ -127,7 +127,10 @@ walkthrough: [docs/paperclip-adapters.md](docs/paperclip-adapters.md#collavre-in
   to temp files and handed to the CLI as inline links, so the agent can see them;
   works across all adapters
 - **OpenAI-shaped errors** — usage limits become `429 insufficient_quota` (with
-  `Retry-After`), an unauthenticated CLI becomes `401 engine_unauthenticated`
+  `Retry-After`), an unauthenticated CLI becomes `401 engine_unauthenticated`.
+  Those statuses and headers apply to non-streaming requests; a streaming request
+  has already flushed `200`, so the same classified error arrives in-band as an
+  SSE `{"error": {...}}` object carrying the same `type`/`code`
 - **Remote CLI auth provisioning** — log a CLI in over HTTP
 - **Usage tracking** — token counts, latency, and per-model request history
 - **API key auth** — optional Bearer tokens for shared deployments
