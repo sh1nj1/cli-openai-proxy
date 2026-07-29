@@ -22,7 +22,7 @@ set, separate from the completion-facing `API_KEYS`:
 ```bash
 API_KEYS=sk-team-abc123 \
 AUTH_ADMIN_KEYS=sk-admin-xyz789 \
-claude-max-api
+cli-openai-proxy
 ```
 
 With it unset, every `/v1/auth/*` route answers `404 auth_provisioning_disabled`

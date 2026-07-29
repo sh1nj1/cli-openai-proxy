@@ -48,25 +48,73 @@ const PRICING: Record<string, { input: number; output: number }> = {
   haiku:  { input: 0.25,  output: 1.25  },
 };
 
-const DEFAULT_DATA_DIR = path.join(
-  process.env.HOME || "/tmp",
-  ".claude-max-proxy"
-);
+export const DATA_DIR_NAME = ".cli-openai-proxy";
+// Pre-rename location. Kept only so an upgrade adopts existing history.
+export const LEGACY_DATA_DIR_NAME = ".claude-max-proxy";
+
+// Resolved per instance, not at module load, so HOME stays overridable.
+function defaultDataDir(): string {
+  return path.join(process.env.HOME || "/tmp", DATA_DIR_NAME);
+}
+
+function legacyDataDir(): string {
+  return path.join(process.env.HOME || "/tmp", LEGACY_DATA_DIR_NAME);
+}
 
 export class UsageTracker {
   private records: RequestRecord[] = [];
   private dataDir: string;
+  private legacyDir: string | null;
   private loaded = false;
   private saveDebounce: NodeJS.Timeout | null = null;
   private startedAt: number;
 
   constructor(dataDir?: string) {
-    this.dataDir = dataDir || DEFAULT_DATA_DIR;
+    this.dataDir = dataDir || defaultDataDir();
+    // An explicitly chosen directory is the caller's business — never migrate into it.
+    this.legacyDir = dataDir ? null : legacyDataDir();
     this.startedAt = Date.now();
+  }
+
+  /**
+   * Adopt the pre-rename data directory. Without this, renaming the package
+   * would silently reset every existing user's usage history to zero — load()
+   * treats a missing file as "no data yet", so the loss would be invisible.
+   */
+  private async migrateLegacyDataDir(): Promise<void> {
+    if (this.legacyDir === null) return;
+
+    try {
+      await fs.access(this.dataDir);
+      return; // already on the new layout
+    } catch {
+      // new dir absent — a legacy dir may be waiting
+    }
+
+    try {
+      await fs.access(this.legacyDir);
+    } catch {
+      return; // nothing to adopt
+    }
+
+    try {
+      await fs.rename(this.legacyDir, this.dataDir);
+    } catch {
+      try {
+        await fs.access(this.dataDir);
+        return; // another process won the migration race
+      } catch {
+        // destination is still absent — keep using the readable legacy data
+      }
+      // Read in place rather than start empty; retried on the next boot.
+      this.dataDir = this.legacyDir;
+    }
   }
 
   async load(): Promise<void> {
     if (this.loaded) return;
+
+    await this.migrateLegacyDataDir();
 
     try {
       await fs.mkdir(this.dataDir, { recursive: true });

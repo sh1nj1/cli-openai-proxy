@@ -16,7 +16,7 @@ import { PKG_VERSION, getTimeoutMs } from "../config.js";
 const DEFAULT_PORT = 3456;
 
 async function main(): Promise<void> {
-  console.log(`\nclaude-max-api-proxy v${PKG_VERSION}`);
+  console.log(`\ncli-openai-proxy v${PKG_VERSION}`);
   console.log("=".repeat(40));
 
   // Parse port and host from command line / environment
