@@ -4,6 +4,7 @@
 
 import type { ClaudeCliResult } from "../types/claude-cli.js";
 import type { OpenAIChatResponse, OpenAIChatChunk, OpenAIUsage } from "../types/openai.js";
+import { runUsage } from "../usage/run-usage.js";
 
 /**
  * Map CLI token counts onto the OpenAI usage object.
@@ -36,7 +37,7 @@ export function cliUsageToOpenai(usage: ClaudeCliResult["usage"] | undefined): O
 export function createUsageChunk(
   requestId: string,
   requestedModel: string,
-  usage: ClaudeCliResult["usage"] | undefined,
+  result: ClaudeCliResult | undefined,
 ): OpenAIChatChunk {
   return {
     id: `chatcmpl-${requestId}`,
@@ -44,7 +45,7 @@ export function createUsageChunk(
     created: Math.floor(Date.now() / 1000),
     model: requestedModel,
     choices: [],
-    usage: cliUsageToOpenai(usage),
+    usage: cliUsageToOpenai(runUsage(result)),
   };
 }
 
@@ -95,7 +96,7 @@ export function cliResultToOpenai(
         finish_reason: "stop",
       },
     ],
-    usage: cliUsageToOpenai(result.usage),
+    usage: cliUsageToOpenai(runUsage(result)),
   };
 }
 

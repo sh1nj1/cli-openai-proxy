@@ -266,7 +266,7 @@ async function handleStreamingResponse(
         // Totals ride their own trailing chunk (empty `choices`) so a client that
         // never asked for them is not handed a chunk whose choices[0] is absent.
         if (includeUsage) {
-          res.write(`data: ${JSON.stringify(createUsageChunk(requestId, requestedModel, result.usage))}\n\n`);
+          res.write(`data: ${JSON.stringify(createUsageChunk(requestId, requestedModel, result))}\n\n`);
         }
         res.write("data: [DONE]\n\n");
         res.end();

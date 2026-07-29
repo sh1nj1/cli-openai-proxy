@@ -7,6 +7,7 @@
 
 import fs from "fs/promises";
 import path from "path";
+import { aggregateRunTokens, type ModelUsage } from "./run-usage.js";
 
 export interface RequestRecord {
   timestamp: number;
@@ -61,13 +62,7 @@ function cost(family: string, inputTokens: number, outputTokens: number): number
   return (inputTokens / 1_000_000) * pricing.input + (outputTokens / 1_000_000) * pricing.output;
 }
 
-/** Per-model usage as the Claude CLI reports it in a result message. */
-export interface ModelUsage {
-  inputTokens?: number;
-  outputTokens?: number;
-  cacheReadInputTokens?: number;
-  cacheCreationInputTokens?: number;
-}
+export type { ModelUsage };
 
 export interface BilledRun {
   /** Pricing family the run is grouped under in `byModel`. */
@@ -90,12 +85,7 @@ export interface BilledRun {
  * sidechain would drag an Opus turn down, a short Opus answer would bill a large
  * Haiku sidechain up.
  *
- * Token totals come from `modelUsage` too. Measured against the CLI: top-level
- * `usage` covers the main chain only while `modelUsage` includes sidechains, and
- * they match exactly when no subagent ran — so the fallback totals are only for
- * runs that reported no model at all (a failure, or codex-jsonl's synthesized
- * empty `modelUsage`), plus a cache field no entry reported at all, which would
- * otherwise zero a count the run totals still carry.
+ * Token totals come from `modelUsage` too — see aggregateRunTokens.
  *
  * The run stays one record, labelled with the family that produced the most
  * output, so request counts stay honest and a Haiku sidechain does not relabel
@@ -111,60 +101,38 @@ export function billRun(
     cacheWriteTokens?: number;
   },
 ): BilledRun {
-  const entries = Object.entries(result?.modelUsage ?? {});
+  const tokens = aggregateRunTokens(result?.modelUsage, {
+    inputTokens: fallback.inputTokens,
+    outputTokens: fallback.outputTokens,
+    cacheReadTokens: fallback.cacheReadTokens ?? 0,
+    cacheWriteTokens: fallback.cacheWriteTokens ?? 0,
+  });
 
+  const entries = Object.entries(result?.modelUsage ?? {});
   if (entries.length === 0) {
     const family = pricingFamily(fallback.model);
     return {
       model: family,
-      inputTokens: fallback.inputTokens,
-      outputTokens: fallback.outputTokens,
-      cacheReadTokens: fallback.cacheReadTokens ?? 0,
-      cacheWriteTokens: fallback.cacheWriteTokens ?? 0,
-      costUsd: cost(family, fallback.inputTokens, fallback.outputTokens),
+      ...tokens,
+      costUsd: cost(family, tokens.inputTokens, tokens.outputTokens),
     };
   }
 
-  const billed: BilledRun = {
-    model: "sonnet",
-    inputTokens: 0,
-    outputTokens: 0,
-    cacheReadTokens: 0,
-    cacheWriteTokens: 0,
-    costUsd: 0,
-  };
+  let model = "sonnet";
   let dominantOutput = -1;
-  // Undefined until some entry reports the field, so an absent one keeps the
-  // run total rather than zeroing it — the cache fields are optional per model
-  // while input/output are not.
-  let cacheRead: number | undefined;
-  let cacheWrite: number | undefined;
+  let costUsd = 0;
 
-  for (const [model, usage] of entries) {
-    const inputTokens = usage?.inputTokens ?? 0;
+  for (const [name, usage] of entries) {
     const outputTokens = usage?.outputTokens ?? 0;
-
-    billed.inputTokens += inputTokens;
-    billed.outputTokens += outputTokens;
-    billed.costUsd += cost(pricingFamily(model), inputTokens, outputTokens);
-
-    if (usage?.cacheReadInputTokens !== undefined) {
-      cacheRead = (cacheRead ?? 0) + usage.cacheReadInputTokens;
-    }
-    if (usage?.cacheCreationInputTokens !== undefined) {
-      cacheWrite = (cacheWrite ?? 0) + usage.cacheCreationInputTokens;
-    }
+    costUsd += cost(pricingFamily(name), usage?.inputTokens ?? 0, outputTokens);
 
     if (outputTokens > dominantOutput) {
       dominantOutput = outputTokens;
-      billed.model = pricingFamily(model);
+      model = pricingFamily(name);
     }
   }
 
-  billed.cacheReadTokens = cacheRead ?? fallback.cacheReadTokens ?? 0;
-  billed.cacheWriteTokens = cacheWrite ?? fallback.cacheWriteTokens ?? 0;
-
-  return billed;
+  return { model, ...tokens, costUsd };
 }
 
 export const DATA_DIR_NAME = ".cli-openai-proxy";

@@ -328,6 +328,30 @@ const streamUsageExecute: AdapterExecute = async (ctx) => {
     usage: { inputTokens: 2, outputTokens: 7, cachedInputTokens: 30_000 } };
 };
 
+// A run whose subagent spent far more than the main chain: `usage` sees only the
+// main chain, `modelUsage` sees both.
+const sidechainResultLine = JSON.stringify({
+  type: "result", subtype: "success", is_error: false, result: "Yo",
+  session_id: "s", total_cost_usd: 0, duration_ms: 1, duration_api_ms: 1,
+  num_turns: 1,
+  usage: { input_tokens: 2, output_tokens: 7, cache_read_input_tokens: 1_000 },
+  modelUsage: {
+    "claude-opus-5": {
+      inputTokens: 2, outputTokens: 7, cacheReadInputTokens: 1_000, costUSD: 0,
+    },
+    "claude-haiku-4-5": {
+      inputTokens: 40, outputTokens: 900, cacheReadInputTokens: 5_000, costUSD: 0,
+    },
+  },
+}) + "\n";
+
+const sidechainExecute: AdapterExecute = async (ctx) => {
+  await ctx.onLog("stdout", deltaLine);
+  await ctx.onLog("stdout", sidechainResultLine);
+  return { exitCode: 0, signal: null, timedOut: false, sessionId: "s",
+    usage: { inputTokens: 2, outputTokens: 7 } };
+};
+
 test("stream_options.include_usage emits a terminal usage chunk before [DONE]", async () => {
   const body = await streamThroughFakeAdapter(
     { model: "paperclip/claude_local", stream_options: { include_usage: true } },
@@ -414,6 +438,40 @@ test("non-streaming usage reports cache tokens in prompt_tokens", async () => {
     const payload = JSON.parse(res.body);
     assert.equal(payload.usage.prompt_tokens, 30_502);
     assert.equal(payload.usage.prompt_tokens_details.cached_tokens, 30_000);
+  } finally {
+    runnerFactory.create = orig;
+  }
+});
+
+test("terminal usage chunk covers subagent runs, not just the main chain", async () => {
+  const body = await streamThroughFakeAdapter(
+    { model: "paperclip/claude_local", stream_options: { include_usage: true } },
+    sidechainExecute,
+  );
+
+  const usageChunks = sseChunks(body).filter((c) => c.usage);
+  assert.equal(usageChunks.length, 1);
+  assert.equal(usageChunks[0].usage.prompt_tokens, 6_042);
+  assert.equal(usageChunks[0].usage.completion_tokens, 907);
+  assert.equal(usageChunks[0].usage.prompt_tokens_details.cached_tokens, 6_000);
+});
+
+test("non-streaming usage covers subagent runs", async () => {
+  // Streaming and non-streaming must agree on the same run — a client switching
+  // stream on/off would otherwise see two different bills for one request.
+  const orig = runnerFactory.create;
+  runnerFactory.create = (model: string) =>
+    model.startsWith("paperclip/")
+      ? new PaperclipRunner(sidechainExecute, { engine: "cli" })
+      : orig(model);
+  try {
+    const req = { body: { model: "paperclip/claude_local", stream: false,
+      messages: [{ role: "user", content: "hi" }] } } as unknown as Request;
+    const res = fakeRes();
+    await handleChatCompletions(req, res);
+    const payload = JSON.parse(res.body);
+    assert.equal(payload.usage.prompt_tokens, 6_042);
+    assert.equal(payload.usage.completion_tokens, 907);
   } finally {
     runnerFactory.create = orig;
   }
