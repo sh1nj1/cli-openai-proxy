@@ -26,6 +26,19 @@ command_path() {
   command -v "$1" 2>/dev/null || true
 }
 
+trusted_command_path() {
+  local name="$1"
+  local candidate
+
+  for candidate in "/usr/bin/$name" "/usr/sbin/$name" "/bin/$name" "/sbin/$name"; do
+    if [[ -x "$candidate" ]]; then
+      printf '%s\n' "$candidate"
+      return
+    fi
+  done
+  return 0
+}
+
 unit_quote() {
   local value="$1"
   value="${value//\\/\\\\}"
@@ -58,6 +71,49 @@ health_check() {
     });
     request.on("timeout", () => request.destroy());
     request.on("error", () => process.exit(1));
+  ' "$1" "$2"
+}
+
+listener_belongs_to_pid() {
+  "$NODE_BIN" -e '
+    const fs = require("node:fs");
+    const pid = process.argv[1];
+    const expectedPort = Number(process.argv[2]);
+
+    try {
+      const socketInodes = new Set();
+      for (const fd of fs.readdirSync(`/proc/${pid}/fd`)) {
+	let target;
+	try {
+	  target = fs.readlinkSync(`/proc/${pid}/fd/${fd}`);
+	} catch {
+	  continue;
+	}
+	const match = /^socket:\[(\d+)\]$/.exec(target);
+	if (match) socketInodes.add(match[1]);
+      }
+
+      for (const table of [`/proc/${pid}/net/tcp`, `/proc/${pid}/net/tcp6`]) {
+	let rows;
+	try {
+	  rows = fs.readFileSync(table, "utf8").trim().split("\n").slice(1);
+	} catch {
+	  continue;
+	}
+	for (const row of rows) {
+	  const fields = row.trim().split(/\s+/);
+	  if (fields.length < 10 || fields[3] !== "0A") continue;
+	  const separator = fields[1].lastIndexOf(":");
+	  const port = Number.parseInt(fields[1].slice(separator + 1), 16);
+	  if (port === expectedPort && socketInodes.has(fields[9])) {
+	    process.exit(0);
+	  }
+	}
+      }
+    } catch {
+      // The unit may be between restart attempts; let the caller retry.
+    }
+    process.exit(1);
   ' "$1" "$2"
 }
 
@@ -103,20 +159,23 @@ CONFIG_HOME="${XDG_CONFIG_HOME:-$HOME/.config}"
 ENV_FILE="$CONFIG_HOME/claude-max-api-proxy.env"
 SYSTEMD_USER_DIR="$CONFIG_HOME/systemd/user"
 SERVICE_FILE="$SYSTEMD_USER_DIR/$SERVICE_NAME.service"
-SERVICE_USER="$(id -un)"
 
 [[ -f "$PROJECT_DIR/package.json" ]] || die "package.json not found in $PROJECT_DIR"
 
 NODE_BIN="$(command_path node)"
 NPM_BIN="$(command_path npm)"
 SYSTEMCTL_BIN="$(command_path systemctl)"
-LOGINCTL_BIN="$(command_path loginctl)"
-SUDO_BIN="$(command_path sudo)"
+LOGINCTL_BIN="$(trusted_command_path loginctl)"
+SUDO_BIN="$(trusted_command_path sudo)"
+ID_BIN="$(trusted_command_path id)"
 
 [[ -n "$NODE_BIN" ]] || die "Node.js $MIN_NODE_VERSION or newer is required"
 [[ -n "$NPM_BIN" ]] || die "npm is required"
 [[ -n "$SYSTEMCTL_BIN" ]] || die "systemctl is required (Ubuntu with systemd)"
 [[ -n "$LOGINCTL_BIN" ]] || die "loginctl is required (systemd-logind)"
+[[ -n "$ID_BIN" ]] || die "id is required"
+
+SERVICE_USER="$("$ID_BIN" -un)"
 
 "$NODE_BIN" -e '
   const current = process.versions.node.split(".").map(Number);
@@ -130,7 +189,7 @@ SUDO_BIN="$(command_path sudo)"
 
 if [[ -z "$(command_path make)" || -z "$(command_path g++)" ]] \
   || [[ -z "$(command_path python3)" && -z "$(command_path python)" ]]; then
-  APT_GET_BIN="$(command_path apt-get)"
+  APT_GET_BIN="$(trusted_command_path apt-get)"
   [[ -n "$APT_GET_BIN" && -n "$SUDO_BIN" ]] \
     || die "Native build tools are required. On Ubuntu: sudo apt-get install -y build-essential python3"
   log "Installing Ubuntu native build prerequisites"
@@ -259,7 +318,14 @@ while ((SECONDS < DEADLINE)); do
       :: | "[::]") PROBE_HOST="::1" ;;
     esac
 
-    if health_check "$PROBE_HOST" "$EFFECTIVE_PORT"; then
+    CURRENT_MAIN_PID=""
+    if listener_belongs_to_pid "$MAIN_PID" "$EFFECTIVE_PORT" \
+      && health_check "$PROBE_HOST" "$EFFECTIVE_PORT"; then
+      CURRENT_MAIN_PID="$("$SYSTEMCTL_BIN" --user show "$SERVICE_NAME.service" \
+      --property=MainPID --value 2>/dev/null || true)"
+    fi
+    if [[ "$CURRENT_MAIN_PID" == "$MAIN_PID" ]] \
+      && listener_belongs_to_pid "$MAIN_PID" "$EFFECTIVE_PORT"; then
       READY=1
       break
     fi
