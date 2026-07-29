@@ -26,8 +26,16 @@ import {
 export const CLAUDE_OAUTH_TOKEN_ENV = "CLAUDE_CODE_OAUTH_TOKEN";
 
 const OAUTH_TOKEN = /sk-ant-oat\d+-[A-Za-z0-9_-]+/;
+// A failed code exchange leaves the CLI alive at a "Press Enter to retry" prompt,
+// so the error line in the output is the only rejection signal there is.
+const OAUTH_ERROR = /OAuth error/i;
 const DEFAULT_URL_TIMEOUT_MS = 60_000;
 const DEFAULT_SUBMIT_TIMEOUT_MS = 120_000;
+// The CLI treats a multi-character chunk as a paste: a \r inside the chunk is
+// swallowed as pasted text, not dispatched as Enter (verified against v2.1.220,
+// which sat at the prompt indefinitely on `write(code + "\r")`). Enter must
+// arrive as its own input event, after the paste has settled.
+const DEFAULT_ENTER_DELAY_MS = 500;
 
 /** Only an OAuth authorize URL is a verification URL; other links the CLI prints are not. */
 const isAuthorizeUrl = (url: string): boolean => url.includes("/oauth/authorize");
@@ -42,6 +50,7 @@ export interface ClaudeSetupTokenOptions {
   spawn?: typeof ptySpawner.spawn;
   urlTimeoutMs?: number;
   submitTimeoutMs?: number;
+  enterDelayMs?: number;
 }
 
 export class ClaudeSetupTokenSession implements EngineAuthSession {
@@ -101,17 +110,28 @@ export class ClaudeSetupTokenSession implements EngineAuthSession {
       );
     }
 
+    this.pty.write(trimmed);
+    await new Promise((resolve) =>
+      setTimeout(resolve, this.options.enterDelayMs ?? DEFAULT_ENTER_DELAY_MS),
+    );
     // \r, not \n: the CLI reads from a terminal, where Enter is carriage return.
-    this.pty.write(`${trimmed}\r`);
+    // Skipped if the session was cancelled (pty nulled) or the CLI died meanwhile;
+    // the waitFor below reports what actually happened.
+    if (this.pty && !this.exited) this.pty.write("\r");
 
     const token = await this.waitFor(
       () => OAUTH_TOKEN.exec(stripAnsi(this.buffer))?.[0] ?? null,
       this.options.submitTimeoutMs ?? DEFAULT_SUBMIT_TIMEOUT_MS,
       "Timed out waiting for Claude to return a token",
       "token_timeout",
-      // A rejected code makes the CLI exit without printing a token; surface that
-      // immediately instead of stalling the caller until the timeout.
-      () => this.abortReason("Claude rejected the authorization code", "code_rejected"),
+      () => {
+        // A rejected exchange does not exit the CLI — it re-prompts ("Press Enter
+        // to retry"), so the printed error is the only signal to fail fast on.
+        if (OAUTH_ERROR.test(stripAnsi(this.buffer))) {
+          return { message: "Claude rejected the authorization code", code: "code_rejected" };
+        }
+        return this.abortReason("Claude rejected the authorization code", "code_rejected");
+      },
     );
 
     this.cancel();
