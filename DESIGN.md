@@ -153,9 +153,9 @@ current runners do not map it to CLI sessions.
 | Unknown / non-`paperclip/*` model id | `404 model_not_found` — the caller's mistake, not a server fault |
 | Empty or missing `messages` | `400 invalid_messages` |
 | Oversized image (decoded > 20MB ceiling) | clean `400` from the image materializer, provided the encoded request still fits under the 30MB JSON body limit; a body so large that `express.json()` rejects it first never reaches the materializer and is currently surfaced as a `500` by the generic error handler |
-| CLI not logged in / auth failure | `401` naming the auth engine (`claude`, `codex`) so the caller knows which login flow to run — optionally via the [remote auth API](docs/cli-auth-provisioning.md) |
+| CLI not logged in / auth failure | non-streaming: `401` naming the auth engine (`claude`, `codex`) so the caller knows which login flow to run — optionally via the [remote auth API](docs/cli-auth-provisioning.md). Streaming: the SSE response has already flushed a `200` header before the CLI starts, so the classified error (same `type`/`code`/`engine`) arrives in-band as a `data: {"error": ...}` event instead of an HTTP status — clients that trigger reauthentication from HTTP status alone will miss it |
 | CLI run failure / timeout | adapter error mapped to an OpenAI-style error body by `adapter-error.ts` |
-| Missing CLI at startup | non-fatal: preflight warns and the server still starts, because the proxy also serves other adapters; a request targeting the missing CLI fails cleanly at request time |
+| Missing Claude CLI at startup | non-fatal: preflight warns and the server still starts, because the proxy also serves other adapters. The preflight checks Claude only (`verifyClaude`/`verifyAuth`); a missing Codex CLI (or any future adapter's CLI) produces no startup diagnostic and surfaces only when the first request targeting it fails cleanly at request time |
 
 ## Configuration
 

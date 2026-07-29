@@ -75,7 +75,7 @@ The route layer is adapter-agnostic; the events it consumes are:
 |-------|---------|--------------|
 | `content_delta` | text fragment | SSE `chat.completion.chunk`s |
 | `result` | terminal CLI result (usage, cost, summary) | final response, usage billing |
-| `error` | `Error` (adapter-aware) | OpenAI-style error body, 401-on-auth-failure |
+| `error` | `Error` (adapter-aware) | OpenAI-style error body — non-streaming maps it to an HTTP status (`401` on auth failure); streaming has already flushed `200` and writes it in-band as an SSE `error` event |
 | `close` | exit code | response finalization |
 | `raw` / `message` / `assistant` | raw CLI lines / parsed messages | debugging only — not consumed by routes (`assistant` is emitted by the Claude runner only) |
 
