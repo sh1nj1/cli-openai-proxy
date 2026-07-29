@@ -141,6 +141,19 @@ service_executable_is_trusted() {
   path_metadata_is_trusted "$resolved" file
 }
 
+prepare_trusted_directory() {
+  local directory="$1"
+  local description="$2"
+
+  [[ "$directory" == /* ]] \
+    || die "$description must be an absolute path: $directory"
+  service_path_is_trusted "$directory" \
+    || die "Refusing $description with untrusted ownership or permissions: $directory"
+  mkdir -p -- "$directory"
+  service_path_is_trusted "$directory" \
+    || die "Failed to create a trusted $description: $directory"
+}
+
 append_service_path() {
   local directory="$1"
 
@@ -322,7 +335,8 @@ log "Building production files"
 (cd "$PROJECT_DIR" && "$NPM_BIN" run build)
 [[ -f "$ENTRYPOINT" ]] || die "Build did not create $ENTRYPOINT"
 
-mkdir -p "$CONFIG_HOME" "$SYSTEMD_USER_DIR"
+prepare_trusted_directory "$CONFIG_HOME" "configuration directory"
+prepare_trusted_directory "$SYSTEMD_USER_DIR" "systemd user unit directory"
 
 if [[ ! -f "$ENV_FILE" ]]; then
   ENV_PORT="$(env_quote "$PORT")"
