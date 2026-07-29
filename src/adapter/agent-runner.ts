@@ -1,9 +1,7 @@
 import type { EventEmitter } from "events";
-import type { ClaudeModel } from "./openai-to-cli.js";
 
 /** Options shared by every CLI adapter runner behind the OpenAI route layer. */
 export interface RunnerOptions {
-  model: ClaudeModel | (string & {});
   /** Accepted for the OpenAI `user` contract; current runners are stateless. */
   sessionId?: string;
   systemPrompt?: string;

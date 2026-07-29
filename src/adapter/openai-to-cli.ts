@@ -22,69 +22,11 @@ function extractText(content: string | OpenAIContentPart[]): string {
   return String(content);
 }
 
-export type ClaudeModel = "opus" | "sonnet" | "haiku";
-
 export interface CliInput {
   prompt: string;
-  model: ClaudeModel;
   systemPrompt?: string;
   sessionId?: string;
   jsonMode?: boolean;
-}
-
-const MODEL_MAP: Record<string, ClaudeModel> = {
-  // Direct model names
-  "claude-opus-4": "opus",
-  "claude-opus-4-6": "opus",
-  "claude-sonnet-4": "sonnet",
-  "claude-sonnet-4-5-20250929": "sonnet",
-  "claude-haiku-4": "haiku",
-  "claude-haiku-4-5-20251001": "haiku",
-  // With provider prefix
-  "claude-code-cli/claude-opus-4": "opus",
-  "claude-code-cli/claude-opus-4-6": "opus",
-  "claude-code-cli/claude-sonnet-4": "sonnet",
-  "claude-code-cli/claude-sonnet-4-5-20250929": "sonnet",
-  "claude-code-cli/claude-haiku-4": "haiku",
-  "claude-code-cli/claude-haiku-4-5-20251001": "haiku",
-  // Anthropic-style model IDs (used by OpenClaw)
-  "anthropic/claude-opus-4-6": "opus",
-  "anthropic/claude-opus-4": "opus",
-  "anthropic/claude-sonnet-4": "sonnet",
-  "anthropic/claude-sonnet-4-5-20250929": "sonnet",
-  "anthropic/claude-haiku-4": "haiku",
-  "anthropic/claude-haiku-4-5-20251001": "haiku",
-  // Claude Max provider prefix (used by OpenClaw)
-  "claude-max/claude-opus-4-6": "opus",
-  "claude-max/claude-opus-4": "opus",
-  "claude-max/claude-sonnet-4": "sonnet",
-  "claude-max/claude-sonnet-4-5-20250929": "sonnet",
-  "claude-max/claude-haiku-4": "haiku",
-  "claude-max/claude-haiku-4-5-20251001": "haiku",
-  // Aliases
-  "opus": "opus",
-  "sonnet": "sonnet",
-  "haiku": "haiku",
-};
-
-/**
- * Extract Claude model alias from request model string
- */
-export function extractModel(model: string): ClaudeModel {
-  if (MODEL_MAP[model]) {
-    return MODEL_MAP[model];
-  }
-
-  // Strip any provider prefix (openai/, anthropic/, claude-max/, etc.)
-  const slashIdx = model.indexOf("/");
-  if (slashIdx !== -1) {
-    const stripped = model.slice(slashIdx + 1);
-    if (MODEL_MAP[stripped]) {
-      return MODEL_MAP[stripped];
-    }
-  }
-
-  return "opus";
 }
 
 /**
@@ -219,7 +161,6 @@ export function openaiToCli(request: OpenAIChatRequest): CliInput {
 
   return {
     prompt: messagesToPrompt(request.messages),
-    model: extractModel(request.model),
     systemPrompt,
     sessionId: request.user,
     jsonMode,

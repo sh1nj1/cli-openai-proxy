@@ -2,57 +2,18 @@
  * Converts Claude CLI output to OpenAI-compatible response format
  */
 
-import type { ClaudeCliAssistant, ClaudeCliResult } from "../types/claude-cli.js";
+import type { ClaudeCliResult } from "../types/claude-cli.js";
 import type { OpenAIChatResponse, OpenAIChatChunk } from "../types/openai.js";
-
-/**
- * Extract text content from Claude CLI assistant message
- */
-export function extractTextContent(message: ClaudeCliAssistant): string {
-  return message.message.content
-    .filter((c) => c.type === "text")
-    .map((c) => c.text)
-    .join("");
-}
-
-/**
- * Convert Claude CLI assistant message to OpenAI streaming chunk
- */
-export function cliToOpenaiChunk(
-  message: ClaudeCliAssistant,
-  requestId: string,
-  isFirst: boolean = false,
-  requestedModel?: string
-): OpenAIChatChunk {
-  const text = extractTextContent(message);
-
-  return {
-    id: `chatcmpl-${requestId}`,
-    object: "chat.completion.chunk",
-    created: Math.floor(Date.now() / 1000),
-    model: requestedModel || normalizeModelName(message.message.model),
-    choices: [
-      {
-        index: 0,
-        delta: {
-          role: isFirst ? "assistant" : undefined,
-          content: text,
-        },
-        finish_reason: message.message.stop_reason ? "stop" : null,
-      },
-    ],
-  };
-}
 
 /**
  * Create a final "done" chunk for streaming
  */
-export function createDoneChunk(requestId: string, model: string): OpenAIChatChunk {
+export function createDoneChunk(requestId: string, requestedModel: string): OpenAIChatChunk {
   return {
     id: `chatcmpl-${requestId}`,
     object: "chat.completion.chunk",
     created: Math.floor(Date.now() / 1000),
-    model: normalizeModelName(model),
+    model: requestedModel,
     choices: [
       {
         index: 0,
@@ -69,21 +30,18 @@ export function createDoneChunk(requestId: string, model: string): OpenAIChatChu
 export function cliResultToOpenai(
   result: ClaudeCliResult,
   requestId: string,
-  requestedModel?: string,
+  requestedModel: string,
   jsonMode?: boolean
 ): OpenAIChatResponse {
-  // Use the requested model so the gateway trusts the response
-  const modelName = requestedModel || (result.modelUsage
-    ? Object.keys(result.modelUsage)[0]
-    : "claude-sonnet-4");
-
   const content = jsonMode ? extractJsonFromText(result.result) : result.result;
 
   return {
     id: `chatcmpl-${requestId}`,
     object: "chat.completion",
     created: Math.floor(Date.now() / 1000),
-    model: normalizeModelName(modelName),
+    // Echoed verbatim: gateways route and validate on this field, so it has to
+    // stay an id the proxy accepts, not one derived from what the CLI reports.
+    model: requestedModel,
     choices: [
       {
         index: 0,
@@ -157,15 +115,4 @@ export function extractJsonFromText(text: string): string {
     }
   }
   return text;
-}
-
-/**
- * Normalize Claude model names to a consistent format
- * e.g., "claude-sonnet-4-5-20250929" -> "claude-sonnet-4"
- */
-function normalizeModelName(model: string): string {
-  if (model.includes("opus")) return "claude-opus-4";
-  if (model.includes("sonnet")) return "claude-sonnet-4";
-  if (model.includes("haiku")) return "claude-haiku-4";
-  return model;
 }

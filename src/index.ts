@@ -1,55 +1,219 @@
 /**
  * Claude Code CLI Provider Plugin for Clawdbot
  *
- * Enables using Claude Max subscription through Claude Code CLI,
- * bypassing OAuth token scope restrictions.
+ * Serves the local coding CLIs registered as Paperclip adapters (Claude Code,
+ * codex) over an OpenAI-compatible API, so a caller spends the subscription each
+ * CLI is already logged into instead of an API key with OAuth scope restrictions.
  */
 
 import { startServer, stopServer, getServer } from "./server/index.js";
 import { verifyClaude, verifyAuth } from "./cli/claude.js";
+import { commandRuns } from "./cli/command.js";
+import { runPreflight } from "./server/preflight.js";
+import {
+  DEFAULT_MODEL,
+  defaultModelForHost,
+  adapterCredentialNotes,
+  adapterLabel,
+  resolvePaperclipModel,
+  suggestedSetupModelIds,
+} from "./adapter/paperclip-registry.js";
 
 // Provider constants
-const PROVIDER_ID = "claude-code-cli";
+export const PROVIDER_ID = "claude-code-cli";
 const PROVIDER_LABEL = "Claude Code CLI";
 const DEFAULT_PORT = 3456;
-const DEFAULT_MODEL = "claude-code-cli/claude-sonnet-4";
 
-// Available models
-const AVAILABLE_MODELS = [
-  {
-    id: "claude-opus-4",
-    name: "Claude Opus 4.5",
-    alias: "opus",
-    reasoning: true,
-  },
-  {
-    id: "claude-sonnet-4",
-    name: "Claude Sonnet 4",
-    alias: "sonnet",
-    reasoning: false,
-  },
-  {
-    id: "claude-haiku-4",
-    name: "Claude Haiku 4",
-    alias: "haiku",
-    reasoning: false,
-  },
-];
+/** "paperclip/claude_local/opus" -> "Claude Local opus (Paperclip)" */
+function modelName(id: string): string {
+  const cliModel = resolvePaperclipModel(id)?.cliModel;
+  return `${adapterLabel(id)}${cliModel ? ` ${cliModel}` : ""} (Paperclip)`;
+}
 
 /**
  * Build model definitions for Clawdbot config
  */
-function buildModelDefinition(model: (typeof AVAILABLE_MODELS)[number]) {
+function buildModelDefinition(id: string) {
   return {
-    id: model.id,
-    name: model.name,
+    id,
+    name: modelName(id),
     api: "openai-completions",
-    reasoning: model.reasoning,
+    // The CLI model is the id's own suffix, so no fixed capability can be claimed here.
+    reasoning: false,
     input: ["text"],
     cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
     contextWindow: 200000,
     maxTokens: 8192,
   };
+}
+
+/** Split a comma-separated model list; blank entries are dropped, not rejected. */
+export function parseSetupModelIds(raw: string): string[] {
+  return raw
+    .split(",")
+    .map((id) => id.trim())
+    .filter(Boolean);
+}
+
+/**
+ * Reject at setup what the proxy would 404 at request time — the config this
+ * setup writes is the one the first completion runs against.
+ */
+export function validateSetupModelIds(raw: string): string | undefined {
+  const ids = parseSetupModelIds(raw);
+  if (ids.length === 0) return "Enter at least one model id";
+  const unknown = ids.filter((id) => resolvePaperclipModel(id) === null);
+  if (unknown.length > 0) {
+    return `Not a registered adapter: ${unknown.join(", ")}. Expected paperclip/<adapter>[/<cli-model>].`;
+  }
+  return undefined;
+}
+
+export interface LocalAuthSetupDeps {
+  verifyClaude: typeof verifyClaude;
+  verifyAuth: typeof verifyAuth;
+  /** Presence probe for a non-Claude adapter's CLI before it is suggested. */
+  commandRuns: typeof commandRuns;
+  startServer: (opts: { port: number }) => Promise<unknown>;
+}
+
+const DEFAULT_SETUP_DEPS: LocalAuthSetupDeps = {
+  verifyClaude,
+  verifyAuth,
+  commandRuns,
+  startServer,
+};
+
+/**
+ * Interactive setup for the `local` auth method.
+ *
+ * Claude is checked but not required: this provider also advertises non-Claude
+ * adapters (paperclip/codex_local), so failing here would lock a codex-only
+ * host out of models it is being offered. Missing Claude becomes a note, which
+ * is the same policy the standalone server applies at startup — hence the
+ * shared `runPreflight`. A Claude-targeted request on such a host still fails
+ * cleanly at request time.
+ */
+export async function runLocalAuthSetup(
+  ctx: any,
+  deps: LocalAuthSetupDeps = DEFAULT_SETUP_DEPS
+): Promise<{ port: number; auth: any }> {
+  const spin = ctx.prompter.progress("Checking Claude CLI...");
+
+  try {
+    const { claudeOk, warnings } = await runPreflight({
+      verifyClaude: deps.verifyClaude,
+      verifyAuth: deps.verifyAuth,
+      log: (msg) => spin.message(msg.trim()),
+    });
+
+    // The provider is configured with this before its first request runs, so it
+    // follows the host: a Claude default on a host that just failed the Claude
+    // preflight would fail that first request until the user switched by hand.
+    const defaultAdapterId = await defaultModelForHost(claudeOk, deps.commandRuns);
+    const defaultModel = `${PROVIDER_ID}/${defaultAdapterId}`;
+
+    if (!claudeOk) {
+      const claudeDefault = `${PROVIDER_ID}/${DEFAULT_MODEL}`;
+      await ctx.prompter.note(
+        [
+          ...warnings,
+          // Only claims a switch that was actually made — and says how to undo it,
+          // since this default is persisted while the probe behind it is not.
+          defaultModel === claudeDefault
+            ? `No other CLI answered either, so the default stays ${defaultModel}.`
+            : `Default model set to ${defaultModel} instead; switch back to ${claudeDefault} once Claude works.`,
+          "Install: npm install -g @anthropic-ai/claude-code",
+          "Authenticate: claude auth login",
+        ].join("\n"),
+        "Claude unavailable"
+      );
+    }
+
+    const portInput = await ctx.prompter.text({
+      message: "Local server port",
+      initialValue: String(DEFAULT_PORT),
+      validate: (v: string) => {
+        const p = parseInt(v, 10);
+        if (isNaN(p) || p < 1 || p > 65535) {
+          return "Enter a valid port (1-65535)";
+        }
+        return undefined;
+      },
+    });
+    const port = parseInt(portInput, 10);
+
+    // Clawdbot selects models from what its config enumerates — `agents.defaults.models`
+    // is an allowlist and takes exact keys only — so a `<cli-model>` suffix that is
+    // never written here cannot be picked, however cleanly the proxy resolves it.
+    const modelsInput = await ctx.prompter.text({
+      message: "Models to register (comma-separated)",
+      initialValue: suggestedSetupModelIds().join(", "),
+      validate: validateSetupModelIds,
+    });
+    const chosen = parseSetupModelIds(modelsInput);
+    // The default is written to the host config whatever this list says, and the
+    // allowlist would then reject the provider's own default.
+    const modelIds = chosen.includes(defaultAdapterId) ? chosen : [defaultAdapterId, ...chosen];
+
+    spin.message("Starting server...");
+    await deps.startServer({ port });
+    spin.stop("Claude CLI provider ready");
+
+    const baseUrl = `http://127.0.0.1:${port}/v1`;
+
+    return {
+      port,
+      auth: {
+        profiles: [
+          {
+            profileId: `${PROVIDER_ID}:local`,
+            credential: {
+              type: "token",
+              provider: PROVIDER_ID,
+              token: "local", // Dummy token - CLI handles auth
+            },
+          },
+        ],
+        configPatch: {
+          models: {
+            providers: {
+              [PROVIDER_ID]: {
+                baseUrl,
+                apiKey: "local",
+                api: "openai-completions",
+                authHeader: false,
+                models: modelIds.map(buildModelDefinition),
+              },
+            },
+          },
+          agents: {
+            defaults: {
+              models: Object.fromEntries(
+                modelIds.map((id) => [`${PROVIDER_ID}/${id}`, {}])
+              ),
+            },
+          },
+        },
+        defaultModel,
+        // Per adapter, not per provider: every advertised model stays selectable
+        // whatever the default is, and they do not spend the same credential.
+        notes: [
+          ...adapterCredentialNotes(),
+          `Default: ${defaultModel}. Any registered model can be selected per request.`,
+          `Registered: ${modelIds.join(", ")}.`,
+          // The proxy takes any suffix; this host only takes what it was told about.
+          `Other CLI models work the same way — add paperclip/<adapter>/<cli-model> to models.providers.${PROVIDER_ID} and agents.defaults.models to select one here.`,
+          "Each CLI keeps its own credentials; none are exposed to this provider.",
+          `Local server running at http://127.0.0.1:${port}`,
+          "Keep the server running to use this provider.",
+        ],
+      },
+    };
+  } catch (err) {
+    spin.stop("Setup failed");
+    throw err;
+  }
 }
 
 /**
@@ -69,8 +233,10 @@ function emptyPluginConfigSchema() {
 const claudeCodeCliPlugin = {
   id: "claude-code-cli-provider",
   name: "Claude Code CLI Provider",
+  // Names no single CLI: which ones are served is the adapter registry's call,
+  // and this string is read before any host has been probed.
   description:
-    "Use Claude Max subscription via Claude Code CLI (bypasses OAuth restrictions)",
+    "Use the CLI logins already on this machine, no API key (bypasses OAuth restrictions)",
   configSchema: emptyPluginConfigSchema(),
 
   register(api: any) {
@@ -88,103 +254,13 @@ const claudeCodeCliPlugin = {
         {
           id: "local",
           label: "Local Claude CLI",
-          hint: "Uses your existing Claude Code CLI authentication (from Claude Max)",
+          hint: "Uses the CLI logins already on this machine; setup lists what each model spends",
           kind: "custom",
 
           run: async (ctx: any) => {
-            const spin = ctx.prompter.progress("Checking Claude CLI...");
-
-            try {
-              // 1. Verify Claude CLI is installed
-              const cliCheck = await verifyClaude();
-              if (!cliCheck.ok) {
-                spin.stop("Claude CLI not found");
-                await ctx.prompter.note(
-                  "Install Claude Code: npm install -g @anthropic-ai/claude-code",
-                  "Installation"
-                );
-                throw new Error(cliCheck.error);
-              }
-              spin.message("Claude CLI found, checking auth...");
-
-              // 2. Verify authentication
-              const authCheck = await verifyAuth();
-              if (!authCheck.ok) {
-                spin.stop("Not authenticated");
-                await ctx.prompter.note(
-                  "Run 'claude auth login' to authenticate with your Claude Max account",
-                  "Authentication"
-                );
-                throw new Error(authCheck.error);
-              }
-              spin.message("Authenticated, starting server...");
-
-              // 3. Ask for port
-              const portInput = await ctx.prompter.text({
-                message: "Local server port",
-                initialValue: String(DEFAULT_PORT),
-                validate: (v: string) => {
-                  const p = parseInt(v, 10);
-                  if (isNaN(p) || p < 1 || p > 65535) {
-                    return "Enter a valid port (1-65535)";
-                  }
-                  return undefined;
-                },
-              });
-              serverPort = parseInt(portInput, 10);
-
-              // 4. Start the local server
-              await startServer({ port: serverPort });
-              spin.stop("Claude CLI provider ready");
-
-              const baseUrl = `http://127.0.0.1:${serverPort}/v1`;
-
-              return {
-                profiles: [
-                  {
-                    profileId: `${PROVIDER_ID}:local`,
-                    credential: {
-                      type: "token",
-                      provider: PROVIDER_ID,
-                      token: "local", // Dummy token - CLI handles auth
-                    },
-                  },
-                ],
-                configPatch: {
-                  models: {
-                    providers: {
-                      [PROVIDER_ID]: {
-                        baseUrl,
-                        apiKey: "local",
-                        api: "openai-completions",
-                        authHeader: false,
-                        models: AVAILABLE_MODELS.map(buildModelDefinition),
-                      },
-                    },
-                  },
-                  agents: {
-                    defaults: {
-                      models: Object.fromEntries(
-                        AVAILABLE_MODELS.map((m) => [
-                          `${PROVIDER_ID}/${m.id}`,
-                          {},
-                        ])
-                      ),
-                    },
-                  },
-                },
-                defaultModel: DEFAULT_MODEL,
-                notes: [
-                  "This uses your Claude Max subscription via Claude Code CLI.",
-                  "Your OAuth token is used by the CLI, not exposed directly.",
-                  `Local server running at http://127.0.0.1:${serverPort}`,
-                  "Keep the server running to use this provider.",
-                ],
-              };
-            } catch (err) {
-              spin.stop("Setup failed");
-              throw err;
-            }
+            const { port, auth } = await runLocalAuthSetup(ctx);
+            serverPort = port;
+            return auth;
           },
         },
       ],

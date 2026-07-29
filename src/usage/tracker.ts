@@ -48,6 +48,125 @@ const PRICING: Record<string, { input: number; output: number }> = {
   haiku:  { input: 0.25,  output: 1.25  },
 };
 
+/** Pricing family a model id belongs to. Unknown ids are priced as Sonnet. */
+function pricingFamily(model: string): string {
+  const id = model.toLowerCase();
+  if (id.includes("opus")) return "opus";
+  if (id.includes("haiku")) return "haiku";
+  return "sonnet";
+}
+
+function cost(family: string, inputTokens: number, outputTokens: number): number {
+  const pricing = PRICING[family];
+  return (inputTokens / 1_000_000) * pricing.input + (outputTokens / 1_000_000) * pricing.output;
+}
+
+/** Per-model usage as the Claude CLI reports it in a result message. */
+export interface ModelUsage {
+  inputTokens?: number;
+  outputTokens?: number;
+  cacheReadInputTokens?: number;
+  cacheCreationInputTokens?: number;
+}
+
+export interface BilledRun {
+  /** Pricing family the run is grouped under in `byModel`. */
+  model: string;
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadTokens: number;
+  cacheWriteTokens: number;
+  costUsd: number;
+}
+
+/**
+ * Price one run from what the CLI reported running.
+ *
+ * A requested id names an adapter, not a model — `paperclip/claude_local` runs
+ * whatever the CLI's own default currently is, so pricing the adapter id would
+ * bill an Opus run at Sonnet rates. `modelUsage` says what actually ran, and a
+ * turn can span families (subagents), so every entry is priced at its own rate:
+ * one family over the whole run is wrong in both directions — a verbose Haiku
+ * sidechain would drag an Opus turn down, a short Opus answer would bill a large
+ * Haiku sidechain up.
+ *
+ * Token totals come from `modelUsage` too. Measured against the CLI: top-level
+ * `usage` covers the main chain only while `modelUsage` includes sidechains, and
+ * they match exactly when no subagent ran — so the fallback totals are only for
+ * runs that reported no model at all (a failure, or codex-jsonl's synthesized
+ * empty `modelUsage`), plus a cache field no entry reported at all, which would
+ * otherwise zero a count the run totals still carry.
+ *
+ * The run stays one record, labelled with the family that produced the most
+ * output, so request counts stay honest and a Haiku sidechain does not relabel
+ * an Opus turn.
+ */
+export function billRun(
+  result: { modelUsage?: Record<string, ModelUsage> } | null | undefined,
+  fallback: {
+    model: string;
+    inputTokens: number;
+    outputTokens: number;
+    cacheReadTokens?: number;
+    cacheWriteTokens?: number;
+  },
+): BilledRun {
+  const entries = Object.entries(result?.modelUsage ?? {});
+
+  if (entries.length === 0) {
+    const family = pricingFamily(fallback.model);
+    return {
+      model: family,
+      inputTokens: fallback.inputTokens,
+      outputTokens: fallback.outputTokens,
+      cacheReadTokens: fallback.cacheReadTokens ?? 0,
+      cacheWriteTokens: fallback.cacheWriteTokens ?? 0,
+      costUsd: cost(family, fallback.inputTokens, fallback.outputTokens),
+    };
+  }
+
+  const billed: BilledRun = {
+    model: "sonnet",
+    inputTokens: 0,
+    outputTokens: 0,
+    cacheReadTokens: 0,
+    cacheWriteTokens: 0,
+    costUsd: 0,
+  };
+  let dominantOutput = -1;
+  // Undefined until some entry reports the field, so an absent one keeps the
+  // run total rather than zeroing it — the cache fields are optional per model
+  // while input/output are not.
+  let cacheRead: number | undefined;
+  let cacheWrite: number | undefined;
+
+  for (const [model, usage] of entries) {
+    const inputTokens = usage?.inputTokens ?? 0;
+    const outputTokens = usage?.outputTokens ?? 0;
+
+    billed.inputTokens += inputTokens;
+    billed.outputTokens += outputTokens;
+    billed.costUsd += cost(pricingFamily(model), inputTokens, outputTokens);
+
+    if (usage?.cacheReadInputTokens !== undefined) {
+      cacheRead = (cacheRead ?? 0) + usage.cacheReadInputTokens;
+    }
+    if (usage?.cacheCreationInputTokens !== undefined) {
+      cacheWrite = (cacheWrite ?? 0) + usage.cacheCreationInputTokens;
+    }
+
+    if (outputTokens > dominantOutput) {
+      dominantOutput = outputTokens;
+      billed.model = pricingFamily(model);
+    }
+  }
+
+  billed.cacheReadTokens = cacheRead ?? fallback.cacheReadTokens ?? 0;
+  billed.cacheWriteTokens = cacheWrite ?? fallback.cacheWriteTokens ?? 0;
+
+  return billed;
+}
+
 export const DATA_DIR_NAME = ".cli-openai-proxy";
 // Pre-rename location. Kept only so an upgrade adopts existing history.
 export const LEGACY_DATA_DIR_NAME = ".claude-max-proxy";
@@ -134,7 +253,10 @@ export class UsageTracker {
    * Record a completed request
    */
   record(entry: {
+    /** Requested id. Only used when the run reported no model of its own. */
     model: string;
+    /** What the CLI reported running, when it reported anything. */
+    modelUsage?: Record<string, ModelUsage>;
     inputTokens: number;
     outputTokens: number;
     cacheReadTokens?: number;
@@ -143,25 +265,17 @@ export class UsageTracker {
     stream: boolean;
     success: boolean;
   }): void {
-    const cliModel = entry.model.toLowerCase();
-    let pricingKey = "sonnet";
-    if (cliModel.includes("opus")) pricingKey = "opus";
-    else if (cliModel.includes("haiku")) pricingKey = "haiku";
-
-    const pricing = PRICING[pricingKey];
-    const estimatedCost =
-      (entry.inputTokens / 1_000_000) * pricing.input +
-      (entry.outputTokens / 1_000_000) * pricing.output;
+    const billed = billRun({ modelUsage: entry.modelUsage }, entry);
 
     const record: RequestRecord = {
       timestamp: Date.now(),
-      model: pricingKey,
-      inputTokens: entry.inputTokens,
-      outputTokens: entry.outputTokens,
-      cacheReadTokens: entry.cacheReadTokens || 0,
-      cacheWriteTokens: entry.cacheWriteTokens || 0,
+      model: billed.model,
+      inputTokens: billed.inputTokens,
+      outputTokens: billed.outputTokens,
+      cacheReadTokens: billed.cacheReadTokens,
+      cacheWriteTokens: billed.cacheWriteTokens,
       durationMs: entry.durationMs,
-      estimatedApiCostUsd: estimatedCost,
+      estimatedApiCostUsd: billed.costUsd,
       stream: entry.stream,
       success: entry.success,
     };

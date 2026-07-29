@@ -1,41 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { extractModel, messagesToPrompt, extractSystemPrompt, openaiToCli } from "./openai-to-cli.js";
-
-describe("extractModel", () => {
-  it("maps direct model names", () => {
-    assert.equal(extractModel("claude-opus-4"), "opus");
-    assert.equal(extractModel("claude-opus-4-6"), "opus");
-    assert.equal(extractModel("claude-sonnet-4"), "sonnet");
-    assert.equal(extractModel("claude-sonnet-4-5-20250929"), "sonnet");
-    assert.equal(extractModel("claude-haiku-4"), "haiku");
-    assert.equal(extractModel("claude-haiku-4-5-20251001"), "haiku");
-  });
-
-  it("maps provider-prefixed names", () => {
-    assert.equal(extractModel("claude-code-cli/claude-opus-4"), "opus");
-    assert.equal(extractModel("anthropic/claude-opus-4-6"), "opus");
-    assert.equal(extractModel("claude-max/claude-sonnet-4"), "sonnet");
-  });
-
-  it("strips any provider prefix generically", () => {
-    assert.equal(extractModel("openai/claude-opus-4-6"), "opus");
-    assert.equal(extractModel("openai/claude-sonnet-4"), "sonnet");
-    assert.equal(extractModel("openai/claude-haiku-4"), "haiku");
-    assert.equal(extractModel("custom-provider/claude-opus-4"), "opus");
-  });
-
-  it("maps aliases", () => {
-    assert.equal(extractModel("opus"), "opus");
-    assert.equal(extractModel("sonnet"), "sonnet");
-    assert.equal(extractModel("haiku"), "haiku");
-  });
-
-  it("defaults to opus for unknown models", () => {
-    assert.equal(extractModel("gpt-4o"), "opus");
-    assert.equal(extractModel("unknown-model"), "opus");
-  });
-});
+import { messagesToPrompt, extractSystemPrompt, openaiToCli } from "./openai-to-cli.js";
 
 describe("messagesToPrompt", () => {
   it("converts a single user message", () => {
@@ -115,13 +80,13 @@ describe("extractSystemPrompt", () => {
 });
 
 describe("openaiToCli", () => {
-  it("returns prompt and model", () => {
+  it("returns the prompt and never carries a model (the registry owns model ids)", () => {
     const result = openaiToCli({
-      model: "claude-opus-4-6",
+      model: "paperclip/claude_local/claude-opus-4-8",
       messages: [{ role: "user", content: "Test" }],
     });
-    assert.equal(result.model, "opus");
     assert.equal(result.prompt, "Test");
+    assert.ok(!("model" in result), "model resolution belongs to paperclip-registry, not here");
   });
 
   it("uses user field as sessionId", () => {
