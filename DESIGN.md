@@ -5,8 +5,12 @@
 cli-openai-proxy serves the agentic coding CLIs installed on a machine (Claude
 Code, Codex — registered as [Paperclip](https://github.com/paperclipai/paperclip)
 adapters) behind a single OpenAI-compatible HTTP API. Any OpenAI client can
-drive them by changing the `model` string; each CLI spends the credential it is
-already logged in with, so the proxy owns no vendor account and issues none.
+drive them by changing the `model` string; each CLI spends its own vendor
+credential — normally the one it is already logged in with on the host, or, for
+Claude, a setup token provisioned through `/v1/auth` that the proxy holds in
+memory and injects per request when `AUTH_TRUST_COMPLETION_CALLERS` is set (see
+[Security Considerations](#security-considerations)). Either way the proxy owns
+no vendor account and issues none.
 
 For the module-by-module map of the codebase, see
 [ARCHITECTURE.md](ARCHITECTURE.md). For adapter-specific behavior (prompt
@@ -37,7 +41,8 @@ injection, streaming granularity, flags), see
 │         ▼                                                       │
 │  ┌───────────────────────┐   ┌────────────────────────────┐     │
 │  │ paperclip-registry    │──▶│ PaperclipRunner            │     │
-│  │ (model id → adapter)  │   │ (spawn, parse, terminate)  │     │
+│  │ (model id → adapter)  │   │ (parse, cancel; spawn +    │     │
+│  │                       │   │  timeout in execute())     │     │
 │  └───────────────────────┘   └────────────────────────────┘     │
 │         │                                 │ events              │
 │         ▼                                 ▼                     │

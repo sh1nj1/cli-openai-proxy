@@ -7,8 +7,8 @@
 
 Claude Code and Codex — the two [Paperclip](https://github.com/paperclipai/paperclip)
 adapters registered here — run behind a single `/v1/chat/completions` endpoint,
-and adding another that speaks one of the supported output formats is one
-registry entry. Any OpenAI client —
+and adding another that matches a supported output format and prompt-injection
+strategy is one registry entry. Any OpenAI client —
 an SDK, an IDE plugin, [Collavre](#use-with-collavre), your own service — can
 drive them, from another machine if you want.
 
@@ -143,11 +143,13 @@ CLI can run, and on the ordinary Claude path — logged in on the host, credenti
 in the keychain — it answers `unknown`, the same answer it gives when `claude`
 is not installed at all. The reliable test is a request.
 
-Adding an engine whose CLI emits one of the supported output formats (Claude
-`stream-json` or Codex JSONL) is one registry entry in
+Adding an engine whose CLI matches an existing output format (Claude
+`stream-json` or Codex JSONL) *and* an existing prompt-injection strategy
+(`task-context` or `prompt-template`) is one registry entry in
 [`src/adapter/paperclip-registry.ts`](src/adapter/paperclip-registry.ts) plus its
-published adapter package; a CLI with a different output format also needs a
-parser and `OutputMode` in `PaperclipRunner` first.
+published adapter package; a CLI that differs on either axis also needs the
+matching parser/`OutputMode` or injection strategy added to `PaperclipRunner`
+first.
 
 ## Use with Collavre
 
