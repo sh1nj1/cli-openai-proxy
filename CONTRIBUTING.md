@@ -26,7 +26,24 @@ Thank you for your interest in contributing!
 
 ## Testing
 
-Test your changes with:
+Build the project and run the automated tests:
+
+```bash
+npm run build
+npm test
+```
+
+Measure coverage and enforce the same minimums used in CI (80% statements,
+80% branches, 85% functions, and 80% lines):
+
+```bash
+npm run test:coverage
+```
+
+The command prints a text summary and writes `coverage/lcov.info`. CI uploads
+the LCOV report as the `coverage-lcov` artifact.
+
+Test the running server manually with:
 
 ```bash
 # Start the server
