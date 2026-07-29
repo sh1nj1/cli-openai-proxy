@@ -170,7 +170,7 @@ log "Writing systemd user service: $SERVICE_FILE"
   printf 'Environment=%s\n' "$(unit_quote "HOME=$HOME")"
   printf 'Environment=%s\n' "$(unit_quote "NODE_ENV=production")"
   printf 'Environment=%s\n' "$(unit_quote "PATH=$SERVICE_PATH")"
-  printf 'EnvironmentFile=-%s\n' "$(unit_quote "$ENV_FILE")"
+  printf 'EnvironmentFile=%s\n' "$(unit_quote "$ENV_FILE")"
   printf 'ExecStart=%s %s\n' "$(unit_quote "$NODE_BIN")" "$(unit_quote "$ENTRYPOINT")"
   printf 'Restart=on-failure\n'
   printf 'RestartSec=5\n'
