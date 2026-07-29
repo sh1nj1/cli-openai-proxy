@@ -117,8 +117,11 @@ unrecognised id is the behaviour the namespace exists to remove.
    }
    ```
 
-   Implementations emit `content_delta`, `assistant`, `result`, `error`, and
-   `close`. Only subprocess execution and timeout enforcement are delegated to
+   Implementations emit `content_delta`, `result`, `error`, and `close` — the
+   full contract the route layer consumes. (The Claude runner additionally
+   emits an `assistant` event for debugging only; Codex never emits it and
+   routes never subscribe to it, so new adapters must not rely on it.) Only
+   subprocess execution and timeout enforcement are delegated to
    the pinned `@paperclipai/*` adapter packages through `execute()`; the runner
    itself owns output parsing (it instantiates `StreamJsonParser` /
    `CodexJsonlParser` and feeds them stdout) and cancellation (`kill()` signals
@@ -217,9 +220,11 @@ real CLIs.
 ## Deployment
 
 - **npm**: `npm install -g cli-openai-proxy`, then run `cli-openai-proxy`.
-- **macOS service**: `./install.sh` builds and registers a
-  `launchd` service (see [docs/macos-setup.md](docs/macos-setup.md)); rerun it
+- **Linux service**: `./install.sh` builds the project and registers a
+  systemd user service (the script exits on any non-Linux `OSTYPE`); rerun it
   after pulling new code.
+- **macOS service**: no installer — create a `launchd` LaunchAgent manually
+  following [docs/macos-setup.md](docs/macos-setup.md).
 
 ## Future Enhancements
 
