@@ -34,7 +34,7 @@ src/
 │   ├── standalone.ts           # bin entry: preflight, config banner, startServer
 │   ├── index.ts                # Express app wiring: middleware order, routes, lifecycle
 │   ├── routes.ts               # /v1/chat/completions, /v1/models, /v1/usage, /health
-│   ├── auth.ts                 # API_KEYS bearer auth for /v1/*
+│   ├── auth.ts                 # API_KEYS bearer auth (skips /health and /v1/auth/*)
 │   ├── auth-routes.ts          # /v1/auth/* provisioning API (AUTH_ADMIN_KEYS gated)
 │   └── preflight.ts            # shared startup/setup Claude checks (non-fatal)
 ├── usage/

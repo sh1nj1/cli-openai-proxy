@@ -118,8 +118,11 @@ unrecognised id is the behaviour the namespace exists to remove.
    ```
 
    Implementations emit `content_delta`, `assistant`, `result`, `error`, and
-   `close`; CLI spawn, output parsing, timeout, and process-group termination
-   are delegated to the pinned `@paperclipai/*` adapter packages.
+   `close`. Only subprocess execution and timeout enforcement are delegated to
+   the pinned `@paperclipai/*` adapter packages through `execute()`; the runner
+   itself owns output parsing (it instantiates `StreamJsonParser` /
+   `CodexJsonlParser` and feeds them stdout) and cancellation (`kill()` signals
+   the process group directly).
 5. **Respond**:
    - *Streaming* (`stream: true`): each `content_delta` becomes an SSE
      `chat.completion.chunk`; the `result` event yields the final chunk, a
@@ -164,7 +167,7 @@ README):
 | `PORT` (or argv) | `3456` | Listen port |
 | `HOST` | `127.0.0.1` | Bind address (`0.0.0.0` to expose; then set `API_KEYS`) |
 | `TIMEOUT` | `0` (unbounded) | Per-run subprocess timeout, also applied as socket inactivity timeout |
-| `API_KEYS` | unset (open access) | Comma-separated proxy access keys for `/v1/*` |
+| `API_KEYS` | unset (open access) | Comma-separated proxy access keys for the completion, model, and usage endpoints; `/v1/auth/*` is exempt and gated solely by `AUTH_ADMIN_KEYS` |
 | `AUTH_ADMIN_KEYS` | unset (feature off) | Enables the remote CLI auth provisioning API |
 | `AUTH_TRUST_COMPLETION_CALLERS` | unset | Opt-in trust boundary for injecting provisioned Claude credentials into completion runs |
 | `DEBUG` | unset | Request logging |
