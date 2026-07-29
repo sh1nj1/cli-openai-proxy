@@ -7,6 +7,7 @@ import {
   UnknownPaperclipModelError,
   DEFAULT_MODEL,
   defaultModelForHost,
+  adapterCredentialNotes,
 } from "./paperclip-registry.js";
 import { PaperclipRunner } from "./paperclip-runner.js";
 
@@ -169,4 +170,27 @@ test("an adapter is not suggested until its own CLI has been probed", async () =
     DEFAULT_MODEL,
     "with no runnable alternative, keep the primary — its install hints are the ones printed",
   );
+});
+
+test("every advertised adapter says which CLI and credential its runs spend", () => {
+  // The plugin prints these verbatim during setup, so an adapter missing from
+  // the list is a model the user is offered with no idea what it charges.
+  const notes = adapterCredentialNotes();
+  assert.equal(notes.length, PAPERCLIP_MODEL_IDS.length);
+
+  for (const id of PAPERCLIP_MODEL_IDS) {
+    const note = notes.find((n) => n.startsWith(`${id} `));
+    assert.ok(note, `${id} must have a credential note`);
+    assert.ok(note!.length > id.length + 10, `${id}'s note must say something`);
+  }
+});
+
+test("no adapter's credential note claims another adapter's CLI", () => {
+  const notes = adapterCredentialNotes();
+  const claude = notes.find((n) => n.startsWith("paperclip/claude_local "))!;
+  const codex = notes.find((n) => n.startsWith("paperclip/codex_local "))!;
+
+  assert.match(claude, /Claude/);
+  assert.doesNotMatch(codex, /Claude Max|Claude Code/);
+  assert.match(codex, /codex/i);
 });

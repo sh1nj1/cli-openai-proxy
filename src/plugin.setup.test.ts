@@ -52,6 +52,47 @@ test("setup completes on a codex-only host (no Claude CLI)", async () => {
   assert.match(notes[0].message, /claude/i);
 });
 
+test("setup notes describe the CLI behind the model that was actually selected", async () => {
+  // Telling a codex-only host that its requests run on a Claude Max subscription
+  // names the wrong subscription, the wrong CLI, and the wrong login to fix.
+  const { auth } = await runLocalAuthSetup(fakeCtx([]), {
+    verifyClaude: async () => ({ ok: false, error: "not found on PATH" }),
+    verifyAuth: async () => ({ ok: true }),
+    commandRuns: async (cmd) => cmd === "codex",
+    startServer: async () => {},
+  });
+
+  const notes: string[] = auth.notes;
+  assert.equal(auth.defaultModel, `${PROVIDER_ID}/paperclip/codex_local`);
+  assert.ok(
+    notes.some((n) => n.includes(auth.defaultModel)),
+    "the notes must name the default the provider was configured with",
+  );
+  assert.ok(
+    !notes.some((n) => /Claude Max/i.test(n) && !n.startsWith("paperclip/claude_local")),
+    "no note may claim Claude Max for a request that runs codex",
+  );
+});
+
+test("setup notes cover every advertised adapter on any host", async () => {
+  // Both adapters stay selectable whatever the default is, so both have to say
+  // what they spend — the Claude host is where the codex line used to go missing.
+  const { auth } = await runLocalAuthSetup(fakeCtx([]), {
+    verifyClaude: async () => ({ ok: true, version: "2.1.218" }),
+    verifyAuth: async () => ({ ok: true }),
+    commandRuns: async () => true,
+    startServer: async () => {},
+  });
+
+  const notes: string[] = auth.notes;
+  for (const model of PLUGIN_MODELS) {
+    assert.ok(
+      notes.some((n) => n.startsWith(`${model.id} `)),
+      `${model.id} is advertised but never described`,
+    );
+  }
+});
+
 test("setup completes when Claude auth is missing", async () => {
   const notes: Note[] = [];
   const started: number[] = [];

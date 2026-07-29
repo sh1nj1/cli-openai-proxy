@@ -26,6 +26,13 @@ export interface PaperclipModelSpec {
   cliFlags: string[];
   /** Engine id in the /v1/auth registry, so an auth failure names the login flow to run. */
   authEngine: string;
+  /**
+   * Which CLI a run through this adapter spawns and whose credential it spends,
+   * phrased to follow the adapter id (`<id> runs <credentialNote>.`). Setup prints
+   * one line per advertised adapter, so a host is never told the wrong subscription
+   * pays for the model it was handed.
+   */
+  credentialNote: string;
 }
 
 const CLAUDE_LOCAL_SPEC: PaperclipModelSpec = {
@@ -36,6 +43,7 @@ const CLAUDE_LOCAL_SPEC: PaperclipModelSpec = {
   outputMode: "stream-json",
   cliFlags: ["--include-partial-messages", "--no-session-persistence"],
   authEngine: "claude",
+  credentialNote: "the Claude Code CLI on your Claude Max subscription",
 };
 
 const REGISTRY: Record<string, PaperclipModelSpec> = {
@@ -57,6 +65,7 @@ const REGISTRY: Record<string, PaperclipModelSpec> = {
     // appends extraArgs verbatim) to keep local runs from tripping the git-repo guard.
     cliFlags: ["--skip-git-repo-check"],
     authEngine: "codex",
+    credentialNote: "the codex CLI on whatever `codex login` signed in with (ChatGPT plan or OpenAI API key)",
   },
 };
 
@@ -67,6 +76,18 @@ export const PAPERCLIP_MODEL_PREFIX = "paperclip/";
 
 /** Adapter used when a request names no model at all. */
 export const DEFAULT_MODEL = "paperclip/claude_local";
+
+/**
+ * One line per advertised adapter, naming the CLI and credential its runs spend.
+ *
+ * Derived from the registry for the same reason the advertised model list is: a
+ * hand-kept copy in the plugin would keep describing whichever adapter it was
+ * written for, which is how a codex-only host came to be told its requests ran
+ * on a Claude Max subscription.
+ */
+export function adapterCredentialNotes(): string[] {
+  return PAPERCLIP_MODEL_IDS.map((id) => `${id} runs ${REGISTRY[id].credentialNote}.`);
+}
 
 /**
  * Model to suggest to a host whose Claude CLI state preflight has just measured.

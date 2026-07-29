@@ -1,15 +1,21 @@
 /**
  * Claude Code CLI Provider Plugin for Clawdbot
  *
- * Enables using Claude Max subscription through Claude Code CLI,
- * bypassing OAuth token scope restrictions.
+ * Serves the local coding CLIs registered as Paperclip adapters (Claude Code,
+ * codex) over an OpenAI-compatible API, so a caller spends the subscription each
+ * CLI is already logged into instead of an API key with OAuth scope restrictions.
  */
 
 import { startServer, stopServer, getServer } from "./server/index.js";
 import { verifyClaude, verifyAuth } from "./cli/claude.js";
 import { commandRuns } from "./cli/command.js";
 import { runPreflight } from "./server/preflight.js";
-import { PAPERCLIP_MODEL_IDS, DEFAULT_MODEL, defaultModelForHost } from "./adapter/paperclip-registry.js";
+import {
+  PAPERCLIP_MODEL_IDS,
+  DEFAULT_MODEL,
+  defaultModelForHost,
+  adapterCredentialNotes,
+} from "./adapter/paperclip-registry.js";
 
 // Provider constants
 export const PROVIDER_ID = "claude-code-cli";
@@ -176,9 +182,12 @@ export async function runLocalAuthSetup(
           },
         },
         defaultModel,
+        // Per adapter, not per provider: every advertised model stays selectable
+        // whatever the default is, and they do not spend the same credential.
         notes: [
-          "This uses your Claude Max subscription via Claude Code CLI.",
-          "Your OAuth token is used by the CLI, not exposed directly.",
+          ...adapterCredentialNotes(),
+          `Default: ${defaultModel}. Any model above can be selected per request.`,
+          "Each CLI keeps its own credentials; none are exposed to this provider.",
           `Local server running at http://127.0.0.1:${port}`,
           "Keep the server running to use this provider.",
         ],
@@ -207,8 +216,10 @@ function emptyPluginConfigSchema() {
 const claudeCodeCliPlugin = {
   id: "claude-code-cli-provider",
   name: "Claude Code CLI Provider",
+  // Names no single CLI: which ones are served is the adapter registry's call,
+  // and this string is read before any host has been probed.
   description:
-    "Use Claude Max subscription via Claude Code CLI (bypasses OAuth restrictions)",
+    "Use the CLI logins already on this machine, no API key (bypasses OAuth restrictions)",
   configSchema: emptyPluginConfigSchema(),
 
   register(api: any) {
@@ -226,7 +237,7 @@ const claudeCodeCliPlugin = {
         {
           id: "local",
           label: "Local Claude CLI",
-          hint: "Uses your existing Claude Code CLI authentication (from Claude Max)",
+          hint: "Uses the CLI logins already on this machine; setup lists what each model spends",
           kind: "custom",
 
           run: async (ctx: any) => {
