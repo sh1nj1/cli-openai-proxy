@@ -64,6 +64,15 @@ export const PAPERCLIP_MODEL_IDS: string[] = Object.keys(REGISTRY);
 /** Prefix reserved for explicitly named Paperclip adapters. */
 export const PAPERCLIP_MODEL_PREFIX = "paperclip/";
 
+/** Adapter used when a request names no model at all. */
+export const DEFAULT_MODEL = "paperclip/claude_local";
+
+export interface ResolvedModel {
+  spec: PaperclipModelSpec;
+  /** Everything after `paperclip/<adapter>/`. Absent means the CLI's default model. */
+  cliModel?: string;
+}
+
 /**
  * Thrown when a `paperclip/<adapterType>` model is requested but no adapter is
  * registered for it. Surfacing this (instead of silently running Claude) is the
@@ -75,40 +84,55 @@ export class UnknownPaperclipModelError extends Error {
     public readonly knownIds: string[],
   ) {
     const known = knownIds.length > 0 ? knownIds.join(", ") : "(none registered)";
-    super(`Unknown Paperclip adapter model "${model}". Registered paperclip models: ${known}.`);
+    super(
+      `Unknown model "${model}". Expected paperclip/<adapter>[/<cli-model>]. ` +
+        `Registered adapters: ${known}. The <cli-model> part is passed to the CLI verbatim; ` +
+        `omit it to use the CLI's default model.`,
+    );
     this.name = "UnknownPaperclipModelError";
   }
 }
 
-export function resolvePaperclipModel(model: string): PaperclipModelSpec | null {
-  return REGISTRY[model] ?? null;
+/**
+ * Split a model id into an adapter and a CLI model string.
+ *
+ * There is exactly one syntax: `paperclip/<adapterType>[/<cliModel...>]`. The adapter
+ * key matches exactly (a prefix match would route `codex_local_x` to the codex CLI),
+ * and everything after it is taken as the model string unvalidated — which models
+ * exist is the CLI's call, not this proxy's.
+ */
+export function resolvePaperclipModel(model: string): ResolvedModel | null {
+  if (!model.startsWith(PAPERCLIP_MODEL_PREFIX)) return null;
+
+  const rest = model.slice(PAPERCLIP_MODEL_PREFIX.length);
+  const slash = rest.indexOf("/");
+  const adapterKey = slash === -1 ? rest : rest.slice(0, slash);
+
+  const spec = REGISTRY[PAPERCLIP_MODEL_PREFIX + adapterKey];
+  if (!spec) return null;
+
+  const cliModel = slash === -1 ? "" : rest.slice(slash + 1).trim();
+  return cliModel ? { spec, cliModel } : { spec };
 }
 
 /**
- * Pick a Paperclip-backed runner for every request.
+ * Build a runner for a model id.
  *
- * A `paperclip/*` model MUST resolve to a registered adapter; an unknown one
- * throws rather than silently running Claude. Existing non-paperclip model ids
- * retain the proxy's historical behavior by using the claude_local adapter.
+ * An unresolvable id throws. Any fallback would resurrect the old behavior where a
+ * requested model was silently ignored, so an unknown id becomes a 404 the caller sees.
  */
 export function createRunner(model: string): AgentRunner {
-  const spec = resolvePaperclipModel(model);
-  if (spec) {
-    return new PaperclipRunner(spec.execute, spec.baseConfig, {
-      promptInjection: spec.promptInjection,
-      outputMode: spec.outputMode,
-      cliFlags: spec.cliFlags,
-      engine: spec.authEngine,
-    });
-  }
-  if (model.startsWith(PAPERCLIP_MODEL_PREFIX)) {
+  const resolved = resolvePaperclipModel(model);
+  if (!resolved) {
     throw new UnknownPaperclipModelError(model, PAPERCLIP_MODEL_IDS);
   }
-  return new PaperclipRunner(CLAUDE_LOCAL_SPEC.execute, CLAUDE_LOCAL_SPEC.baseConfig, {
-    promptInjection: CLAUDE_LOCAL_SPEC.promptInjection,
-    outputMode: CLAUDE_LOCAL_SPEC.outputMode,
-    cliFlags: CLAUDE_LOCAL_SPEC.cliFlags,
-    engine: CLAUDE_LOCAL_SPEC.authEngine,
+  const { spec, cliModel } = resolved;
+  return new PaperclipRunner(spec.execute, spec.baseConfig, {
+    model: cliModel,
+    promptInjection: spec.promptInjection,
+    outputMode: spec.outputMode,
+    cliFlags: spec.cliFlags,
+    engine: spec.authEngine,
   });
 }
 
