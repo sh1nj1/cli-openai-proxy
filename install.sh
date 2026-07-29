@@ -7,6 +7,7 @@ SERVICE_NAME="${SERVICE_NAME:-com.claude-code-provider}"
 PORT="${INSTALL_PORT:-3456}"
 HOST="${INSTALL_HOST:-127.0.0.1}"
 MIN_NODE_VERSION="22.13.0"
+READINESS_TIMEOUT="${INSTALL_READINESS_TIMEOUT:-30}"
 
 log() {
   printf '[install] %s\n' "$*"
@@ -42,11 +43,57 @@ env_quote() {
   printf '"%s"' "$value"
 }
 
+health_check() {
+  "$NODE_BIN" -e '
+    const http = require("node:http");
+    const request = http.get({
+      hostname: process.argv[1],
+      port: Number(process.argv[2]),
+      path: "/health",
+      timeout: 1000,
+    }, (response) => {
+      response.resume();
+      const healthy = response.statusCode >= 200 && response.statusCode < 300;
+      response.on("end", () => process.exit(healthy ? 0 : 1));
+    });
+    request.on("timeout", () => request.destroy());
+    request.on("error", () => process.exit(1));
+  ' "$1" "$2"
+}
+
+read_effective_listener() {
+  local pid="$1"
+  local env_entry
+  local value
+
+  [[ -r "/proc/$pid/environ" ]] || return 1
+  EFFECTIVE_HOST="127.0.0.1"
+  EFFECTIVE_PORT="3456"
+  while IFS= read -r -d '' env_entry; do
+    case "$env_entry" in
+    HOST=*)
+      value="${env_entry#HOST=}"
+      [[ -z "$value" ]] || EFFECTIVE_HOST="$value"
+      ;;
+    PORT=*)
+      value="${env_entry#PORT=}"
+      [[ -z "$value" ]] || EFFECTIVE_PORT="$value"
+      ;;
+    esac
+  done <"/proc/$pid/environ"
+
+  [[ -n "$EFFECTIVE_HOST" ]]
+  [[ "$EFFECTIVE_PORT" =~ ^[0-9]+$ ]] \
+    && ((EFFECTIVE_PORT >= 1 && EFFECTIVE_PORT <= 65535))
+}
+
 [[ "$(uname -s)" == "Linux" ]] || die "This installer supports Linux only"
 [[ "$EUID" -ne 0 ]] || die "Run this script as the service user, not with sudo"
 [[ "$SERVICE_NAME" =~ ^[A-Za-z0-9_.@-]+$ ]] || die "Invalid SERVICE_NAME: $SERVICE_NAME"
 [[ "$PORT" =~ ^[0-9]+$ ]] && ((PORT >= 1 && PORT <= 65535)) \
   || die "PORT must be an integer between 1 and 65535"
+[[ "$READINESS_TIMEOUT" =~ ^[0-9]+$ ]] && ((READINESS_TIMEOUT >= 1 && READINESS_TIMEOUT <= 300)) \
+  || die "INSTALL_READINESS_TIMEOUT must be an integer between 1 and 300 seconds"
 [[ "$HOST" != *$'\n'* && "$HOST" != *$'\r'* ]] \
   || die "HOST must not contain newlines"
 
@@ -193,15 +240,53 @@ log "Enabling and restarting $SERVICE_NAME"
 "$SYSTEMCTL_BIN" --user daemon-reload
 "$SYSTEMCTL_BIN" --user enable "$SERVICE_NAME.service"
 "$SYSTEMCTL_BIN" --user restart "$SERVICE_NAME.service"
-"$SYSTEMCTL_BIN" --user --no-pager --full status "$SERVICE_NAME.service" || {
-  warn "The service did not start successfully"
+
+EFFECTIVE_HOST=""
+EFFECTIVE_PORT=""
+PROBE_HOST=""
+MAIN_PID=""
+READY=0
+DEADLINE=$((SECONDS + READINESS_TIMEOUT))
+
+log "Waiting up to ${READINESS_TIMEOUT}s for the health endpoint"
+while ((SECONDS < DEADLINE)); do
+  MAIN_PID="$("$SYSTEMCTL_BIN" --user show "$SERVICE_NAME.service" \
+    --property=MainPID --value 2>/dev/null || true)"
+  if [[ "$MAIN_PID" =~ ^[1-9][0-9]*$ ]] && read_effective_listener "$MAIN_PID"; then
+    PROBE_HOST="$EFFECTIVE_HOST"
+    case "$PROBE_HOST" in
+      0.0.0.0) PROBE_HOST="127.0.0.1" ;;
+      :: | "[::]") PROBE_HOST="::1" ;;
+    esac
+
+    if health_check "$PROBE_HOST" "$EFFECTIVE_PORT"; then
+      READY=1
+      break
+    fi
+  fi
+  sleep 1
+done
+
+if ((READY == 0)); then
+  "$SYSTEMCTL_BIN" --user --no-pager --full status "$SERVICE_NAME.service" || true
+  warn "The service did not become ready within ${READINESS_TIMEOUT}s"
   warn "Inspect logs with: journalctl --user -u $SERVICE_NAME.service -n 100"
   exit 1
-}
+fi
+
+DISPLAY_HOST="$EFFECTIVE_HOST"
+if [[ "$DISPLAY_HOST" == *:* && "$DISPLAY_HOST" != \[*\] ]]; then
+  DISPLAY_HOST="[$DISPLAY_HOST]"
+fi
+DISPLAY_PROBE_HOST="$PROBE_HOST"
+if [[ "$DISPLAY_PROBE_HOST" == *:* && "$DISPLAY_PROBE_HOST" != \[*\] ]]; then
+  DISPLAY_PROBE_HOST="[$DISPLAY_PROBE_HOST]"
+fi
 
 log "Installation complete"
 printf '\n'
-printf '  Health:  http://%s:%s/health\n' "$HOST" "$PORT"
+printf '  Listener: %s:%s\n' "$DISPLAY_HOST" "$EFFECTIVE_PORT"
+printf '  Health:   http://%s:%s/health\n' "$DISPLAY_PROBE_HOST" "$EFFECTIVE_PORT"
 printf '  Status:  systemctl --user status %s.service\n' "$SERVICE_NAME"
 printf '  Logs:    journalctl --user -u %s.service -f\n' "$SERVICE_NAME"
 printf '  Config:  %s\n' "$ENV_FILE"
