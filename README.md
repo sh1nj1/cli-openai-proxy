@@ -97,14 +97,16 @@ disk) still does, and the next request can see it. See
 
 Any model id that is *not* prefixed `paperclip/` goes to the Claude adapter, so
 existing OpenAI-style Claude ids keep working — including provider-prefixed
-forms (`anthropic/…`, `openai/…`, `claude-code-cli/…`). An unregistered
-`paperclip/<name>` returns `404 model_not_found` rather than silently running
-something else.
+forms (`anthropic/…`, `openai/…`, `claude-code-cli/…`). Only the
+`paperclip/` prefix is validated: an unregistered `paperclip/<name>` returns
+`404 model_not_found` rather than silently running something else. Every other
+id is accepted, and one the alias table does not recognize — `gpt-4o`, a
+misspelled Claude id — runs Claude Opus without an error.
 
-This table — and `GET /v1/models` — is the catalog of what the proxy *accepts*,
-not of what this host can currently run. Neither checks whether the underlying
-CLI is installed or logged in, so a request can be accepted here and still fail
-at execution. `GET /v1/auth/{engine}/status` (requires `AUTH_ADMIN_KEYS`; see
+This table — and `GET /v1/models` — is the catalog the proxy *advertises*, not
+the set it accepts (wider, per above) nor what this host can currently run.
+Neither checks whether the underlying CLI is installed or logged in, so a
+request can be accepted here and still fail at execution. `GET /v1/auth/{engine}/status` (requires `AUTH_ADMIN_KEYS`; see
 below) is an auth diagnostic, not an availability check: it never tests that the
 CLI can run, and on the ordinary Claude path — logged in on the host, credential
 in the keychain — it answers `unknown`, the same answer it gives when `claude`
