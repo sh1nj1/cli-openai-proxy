@@ -11,10 +11,12 @@ import { verifyClaude, verifyAuth } from "./cli/claude.js";
 import { commandRuns } from "./cli/command.js";
 import { runPreflight } from "./server/preflight.js";
 import {
-  PAPERCLIP_MODEL_IDS,
   DEFAULT_MODEL,
   defaultModelForHost,
   adapterCredentialNotes,
+  adapterLabel,
+  resolvePaperclipModel,
+  suggestedSetupModelIds,
 } from "./adapter/paperclip-registry.js";
 
 // Provider constants
@@ -22,54 +24,49 @@ export const PROVIDER_ID = "claude-code-cli";
 const PROVIDER_LABEL = "Claude Code CLI";
 const DEFAULT_PORT = 3456;
 
-/**
- * The provider is configured with this before its first request runs, so it
- * follows the host: a Claude default on a host that just failed the Claude
- * preflight would fail that first request until the user switched models by hand.
- */
-export const pluginDefaultModel = async (
-  claudeOk: boolean,
-  canRun?: (command: string) => Promise<boolean>,
-): Promise<string> => `${PROVIDER_ID}/${await defaultModelForHost(claudeOk, canRun)}`;
-
-/** "claude_local" -> "Claude Local" */
-function adapterLabel(id: string): string {
-  return id
-    .slice(id.lastIndexOf("/") + 1)
-    .split("_")
-    .map((word) => word.charAt(0).toUpperCase() + word.slice(1))
-    .join(" ");
+/** "paperclip/claude_local/opus" -> "Claude Local opus (Paperclip)" */
+function modelName(id: string): string {
+  const cliModel = resolvePaperclipModel(id)?.cliModel;
+  return `${adapterLabel(id)}${cliModel ? ` ${cliModel}` : ""} (Paperclip)`;
 }
-
-/**
- * Advertised models come from the adapter registry rather than a hand-kept list:
- * the proxy 404s any id it does not resolve, so a stale entry here breaks every
- * completion routed through it.
- *
- * Each entry names an adapter, not a CLI model — a caller appends `/<cli-model>`
- * to pick one, and omitting it uses the CLI's own default.
- */
-export const PLUGIN_MODELS = PAPERCLIP_MODEL_IDS.map((id) => ({
-  id,
-  name: `${adapterLabel(id)} (Paperclip)`,
-  // The CLI model is chosen per request, so no fixed capability can be claimed here.
-  reasoning: false,
-}));
 
 /**
  * Build model definitions for Clawdbot config
  */
-function buildModelDefinition(model: (typeof PLUGIN_MODELS)[number]) {
+function buildModelDefinition(id: string) {
   return {
-    id: model.id,
-    name: model.name,
+    id,
+    name: modelName(id),
     api: "openai-completions",
-    reasoning: model.reasoning,
+    // The CLI model is the id's own suffix, so no fixed capability can be claimed here.
+    reasoning: false,
     input: ["text"],
     cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
     contextWindow: 200000,
     maxTokens: 8192,
   };
+}
+
+/** Split a comma-separated model list; blank entries are dropped, not rejected. */
+export function parseSetupModelIds(raw: string): string[] {
+  return raw
+    .split(",")
+    .map((id) => id.trim())
+    .filter(Boolean);
+}
+
+/**
+ * Reject at setup what the proxy would 404 at request time — the config this
+ * setup writes is the one the first completion runs against.
+ */
+export function validateSetupModelIds(raw: string): string | undefined {
+  const ids = parseSetupModelIds(raw);
+  if (ids.length === 0) return "Enter at least one model id";
+  const unknown = ids.filter((id) => resolvePaperclipModel(id) === null);
+  if (unknown.length > 0) {
+    return `Not a registered adapter: ${unknown.join(", ")}. Expected paperclip/<adapter>[/<cli-model>].`;
+  }
+  return undefined;
 }
 
 export interface LocalAuthSetupDeps {
@@ -110,7 +107,11 @@ export async function runLocalAuthSetup(
       log: (msg) => spin.message(msg.trim()),
     });
 
-    const defaultModel = await pluginDefaultModel(claudeOk, deps.commandRuns);
+    // The provider is configured with this before its first request runs, so it
+    // follows the host: a Claude default on a host that just failed the Claude
+    // preflight would fail that first request until the user switched by hand.
+    const defaultAdapterId = await defaultModelForHost(claudeOk, deps.commandRuns);
+    const defaultModel = `${PROVIDER_ID}/${defaultAdapterId}`;
 
     if (!claudeOk) {
       const claudeDefault = `${PROVIDER_ID}/${DEFAULT_MODEL}`;
@@ -142,6 +143,19 @@ export async function runLocalAuthSetup(
     });
     const port = parseInt(portInput, 10);
 
+    // Clawdbot selects models from what its config enumerates — `agents.defaults.models`
+    // is an allowlist and takes exact keys only — so a `<cli-model>` suffix that is
+    // never written here cannot be picked, however cleanly the proxy resolves it.
+    const modelsInput = await ctx.prompter.text({
+      message: "Models to register (comma-separated)",
+      initialValue: suggestedSetupModelIds().join(", "),
+      validate: validateSetupModelIds,
+    });
+    const chosen = parseSetupModelIds(modelsInput);
+    // The default is written to the host config whatever this list says, and the
+    // allowlist would then reject the provider's own default.
+    const modelIds = chosen.includes(defaultAdapterId) ? chosen : [defaultAdapterId, ...chosen];
+
     spin.message("Starting server...");
     await deps.startServer({ port });
     spin.stop("Claude CLI provider ready");
@@ -169,14 +183,14 @@ export async function runLocalAuthSetup(
                 apiKey: "local",
                 api: "openai-completions",
                 authHeader: false,
-                models: PLUGIN_MODELS.map(buildModelDefinition),
+                models: modelIds.map(buildModelDefinition),
               },
             },
           },
           agents: {
             defaults: {
               models: Object.fromEntries(
-                PLUGIN_MODELS.map((m) => [`${PROVIDER_ID}/${m.id}`, {}])
+                modelIds.map((id) => [`${PROVIDER_ID}/${id}`, {}])
               ),
             },
           },
@@ -186,7 +200,10 @@ export async function runLocalAuthSetup(
         // whatever the default is, and they do not spend the same credential.
         notes: [
           ...adapterCredentialNotes(),
-          `Default: ${defaultModel}. Any model above can be selected per request.`,
+          `Default: ${defaultModel}. Any registered model can be selected per request.`,
+          `Registered: ${modelIds.join(", ")}.`,
+          // The proxy takes any suffix; this host only takes what it was told about.
+          `Other CLI models work the same way — add paperclip/<adapter>/<cli-model> to models.providers.${PROVIDER_ID} and agents.defaults.models to select one here.`,
           "Each CLI keeps its own credentials; none are exposed to this provider.",
           `Local server running at http://127.0.0.1:${port}`,
           "Keep the server running to use this provider.",

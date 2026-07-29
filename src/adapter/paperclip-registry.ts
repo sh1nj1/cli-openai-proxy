@@ -33,6 +33,18 @@ export interface PaperclipModelSpec {
    * pays for the model it was handed.
    */
   credentialNote: string;
+  /**
+   * `<cli-model>` suffixes to offer at setup, for a host that selects models
+   * from an enumerated list instead of passing the id through (Clawdbot's
+   * `agents.defaults.models` is an allowlist, and it has no prefix form).
+   *
+   * A suggestion, not a catalog: the setup prompt is editable, request routing
+   * still hands the CLI whatever suffix it is given, and a stale entry costs an
+   * edit at setup rather than a failed request. Family aliases only — they
+   * follow the CLI to each new model, which is why codex, whose `--model` takes
+   * full ids that turn over, suggests none.
+   */
+  suggestedCliModels: string[];
 }
 
 const CLAUDE_LOCAL_SPEC: PaperclipModelSpec = {
@@ -44,6 +56,7 @@ const CLAUDE_LOCAL_SPEC: PaperclipModelSpec = {
   cliFlags: ["--include-partial-messages", "--no-session-persistence"],
   authEngine: "claude",
   credentialNote: "the Claude Code CLI on your Claude Max subscription",
+  suggestedCliModels: ["fable", "opus", "sonnet", "haiku"],
 };
 
 const REGISTRY: Record<string, PaperclipModelSpec> = {
@@ -66,6 +79,9 @@ const REGISTRY: Record<string, PaperclipModelSpec> = {
     cliFlags: ["--skip-git-repo-check"],
     authEngine: "codex",
     credentialNote: "the codex CLI on whatever `codex login` signed in with (ChatGPT plan or OpenAI API key)",
+    // `codex --model` takes full ids only, and they turn over faster than this
+    // package ships; the adapter's own default is the entry that stays correct.
+    suggestedCliModels: [],
   },
 };
 
@@ -87,6 +103,29 @@ export const DEFAULT_MODEL = "paperclip/claude_local";
  */
 export function adapterCredentialNotes(): string[] {
   return PAPERCLIP_MODEL_IDS.map((id) => `${id} runs ${REGISTRY[id].credentialNote}.`);
+}
+
+/**
+ * Model ids to offer a host that has to enumerate what it can select.
+ *
+ * Every adapter, plus the CLI models it suggests — so the `paperclip/<adapter>/
+ * <cli-model>` form the docs teach is selectable without the user first learning
+ * that the host needs the id spelled out.
+ */
+export function suggestedSetupModelIds(): string[] {
+  return PAPERCLIP_MODEL_IDS.flatMap((id) => [
+    id,
+    ...REGISTRY[id].suggestedCliModels.map((cliModel) => `${id}/${cliModel}`),
+  ]);
+}
+
+/** "paperclip/claude_local[/opus]" -> "Claude Local" */
+export function adapterLabel(id: string): string {
+  const adapterType = resolvePaperclipModel(id)?.spec.adapterType ?? id;
+  return adapterType
+    .split("_")
+    .map((word) => word.charAt(0).toUpperCase() + word.slice(1))
+    .join(" ");
 }
 
 /**

@@ -8,6 +8,8 @@ import {
   DEFAULT_MODEL,
   defaultModelForHost,
   adapterCredentialNotes,
+  adapterLabel,
+  suggestedSetupModelIds,
 } from "./paperclip-registry.js";
 import { PaperclipRunner } from "./paperclip-runner.js";
 
@@ -193,4 +195,32 @@ test("no adapter's credential note claims another adapter's CLI", () => {
   assert.match(claude, /Claude/);
   assert.doesNotMatch(codex, /Claude Max|Claude Code/);
   assert.match(codex, /codex/i);
+});
+
+test("every suggested setup id resolves, and each suffix stays on its own adapter", () => {
+  // These are written into a host's model catalog, so a suffix filed under the
+  // wrong adapter would run the other CLI rather than fail.
+  const suggested = suggestedSetupModelIds();
+
+  for (const id of PAPERCLIP_MODEL_IDS) {
+    assert.ok(suggested.includes(id), `${id} must stay selectable without a suffix`);
+  }
+
+  for (const id of suggested) {
+    const resolved = resolvePaperclipModel(id);
+    assert.ok(resolved, `${id} is suggested but 404s`);
+    const base = resolved!.cliModel ? id.slice(0, id.length - resolved!.cliModel.length - 1) : id;
+    assert.equal(
+      resolvePaperclipModel(base)!.spec.adapterType,
+      resolved!.spec.adapterType,
+      `${id} resolves to a different adapter than the one it names`,
+    );
+  }
+});
+
+test("a suffixed id is labelled by its adapter, not by its CLI model", () => {
+  // The label goes in the host's model picker next to the id.
+  assert.equal(adapterLabel("paperclip/claude_local"), "Claude Local");
+  assert.equal(adapterLabel("paperclip/claude_local/opus"), "Claude Local");
+  assert.equal(adapterLabel("paperclip/codex_local"), "Codex Local");
 });
