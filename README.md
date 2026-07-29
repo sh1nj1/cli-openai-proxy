@@ -380,7 +380,7 @@ to compile `node-pty`. `sudo` is used only for those OS prerequisites and the
 linger setting; the proxy itself runs as the current user.
 
 The default listener is `127.0.0.1:3456`. Edit
-`${XDG_CONFIG_HOME:-$HOME/.config}/claude-max-api-proxy.env` to configure
+`${XDG_CONFIG_HOME:-$HOME/.config}/cli-openai-proxy.env` to configure
 `PORT`, `HOST`, `API_KEYS`, or remote CLI authentication, then restart the
 service. The installer also prints the effective path as `Config:`. If `HOST`
 is changed to a non-loopback address, set `API_KEYS` before exposing the port.

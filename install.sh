@@ -402,7 +402,7 @@ PROJECT_DIR="$(cd -- "$SCRIPT_DIR" && pwd -P)"
   || die "Project path must not contain a colon or newline: $PROJECT_DIR"
 ENTRYPOINT="$PROJECT_DIR/dist/server/standalone.js"
 CONFIG_HOME="${XDG_CONFIG_HOME:-$HOME/.config}"
-ENV_FILE="$CONFIG_HOME/claude-max-api-proxy.env"
+ENV_FILE="$CONFIG_HOME/cli-openai-proxy.env"
 SYSTEMD_USER_DIR="$CONFIG_HOME/systemd/user"
 SERVICE_FILE="$SYSTEMD_USER_DIR/$SERVICE_NAME.service"
 
