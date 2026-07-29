@@ -1,7 +1,6 @@
 /**
- * Shared line-buffered parser for Claude Code CLI `--output-format stream-json`
- * NDJSON. Consumed by ClaudeSubprocess (direct spawn) and PaperclipRunner
- * (adapter onLog), so both classify stdout identically.
+ * Line-buffered parser for Claude Code CLI `--output-format stream-json` NDJSON.
+ * PaperclipRunner feeds adapter stdout through it to normalize live events.
  */
 import type { ClaudeCliMessage, ClaudeCliStreamEvent } from "../types/claude-cli.js";
 import { isContentDelta, isAssistantMessage, isResultMessage } from "../types/claude-cli.js";

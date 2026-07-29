@@ -7,7 +7,6 @@ import {
   UnknownPaperclipModelError,
 } from "./paperclip-registry.js";
 import { PaperclipRunner } from "./paperclip-runner.js";
-import { ClaudeSubprocess } from "../subprocess/manager.js";
 
 test("resolves a known paperclip model to a spec with an execute fn", () => {
   const spec = resolvePaperclipModel("paperclip/claude_local");
@@ -42,16 +41,18 @@ test("resolves paperclip/codex_local to the codex adapter with per-adapter strat
   assert.ok(!spec!.cliFlags.includes("--include-partial-messages"), "no claude-only flags for codex");
 });
 
-test("createRunner returns PaperclipRunner for paperclip models, ClaudeSubprocess otherwise", () => {
+test("createRunner returns PaperclipRunner for every supported model path", () => {
   assert.ok(createRunner("paperclip/claude_local") instanceof PaperclipRunner);
   assert.ok(createRunner("paperclip/codex_local") instanceof PaperclipRunner);
-  assert.ok(createRunner("claude-opus-4") instanceof ClaudeSubprocess);
+  assert.ok(createRunner("claude-opus-4") instanceof PaperclipRunner);
+  assert.ok(createRunner("claude-sonnet-4") instanceof PaperclipRunner);
+  assert.ok(createRunner("claude-haiku-4") instanceof PaperclipRunner);
 });
 
 test("createRunner NEVER silently falls back to Claude for an unknown paperclip/* model", () => {
   // Regression: an unregistered paperclip/* id used to fall through to
-  // `new ClaudeSubprocess()`, so requesting a Paperclip adapter silently ran
-  // Claude instead. A paperclip/* prefix must resolve to a Paperclip adapter or error.
+  // the default Claude runner, so requesting a Paperclip adapter silently ran
+  // the wrong adapter. A paperclip/* prefix must resolve explicitly or error.
   assert.throws(() => createRunner("paperclip/gemini_local"), UnknownPaperclipModelError);
   assert.throws(() => createRunner("paperclip/definitely_not_registered"), UnknownPaperclipModelError);
 });

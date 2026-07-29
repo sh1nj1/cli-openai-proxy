@@ -13,7 +13,7 @@ test("runPreflight: missing Claude CLI is a warning, not a fatal failure (codex-
   // Non-fatal: server is allowed to start even though Claude is unavailable.
   assert.equal(result.claudeOk, false);
   assert.equal(result.warnings.length, 1);
-  // The warning must tell the operator paperclip/* adapters still work.
+  // The warning must name the non-Claude adapter that still works.
   assert.match(result.warnings[0], /paperclip/i);
   assert.equal(warnings.length, 1);
 });

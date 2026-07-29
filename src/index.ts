@@ -6,7 +6,7 @@
  */
 
 import { startServer, stopServer, getServer } from "./server/index.js";
-import { verifyClaude, verifyAuth } from "./subprocess/manager.js";
+import { verifyClaude, verifyAuth } from "./cli/claude.js";
 
 // Provider constants
 const PROVIDER_ID = "claude-code-cli";
@@ -239,7 +239,6 @@ export default claudeCodeCliPlugin;
 
 // Also export server utilities for standalone use
 export { startServer, stopServer, getServer } from "./server/index.js";
-export { ClaudeSubprocess, verifyClaude, verifyAuth } from "./subprocess/manager.js";
-export { sessionManager } from "./session/manager.js";
+export { verifyClaude, verifyAuth } from "./cli/claude.js";
 export { usageTracker } from "./usage/tracker.js";
 export type { UsageSummary, RequestRecord } from "./usage/tracker.js";

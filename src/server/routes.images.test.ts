@@ -6,7 +6,7 @@ import { EventEmitter } from "events";
 
 import { handleChatCompletions } from "./routes.js";
 import { runnerFactory } from "../adapter/paperclip-registry.js";
-import type { AgentRunner } from "../adapter/paperclip-runner.js";
+import type { AgentRunner } from "../adapter/agent-runner.js";
 import type { ClaudeCliResult } from "../types/claude-cli.js";
 
 const HELLO_B64 = Buffer.from("hello").toString("base64");

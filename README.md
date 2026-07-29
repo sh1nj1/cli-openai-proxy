@@ -47,7 +47,7 @@ Your App (any OpenAI client)
 cli-openai-proxy (this)  <-- localhost:3456
     |
     v
-Claude Code CLI (subprocess)
+Paperclip CLI adapter (`@paperclipai/*`)
     |
     v
 Your Max subscription (OAuth)
@@ -60,9 +60,9 @@ Anthropic blocks OAuth tokens from direct third-party API use. But the CLI can u
 
 ## Paperclip adapters
 
-Beyond the built-in direct Claude path, this proxy can run requests through
-[Paperclip](https://github.com/paperclipai/paperclip) agent adapters when the
-model is named `paperclip/<adapterType>` (e.g. `paperclip/claude_local`). See
+All CLI execution runs through [Paperclip](https://github.com/paperclipai/paperclip)
+agent adapters. Existing Claude model ids use `claude_local`; models named
+`paperclip/<adapterType>` select an adapter explicitly. See
 [docs/paperclip-adapters.md](docs/paperclip-adapters.md).
 
 ## Features
@@ -73,9 +73,9 @@ model is named `paperclip/<adapterType>` (e.g. `paperclip/claude_local`). See
 - **Usage tracking** — See token counts, cost savings, and request history
 - **API key auth** — Optional Bearer token auth for team/shared use
 - **Multiple models** — Opus, Sonnet, and Haiku
-- **Session management** — Conversation context across requests
+- **Stateless execution** — Fresh isolated workspace per request
 - **Auto-start** — macOS LaunchAgent for always-on service
-- **Credential-aware** — Uses `spawn()` (no shell interpolation) and removes proxy access keys from CLI child environments
+- **Credential-aware** — Removes proxy access keys from adapter child environments
 
 ## Usage Tracking (New in v1.2)
 

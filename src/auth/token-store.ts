@@ -45,8 +45,7 @@ export function clearAllCredentials(): void {
 /**
  * Env vars to merge into a run of `engine`. Provisioned credentials must reach
  * the CLI subprocess somehow, and env is the only channel that works for a CLI
- * which does not persist its own token — so this is applied on BOTH run paths
- * (direct ClaudeSubprocess and PaperclipRunner).
+ * which does not persist its own token.
  *
  * Scoped to one engine, never merged across them: a credential is a secret owned
  * by one vendor's CLI, and returning all of them would launch e.g. the codex

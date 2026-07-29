@@ -2,11 +2,11 @@
  * Startup preflight checks.
  *
  * Claude CLI / auth are NOT hard requirements: this proxy also serves
- * `paperclip/*` adapter models (e.g. codex) that never touch the Claude CLI.
+ * non-Claude adapters (e.g. `paperclip/codex_local`).
  * On a host that only has the codex CLI, a missing/unauthenticated Claude must
  * NOT stop the server from starting — it is surfaced as a warning instead. A
  * Claude-targeted request on such a host still fails cleanly at request time
- * (the subprocess manager rejects with a clear "Claude CLI not found" error).
+ * (the Claude adapter rejects with a clear CLI-not-found error).
  */
 
 export interface PreflightDeps {
@@ -41,7 +41,7 @@ export async function runPreflight(deps: PreflightDeps): Promise<PreflightResult
   if (!cliCheck.ok) {
     return record(
       `Claude CLI unavailable: ${cliCheck.error}. ` +
-        `Claude-backed models will fail; paperclip/* adapter models remain available.`
+        `Claude-backed models will fail; non-Claude adapters such as paperclip/codex_local remain available.`
     );
   }
   log(`  ✓ Claude CLI: ${cliCheck.version || "OK"}`);
@@ -51,7 +51,7 @@ export async function runPreflight(deps: PreflightDeps): Promise<PreflightResult
   if (!authCheck.ok) {
     return record(
       `Claude authentication unavailable: ${authCheck.error} (run: claude auth login). ` +
-        `Claude-backed models will fail; paperclip/* adapter models remain available.`
+        `Claude-backed models will fail; non-Claude adapters such as paperclip/codex_local remain available.`
     );
   }
   log("  ✓ Authentication: OK");

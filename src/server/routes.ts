@@ -7,7 +7,7 @@
 import type { Request, Response } from "express";
 import { v4 as uuidv4 } from "uuid";
 import { runnerFactory, PAPERCLIP_MODEL_IDS, UnknownPaperclipModelError } from "../adapter/paperclip-registry.js";
-import type { AgentRunner } from "../adapter/paperclip-runner.js";
+import type { AgentRunner } from "../adapter/agent-runner.js";
 import { openaiToCli } from "../adapter/openai-to-cli.js";
 import { materializeImages, ImageValidationError } from "../adapter/image-materializer.js";
 import { openaiErrorFromError } from "../adapter/adapter-error.js";
