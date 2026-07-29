@@ -192,3 +192,36 @@ test("unregistered paperclip/* model returns 404 model_not_found (never runs Cla
   assert.match(res.body, /"code":"model_not_found"/, "OpenAI-style model_not_found code");
   assert.match(res.body, /paperclip\/definitely_not_registered/, "error names the requested model");
 });
+
+test("an unauthenticated CLI returns 401 engine_unauthenticated naming the engine", async () => {
+  // Collavre drives the matching /v1/auth flow off this payload, so the code must
+  // be machine-distinguishable from a bad proxy key and must name the engine.
+  const authMsg = "Invalid API key. Please run /login to authenticate.";
+  const authExecute: AdapterExecute = async () => ({
+    exitCode: 1, signal: null, timedOut: false,
+    errorMessage: authMsg, errorCode: "claude_auth_required",
+  });
+  const orig = runnerFactory.create;
+  runnerFactory.create = (model: string) =>
+    model.startsWith("paperclip/")
+      ? new PaperclipRunner(authExecute, { engine: "cli" }, { engine: "codex" })
+      : orig(model);
+
+  try {
+    const req = { body: { model: "paperclip/codex_local", stream: false,
+      messages: [{ role: "user", content: "hi" }] } } as unknown as Request;
+    const res = fakeRes();
+    let statusCode = 0;
+    res.status = (code: number) => { statusCode = code; return res; };
+
+    await handleChatCompletions(req, res);
+
+    assert.equal(statusCode, 401, "unauthenticated CLI -> HTTP 401");
+    const payload = JSON.parse(res.body) as { error: { code: string; engine: string; message: string } };
+    assert.equal(payload.error.code, "engine_unauthenticated");
+    assert.equal(payload.error.engine, "codex", "names which login flow to open");
+    assert.equal(payload.error.message, authMsg, "verbatim CLI message");
+  } finally {
+    runnerFactory.create = orig;
+  }
+});

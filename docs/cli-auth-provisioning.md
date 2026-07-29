@@ -1,0 +1,246 @@
+# CLI auth provisioning API
+
+Using this proxy normally means installing `claude` / `codex` on the host **and
+logging each of them in locally**. That last step is the one a remote user cannot
+do. These endpoints move it over HTTP: a client (e.g. Collavre) can start a login
+flow, show the user whatever the CLI needs, and hand the result back — without
+shell access to the host.
+
+The intended loop:
+
+1. A completion fails with `401 engine_unauthenticated` naming the engine.
+2. The client opens that engine's flow (`POST /v1/auth/{engine}/sessions`).
+3. The user completes it (opens a URL, or pastes a key).
+4. The client submits the result; the next completion works.
+
+## Enabling it
+
+Disabled unless `AUTH_ADMIN_KEYS` is set. These endpoints mutate host
+credentials and accept secrets in request bodies, so they use their **own** key
+set, separate from the completion-facing `API_KEYS`:
+
+```bash
+API_KEYS=sk-team-abc123 \
+AUTH_ADMIN_KEYS=sk-admin-xyz789 \
+claude-max-api
+```
+
+With it unset, every `/v1/auth/*` route answers `404 auth_provisioning_disabled`
+— upgrading the proxy never exposes a login endpoint by itself. A completion key
+is not accepted here, and an admin key is not accepted for completions.
+
+Both key sets are read into memory at startup and **removed from the process
+environment**, so neither is inherited by the CLI children a completion spawns.
+That matters because those children run with permissions skipped: anything left
+in their environment is readable by whoever wrote the prompt, and an ordinary
+completion caller could otherwise recover the admin key and use these endpoints.
+
+The captured values persist for the life of the process, so restarting the server
+in-process (`stopServer()` then `startServer()`) re-initializes from them rather
+than from the environment they were removed from. Re-setting the variable before a
+restart still wins, which is how you rotate keys without a new process.
+
+| Env | Meaning |
+| --- | --- |
+| `AUTH_ADMIN_KEYS` | Comma-separated admin keys. Unset = feature off. |
+| `AUTH_TRUST_COMPLETION_CALLERS` | Declares completion callers trusted with provisioned credentials. Required for `claude` — see below. |
+| `AUTH_SESSION_TTL_MS` | Session lifetime before reaping (default `600000`). |
+
+## A provisioned Claude credential is visible to completion callers
+
+`claude setup-token` prints its token instead of persisting it, so the proxy
+holds it and injects it into the CLI child of every completion. **That child's
+environment is readable by whoever wrote the prompt**, so a provisioned Claude
+token is recoverable by any caller who can reach `/v1/chat/completions`.
+
+This is not something the proxy can filter away:
+
+- The child runs with `--dangerously-skip-permissions`, so a prompt can run
+  arbitrary commands.
+- The CLI does scrub `CLAUDE_CODE_OAUTH_TOKEN` from the environment it hands its
+  own tools — but `ps` reports the environment a process was **exec'd** with, and
+  no runtime deletion changes that. Do not rely on the scrub.
+- Env is the only channel that reaches a CLI which does not persist its own
+  credential. Removing the injection removes the feature.
+
+So it is the operator's decision, made explicitly:
+
+```bash
+AUTH_TRUST_COMPLETION_CALLERS=1
+```
+
+Set it only when every holder of an `API_KEYS` entry is as trusted as the holder
+of `AUTH_ADMIN_KEYS` — on a single-operator proxy they are usually the same
+person. Without it, `POST /v1/auth/claude/sessions` answers `403
+caller_trust_not_declared` (refused before you complete a login, so no token is
+minted), and any credential already held is withheld from CLI children.
+
+`codex` is not gated: `codex login --with-api-key` persists to `~/.codex`
+itself, so nothing of its is injected into an environment this proxy builds.
+Note that the file it writes is still readable by a completion caller's shell —
+but that is the host's own pre-existing posture, identical to logging in at the
+console, and unchanged by this API.
+
+## Flows
+
+Each engine declares the shape of its login, so the client branches its UI on
+`flow` rather than on the engine name:
+
+| Engine | `flow` | CLI command | Credential ends up |
+| --- | --- | --- | --- |
+| `codex` | `api-key` | `codex login --with-api-key` (key over stdin) | in `~/.codex`, written by the CLI |
+| `claude` | `paste-code` | `claude setup-token` | in proxy memory, injected per run — requires `AUTH_TRUST_COMPLETION_CALLERS` |
+
+**`api-key`** — no verification URL. Submit the key; the CLI stores it itself.
+
+**`paste-code`** — `claude setup-token` prints an OAuth URL and then blocks
+waiting for the code the user gets back from it. Its redirect target is
+Anthropic's *hosted* callback (`platform.claude.com/oauth/code/callback`), not
+localhost, which is what makes it work remotely: the user can complete it on any
+device and read the code off the page.
+
+Two consequences worth knowing:
+
+- The CLI only renders that UI on a real terminal, so the proxy drives it under a
+  pty (`node-pty`) and holds the child process alive between the start and submit
+  requests. An abandoned session is therefore a live process — hence the TTL
+  reaper, the one-session-per-engine rule, and the cleanup on server shutdown.
+- `setup-token` **does not persist anything**. It prints the token and expects
+  the caller to export `CLAUDE_CODE_OAUTH_TOKEN`. The proxy holds that token **in
+  memory only** and injects it into runs **of that engine alone** — a credential
+  is one vendor's secret, so the codex CLI is never launched holding a Claude
+  token, and vice versa. Nothing is written to disk, and a proxy restart drops it
+  — re-running the flow is the recovery path.
+
+## Endpoints
+
+All require `Authorization: Bearer <AUTH_ADMIN_KEYS entry>`.
+
+### `GET /v1/auth/engines`
+
+```json
+{ "object": "list", "data": [
+  { "engine": "claude", "flow": "paste-code" },
+  { "engine": "codex",  "flow": "api-key" }
+] }
+```
+
+### `GET /v1/auth/{engine}/status`
+
+`state` is `authenticated` | `unauthenticated` | `unknown`.
+
+`unknown` is not a failure. Claude Code keeps host credentials in the OS
+keychain, which the proxy cannot read, so "not provisioned through this API" is
+no evidence of being logged out — reporting it as `unauthenticated` would send a
+client into a login flow it does not need. `codex` exposes a real check and is
+therefore definitive when the CLI answers; a timed-out or externally terminated
+check returns `unknown` because it produced no authentication verdict.
+
+A stored Claude token counts as `authenticated` only while
+`AUTH_TRUST_COMPLETION_CALLERS` is affirmative. If the operator removes that
+declaration, the token remains in memory but is withheld from completion
+children, and status returns `unknown` rather than claiming a credential that
+runs cannot use. An explicit host credential can still make the status
+`authenticated`.
+
+### `POST /v1/auth/{engine}/sessions` → `201`
+
+Starts an attempt, superseding any existing one for that engine.
+
+The engine's single session slot is claimed before the CLI is asked for its URL,
+so two overlapping starts cannot both take it. The loser is answered `409
+session_superseded` as soon as it is superseded — not after its own URL wait
+expires — and its CLI child is killed immediately. Retry to get the slot back.
+
+```json
+{
+  "sessionId": "9ceb7f66-…",
+  "engine": "claude",
+  "flow": "paste-code",
+  "status": "pending",
+  "verificationUrl": "https://claude.com/cai/oauth/authorize?…",
+  "instructions": "Open the URL, approve access, then submit the code…",
+  "expiresAt": "2026-07-28T04:38:04.786Z"
+}
+```
+
+`verificationUrl` is present only for `paste-code`.
+
+### `POST /v1/auth/{engine}/sessions/{sessionId}`
+
+Body takes `value` (aliases: `code`, `api_key`, `apiKey`):
+
+```bash
+curl -X POST -H "Authorization: Bearer $ADMIN_KEY" -H 'content-type: application/json' \
+  -d '{"code":"abc123#state"}' \
+  http://127.0.0.1:3456/v1/auth/claude/sessions/9ceb7f66-…
+```
+
+Answers `200` with the session, `status` now `authorized` or `failed`. A rejected
+credential is a completed attempt, not a transport error, so it is a `200`
+carrying `error: { message, code }` — only malformed requests (`400`) and unknown
+sessions/engines (`404`) are 4xx.
+
+One submission drives a session at a time: a second POST that arrives while the
+first is still with the CLI is answered `409 session_submitting` rather than
+writing a second code into the same pty, or starting a second `codex login` that
+races the first to replace the host credential. Retry once the first completes.
+
+### `GET /v1/auth/{engine}/sessions/{sessionId}`
+
+Poll a pending session. Completed and cancelled sessions are forgotten, so they
+answer `404 unknown_session`.
+
+### `DELETE /v1/auth/{engine}/sessions/{sessionId}`
+
+Abandon, killing any held CLI child — including a `codex login` still running
+from a submission in flight, which would otherwise finish and overwrite whatever
+credential was installed after it. That submission answers `session_cancelled`.
+
+### `DELETE /v1/auth/{engine}/credential`
+
+Forget a credential this API provisioned: `{ "engine": "claude", "cleared": true }`.
+Only affects credentials the proxy holds — a CLI that persists its own is left
+alone, since logging that out is the CLI's own concern.
+
+## The completion-side signal
+
+A run whose CLI has no usable credentials answers `401` with:
+
+```json
+{ "error": {
+  "message": "Invalid API key. Please run /login to authenticate.",
+  "type": "invalid_request_error",
+  "code": "engine_unauthenticated",
+  "engine": "codex"
+} }
+```
+
+`engine_unauthenticated` is deliberately distinct from `invalid_api_key` (which
+means the *caller's* key is wrong), and `engine` names which flow to open. In
+streaming mode the same object arrives in-band on the SSE stream, since the 200
+header has already been flushed.
+
+Both run paths emit it. `paperclip/*` models get the classification from the
+adapter (`errorCode: "claude_auth_required"`); the default `claude-*` models run
+the CLI directly, with no adapter, so the proxy matches the CLI's own
+"please log in" wording — but only on a run that already failed (`is_error`, or a
+nonzero exit), so an ordinary answer that discusses logins is never turned into a
+401. A failure whose wording is not recognised keeps its previous shape rather
+than being guessed at, so a client should still treat a repeated failure without
+this code as "check the host".
+
+## Scope and limits
+
+- **Auth is per host, not per caller.** `codex` credentials are host-global, and
+  the proxy holds a single provisioned credential per engine. Every caller shares
+  one identity per engine. Treat one proxy as one identity.
+- **`paste-code` sessions do not survive a restart**, by design — nothing is
+  persisted. The client restarts the flow. `stopServer()` cancels every pending
+  session and kills the child it holds, so this holds for an in-process restart
+  too: the sessions live in module state, not on the listener, and would
+  otherwise stay resolvable and submittable against the next server.
+- The proxy passes `BROWSER=none` to `claude setup-token`: this flow
+  authenticates a *remote* user, and on a host with a logged-in browser session a
+  locally opened browser can approve the request before that user ever sees the
+  URL. Best-effort — the printed URL remains the contract.

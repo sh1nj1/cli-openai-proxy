@@ -9,6 +9,7 @@
     "claude-max-api": "dist/server/standalone.js"
   },
   "scripts": {
+    "postinstall": "node scripts/fix-node-pty-permissions.mjs",
     "build": "tsc",
     "dev": "tsc --watch",
     "start": "node dist/server/standalone.js",
@@ -43,6 +44,7 @@
     "@paperclipai/adapter-codex-local": "^2026.722.0",
     "@paperclipai/adapter-utils": "^2026.722.0",
     "express": "^4.21.2",
+    "node-pty": "^1.1.0",
     "uuid": "^11.0.5"
   },
   "devDependencies": {
@@ -64,6 +66,7 @@
   },
   "files": [
     "dist",
+    "scripts",
     "docs",
     "README.md",
     "CONTRIBUTING.md"

@@ -14,7 +14,10 @@ import type {
 } from "../types/claude-cli.js";
 import type { ClaudeModel } from "../adapter/openai-to-cli.js";
 import { StreamJsonParser, type StreamJsonSink } from "../adapter/stream-json-parser.js";
-import { DEFAULT_TIMEOUT_MS, getBgWaitCeilingMs } from "../config.js";
+import { DEFAULT_TIMEOUT_MS, getBgWaitCeilingMs, stripProxySecrets } from "../config.js";
+import { getProvisionedAuthEnv } from "../auth/token-store.js";
+import { isClaudeAuthRequired } from "../adapter/claude-auth-detect.js";
+import { engineUnauthenticatedError } from "../adapter/adapter-error.js";
 
 export interface SubprocessOptions {
   // ClaudeModel literals keep autocomplete for the direct Claude path; the
@@ -28,6 +31,12 @@ export interface SubprocessOptions {
 }
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/** Enough stderr to classify a failure, small enough to never grow with output. */
+const STDERR_TAIL_LIMIT = 4000;
+
+/** Engine id this runner authenticates, as named in the /v1/auth registry. */
+const ENGINE = "claude";
 
 export function isValidSessionId(sessionId: string): boolean {
   return UUID_RE.test(sessionId);
@@ -52,6 +61,10 @@ export class ClaudeSubprocess extends EventEmitter {
   private timeoutId: NodeJS.Timeout | null = null;
   private isKilled: boolean = false;
   private parser: StreamJsonParser | null = null;
+  /** Set once an auth failure has been reported, so `close` does not report it twice. */
+  private authErrorEmitted = false;
+  /** Bounded stderr tail, kept only to classify a run that dies without a result. */
+  private stderrTail = "";
 
   /**
    * Start the Claude CLI subprocess with the given prompt
@@ -67,10 +80,19 @@ export class ClaudeSubprocess extends EventEmitter {
         this.process = spawn("claude", args, {
           cwd: options.cwd || process.cwd(),
           env: {
-            ...process.env,
+            // The keys that authenticate callers TO the proxy are not inherited:
+            // this child runs with permissions skipped, so anything in its env is
+            // readable by whoever wrote the prompt.
+            ...stripProxySecrets(process.env),
             // Keep `claude -p` alive until background subagents finish instead of
             // exiting at the CLI's 10-minute default cap (see config.ts).
             CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS: String(getBgWaitCeilingMs()),
+            // A credential provisioned through /v1/auth is held in memory only, so
+            // env is the sole channel that reaches the CLI. Applied last: an
+            // explicitly provisioned credential wins over a stale inherited one.
+            // "claude" by name — this runner only ever spawns the claude CLI, and
+            // another engine's credential has no business in its environment.
+            ...getProvisionedAuthEnv("claude"),
           },
           stdio: ["pipe", "pipe", "pipe"],
         });
@@ -116,6 +138,7 @@ export class ClaudeSubprocess extends EventEmitter {
           const errorText = chunk.toString().trim();
           if (errorText) {
             console.error("[Subprocess stderr]:", errorText);
+            this.stderrTail = `${this.stderrTail}\n${errorText}`.slice(-STDERR_TAIL_LIMIT);
           }
         });
 
@@ -132,6 +155,10 @@ export class ClaudeSubprocess extends EventEmitter {
           // subprocess kill/timeout/disconnect) is now parsed and emitted,
           // whereas the pre-refactor split/pop buffering silently dropped it.
           this.parser?.flush();
+          // A hard auth failure can kill the CLI before it emits any result, which
+          // would otherwise surface as a generic 500. Classify from stderr so this
+          // path advertises the same recoverable 401 as the result path above.
+          if (code !== 0) this.reportAuthFailure(this.stderrTail);
           this.emit("close", code);
         });
 
@@ -195,6 +222,12 @@ export class ClaudeSubprocess extends EventEmitter {
           const result = message as ClaudeCliResult;
           if (result.is_error || result.subtype === "error") {
             console.error(`\n[Subprocess] Error: ${result.result}`);
+            // A terminal error message would otherwise be relayed as a successful
+            // completion (cliResultToOpenai ignores is_error), so an unauthenticated
+            // run would answer 200 with the CLI's complaint as assistant text and the
+            // caller could never trigger the /v1/auth recovery flow. Report the same
+            // 401 engine_unauthenticated the Paperclip path produces instead.
+            if (this.reportAuthFailure(result.result, ...(result.errors ?? []))) return;
           }
           const usage = result.usage;
           if (usage) {
@@ -210,6 +243,20 @@ export class ClaudeSubprocess extends EventEmitter {
       this.parser = new StreamJsonParser(sink);
     }
     this.parser.push(chunk);
+  }
+
+  /**
+   * Emit the recoverable 401 if `texts` show the CLI wants a login. Returns
+   * whether it fired, so the caller can suppress the message it would otherwise
+   * have relayed. Fires at most once per run: the result path and the close path
+   * can both see the same failure.
+   */
+  private reportAuthFailure(...texts: Array<string | null | undefined>): boolean {
+    if (this.authErrorEmitted || !isClaudeAuthRequired(...texts)) return false;
+    this.authErrorEmitted = true;
+    const detail = texts.find((t) => t && t.trim())?.trim() ?? "Claude CLI is not authenticated";
+    this.emit("error", engineUnauthenticatedError(detail, ENGINE));
+    return true;
   }
 
   /**

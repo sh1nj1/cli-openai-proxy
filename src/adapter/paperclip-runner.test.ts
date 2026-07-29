@@ -520,3 +520,68 @@ test("signals a child spawned after a pre-spawn kill() (disconnect before onSpaw
     release();
   }
 });
+
+/**
+ * The adapter builds its child env as {...process.env, ...config.env} inside a
+ * dependency, so shadowing through config.env is the only reach this code has.
+ * Without it, a caller can ask the model to print AUTH_ADMIN_KEYS — the key that
+ * gates the credential-mutating /v1/auth routes.
+ */
+test("proxy-only keys are shadowed in the adapter's child environment", async () => {
+  const { PROXY_ONLY_SECRET_VARS } = await import("../config.js");
+  const saved = process.env.AUTH_ADMIN_KEYS;
+  process.env.AUTH_ADMIN_KEYS = "admin-key-should-not-leak";
+  try {
+    let captured: Record<string, string> = {};
+    const fakeExecute: AdapterExecute = async (ctx) => {
+      captured = (ctx.config.env ?? {}) as Record<string, string>;
+      return { exitCode: 0, signal: null, timedOut: false, sessionId: "s",
+        usage: { inputTokens: 1, outputTokens: 1 } };
+    };
+    await new PaperclipRunner(fakeExecute, { engine: "cli" }, { engine: "codex" }).start("p", { model: "opus" });
+
+    for (const key of PROXY_ONLY_SECRET_VARS) {
+      assert.equal(captured[key], "", `${key} must be shadowed, not inherited`);
+    }
+  } finally {
+    if (saved === undefined) delete process.env.AUTH_ADMIN_KEYS;
+    else process.env.AUTH_ADMIN_KEYS = saved;
+  }
+});
+
+// A provisioned credential is one vendor's secret. Every adapter spawns a
+// different vendor's CLI, so it must only reach the engine it was issued for.
+test("a provisioned credential reaches its own engine's adapter and no other", async () => {
+  const { setCredential, clearAllCredentials } = await import("../auth/token-store.js");
+  const envOf = async (engine: string | undefined): Promise<Record<string, string>> => {
+    let captured: Record<string, string> = {};
+    const fakeExecute: AdapterExecute = async (ctx) => {
+      captured = (ctx.config.env ?? {}) as Record<string, string>;
+      return { exitCode: 0, signal: null, timedOut: false, sessionId: "s",
+        usage: { inputTokens: 1, outputTokens: 1 } };
+    };
+    const runner = new PaperclipRunner(fakeExecute, { engine: "cli" }, { engine });
+    await runner.start("p", { model: "opus" });
+    return captured;
+  };
+
+  setCredential("claude", { envVar: "CLAUDE_CODE_OAUTH_TOKEN", value: "sk-ant-oat01-secret" });
+  const { TRUST_COMPLETION_CALLERS_VAR } = await import("../config.js");
+  process.env[TRUST_COMPLETION_CALLERS_VAR] = "1";
+  try {
+    assert.equal((await envOf("claude")).CLAUDE_CODE_OAUTH_TOKEN, "sk-ant-oat01-secret");
+    // Undeclared trust withholds it from the adapter env entirely.
+    delete process.env[TRUST_COMPLETION_CALLERS_VAR];
+    assert.equal((await envOf("claude")).CLAUDE_CODE_OAUTH_TOKEN, undefined);
+    process.env[TRUST_COMPLETION_CALLERS_VAR] = "1";
+    assert.equal(
+      (await envOf("codex")).CLAUDE_CODE_OAUTH_TOKEN,
+      undefined,
+      "the codex CLI must not be launched holding a Claude credential",
+    );
+    assert.equal((await envOf(undefined)).CLAUDE_CODE_OAUTH_TOKEN, undefined);
+  } finally {
+    clearAllCredentials();
+    delete process.env[TRUST_COMPLETION_CALLERS_VAR];
+  }
+});

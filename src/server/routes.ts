@@ -281,11 +281,11 @@ async function handleStreamingResponse(
       // Streaming already flushed a 200 header (keepalive), so the HTTP status can't
       // change — deliver the classified error in-band with the verbatim message so an
       // OpenAI client parses type/code (e.g. insufficient_quota) from the SSE stream.
-      const { type, code, message } = openaiErrorFromError(error);
+      const { type, code, message, engine } = openaiErrorFromError(error);
       if (!res.writableEnded) {
         res.write(
           `data: ${JSON.stringify({
-            error: { message, type, code },
+            error: { message, type, code, ...(engine ? { engine } : {}) },
           })}\n\n`
         );
         res.end();
@@ -368,10 +368,10 @@ async function handleNonStreamingResponse(
       // A classified adapter failure (usage limit / auth / unknown model) carries the
       // OpenAI status + type + code; a plain Error is an internal 500. Either way the
       // verbatim message is passed through unchanged.
-      const { status, type, code, message, retryAfterSeconds } = openaiErrorFromError(error);
+      const { status, type, code, message, retryAfterSeconds, engine } = openaiErrorFromError(error);
       if (res.writable) {
         if (retryAfterSeconds != null) res.setHeader("Retry-After", String(retryAfterSeconds));
-        res.status(status).json({ error: { message, type, code } });
+        res.status(status).json({ error: { message, type, code, ...(engine ? { engine } : {}) } });
       }
       resolve();
     });
