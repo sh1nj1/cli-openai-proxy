@@ -43,8 +43,24 @@ unit_quote() {
   local value="$1"
   value="${value//\\/\\\\}"
   value="${value//\"/\\\"}"
+  value="${value//$'\n'/\\n}"
+  value="${value//$'\r'/\\r}"
+  value="${value//$'\t'/\\t}"
   value="${value//%/%%}"
   printf '"%s"' "$value"
+}
+
+unit_scalar_escape() {
+  local value="$1"
+  value="${value//\\/\\\\}"
+  value="${value//$'\n'/\\n}"
+  value="${value//$'\r'/\\r}"
+  value="${value//$'\t'/\\t}"
+  value="${value// /\\x20}"
+  value="${value//\"/\\x22}"
+  value="${value//\'/\\x27}"
+  value="${value//%/%%}"
+  printf '%s' "$value"
 }
 
 env_quote() {
@@ -56,42 +72,73 @@ env_quote() {
   printf '"%s"' "$value"
 }
 
+path_metadata_is_trusted() {
+  local path="$1"
+  local expected_type="$2"
+  local metadata
+  local owner
+  local mode
+
+  if [[ "$expected_type" == "directory" ]]; then
+    [[ -d "$path" ]] || return 1
+  else
+    [[ -f "$path" ]] || return 1
+  fi
+  metadata="$(LC_ALL=C "$STAT_BIN" --dereference --format='%u %a' -- "$path" 2>/dev/null)" \
+    || return 1
+  read -r owner mode <<<"$metadata"
+  [[ "$owner" == "0" || "$owner" == "$EUID" ]] || return 1
+  [[ "$mode" =~ ^[0-7]+$ ]] || return 1
+  (( (8#$mode & 8#022) == 0 ))
+}
+
+trusted_existing_directory_ancestors() {
+  local current="$1"
+  local parent
+
+  while true; do
+    [[ ! -L "$current" || -e "$current" ]] || return 1
+    if [[ -e "$current" ]] && ! path_metadata_is_trusted "$current" directory; then
+      return 1
+    fi
+    parent="$(dirname -- "$current")"
+    [[ "$parent" != "$current" ]] || return 0
+    current="$parent"
+  done
+}
+
 service_path_is_trusted() {
-  "$NODE_BIN" -e '
-    const fs = require("node:fs");
-    const path = require("node:path");
-    const serviceUid = process.getuid();
-    const candidate = path.normalize(process.argv[1]);
+  local candidate="$1"
+  local existing
+  local parent
+  local resolved
 
-    const hasTrustedMetadata = (stats) =>
-      stats.isDirectory()
-      && (stats.uid === 0 || stats.uid === serviceUid)
-      && (stats.mode & 0o022) === 0;
+  [[ "$candidate" == /* ]] || return 1
+  trusted_existing_directory_ancestors "$candidate" || return 1
 
-    const trustedExistingAncestors = (start) => {
-      let current = start;
-      while (true) {
-	try {
-	  if (!hasTrustedMetadata(fs.statSync(current))) process.exit(1);
-	} catch (error) {
-	  if (error.code !== "ENOENT") process.exit(1);
-	}
-	const parent = path.dirname(current);
-	if (parent === current) return;
-	current = parent;
-      }
-    };
+  existing="$candidate"
+  while [[ ! -e "$existing" ]]; do
+    [[ ! -L "$existing" ]] || return 1
+    parent="$(dirname -- "$existing")"
+    [[ "$parent" != "$existing" ]] || return 1
+    existing="$parent"
+  done
+  resolved="$("$REALPATH_BIN" --canonicalize-existing -- "$existing" 2>/dev/null)" \
+    || return 1
+  trusted_existing_directory_ancestors "$resolved"
+}
 
-    trustedExistingAncestors(candidate);
+service_executable_is_trusted() {
+  local executable="$1"
+  local resolved
 
-    let existing = candidate;
-    while (!fs.existsSync(existing)) {
-      const parent = path.dirname(existing);
-      if (parent === existing) process.exit(1);
-      existing = parent;
-    }
-    trustedExistingAncestors(fs.realpathSync(existing));
-  ' "$1"
+  [[ "$executable" == /* && -f "$executable" && -x "$executable" ]] || return 1
+  service_path_is_trusted "$(dirname -- "$executable")" || return 1
+  resolved="$("$REALPATH_BIN" --canonicalize-existing -- "$executable" 2>/dev/null)" \
+    || return 1
+  [[ -x "$resolved" ]] || return 1
+  service_path_is_trusted "$(dirname -- "$resolved")" || return 1
+  path_metadata_is_trusted "$resolved" file
 }
 
 append_service_path() {
@@ -223,12 +270,18 @@ SYSTEMCTL_BIN="$(command_path systemctl)"
 LOGINCTL_BIN="$(trusted_command_path loginctl)"
 SUDO_BIN="$(trusted_command_path sudo)"
 ID_BIN="$(trusted_command_path id)"
+STAT_BIN="$(trusted_command_path stat)"
+REALPATH_BIN="$(trusted_command_path realpath)"
 
 [[ -n "$NODE_BIN" ]] || die "Node.js $MIN_NODE_VERSION or newer is required"
 [[ -n "$NPM_BIN" ]] || die "npm is required"
 [[ -n "$SYSTEMCTL_BIN" ]] || die "systemctl is required (Ubuntu with systemd)"
 [[ -n "$LOGINCTL_BIN" ]] || die "loginctl is required (systemd-logind)"
 [[ -n "$ID_BIN" ]] || die "id is required"
+[[ -n "$STAT_BIN" ]] || die "stat is required (GNU coreutils)"
+[[ -n "$REALPATH_BIN" ]] || die "realpath is required (GNU coreutils)"
+service_executable_is_trusted "$NODE_BIN" \
+  || die "Refusing Node.js executable with untrusted ownership or permissions: $NODE_BIN"
 
 SERVICE_USER="$("$ID_BIN" -un)"
 
@@ -339,11 +392,11 @@ log "Writing systemd user service: $SERVICE_FILE"
   printf '\n'
   printf '[Service]\n'
   printf 'Type=simple\n'
-  printf 'WorkingDirectory=%s\n' "$(unit_quote "$PROJECT_DIR")"
+  printf 'WorkingDirectory=%s\n' "$(unit_scalar_escape "$PROJECT_DIR")"
   printf 'Environment=%s\n' "$(unit_quote "HOME=$HOME")"
   printf 'Environment=%s\n' "$(unit_quote "NODE_ENV=production")"
   printf 'Environment=%s\n' "$(unit_quote "PATH=$SERVICE_PATH")"
-  printf 'EnvironmentFile=%s\n' "$(unit_quote "$ENV_FILE")"
+  printf 'EnvironmentFile=%s\n' "$(unit_scalar_escape "$ENV_FILE")"
   printf 'ExecStart=%s %s\n' "$(unit_quote "$NODE_BIN")" "$(unit_quote "$ENTRYPOINT")"
   printf 'Restart=on-failure\n'
   printf 'RestartSec=5\n'
