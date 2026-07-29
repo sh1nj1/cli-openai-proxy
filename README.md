@@ -378,5 +378,3 @@ Paperclip), streaming, usage tracking, and remote auth provisioning.
 ## License
 
 MIT — see [LICENSE](LICENSE). Copyright (c) 2026 Atal Ashutosh.
-</content>
-</invoke>
