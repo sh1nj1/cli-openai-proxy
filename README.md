@@ -99,6 +99,7 @@ paperclip/<adapter>[/<cli-model>]
 |---------------|------|-------------|
 | `paperclip/claude_local` | Claude Code (`claude`), CLI's default model | `claude` |
 | `paperclip/claude_local/opus` | Claude Code with `--model opus` | `claude` |
+| `paperclip/claude_local/claude-opus-4-6` | Claude Code with `--model claude-opus-4-6` | `claude` |
 | `paperclip/codex_local` | Codex (`codex`), CLI's default model | `codex` |
 | `paperclip/codex_local/gpt-5.4-mini` | Codex with `--model gpt-5.4-mini` | `codex` |
 
@@ -109,10 +110,23 @@ id the CLI rejects surfaces as the CLI's own error rather than silently running
 something else. Omit `<cli-model>` to let the CLI pick its default; omit `model`
 from the request entirely and you get `paperclip/claude_local`.
 
+Whatever the CLI takes for its own `--model` flag works here, because that is
+literally where the value goes. For `claude` that is either an alias for the
+latest of a family (`opus`, `sonnet`, `fable`) or a full id
+(`claude-opus-4-6`); `codex` takes full ids only. Pick by intent, not by
+correctness — an alias follows the CLI to each new model, a full id pins the one
+you tested against.
+
 An id outside this namespace returns `404 model_not_found`. That includes ids
 earlier versions accepted — `claude-opus-4`, `claude-max/…`, `anthropic/…`,
 `claude-code-cli/…`, and bare `opus`/`sonnet`/`haiku` — so a client configured
-against those needs its model id updated.
+against those needs its model id updated. Aliases are only meaningful as the
+`<cli-model>` part, where the CLI resolves them: `paperclip/claude_local/opus`
+runs, bare `opus` is a `404`.
+
+The `model` field on a response echoes the id you requested, unchanged, on both
+the streaming and non-streaming paths — so a gateway that routes or validates on
+it always sees an id this proxy accepts.
 
 This table — and `GET /v1/models` — is the set of adapters the proxy accepts,
 not what this host can currently run: neither checks whether the underlying CLI

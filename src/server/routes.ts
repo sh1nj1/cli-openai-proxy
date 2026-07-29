@@ -17,7 +17,7 @@ import {
   extractJsonFromText,
 } from "../adapter/cli-to-openai.js";
 import type { OpenAIChatRequest } from "../types/openai.js";
-import type { ClaudeCliAssistant, ClaudeCliResult, ClaudeCliStreamEvent } from "../types/claude-cli.js";
+import type { ClaudeCliResult, ClaudeCliStreamEvent } from "../types/claude-cli.js";
 import { usageTracker } from "../usage/tracker.js";
 import { isAuthEnabled } from "./auth.js";
 import { PKG_VERSION, getTimeoutMs, KEEPALIVE_INTERVAL_MS } from "../config.js";
@@ -154,7 +154,6 @@ async function handleStreamingResponse(
 
   return new Promise<void>((resolve, reject) => {
     let isFirst = true;
-    let lastModel = requestedModel;
     let isComplete = false;
     let jsonBuffer = "";
     let keepaliveInterval: NodeJS.Timeout | null = null;
@@ -212,11 +211,6 @@ async function handleStreamingResponse(
       }
     });
 
-    // Handle final assistant message
-    subprocess.on("assistant", (_message: ClaudeCliAssistant) => {
-      // We use requestedModel instead of CLI-returned model
-    });
-
     subprocess.on("result", (result: ClaudeCliResult) => {
       isComplete = true;
       clearKeepalive();
@@ -257,7 +251,7 @@ async function handleStreamingResponse(
           res.write(`data: ${JSON.stringify(chunk)}\n\n`);
         }
         // Send final done chunk with finish_reason
-        const doneChunk = createDoneChunk(requestId, lastModel);
+        const doneChunk = createDoneChunk(requestId, requestedModel);
         res.write(`data: ${JSON.stringify(doneChunk)}\n\n`);
         res.write("data: [DONE]\n\n");
         res.end();
