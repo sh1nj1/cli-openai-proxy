@@ -85,8 +85,9 @@ unrecognised id is the behaviour the namespace exists to remove.
 - Everything after the adapter key is passed to the CLI verbatim as its model
   string. Which models exist is the CLI's call, not this proxy's — the proxy
   keeps no model catalog.
-- An omitted `model` field (and only that) falls back to `DEFAULT_MODEL`
-  (`paperclip/claude_local`).
+- A missing or falsy `model` value (omitted, `""`, `null`) falls back to
+  `DEFAULT_MODEL` (`paperclip/claude_local`) via `body.model || DEFAULT_MODEL` —
+  an empty string is not rejected, it silently runs the default CLI.
 - `GET /v1/models` enumerates the same registry that request routing resolves
   against, so a caller cannot be shown an id that then 404s.
 
@@ -148,7 +149,7 @@ current runners do not map it to CLI sessions.
 |-----------|----------|
 | Unknown / non-`paperclip/*` model id | `404 model_not_found` — the caller's mistake, not a server fault |
 | Empty or missing `messages` | `400 invalid_messages` |
-| Oversized image (decoded > 20MB ceiling) | clean `400` from the image materializer (the 30MB body limit exists so this beats a raw 413) |
+| Oversized image (decoded > 20MB ceiling) | clean `400` from the image materializer, provided the encoded request still fits under the 30MB JSON body limit; a body so large that `express.json()` rejects it first never reaches the materializer and is currently surfaced as a `500` by the generic error handler |
 | CLI not logged in / auth failure | `401` naming the auth engine (`claude`, `codex`) so the caller knows which login flow to run — optionally via the [remote auth API](docs/cli-auth-provisioning.md) |
 | CLI run failure / timeout | adapter error mapped to an OpenAI-style error body by `adapter-error.ts` |
 | Missing CLI at startup | non-fatal: preflight warns and the server still starts, because the proxy also serves other adapters; a request targeting the missing CLI fails cleanly at request time |

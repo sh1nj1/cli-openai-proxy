@@ -69,16 +69,20 @@ src/
 
 ## Runner Event Contract
 
-The route layer is adapter-agnostic; every runner emits:
+The route layer is adapter-agnostic; the events it consumes are:
 
 | Event | Payload | Consumed for |
 |-------|---------|--------------|
 | `content_delta` | text fragment | SSE `chat.completion.chunk`s |
-| `assistant` | full assistant message | non-streaming fallback text |
 | `result` | terminal CLI result (usage, cost, summary) | final response, usage billing |
 | `error` | `Error` (adapter-aware) | OpenAI-style error body, 401-on-auth-failure |
 | `close` | exit code | response finalization |
-| `raw` / `message` | raw CLI lines / parsed messages | debugging |
+| `raw` / `message` / `assistant` | raw CLI lines / parsed messages | debugging only — not consumed by routes (`assistant` is emitted by the Claude runner only) |
+
+A `result` before `close` is mandatory: `handleNonStreamingResponse` builds its
+response solely from `result` and returns a 500 if the runner closes without
+one. A new adapter must emit `result`; emitting only `assistant` is not a
+substitute.
 
 ## HTTP Surface
 
