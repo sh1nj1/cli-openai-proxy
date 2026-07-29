@@ -8,16 +8,20 @@
 import { startServer, stopServer, getServer } from "./server/index.js";
 import { verifyClaude, verifyAuth } from "./cli/claude.js";
 import { runPreflight } from "./server/preflight.js";
-import {
-  PAPERCLIP_MODEL_IDS,
-  DEFAULT_MODEL as DEFAULT_PAPERCLIP_MODEL,
-} from "./adapter/paperclip-registry.js";
+import { PAPERCLIP_MODEL_IDS, defaultModelForHost } from "./adapter/paperclip-registry.js";
 
 // Provider constants
 export const PROVIDER_ID = "claude-code-cli";
 const PROVIDER_LABEL = "Claude Code CLI";
 const DEFAULT_PORT = 3456;
-export const PLUGIN_DEFAULT_MODEL = `${PROVIDER_ID}/${DEFAULT_PAPERCLIP_MODEL}`;
+
+/**
+ * The provider is configured with this before its first request runs, so it
+ * follows the host: a Claude default on a host that just failed the Claude
+ * preflight would fail that first request until the user switched models by hand.
+ */
+export const pluginDefaultModel = (claudeOk: boolean): string =>
+  `${PROVIDER_ID}/${defaultModelForHost(claudeOk)}`;
 
 /** "claude_local" -> "Claude Local" */
 function adapterLabel(id: string): string {
@@ -98,6 +102,7 @@ export async function runLocalAuthSetup(
       await ctx.prompter.note(
         [
           ...warnings,
+          `Default model set to ${pluginDefaultModel(false)} instead.`,
           "Install: npm install -g @anthropic-ai/claude-code",
           "Authenticate: claude auth login",
         ].join("\n"),
@@ -157,7 +162,7 @@ export async function runLocalAuthSetup(
             },
           },
         },
-        defaultModel: PLUGIN_DEFAULT_MODEL,
+        defaultModel: pluginDefaultModel(claudeOk),
         notes: [
           "This uses your Claude Max subscription via Claude Code CLI.",
           "Your OAuth token is used by the CLI, not exposed directly.",

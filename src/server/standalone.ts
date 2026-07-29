@@ -12,7 +12,7 @@ import { startServer, stopServer } from "./index.js";
 import { verifyClaude, verifyAuth } from "../cli/claude.js";
 import { runPreflight } from "./preflight.js";
 import { PKG_VERSION, getTimeoutMs } from "../config.js";
-import { DEFAULT_MODEL } from "../adapter/paperclip-registry.js";
+import { defaultModelForHost } from "../adapter/paperclip-registry.js";
 
 const DEFAULT_PORT = 3456;
 
@@ -36,7 +36,7 @@ async function main(): Promise<void> {
   // surfaced as a warning; a claude-targeted request fails cleanly at request
   // time instead.
   console.log("\n[Preflight]");
-  await runPreflight({
+  const { claudeOk } = await runPreflight({
     verifyClaude,
     verifyAuth,
     log: (m) => console.log(m),
@@ -75,8 +75,10 @@ async function main(): Promise<void> {
     console.log(`    -H "Content-Type: application/json" \\`);
     // Taken from the registry, not spelled out: the proxy 404s any id it cannot
     // resolve, so a hand-written example here goes stale into a broken command.
+    // It also follows preflight, so a codex-only host is not shown a copy-paste
+    // command whose CLI was just reported missing.
     console.log(
-      `    -d '{"model": "${DEFAULT_MODEL}", "messages": [{"role": "user", "content": "Hello!"}]}'`,
+      `    -d '{"model": "${defaultModelForHost(claudeOk)}", "messages": [{"role": "user", "content": "Hello!"}]}'`,
     );
     console.log("\nReady. Press Ctrl+C to stop.\n");
   } catch (err) {

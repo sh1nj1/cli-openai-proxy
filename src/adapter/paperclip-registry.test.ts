@@ -6,6 +6,7 @@ import {
   PAPERCLIP_MODEL_IDS,
   UnknownPaperclipModelError,
   DEFAULT_MODEL,
+  defaultModelForHost,
 } from "./paperclip-registry.js";
 import { PaperclipRunner } from "./paperclip-runner.js";
 
@@ -130,4 +131,17 @@ test("createRunner builds the runner with the parsed model", () => {
 test("DEFAULT_MODEL is a registered adapter", () => {
   assert.ok(resolvePaperclipModel(DEFAULT_MODEL), "default must resolve");
   assert.ok(PAPERCLIP_MODEL_IDS.includes(DEFAULT_MODEL));
+});
+
+test("a healthy Claude host keeps the plain default", () => {
+  assert.equal(defaultModelForHost(true), DEFAULT_MODEL);
+});
+
+test("a host without Claude is pointed away from the Claude adapter", () => {
+  // Suggesting claude_local to a host whose Claude CLI just failed preflight
+  // hands the user a first request that cannot succeed.
+  const suggested = defaultModelForHost(false);
+  const resolved = resolvePaperclipModel(suggested);
+  assert.ok(resolved, `${suggested} must resolve`);
+  assert.notEqual(resolved!.spec.authEngine, "claude");
 });

@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { PLUGIN_MODELS, PLUGIN_DEFAULT_MODEL, PROVIDER_ID } from "./index.js";
+import { PLUGIN_MODELS, pluginDefaultModel, PROVIDER_ID } from "./index.js";
 import { resolvePaperclipModel } from "./adapter/paperclip-registry.js";
 
 test("every model the plugin advertises resolves to a registered adapter", () => {
@@ -23,10 +23,15 @@ test("the plugin advertises no legacy alias ids", () => {
 });
 
 test("the plugin default model is a provider-qualified registered adapter", () => {
-  assert.ok(PLUGIN_DEFAULT_MODEL.startsWith(`${PROVIDER_ID}/`));
-  const modelId = PLUGIN_DEFAULT_MODEL.slice(PROVIDER_ID.length + 1);
-  assert.ok(
-    resolvePaperclipModel(modelId) !== null,
-    `${modelId} is the default but not registered`,
-  );
+  // Whichever host state it is asked about, the default has to be an id the
+  // proxy accepts — the provider is configured with it before any request runs.
+  for (const claudeOk of [true, false]) {
+    const advertised = pluginDefaultModel(claudeOk);
+    assert.ok(advertised.startsWith(`${PROVIDER_ID}/`));
+    const modelId = advertised.slice(PROVIDER_ID.length + 1);
+    assert.ok(
+      resolvePaperclipModel(modelId) !== null,
+      `${modelId} is the default but not registered`,
+    );
+  }
 });

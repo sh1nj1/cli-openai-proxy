@@ -67,6 +67,23 @@ export const PAPERCLIP_MODEL_PREFIX = "paperclip/";
 /** Adapter used when a request names no model at all. */
 export const DEFAULT_MODEL = "paperclip/claude_local";
 
+/**
+ * Model to suggest to a host whose Claude CLI state preflight has just measured.
+ *
+ * Preflight only probes Claude, so a `false` here does not prove any other CLI
+ * works — it only proves this one does not, which is enough to stop handing the
+ * user a first request that is guaranteed to fail. Only advisory, one-shot
+ * output uses this (setup's default model, the startup example); request routing
+ * keeps `DEFAULT_MODEL` unconditionally, because a startup probe goes stale the
+ * moment the user installs or logs into the CLI.
+ */
+export function defaultModelForHost(claudeOk: boolean): string {
+  if (claudeOk) return DEFAULT_MODEL;
+  return (
+    PAPERCLIP_MODEL_IDS.find((id) => REGISTRY[id].authEngine !== "claude") ?? DEFAULT_MODEL
+  );
+}
+
 export interface ResolvedModel {
   spec: PaperclipModelSpec;
   /** Everything after `paperclip/<adapter>/`. Absent means the CLI's default model. */

@@ -36,7 +36,9 @@ test("setup completes on a codex-only host (no Claude CLI)", async () => {
 
   assert.deepEqual(started, [3456]);
   assert.equal(port, 3456);
-  assert.equal(auth.defaultModel.startsWith(`${PROVIDER_ID}/`), true);
+  // Defaulting to the adapter whose CLI just failed preflight would make the
+  // provider's very first completion fail on a host that is otherwise usable.
+  assert.equal(auth.defaultModel, `${PROVIDER_ID}/paperclip/codex_local`);
 
   const advertised = auth.configPatch.models.providers[PROVIDER_ID].models.map(
     (m: { id: string }) => m.id,
@@ -77,6 +79,7 @@ test("setup warns about nothing when Claude is fully available", async () => {
 
   assert.deepEqual(notes, []);
   assert.ok(auth.profiles.length > 0);
+  assert.equal(auth.defaultModel, `${PROVIDER_ID}/paperclip/claude_local`);
 });
 
 test("a failing server start still fails setup", async () => {
