@@ -7,7 +7,7 @@
 
 import fs from "fs/promises";
 import path from "path";
-import { aggregateRunTokens, type ModelUsage } from "./run-usage.js";
+import { aggregateRunTokens, type ModelUsage, type RunTokens } from "./run-usage.js";
 
 export interface RequestRecord {
   timestamp: number;
@@ -49,6 +49,11 @@ const PRICING: Record<string, { input: number; output: number }> = {
   haiku:  { input: 0.25,  output: 1.25  },
 };
 
+// Cached prompt tokens are billed off the input rate, not free: a cache read
+// costs a tenth of it, writing the cache 1.25x (5-minute TTL).
+const CACHE_READ_RATE = 0.1;
+const CACHE_WRITE_RATE = 1.25;
+
 /** Pricing family a model id belongs to. Unknown ids are priced as Sonnet. */
 function pricingFamily(model: string): string {
   const id = model.toLowerCase();
@@ -57,9 +62,22 @@ function pricingFamily(model: string): string {
   return "sonnet";
 }
 
-function cost(family: string, inputTokens: number, outputTokens: number): number {
+function cost(family: string, tokens: RunTokens): number {
   const pricing = PRICING[family];
-  return (inputTokens / 1_000_000) * pricing.input + (outputTokens / 1_000_000) * pricing.output;
+  const promptTokens = tokens.inputTokens
+    + tokens.cacheReadTokens * CACHE_READ_RATE
+    + tokens.cacheWriteTokens * CACHE_WRITE_RATE;
+  return (promptTokens / 1_000_000) * pricing.input
+    + (tokens.outputTokens / 1_000_000) * pricing.output;
+}
+
+/**
+ * Rates like 0.1x are not binary-exact, so a run's dollars carry float dust
+ * (0.30000000000000004). Sub-cent precision is well past anything meaningful
+ * for an estimate, and getSummary rounds harder still.
+ */
+function roundUsd(usd: number): number {
+  return Math.round(usd * 1_000_000) / 1_000_000;
 }
 
 export type { ModelUsage };
@@ -114,17 +132,29 @@ export function billRun(
     return {
       model: family,
       ...tokens,
-      costUsd: cost(family, tokens.inputTokens, tokens.outputTokens),
+      costUsd: roundUsd(cost(family, tokens)),
     };
   }
 
   let model = "sonnet";
   let dominantOutput = -1;
   let costUsd = 0;
+  let pricedCacheRead = 0;
+  let pricedCacheWrite = 0;
 
   for (const [name, usage] of entries) {
     const outputTokens = usage?.outputTokens ?? 0;
-    costUsd += cost(pricingFamily(name), usage?.inputTokens ?? 0, outputTokens);
+    const cacheReadTokens = usage?.cacheReadInputTokens ?? 0;
+    const cacheWriteTokens = usage?.cacheCreationInputTokens ?? 0;
+    pricedCacheRead += cacheReadTokens;
+    pricedCacheWrite += cacheWriteTokens;
+
+    costUsd += cost(pricingFamily(name), {
+      inputTokens: usage?.inputTokens ?? 0,
+      outputTokens,
+      cacheReadTokens,
+      cacheWriteTokens,
+    });
 
     if (outputTokens > dominantOutput) {
       dominantOutput = outputTokens;
@@ -132,7 +162,17 @@ export function billRun(
     }
   }
 
-  return { model, ...tokens, costUsd };
+  // Cache detail is optional per model, so the aggregate can carry run totals no
+  // entry accounted for. Price the remainder at the dominant family's rate —
+  // otherwise cache tokens the record does report would cost nothing.
+  costUsd += cost(model, {
+    inputTokens: 0,
+    outputTokens: 0,
+    cacheReadTokens: tokens.cacheReadTokens - pricedCacheRead,
+    cacheWriteTokens: tokens.cacheWriteTokens - pricedCacheWrite,
+  });
+
+  return { model, ...tokens, costUsd: roundUsd(costUsd) };
 }
 
 export const DATA_DIR_NAME = ".cli-openai-proxy";

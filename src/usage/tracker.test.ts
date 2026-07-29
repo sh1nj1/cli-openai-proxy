@@ -225,6 +225,48 @@ test("prefers a reported cache total of zero over the run total", () => {
   assert.equal(billed.cacheWriteTokens, 20_005);
 });
 
+test("prices cached prompt tokens at their own API rates", () => {
+  // The saved-cost estimate answers "what would this have cost on the API", and
+  // there cached input is not free: a read bills at a tenth of the input rate,
+  // writing the cache at 1.25x. Pricing only uncached input reports a prompt
+  // served entirely from cache as costing nothing.
+  const read = billRun(
+    { modelUsage: { "claude-opus-5": { inputTokens: 0, outputTokens: 0, cacheReadInputTokens: 1_000_000 } } },
+    RUN_TOTALS,
+  );
+  assert.equal(read.costUsd, 1.5);
+
+  const write = billRun(
+    { modelUsage: { "claude-opus-5": { inputTokens: 0, outputTokens: 0, cacheCreationInputTokens: 1_000_000 } } },
+    RUN_TOTALS,
+  );
+  assert.equal(write.costUsd, 18.75);
+});
+
+test("prices cache totals the models left unreported", () => {
+  // billRun keeps the run's cache totals when no entry reports them, so those
+  // tokens are in the record; pricing only per-entry cache would bill them at 0.
+  const billed = billRun(
+    { modelUsage: { "claude-opus-5": { inputTokens: 0, outputTokens: 0 } } },
+    { ...RUN_TOTALS, cacheReadTokens: 1_000_000 },
+  );
+
+  assert.equal(billed.cacheReadTokens, 1_000_000);
+  assert.equal(billed.costUsd, 1.5);
+});
+
+test("prices a fully cached run that reported no model", () => {
+  // The codex adapter synthesizes an empty modelUsage, so its whole prompt is
+  // priced through the fallback — a cache-heavy turn there must not bill zero.
+  const billed = billRun(
+    { modelUsage: {} },
+    { ...RUN_TOTALS, model: "paperclip/codex_local", cacheReadTokens: 1_000_000 },
+  );
+
+  assert.equal(billed.model, "sonnet");
+  assert.equal(billed.costUsd, 0.3);
+});
+
 test("falls back to the requested id and run totals when no model was reported", () => {
   // Failed runs produce no result at all, and codex-jsonl synthesizes an empty
   // modelUsage — neither knows more than the request did.
