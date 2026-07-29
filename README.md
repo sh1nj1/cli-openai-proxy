@@ -360,6 +360,41 @@ launchctl load ~/Library/LaunchAgents/com.cli-openai-proxy.plist
 
 See [docs/macos-setup.md](docs/macos-setup.md).
 
+## Auto-Start on Ubuntu
+
+Run the installer as the same user that authenticated the agent CLI(s). Do not
+run it with `sudo`.
+
+```bash
+git clone https://github.com/sh1nj1/cli-openai-proxy.git
+cd cli-openai-proxy
+./install.sh
+```
+
+The installer checks for Node.js 22.13.0 or newer, installs dependencies,
+builds the project, and enables the
+`com.claude-code-provider.service` systemd user service. It also enables
+systemd linger so the proxy starts at boot before login. On a minimal Ubuntu
+installation it also installs `build-essential` and Python 3, which are needed
+to compile `node-pty`. `sudo` is used only for those OS prerequisites and the
+linger setting; the proxy itself runs as the current user.
+
+The default listener is `127.0.0.1:3456`. Edit
+`~/.config/claude-max-api-proxy.env` to configure `PORT`, `HOST`, `API_KEYS`,
+or remote CLI authentication, then restart the service. If `HOST` is changed
+to a non-loopback address, set `API_KEYS` before exposing the port.
+
+```bash
+systemctl --user restart com.claude-code-provider.service
+systemctl --user status com.claude-code-provider.service
+journalctl --user -u com.claude-code-provider.service -f
+curl http://127.0.0.1:3456/health
+```
+
+After pulling new code from `main`, rerun `./install.sh`. Existing environment
+configuration is preserved while dependencies, the build, and the service are
+updated.
+
 ## Architecture
 
 ```
