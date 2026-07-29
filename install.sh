@@ -56,6 +56,19 @@ env_quote() {
   printf '"%s"' "$value"
 }
 
+append_service_path() {
+  local directory="$1"
+
+  [[ "$directory" == /* ]] || return
+  [[ "$directory" != *:* && "$directory" != *$'\n'* && "$directory" != *$'\r'* ]] || return
+  [[ ":$SERVICE_PATH:" != *":$directory:"* ]] || return
+  if [[ -n "$SERVICE_PATH" ]]; then
+    SERVICE_PATH="$SERVICE_PATH:$directory"
+  else
+    SERVICE_PATH="$directory"
+  fi
+}
+
 health_check() {
   "$NODE_BIN" -e '
     const http = require("node:http");
@@ -203,6 +216,9 @@ if [[ -z "$CLAUDE_BIN" ]]; then
   warn "Install it with: npm install -g @anthropic-ai/claude-code"
 fi
 CODEX_BIN="$(command_path codex)"
+if [[ -z "$CODEX_BIN" ]]; then
+  warn "Codex CLI was not found; Codex requests will fail until it is installed and authenticated"
+fi
 
 log "Installing dependencies"
 (cd "$PROJECT_DIR" && "$NPM_BIN" ci)
@@ -254,14 +270,23 @@ CODEX_DIR=""
 if [[ -n "$CODEX_BIN" ]]; then
   CODEX_DIR="$(dirname -- "$CODEX_BIN")"
 fi
-SERVICE_PATH="$NODE_DIR"
-if [[ -n "$CLAUDE_DIR" && "$CLAUDE_DIR" != "$NODE_DIR" ]]; then
-  SERVICE_PATH="$SERVICE_PATH:$CLAUDE_DIR"
+NPM_PREFIX="$("$NPM_BIN" prefix --global 2>/dev/null || true)"
+SERVICE_PATH=""
+append_service_path "$NODE_DIR"
+append_service_path "$CLAUDE_DIR"
+append_service_path "$CODEX_DIR"
+append_service_path "$HOME/.local/bin"
+append_service_path "$HOME/bin"
+if [[ -n "$NPM_PREFIX" ]]; then
+  append_service_path "$NPM_PREFIX/bin"
 fi
-if [[ -n "$CODEX_DIR" && "$CODEX_DIR" != "$NODE_DIR" && "$CODEX_DIR" != "$CLAUDE_DIR" ]]; then
-  SERVICE_PATH="$SERVICE_PATH:$CODEX_DIR"
-fi
-SERVICE_PATH="$SERVICE_PATH:/usr/local/bin:/usr/bin:/bin"
+IFS=: read -r -a USER_PATH_DIRS <<<"${PATH:-}"
+for directory in "${USER_PATH_DIRS[@]}"; do
+  append_service_path "$directory"
+done
+append_service_path "/usr/local/bin"
+append_service_path "/usr/bin"
+append_service_path "/bin"
 
 log "Writing systemd user service: $SERVICE_FILE"
 {

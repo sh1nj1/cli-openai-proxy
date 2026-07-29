@@ -384,6 +384,9 @@ The default listener is `127.0.0.1:3456`. Edit
 `PORT`, `HOST`, `API_KEYS`, or remote CLI authentication, then restart the
 service. The installer also prints the effective path as `Config:`. If `HOST`
 is changed to a non-loopback address, set `API_KEYS` before exposing the port.
+The service PATH includes common user CLI locations and the absolute entries
+from PATH when the installer runs. Rerun `./install.sh` after adding a new
+custom CLI installation directory to PATH.
 
 ```bash
 systemctl --user restart com.claude-code-provider.service
