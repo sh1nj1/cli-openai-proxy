@@ -12,6 +12,7 @@ import { startServer, stopServer } from "./index.js";
 import { verifyClaude, verifyAuth } from "../cli/claude.js";
 import { runPreflight } from "./preflight.js";
 import { PKG_VERSION, getTimeoutMs } from "../config.js";
+import { DEFAULT_MODEL } from "../adapter/paperclip-registry.js";
 
 const DEFAULT_PORT = 3456;
 
@@ -72,7 +73,11 @@ async function main(): Promise<void> {
     console.log(`  curl -s ${baseUrl}/health | jq .`);
     console.log(`  curl -X POST ${baseUrl}/v1/chat/completions \\`);
     console.log(`    -H "Content-Type: application/json" \\`);
-    console.log(`    -d '{"model": "claude-sonnet-4", "messages": [{"role": "user", "content": "Hello!"}]}'`);
+    // Taken from the registry, not spelled out: the proxy 404s any id it cannot
+    // resolve, so a hand-written example here goes stale into a broken command.
+    console.log(
+      `    -d '{"model": "${DEFAULT_MODEL}", "messages": [{"role": "user", "content": "Hello!"}]}'`,
+    );
     console.log("\nReady. Press Ctrl+C to stop.\n");
   } catch (err) {
     console.error("Failed to start server:", err);
