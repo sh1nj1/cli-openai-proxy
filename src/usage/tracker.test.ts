@@ -1,5 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import type { PathLike } from "node:fs";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -70,6 +71,29 @@ test("leaves an existing new-layout directory alone", async () => {
     // Migration must not overwrite data already written under the new name.
     assert.equal(tracker.getSummary().totalRequests, 2);
     await fs.access(path.join(home, LEGACY_DATA_DIR_NAME, "usage.json"));
+  });
+});
+
+test("uses the new directory when another process wins the migration race", async (t) => {
+  await withFakeHome(async (home) => {
+    const legacyDir = path.join(home, LEGACY_DATA_DIR_NAME);
+    const dataDir = path.join(home, DATA_DIR_NAME);
+    await seed(legacyDir, [SAMPLE_RECORD]);
+
+    const realRename = fs.rename.bind(fs);
+    t.mock.method(fs, "rename", async (oldPath: PathLike, newPath: PathLike) => {
+      // Model the other process completing the move after both initial access
+      // checks, but before this process's rename returns its source-missing error.
+      await realRename(oldPath, newPath);
+      throw new Error("ENOENT: migration source was moved by another process");
+    });
+
+    const tracker = new UsageTracker();
+    await tracker.load();
+
+    assert.equal(tracker.getSummary().totalRequests, 1);
+    await fs.access(path.join(dataDir, "usage.json"));
+    await assert.rejects(() => fs.access(legacyDir));
   });
 });
 

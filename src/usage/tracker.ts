@@ -100,6 +100,12 @@ export class UsageTracker {
     try {
       await fs.rename(this.legacyDir, this.dataDir);
     } catch {
+      try {
+        await fs.access(this.dataDir);
+        return; // another process won the migration race
+      } catch {
+        // destination is still absent — keep using the readable legacy data
+      }
       // Read in place rather than start empty; retried on the next boot.
       this.dataDir = this.legacyDir;
     }
