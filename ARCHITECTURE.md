@@ -100,6 +100,12 @@ substitute.
   directory is migrated there on first load).
 - **Provisioned credentials**: in proxy memory only (`auth/token-store.ts`);
   codex API keys are handed to `codex login` which persists them in `~/.codex`.
+- **In-flight auth provisioning sessions**: while a `/v1/auth/:engine/sessions`
+  flow is pending, `auth/session-manager.ts` holds it in module-level maps
+  (`byId`, `byEngine`, plus a `starting` reservation) and may keep a live CLI
+  child running until the code is submitted. Sessions are dropped on
+  submission, cancellation, TTL expiry (default 10 min, `AUTH_SESSION_TTL_MS`),
+  or server shutdown — and, being memory-only, do not survive a restart.
 - **Everything else is stateless on the proxy side**: fresh workdir per run,
   no session resume, no model catalog. Claude runs write no transcript
   (`--no-session-persistence`); Codex is not passed `--ephemeral`, so the
