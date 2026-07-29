@@ -89,24 +89,35 @@ disk) still does, and the next request can see it. See
 
 ## Engines and Models
 
+Model ids follow one rule:
+
+```
+paperclip/<adapter>[/<cli-model>]
+```
+
 | `model` value | Runs | Auth engine |
 |---------------|------|-------------|
-| `paperclip/claude_local` | Claude Code (`claude`) | `claude` |
-| `paperclip/codex_local` | Codex (`codex`) | `codex` |
-| `claude-opus-4-6`, `claude-sonnet-4`, `claude-haiku-4`, … | Claude Code, with that model selected | `claude` |
+| `paperclip/claude_local` | Claude Code (`claude`), CLI's default model | `claude` |
+| `paperclip/claude_local/opus` | Claude Code with `--model opus` | `claude` |
+| `paperclip/codex_local` | Codex (`codex`), CLI's default model | `codex` |
+| `paperclip/codex_local/gpt-5.4-mini` | Codex with `--model gpt-5.4-mini` | `codex` |
 
-Any model id that is *not* prefixed `paperclip/` goes to the Claude adapter, so
-existing OpenAI-style Claude ids keep working — including provider-prefixed
-forms (`anthropic/…`, `openai/…`, `claude-code-cli/…`). Only the
-`paperclip/` prefix is validated: an unregistered `paperclip/<name>` returns
-`404 model_not_found` rather than silently running something else. Every other
-id is accepted, and one the alias table does not recognize — `gpt-4o`, a
-misspelled Claude id — runs Claude Opus without an error.
+The adapter part is matched against the registry; everything after it is the
+model, passed to the CLI verbatim. The proxy keeps no model catalog of its own,
+so a model works the moment your CLI supports it, with no proxy release — and an
+id the CLI rejects surfaces as the CLI's own error rather than silently running
+something else. Omit `<cli-model>` to let the CLI pick its default; omit `model`
+from the request entirely and you get `paperclip/claude_local`.
 
-This table — and `GET /v1/models` — is the catalog the proxy *advertises*, not
-the set it accepts (wider, per above) nor what this host can currently run.
-Neither checks whether the underlying CLI is installed or logged in, so a
-request can be accepted here and still fail at execution. `GET /v1/auth/{engine}/status` (requires `AUTH_ADMIN_KEYS`; see
+An id outside this namespace returns `404 model_not_found`. That includes ids
+earlier versions accepted — `claude-opus-4`, `claude-max/…`, `anthropic/…`,
+`claude-code-cli/…`, and bare `opus`/`sonnet`/`haiku` — so a client configured
+against those needs its model id updated.
+
+This table — and `GET /v1/models` — is the set of adapters the proxy accepts,
+not what this host can currently run: neither checks whether the underlying CLI
+is installed or logged in, so a request can be accepted here and still fail at
+execution. `GET /v1/auth/{engine}/status` (requires `AUTH_ADMIN_KEYS`; see
 below) is an auth diagnostic, not an availability check: it never tests that the
 CLI can run, and on the ordinary Claude path — logged in on the host, credential
 in the keychain — it answers `unknown`, the same answer it gives when `claude`
@@ -138,6 +149,8 @@ walkthrough: [docs/paperclip-adapters.md](docs/paperclip-adapters.md#collavre-in
 ## Features
 
 - **OpenAI-compatible API** — drop-in for any OpenAI client
+- **Any CLI model** — the model part of the id is passed to the CLI verbatim, so
+  the proxy keeps no model catalog to fall out of date
 - **Streaming** — SSE deltas as the CLI produces output
 - **Image input** — OpenAI `image_url` parts (base64 data URLs) are materialized
   to temp files and handed to the CLI as inline links, so the agent can see them;
@@ -271,7 +284,7 @@ response = client.chat.completions.create(
   "models": [{
     "title": "Claude Code CLI",
     "provider": "openai",
-    "model": "claude-opus-4-6",
+    "model": "paperclip/claude_local/opus",
     "apiBase": "http://localhost:3456/v1",
     "apiKey": "not-needed"
   }]
@@ -280,7 +293,9 @@ response = client.chat.completions.create(
 
 ### OpenClaw
 
-Configure an OpenAI-compatible provider pointing at `localhost:3456`.
+Configure an OpenAI-compatible provider pointing at `localhost:3456`, with the
+model set to a `paperclip/…` id. The built-in `claude-max` provider preset sends
+`claude-max/claude-*` ids, which this proxy does not accept.
 
 ### cURL (streaming)
 
