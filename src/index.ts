@@ -7,39 +7,45 @@
 
 import { startServer, stopServer, getServer } from "./server/index.js";
 import { verifyClaude, verifyAuth } from "./cli/claude.js";
+import {
+  PAPERCLIP_MODEL_IDS,
+  DEFAULT_MODEL as DEFAULT_PAPERCLIP_MODEL,
+} from "./adapter/paperclip-registry.js";
 
 // Provider constants
-const PROVIDER_ID = "claude-code-cli";
+export const PROVIDER_ID = "claude-code-cli";
 const PROVIDER_LABEL = "Claude Code CLI";
 const DEFAULT_PORT = 3456;
-const DEFAULT_MODEL = "claude-code-cli/claude-sonnet-4";
+export const PLUGIN_DEFAULT_MODEL = `${PROVIDER_ID}/${DEFAULT_PAPERCLIP_MODEL}`;
 
-// Available models
-const AVAILABLE_MODELS = [
-  {
-    id: "claude-opus-4",
-    name: "Claude Opus 4.5",
-    alias: "opus",
-    reasoning: true,
-  },
-  {
-    id: "claude-sonnet-4",
-    name: "Claude Sonnet 4",
-    alias: "sonnet",
-    reasoning: false,
-  },
-  {
-    id: "claude-haiku-4",
-    name: "Claude Haiku 4",
-    alias: "haiku",
-    reasoning: false,
-  },
-];
+/** "claude_local" -> "Claude Local" */
+function adapterLabel(id: string): string {
+  return id
+    .slice(id.lastIndexOf("/") + 1)
+    .split("_")
+    .map((word) => word.charAt(0).toUpperCase() + word.slice(1))
+    .join(" ");
+}
+
+/**
+ * Advertised models come from the adapter registry rather than a hand-kept list:
+ * the proxy 404s any id it does not resolve, so a stale entry here breaks every
+ * completion routed through it.
+ *
+ * Each entry names an adapter, not a CLI model — a caller appends `/<cli-model>`
+ * to pick one, and omitting it uses the CLI's own default.
+ */
+export const PLUGIN_MODELS = PAPERCLIP_MODEL_IDS.map((id) => ({
+  id,
+  name: `${adapterLabel(id)} (Paperclip)`,
+  // The CLI model is chosen per request, so no fixed capability can be claimed here.
+  reasoning: false,
+}));
 
 /**
  * Build model definitions for Clawdbot config
  */
-function buildModelDefinition(model: (typeof AVAILABLE_MODELS)[number]) {
+function buildModelDefinition(model: (typeof PLUGIN_MODELS)[number]) {
   return {
     id: model.id,
     name: model.name,
@@ -158,14 +164,14 @@ const claudeCodeCliPlugin = {
                         apiKey: "local",
                         api: "openai-completions",
                         authHeader: false,
-                        models: AVAILABLE_MODELS.map(buildModelDefinition),
+                        models: PLUGIN_MODELS.map(buildModelDefinition),
                       },
                     },
                   },
                   agents: {
                     defaults: {
                       models: Object.fromEntries(
-                        AVAILABLE_MODELS.map((m) => [
+                        PLUGIN_MODELS.map((m) => [
                           `${PROVIDER_ID}/${m.id}`,
                           {},
                         ])
@@ -173,7 +179,7 @@ const claudeCodeCliPlugin = {
                     },
                   },
                 },
-                defaultModel: DEFAULT_MODEL,
+                defaultModel: PLUGIN_DEFAULT_MODEL,
                 notes: [
                   "This uses your Claude Max subscription via Claude Code CLI.",
                   "Your OAuth token is used by the CLI, not exposed directly.",
