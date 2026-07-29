@@ -89,6 +89,25 @@ export function displayCostUsd(usd: number): number {
   return Math.round(usd * PER_MILLION) / PER_MILLION;
 }
 
+/**
+ * The pricing family that ran the main chain, when the run's own numbers name it.
+ *
+ * `modelUsage` never labels which entry is the main chain, but the top-level
+ * totals are the main chain's alone — so the entry matching them on both input
+ * and output is that chain. A main chain that itself spanned models matches
+ * nothing (and two identical entries match ambiguously); the caller keeps its
+ * own default then.
+ */
+function mainChainFamily(
+  entries: [string, ModelUsage | undefined][],
+  mainChain: { inputTokens: number; outputTokens: number },
+): string | null {
+  const matches = entries.filter(([, usage]) =>
+    (usage?.inputTokens ?? 0) === mainChain.inputTokens
+    && (usage?.outputTokens ?? 0) === mainChain.outputTokens);
+  return matches.length === 1 ? pricingFamily(matches[0][0]) : null;
+}
+
 export type { ModelUsage };
 
 export interface BilledRun {
@@ -172,9 +191,11 @@ export function billRun(
   }
 
   // Cache detail is optional per model, so the aggregate can carry run totals no
-  // entry accounted for. Price the remainder at the dominant family's rate —
-  // otherwise cache tokens the record does report would cost nothing.
-  costUsd += cost(model, {
+  // entry accounted for — otherwise cache tokens the record does report would
+  // cost nothing. Those totals came from the main chain, so they are priced at
+  // its rate, not at the rate of whichever model happened to talk the most: a
+  // verbose Haiku sidechain must not decide what an Opus prompt cost.
+  costUsd += cost(mainChainFamily(entries, fallback) ?? model, {
     inputTokens: 0,
     outputTokens: 0,
     cacheReadTokens: tokens.cacheReadTokens - pricedCacheRead,

@@ -297,6 +297,42 @@ test("prices cache totals the models left unreported", () => {
   assert.equal(billed.costUsd, 1.5);
 });
 
+test("prices unreported cache against the main chain, not the loudest sidechain", () => {
+  // Those tokens come from the top-level totals, which are the main chain's — so
+  // charging them to whichever model produced the most output prices an Opus
+  // prompt at Haiku rates whenever a sidechain out-talks the turn that cached it.
+  // `modelUsage` never labels the main chain, but the entry matching the
+  // top-level input/output is it.
+  const billed = billRun(
+    {
+      modelUsage: {
+        "claude-opus-5": { inputTokens: 0, outputTokens: 0 },
+        "claude-haiku-4-5": { inputTokens: 0, outputTokens: 1_000_000 },
+      },
+    },
+    { ...RUN_TOTALS, cacheReadTokens: 1_000_000 },
+  );
+
+  assert.equal(billed.model, "haiku");
+  assert.equal(billed.costUsd, 1.25 + 1.5);
+});
+
+test("prices unreported cache at the dominant rate when no entry is the main chain", () => {
+  // A main chain that itself spanned models matches no single entry. Nothing
+  // identifies it then, so the run keeps the model that did the most work.
+  const billed = billRun(
+    {
+      modelUsage: {
+        "claude-opus-5": { inputTokens: 0, outputTokens: 0 },
+        "claude-haiku-4-5": { inputTokens: 0, outputTokens: 1_000_000 },
+      },
+    },
+    { ...RUN_TOTALS, outputTokens: 100, cacheReadTokens: 1_000_000 },
+  );
+
+  assert.equal(billed.costUsd, 1.25 + 0.025);
+});
+
 test("prices a fully cached run that reported no model", () => {
   // The codex adapter synthesizes an empty modelUsage, so its whole prompt is
   // priced through the fallback — a cache-heavy turn there must not bill zero.
