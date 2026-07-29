@@ -195,12 +195,18 @@ Log the underlying `claude` / `codex` CLIs in over HTTP instead of shelling into
 the host — so a remote UI can recover from an auth failure on its own. Off unless
 `AUTH_ADMIN_KEYS` is set (its own key set, separate from `API_KEYS`):
 
+Start the server:
+
 ```bash
 API_KEYS=sk-team-abc123 \
 AUTH_ADMIN_KEYS=sk-admin-xyz789 \
 AUTH_TRUST_COMPLETION_CALLERS=1 \
 cli-openai-proxy
+```
 
+Then, in another terminal:
+
+```bash
 # 1. open a session — codex returns an API-key prompt, claude an OAuth URL
 SESSION_ID=$(curl -sX POST -H "Authorization: Bearer sk-admin-xyz789" \
   http://localhost:3456/v1/auth/codex/sessions | jq -r .sessionId)
