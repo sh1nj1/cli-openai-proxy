@@ -140,11 +140,15 @@ unrecognised id is the behaviour the namespace exists to remove.
 
 ## Session Behavior
 
-CLI runs are intentionally stateless. Each request gets a fresh temporary
-working directory (`/tmp/paperclip-run-*`, deliberately not a git repo), and no
-session transcript is resumed or persisted (`--no-session-persistence` for
-Claude). The OpenAI `user` field is accepted for contract compatibility but
-current runners do not map it to CLI sessions.
+CLI runs are intentionally stateless from the proxy's point of view: each
+request gets a fresh temporary working directory (`/tmp/paperclip-run-*`,
+deliberately not a git repo) and no session is ever resumed. On-disk
+persistence differs by lane, though. Claude runs with
+`--no-session-persistence`, so no transcript is written. Codex is invoked
+without `--ephemeral` (the registry passes only `--skip-git-repo-check`), so
+the Codex CLI may still persist its own session files under `~/.codex` even
+though the proxy never reads them back. The OpenAI `user` field is accepted
+for contract compatibility but current runners do not map it to CLI sessions.
 
 ## Error Handling
 

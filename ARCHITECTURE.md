@@ -100,5 +100,7 @@ substitute.
   directory is migrated there on first load).
 - **Provisioned credentials**: in proxy memory only (`auth/token-store.ts`);
   codex API keys are handed to `codex login` which persists them in `~/.codex`.
-- **Everything else is stateless**: no session transcripts, fresh workdir per
-  run, no model catalog.
+- **Everything else is stateless on the proxy side**: fresh workdir per run,
+  no session resume, no model catalog. Claude runs write no transcript
+  (`--no-session-persistence`); Codex is not passed `--ephemeral`, so the
+  Codex CLI may persist its own session files under `~/.codex`.
