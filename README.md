@@ -173,13 +173,15 @@ AUTH_ADMIN_KEYS=sk-admin-xyz789 \
 AUTH_TRUST_COMPLETION_CALLERS=1 \
 cli-openai-proxy
 
-# codex: submit an API key
+# 1. open a session — codex returns an API-key prompt, claude an OAuth URL
 curl -X POST -H "Authorization: Bearer sk-admin-xyz789" \
   http://localhost:3456/v1/auth/codex/sessions
 
-# claude: get an OAuth URL back, then submit the code from it
+# 2. submit the API key (claude: the code from the OAuth URL) to finish
 curl -X POST -H "Authorization: Bearer sk-admin-xyz789" \
-  http://localhost:3456/v1/auth/claude/sessions
+  -H "Content-Type: application/json" \
+  -d '{"value": "sk-..."}' \
+  http://localhost:3456/v1/auth/codex/sessions/$SESSION_ID
 ```
 
 `AUTH_TRUST_COMPLETION_CALLERS=1` is required only for Claude provisioning. It
