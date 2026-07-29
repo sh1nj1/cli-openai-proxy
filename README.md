@@ -1,5 +1,8 @@
 # cli-openai-proxy
 
+[![CI](https://github.com/sh1nj1/cli-openai-proxy/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/sh1nj1/cli-openai-proxy/actions/workflows/ci.yml)
+[![codecov](https://codecov.io/gh/sh1nj1/cli-openai-proxy/branch/main/graph/badge.svg)](https://codecov.io/gh/sh1nj1/cli-openai-proxy)
+
 **One OpenAI-compatible endpoint in front of the agentic coding CLIs you already have installed.**
 
 Claude Code and Codex — the two [Paperclip](https://github.com/paperclipai/paperclip)
