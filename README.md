@@ -52,7 +52,8 @@ npm install && npm run build
 npm start
 ```
 
-Send a request:
+Send a request. Pick the model that matches the CLI you actually have —
+`paperclip/codex_local` for Codex, `paperclip/claude_local` for Claude Code:
 
 ```bash
 curl -X POST http://localhost:3456/v1/chat/completions \
