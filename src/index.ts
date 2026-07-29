@@ -7,8 +7,9 @@
 
 import { startServer, stopServer, getServer } from "./server/index.js";
 import { verifyClaude, verifyAuth } from "./cli/claude.js";
+import { commandRuns } from "./cli/command.js";
 import { runPreflight } from "./server/preflight.js";
-import { PAPERCLIP_MODEL_IDS, defaultModelForHost } from "./adapter/paperclip-registry.js";
+import { PAPERCLIP_MODEL_IDS, DEFAULT_MODEL, defaultModelForHost } from "./adapter/paperclip-registry.js";
 
 // Provider constants
 export const PROVIDER_ID = "claude-code-cli";
@@ -20,8 +21,10 @@ const DEFAULT_PORT = 3456;
  * follows the host: a Claude default on a host that just failed the Claude
  * preflight would fail that first request until the user switched models by hand.
  */
-export const pluginDefaultModel = (claudeOk: boolean): string =>
-  `${PROVIDER_ID}/${defaultModelForHost(claudeOk)}`;
+export const pluginDefaultModel = async (
+  claudeOk: boolean,
+  canRun?: (command: string) => Promise<boolean>,
+): Promise<string> => `${PROVIDER_ID}/${await defaultModelForHost(claudeOk, canRun)}`;
 
 /** "claude_local" -> "Claude Local" */
 function adapterLabel(id: string): string {
@@ -66,12 +69,15 @@ function buildModelDefinition(model: (typeof PLUGIN_MODELS)[number]) {
 export interface LocalAuthSetupDeps {
   verifyClaude: typeof verifyClaude;
   verifyAuth: typeof verifyAuth;
+  /** Presence probe for a non-Claude adapter's CLI before it is suggested. */
+  commandRuns: typeof commandRuns;
   startServer: (opts: { port: number }) => Promise<unknown>;
 }
 
 const DEFAULT_SETUP_DEPS: LocalAuthSetupDeps = {
   verifyClaude,
   verifyAuth,
+  commandRuns,
   startServer,
 };
 
@@ -98,11 +104,18 @@ export async function runLocalAuthSetup(
       log: (msg) => spin.message(msg.trim()),
     });
 
+    const defaultModel = await pluginDefaultModel(claudeOk, deps.commandRuns);
+
     if (!claudeOk) {
+      const claudeDefault = `${PROVIDER_ID}/${DEFAULT_MODEL}`;
       await ctx.prompter.note(
         [
           ...warnings,
-          `Default model set to ${pluginDefaultModel(false)} instead.`,
+          // Only claims a switch that was actually made — and says how to undo it,
+          // since this default is persisted while the probe behind it is not.
+          defaultModel === claudeDefault
+            ? `No other CLI answered either, so the default stays ${defaultModel}.`
+            : `Default model set to ${defaultModel} instead; switch back to ${claudeDefault} once Claude works.`,
           "Install: npm install -g @anthropic-ai/claude-code",
           "Authenticate: claude auth login",
         ].join("\n"),
@@ -162,7 +175,7 @@ export async function runLocalAuthSetup(
             },
           },
         },
-        defaultModel: pluginDefaultModel(claudeOk),
+        defaultModel,
         notes: [
           "This uses your Claude Max subscription via Claude Code CLI.",
           "Your OAuth token is used by the CLI, not exposed directly.",

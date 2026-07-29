@@ -18,7 +18,7 @@ import {
 } from "../adapter/cli-to-openai.js";
 import type { OpenAIChatRequest } from "../types/openai.js";
 import type { ClaudeCliResult, ClaudeCliStreamEvent } from "../types/claude-cli.js";
-import { usageTracker, billedModel } from "../usage/tracker.js";
+import { usageTracker } from "../usage/tracker.js";
 import { isAuthEnabled } from "./auth.js";
 import { PKG_VERSION, getTimeoutMs, KEEPALIVE_INTERVAL_MS } from "../config.js";
 
@@ -217,7 +217,8 @@ async function handleStreamingResponse(
 
       // Track usage
       usageTracker.record({
-        model: billedModel(result, requestedModel),
+        model: requestedModel,
+        modelUsage: result.modelUsage,
         inputTokens: result.usage?.input_tokens || 0,
         outputTokens: result.usage?.output_tokens || 0,
         cacheReadTokens: result.usage?.cache_read_input_tokens || 0,
@@ -374,7 +375,8 @@ async function handleNonStreamingResponse(
       if (finalResult) {
         // Track usage
         usageTracker.record({
-          model: billedModel(finalResult, requestedModel),
+          model: requestedModel,
+          modelUsage: finalResult.modelUsage,
           inputTokens: finalResult.usage?.input_tokens || 0,
           outputTokens: finalResult.usage?.output_tokens || 0,
           cacheReadTokens: finalResult.usage?.cache_read_input_tokens || 0,

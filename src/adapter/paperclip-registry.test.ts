@@ -133,15 +133,40 @@ test("DEFAULT_MODEL is a registered adapter", () => {
   assert.ok(PAPERCLIP_MODEL_IDS.includes(DEFAULT_MODEL));
 });
 
-test("a healthy Claude host keeps the plain default", () => {
-  assert.equal(defaultModelForHost(true), DEFAULT_MODEL);
+test("a healthy Claude host keeps the plain default without probing anything", async () => {
+  const probed: string[] = [];
+  assert.equal(
+    await defaultModelForHost(true, async (cmd) => {
+      probed.push(cmd);
+      return true;
+    }),
+    DEFAULT_MODEL,
+  );
+  assert.deepEqual(probed, [], "a working Claude host needs no other CLI");
 });
 
-test("a host without Claude is pointed away from the Claude adapter", () => {
+test("a host without Claude is pointed at a non-Claude adapter that runs", async () => {
   // Suggesting claude_local to a host whose Claude CLI just failed preflight
   // hands the user a first request that cannot succeed.
-  const suggested = defaultModelForHost(false);
+  const suggested = await defaultModelForHost(false, async () => true);
   const resolved = resolvePaperclipModel(suggested);
   assert.ok(resolved, `${suggested} must resolve`);
   assert.notEqual(resolved!.spec.authEngine, "claude");
+});
+
+test("an adapter is not suggested until its own CLI has been probed", async () => {
+  // Claude missing does not make codex present. Suggesting an unprobed adapter
+  // just swaps one guaranteed failure for another.
+  const probed: string[] = [];
+  const suggested = await defaultModelForHost(false, async (cmd) => {
+    probed.push(cmd);
+    return false;
+  });
+
+  assert.ok(probed.length > 0, "the fallback adapter's CLI must be probed");
+  assert.equal(
+    suggested,
+    DEFAULT_MODEL,
+    "with no runnable alternative, keep the primary — its install hints are the ones printed",
+  );
 });

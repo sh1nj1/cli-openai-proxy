@@ -12,6 +12,7 @@ import {
   type OutputMode,
 } from "./paperclip-runner.js";
 import type { AgentRunner } from "./agent-runner.js";
+import { commandRuns } from "../cli/command.js";
 
 export interface PaperclipModelSpec {
   adapterType: string;
@@ -70,18 +71,30 @@ export const DEFAULT_MODEL = "paperclip/claude_local";
 /**
  * Model to suggest to a host whose Claude CLI state preflight has just measured.
  *
- * Preflight only probes Claude, so a `false` here does not prove any other CLI
- * works — it only proves this one does not, which is enough to stop handing the
- * user a first request that is guaranteed to fail. Only advisory, one-shot
- * output uses this (setup's default model, the startup example); request routing
- * keeps `DEFAULT_MODEL` unconditionally, because a startup probe goes stale the
- * moment the user installs or logs into the CLI.
+ * A failed Claude preflight is enough to stop handing the user a first request
+ * that is guaranteed to fail, but it says nothing about any other CLI — so the
+ * alternative is probed before it is named, rather than swapping one absent CLI
+ * for another. With nothing runnable left, the suggestion stays `DEFAULT_MODEL`:
+ * that is the CLI whose install and login hints are the ones being printed.
+ *
+ * Only advisory, one-shot output uses this (setup's default model, the startup
+ * example); request routing keeps `DEFAULT_MODEL` unconditionally, because a
+ * startup probe goes stale the moment the user installs or logs into a CLI.
  */
-export function defaultModelForHost(claudeOk: boolean): string {
+export async function defaultModelForHost(
+  claudeOk: boolean,
+  canRun: (command: string) => Promise<boolean> = commandRuns,
+): Promise<string> {
   if (claudeOk) return DEFAULT_MODEL;
-  return (
-    PAPERCLIP_MODEL_IDS.find((id) => REGISTRY[id].authEngine !== "claude") ?? DEFAULT_MODEL
-  );
+
+  for (const id of PAPERCLIP_MODEL_IDS) {
+    const spec = REGISTRY[id];
+    if (spec.authEngine === "claude") continue;
+    const command = String(spec.baseConfig.command ?? "");
+    if (command && (await canRun(command))) return id;
+  }
+
+  return DEFAULT_MODEL;
 }
 
 export interface ResolvedModel {

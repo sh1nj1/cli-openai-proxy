@@ -6,7 +6,7 @@ import os from "node:os";
 import path from "node:path";
 import {
   UsageTracker,
-  billedModel,
+  billRun,
   DATA_DIR_NAME,
   LEGACY_DATA_DIR_NAME,
 } from "./tracker.js";
@@ -123,36 +123,89 @@ test("never migrates into an explicitly supplied directory", async () => {
 // A request id names an adapter, not a model: `paperclip/claude_local` runs whatever
 // the CLI's current default is. Pricing must follow what actually ran, or /v1/usage
 // reports Sonnet rates for an Opus run and understates the saved cost ~5x.
-const modelUsage = (entries: Record<string, number>) =>
-  Object.fromEntries(
-    Object.entries(entries).map(([model, outputTokens]) => [
-      model,
-      { inputTokens: 0, outputTokens, costUSD: 0 },
-    ]),
-  );
+const RUN_TOTALS = {
+  model: "paperclip/claude_local",
+  inputTokens: 0,
+  outputTokens: 0,
+  cacheReadTokens: 0,
+  cacheWriteTokens: 0,
+};
 
 test("bills an adapter-only id by the model the CLI reported running", () => {
-  assert.equal(
-    billedModel({ modelUsage: modelUsage({ "claude-opus-5[1m]": 5 }) }, "paperclip/claude_local"),
-    "claude-opus-5[1m]",
+  const billed = billRun(
+    { modelUsage: { "claude-opus-5[1m]": { inputTokens: 0, outputTokens: 1_000_000 } } },
+    { ...RUN_TOTALS, outputTokens: 1_000_000 },
   );
+  assert.equal(billed.model, "opus");
+  assert.equal(billed.costUsd, 75);
 });
 
-test("bills the dominant model when subagents ran on another one", () => {
-  assert.equal(
-    billedModel(
-      { modelUsage: modelUsage({ "claude-haiku-4-5": 20, "claude-opus-5": 900 }) },
-      "paperclip/claude_local",
-    ),
-    "claude-opus-5",
+test("prices each model of a mixed run at its own rate", () => {
+  // One rate over the whole run is wrong in both directions: a verbose Haiku
+  // sidechain would drag an Opus turn down to Haiku rates, and a short Opus
+  // answer would bill a large Haiku sidechain at Opus rates.
+  const billed = billRun(
+    {
+      modelUsage: {
+        "claude-opus-5": { inputTokens: 1_000_000, outputTokens: 0 },
+        "claude-haiku-4-5": { inputTokens: 0, outputTokens: 1_000_000 },
+      },
+    },
+    { ...RUN_TOTALS, inputTokens: 1_000_000 },
   );
+
+  assert.equal(billed.costUsd, 15 + 1.25);
 });
 
-test("falls back to the requested id when the run reported no model", () => {
+test("counts the tokens a subagent added", () => {
+  // Verified against the real CLI: top-level `usage` covers the main chain only,
+  // while `modelUsage` includes sidechains — pricing the main-chain totals drops
+  // subagent work from the saved-cost estimate entirely.
+  const billed = billRun(
+    {
+      modelUsage: {
+        "claude-sonnet-5": {
+          inputTokens: 8,
+          outputTokens: 418,
+          cacheReadInputTokens: 91_526,
+          cacheCreationInputTokens: 45_310,
+        },
+      },
+    },
+    { ...RUN_TOTALS, inputTokens: 4, outputTokens: 337, cacheReadTokens: 67_164, cacheWriteTokens: 20_005 },
+  );
+
+  assert.equal(billed.inputTokens, 8);
+  assert.equal(billed.outputTokens, 418);
+  assert.equal(billed.cacheReadTokens, 91_526);
+  assert.equal(billed.cacheWriteTokens, 45_310);
+});
+
+test("labels a mixed run by the model that produced the most output", () => {
+  // One request stays one record, so `byModel` groups it under the model that
+  // did the work — a Haiku sidechain does not relabel an Opus turn.
+  const billed = billRun(
+    {
+      modelUsage: {
+        "claude-haiku-4-5": { inputTokens: 0, outputTokens: 20 },
+        "claude-opus-5": { inputTokens: 0, outputTokens: 900 },
+      },
+    },
+    RUN_TOTALS,
+  );
+  assert.equal(billed.model, "opus");
+});
+
+test("falls back to the requested id and run totals when no model was reported", () => {
   // Failed runs produce no result at all, and codex-jsonl synthesizes an empty
   // modelUsage — neither knows more than the request did.
-  assert.equal(billedModel(null, "paperclip/claude_local/opus"), "paperclip/claude_local/opus");
-  assert.equal(billedModel({ modelUsage: {} }, "paperclip/codex_local"), "paperclip/codex_local");
+  const noResult = billRun(null, { ...RUN_TOTALS, model: "paperclip/claude_local/opus", outputTokens: 1_000_000 });
+  assert.equal(noResult.model, "opus");
+  assert.equal(noResult.costUsd, 75);
+
+  const codex = billRun({ modelUsage: {} }, { ...RUN_TOTALS, model: "paperclip/codex_local", inputTokens: 7 });
+  assert.equal(codex.model, "sonnet");
+  assert.equal(codex.inputTokens, 7);
 });
 
 test("records an adapter-only Claude run at Opus pricing", async () => {
@@ -161,8 +214,8 @@ test("records an adapter-only Claude run at Opus pricing", async () => {
     await tracker.load();
 
     tracker.record({
-      model: billedModel({ modelUsage: modelUsage({ "claude-opus-5[1m]": 1_000_000 }) },
-        "paperclip/claude_local"),
+      model: "paperclip/claude_local",
+      modelUsage: { "claude-opus-5[1m]": { inputTokens: 0, outputTokens: 1_000_000 } },
       inputTokens: 0,
       outputTokens: 1_000_000,
       durationMs: 1,
@@ -173,5 +226,31 @@ test("records an adapter-only Claude run at Opus pricing", async () => {
     const { byModel } = tracker.getSummary();
     assert.deepEqual(Object.keys(byModel), ["opus"]);
     assert.equal(byModel.opus.estimatedCostUsd, 75);
+  });
+});
+
+test("a mixed run stays one request priced per model", async () => {
+  await withFakeHome(async (home) => {
+    const tracker = new UsageTracker(path.join(home, "usage"));
+    await tracker.load();
+
+    tracker.record({
+      model: "paperclip/claude_local",
+      modelUsage: {
+        "claude-opus-5": { inputTokens: 1_000_000, outputTokens: 0 },
+        "claude-haiku-4-5": { inputTokens: 0, outputTokens: 1_000_000 },
+      },
+      inputTokens: 1_000_000,
+      outputTokens: 0,
+      durationMs: 1,
+      stream: false,
+      success: true,
+    });
+
+    const summary = tracker.getSummary();
+    assert.equal(summary.totalRequests, 1);
+    assert.equal(summary.totalInputTokens, 1_000_000);
+    assert.equal(summary.totalOutputTokens, 1_000_000);
+    assert.equal(summary.estimatedApiCostSavedUsd, 16.25);
   });
 });

@@ -349,6 +349,11 @@ Anthropic's published API rates and a fixed $200 figure — leftovers from the
 project's Claude-only origins. Treat them as a rough reference for Claude
 traffic only; they say nothing about other engines.
 
+Counts follow what the CLI reports it ran, not the requested id — `paperclip/claude_local`
+names an adapter, so the model is only known after the run. Subagent tokens are
+included, and a turn spanning several models is priced per model while staying one
+request under the model that produced most of its output.
+
 ## Prerequisites
 
 - **Node.js >= 22.13.0**

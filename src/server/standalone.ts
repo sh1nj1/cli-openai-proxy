@@ -78,7 +78,7 @@ async function main(): Promise<void> {
     // It also follows preflight, so a codex-only host is not shown a copy-paste
     // command whose CLI was just reported missing.
     console.log(
-      `    -d '{"model": "${defaultModelForHost(claudeOk)}", "messages": [{"role": "user", "content": "Hello!"}]}'`,
+      `    -d '{"model": "${await defaultModelForHost(claudeOk)}", "messages": [{"role": "user", "content": "Hello!"}]}'`,
     );
     console.log("\nReady. Press Ctrl+C to stop.\n");
   } catch (err) {

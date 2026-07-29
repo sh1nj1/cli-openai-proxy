@@ -29,6 +29,7 @@ test("setup completes on a codex-only host (no Claude CLI)", async () => {
   const { port, auth } = await runLocalAuthSetup(fakeCtx(notes), {
     verifyClaude: async () => ({ ok: false, error: "not found on PATH" }),
     verifyAuth: async () => ({ ok: true }),
+    commandRuns: async (cmd) => cmd === "codex",
     startServer: async (opts) => {
       started.push(opts.port);
     },
@@ -58,6 +59,7 @@ test("setup completes when Claude auth is missing", async () => {
   await runLocalAuthSetup(fakeCtx(notes), {
     verifyClaude: async () => ({ ok: true, version: "2.1.218" }),
     verifyAuth: async () => ({ ok: false, error: "not logged in" }),
+    commandRuns: async (cmd) => cmd === "codex",
     startServer: async (opts) => {
       started.push(opts.port);
     },
@@ -68,12 +70,31 @@ test("setup completes when Claude auth is missing", async () => {
   assert.match(notes[0].message, /claude auth login/i);
 });
 
+test("a host with no working CLI at all is not sent to an absent one", async () => {
+  // Claude missing does not imply codex present. Naming codex here would state
+  // something the setup never checked, and the first completion fails either way.
+  const notes: Note[] = [];
+
+  const { auth } = await runLocalAuthSetup(fakeCtx(notes), {
+    verifyClaude: async () => ({ ok: false, error: "not found on PATH" }),
+    verifyAuth: async () => ({ ok: true }),
+    commandRuns: async () => false,
+    startServer: async () => {},
+  });
+
+  assert.equal(auth.defaultModel, `${PROVIDER_ID}/paperclip/claude_local`);
+  assert.equal(notes.length, 1);
+  assert.doesNotMatch(notes[0].message, /codex_local instead/i);
+  assert.match(notes[0].message, /npm install -g @anthropic-ai\/claude-code/);
+});
+
 test("setup warns about nothing when Claude is fully available", async () => {
   const notes: Note[] = [];
 
   const { auth } = await runLocalAuthSetup(fakeCtx(notes), {
     verifyClaude: async () => ({ ok: true, version: "2.1.218" }),
     verifyAuth: async () => ({ ok: true }),
+    commandRuns: async () => true,
     startServer: async () => {},
   });
 
@@ -88,6 +109,7 @@ test("a failing server start still fails setup", async () => {
     runLocalAuthSetup(fakeCtx([]), {
       verifyClaude: async () => ({ ok: true, version: "2.1.218" }),
       verifyAuth: async () => ({ ok: true }),
+      commandRuns: async () => true,
       startServer: async () => {
         throw new Error("EADDRINUSE");
       },

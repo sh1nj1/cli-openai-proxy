@@ -22,11 +22,11 @@ test("the plugin advertises no legacy alias ids", () => {
   }
 });
 
-test("the plugin default model is a provider-qualified registered adapter", () => {
+test("the plugin default model is a provider-qualified registered adapter", async () => {
   // Whichever host state it is asked about, the default has to be an id the
   // proxy accepts — the provider is configured with it before any request runs.
   for (const claudeOk of [true, false]) {
-    const advertised = pluginDefaultModel(claudeOk);
+    const advertised = await pluginDefaultModel(claudeOk, async () => true);
     assert.ok(advertised.startsWith(`${PROVIDER_ID}/`));
     const modelId = advertised.slice(PROVIDER_ID.length + 1);
     assert.ok(

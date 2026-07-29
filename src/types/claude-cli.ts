@@ -77,9 +77,15 @@ export interface ClaudeCliResult {
     cache_creation_input_tokens?: number;
     cache_read_input_tokens?: number;
   };
+  /**
+   * Per-model totals for the whole run, sidechains included — unlike `usage`,
+   * which covers the main chain only.
+   */
   modelUsage: Record<string, {
     inputTokens: number;
     outputTokens: number;
+    cacheReadInputTokens?: number;
+    cacheCreationInputTokens?: number;
     costUSD: number;
   }>;
   /** Diagnostics the CLI attaches to a failed run; `result` is often empty then. */
