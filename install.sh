@@ -387,7 +387,7 @@ read_effective_listener() {
 
 [[ "$OSTYPE" == linux* ]] || die "This installer supports Linux only"
 [[ "$EUID" -ne 0 ]] || die "Run this script as the service user, not with sudo"
-[[ "$SERVICE_NAME" =~ ^[A-Za-z0-9_.@-]+$ ]] || die "Invalid SERVICE_NAME: $SERVICE_NAME"
+[[ "$SERVICE_NAME" =~ ^[A-Za-z0-9_.@][A-Za-z0-9_.@-]*$ ]] || die "Invalid SERVICE_NAME: $SERVICE_NAME"
 [[ "$PORT" =~ ^[0-9]+$ ]] && ((PORT >= 1 && PORT <= 65535)) \
   || die "PORT must be an integer between 1 and 65535"
 [[ "$READINESS_TIMEOUT" =~ ^[0-9]+$ ]] && ((READINESS_TIMEOUT >= 1 && READINESS_TIMEOUT <= 300)) \
