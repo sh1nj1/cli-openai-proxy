@@ -221,14 +221,19 @@ means the *caller's* key is wrong), and `engine` names which flow to open. In
 streaming mode the same object arrives in-band on the SSE stream, since the 200
 header has already been flushed.
 
-Both run paths emit it. `paperclip/*` models get the classification from the
-adapter (`errorCode: "claude_auth_required"`); the default `claude-*` models run
-the CLI directly, with no adapter, so the proxy matches the CLI's own
-"please log in" wording — but only on a run that already failed (`is_error`, or a
-nonzero exit), so an ordinary answer that discusses logins is never turned into a
-401. A failure whose wording is not recognised keeps its previous shape rather
-than being guessed at, so a client should still treat a repeated failure without
-this code as "check the host".
+Every completion runs through a Paperclip adapter, so there is one path to this
+signal: the adapter classifies the failed run as `errorCode:
+"claude_auth_required"`, and the proxy maps that to `engine_unauthenticated`,
+naming the engine from the adapter's own auth engine — `paperclip/claude_local`
+→ `claude`, `paperclip/codex_local` → `codex`. The proxy never reads the CLI's
+wording: the message is passed through verbatim for a human to read, while the
+machine-readable part is the adapter's code. A failure the adapter does not
+classify that way keeps its own shape (`500`, or `429` for a quota or transient
+family) rather than being guessed at, so a client should still treat a repeated
+failure without this code as "check the host".
+
+Models are named `paperclip/<adapter>[/<cli-model>]`; an id outside that
+namespace answers `404 model_not_found` and so never reaches an engine at all.
 
 ## Scope and limits
 
