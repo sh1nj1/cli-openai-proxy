@@ -441,35 +441,23 @@ async function handleNonStreamingResponse(
  *
  * Returns available models
  */
+/**
+ * Only paperclip adapters are exposed, and anything unlisted is a 404 — so the
+ * advertised set and the accepted set both come from the registry.
+ *
+ * Each entry names an adapter. A model can be appended as `<id>/<cli-model>`, but
+ * the CLI owns the model list, so none are enumerated here.
+ */
 const MODELS_DATA = (() => {
   const now = Math.floor(Date.now() / 1000);
-  const baseModels = [
-    "claude-opus-4-6",
-    "claude-opus-4",
-    "claude-sonnet-4-5-20250929",
-    "claude-sonnet-4",
-    "claude-haiku-4-5-20251001",
-    "claude-haiku-4",
-  ];
-  const prefixes = ["", "openai/", "anthropic/", "claude-max/", "claude-code-cli/"];
   return Object.freeze({
     object: "list" as const,
-    data: [
-      ...prefixes.flatMap((prefix) =>
-        baseModels.map((id) => ({
-          id: `${prefix}${id}`,
-          object: "model" as const,
-          owned_by: "anthropic",
-          created: now,
-        }))
-      ),
-      ...PAPERCLIP_MODEL_IDS.map((id) => ({
-        id,
-        object: "model" as const,
-        owned_by: "paperclip",
-        created: now,
-      })),
-    ],
+    data: PAPERCLIP_MODEL_IDS.map((id) => ({
+      id,
+      object: "model" as const,
+      owned_by: "paperclip",
+      created: now,
+    })),
   });
 })();
 
