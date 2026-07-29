@@ -10,7 +10,7 @@ claude --print \
   --input-format stream-json \
   --verbose \
   --include-partial-messages \
-  --model <opus|sonnet|haiku> \
+  --model <alias|full-id> \
   --session-id <uuid> \
   --resume <session-id>
 ```
@@ -26,7 +26,7 @@ claude --print \
 | `--include-partial-messages` | Get streaming chunks as they arrive |
 | `--session-id <uuid>` | Use specific session ID |
 | `--resume <id>` | Resume existing conversation |
-| `--model <alias>` | Model: opus, sonnet, haiku |
+| `--model <alias>` | Family alias (`fable`, `opus`, `sonnet`, `haiku`) or a full id (`claude-opus-4-6`). The CLI owns this list; check `claude --help` |
 | `--no-session-persistence` | Don't save sessions to disk |
 
 ## Output Message Types

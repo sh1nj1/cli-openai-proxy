@@ -112,8 +112,9 @@ from the request entirely and you get `paperclip/claude_local`.
 
 Whatever the CLI takes for its own `--model` flag works here, because that is
 literally where the value goes. For `claude` that is either an alias for the
-latest of a family (`opus`, `sonnet`, `fable`) or a full id
-(`claude-opus-4-6`); `codex` takes full ids only. Pick by intent, not by
+latest of a family (`fable`, `opus`, `sonnet`, `haiku`) or a full id
+(`claude-opus-4-6`); `codex` takes full ids only. Run `claude --help` for the
+aliases your installed CLI knows — the proxy does not track them. Pick by intent, not by
 correctness — an alias follows the CLI to each new model, a full id pins the one
 you tested against.
 

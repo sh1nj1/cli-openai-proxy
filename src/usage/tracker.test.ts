@@ -196,6 +196,35 @@ test("labels a mixed run by the model that produced the most output", () => {
   assert.equal(billed.model, "opus");
 });
 
+test("keeps the run's cache totals when no model entry reports them", () => {
+  // The cache fields are optional per model, and input/output are not — so a
+  // result that reports models without cache detail would otherwise zero counts
+  // the top-level totals still carry.
+  const billed = billRun(
+    { modelUsage: { "claude-opus-5": { inputTokens: 4, outputTokens: 337 } } },
+    { ...RUN_TOTALS, inputTokens: 4, outputTokens: 337, cacheReadTokens: 67_164, cacheWriteTokens: 20_005 },
+  );
+
+  assert.equal(billed.cacheReadTokens, 67_164);
+  assert.equal(billed.cacheWriteTokens, 20_005);
+});
+
+test("prefers a reported cache total of zero over the run total", () => {
+  // A reported 0 is a measurement, not a gap: `modelUsage` covers the whole run,
+  // so it cannot be missing cache reads the main chain performed.
+  const billed = billRun(
+    {
+      modelUsage: {
+        "claude-opus-5": { inputTokens: 4, outputTokens: 337, cacheReadInputTokens: 0 },
+      },
+    },
+    { ...RUN_TOTALS, cacheReadTokens: 67_164, cacheWriteTokens: 20_005 },
+  );
+
+  assert.equal(billed.cacheReadTokens, 0);
+  assert.equal(billed.cacheWriteTokens, 20_005);
+});
+
 test("falls back to the requested id and run totals when no model was reported", () => {
   // Failed runs produce no result at all, and codex-jsonl synthesizes an empty
   // modelUsage — neither knows more than the request did.

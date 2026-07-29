@@ -94,7 +94,8 @@ export interface BilledRun {
  * `usage` covers the main chain only while `modelUsage` includes sidechains, and
  * they match exactly when no subagent ran — so the fallback totals are only for
  * runs that reported no model at all (a failure, or codex-jsonl's synthesized
- * empty `modelUsage`).
+ * empty `modelUsage`), plus a cache field no entry reported at all, which would
+ * otherwise zero a count the run totals still carry.
  *
  * The run stays one record, labelled with the family that produced the most
  * output, so request counts stay honest and a Haiku sidechain does not relabel
@@ -133,6 +134,11 @@ export function billRun(
     costUsd: 0,
   };
   let dominantOutput = -1;
+  // Undefined until some entry reports the field, so an absent one keeps the
+  // run total rather than zeroing it — the cache fields are optional per model
+  // while input/output are not.
+  let cacheRead: number | undefined;
+  let cacheWrite: number | undefined;
 
   for (const [model, usage] of entries) {
     const inputTokens = usage?.inputTokens ?? 0;
@@ -140,15 +146,23 @@ export function billRun(
 
     billed.inputTokens += inputTokens;
     billed.outputTokens += outputTokens;
-    billed.cacheReadTokens += usage?.cacheReadInputTokens ?? 0;
-    billed.cacheWriteTokens += usage?.cacheCreationInputTokens ?? 0;
     billed.costUsd += cost(pricingFamily(model), inputTokens, outputTokens);
+
+    if (usage?.cacheReadInputTokens !== undefined) {
+      cacheRead = (cacheRead ?? 0) + usage.cacheReadInputTokens;
+    }
+    if (usage?.cacheCreationInputTokens !== undefined) {
+      cacheWrite = (cacheWrite ?? 0) + usage.cacheCreationInputTokens;
+    }
 
     if (outputTokens > dominantOutput) {
       dominantOutput = outputTokens;
       billed.model = pricingFamily(model);
     }
   }
+
+  billed.cacheReadTokens = cacheRead ?? fallback.cacheReadTokens ?? 0;
+  billed.cacheWriteTokens = cacheWrite ?? fallback.cacheWriteTokens ?? 0;
 
   return billed;
 }
