@@ -200,95 +200,17 @@ const plugin = {
 export default plugin;
 ```
 
-### 3. Subprocess Manager (subprocess/manager.ts)
+### 3. Agent Runner (`adapter/agent-runner.ts`)
 
-**Security Note**: Uses `spawn()` instead of `exec()` to prevent command injection.
+The OpenAI route layer depends only on `AgentRunner`. `createRunner()` maps
+existing Claude model ids to the Paperclip `claude_local` adapter and explicit
+`paperclip/*` ids to their registered adapters. CLI spawn, parsing, timeout, and
+process-group termination are delegated to the pinned `@paperclipai/*` packages.
 
 ```typescript
-import { spawn, ChildProcess } from "child_process";
-import { EventEmitter } from "events";
-import { ClaudeCliMessage, ClaudeCliResult } from "../types/claude-cli.js";
-
-interface SubprocessOptions {
-  model: "opus" | "sonnet" | "haiku";
-  sessionId?: string;
-  cwd?: string;
-}
-
-export class ClaudeSubprocess extends EventEmitter {
-  private process: ChildProcess | null = null;
-  private buffer: string = "";
-
-  async start(prompt: string, options: SubprocessOptions): Promise<void> {
-    const args = [
-      "--print",
-      "--output-format", "stream-json",
-      "--input-format", "stream-json",
-      "--verbose",
-      "--model", options.model,
-    ];
-
-    if (options.sessionId) {
-      args.push("--session-id", options.sessionId);
-    }
-
-    // Don't persist sessions for stateless API usage
-    args.push("--no-session-persistence");
-
-    // Use spawn() for security - no shell interpretation
-    this.process = spawn("claude", args, {
-      cwd: options.cwd || process.cwd(),
-      env: { ...process.env },
-      stdio: ["pipe", "pipe", "pipe"],
-    });
-
-    // Send the prompt via stdin
-    this.process.stdin?.write(JSON.stringify({
-      type: "user_message",
-      content: prompt,
-    }) + "\n");
-    this.process.stdin?.end();
-
-    // Parse JSON stream from stdout
-    this.process.stdout?.on("data", (chunk) => {
-      this.buffer += chunk.toString();
-      this.processBuffer();
-    });
-
-    this.process.stderr?.on("data", (chunk) => {
-      this.emit("error", new Error(chunk.toString()));
-    });
-
-    this.process.on("close", (code) => {
-      this.emit("close", code);
-    });
-  }
-
-  private processBuffer(): void {
-    const lines = this.buffer.split("\n");
-    this.buffer = lines.pop() || ""; // Keep incomplete line
-
-    for (const line of lines) {
-      if (!line.trim()) continue;
-      try {
-        const message: ClaudeCliMessage = JSON.parse(line);
-        this.emit("message", message);
-
-        if (message.type === "assistant") {
-          this.emit("assistant", message);
-        } else if (message.type === "result") {
-          this.emit("result", message as ClaudeCliResult);
-        }
-      } catch (e) {
-        // Non-JSON output, emit as raw
-        this.emit("raw", line);
-      }
-    }
-  }
-
-  kill(): void {
-    this.process?.kill();
-  }
+interface AgentRunner extends EventEmitter {
+  start(prompt: string, options: RunnerOptions): Promise<void>;
+  kill(signal?: NodeJS.Signals): void;
 }
 ```
 
@@ -454,7 +376,7 @@ export async function stopServer(instance: Server): Promise<void> {
 
 ```typescript
 import { Request, Response } from "express";
-import { ClaudeSubprocess } from "../subprocess/manager.js";
+import { runnerFactory } from "../adapter/paperclip-registry.js";
 import { openaiToCli } from "../adapter/openai-to-cli.js";
 import { cliToOpenaiChunk, cliResultToOpenai } from "../adapter/cli-to-openai.js";
 import { v4 as uuidv4 } from "uuid";
@@ -465,7 +387,7 @@ export async function handleChatCompletions(req: Request, res: Response) {
 
   try {
     const cliInput = openaiToCli(req.body);
-    const subprocess = new ClaudeSubprocess();
+    const subprocess = runnerFactory.create(req.body.model);
 
     if (stream) {
       // SSE streaming response
@@ -520,71 +442,10 @@ export async function handleChatCompletions(req: Request, res: Response) {
 }
 ```
 
-### 7. Session Management (session/manager.ts)
+### 7. Session Behavior
 
-```typescript
-import { v4 as uuidv4 } from "uuid";
-import fs from "fs/promises";
-import path from "path";
-
-interface SessionMapping {
-  clawdbotId: string;      // Clawdbot conversation ID
-  claudeSessionId: string;  // Claude CLI session UUID
-  createdAt: number;
-  lastUsedAt: number;
-}
-
-const SESSION_FILE = path.join(process.env.HOME || "", ".claude-code-cli-sessions.json");
-
-class SessionManager {
-  private sessions: Map<string, SessionMapping> = new Map();
-
-  async load(): Promise<void> {
-    try {
-      const data = await fs.readFile(SESSION_FILE, "utf-8");
-      const parsed = JSON.parse(data);
-      this.sessions = new Map(Object.entries(parsed));
-    } catch {
-      // File doesn't exist, start fresh
-    }
-  }
-
-  async save(): Promise<void> {
-    const data = Object.fromEntries(this.sessions);
-    await fs.writeFile(SESSION_FILE, JSON.stringify(data, null, 2));
-  }
-
-  getOrCreate(clawdbotId: string): string {
-    const existing = this.sessions.get(clawdbotId);
-    if (existing) {
-      existing.lastUsedAt = Date.now();
-      return existing.claudeSessionId;
-    }
-
-    const claudeSessionId = uuidv4();
-    this.sessions.set(clawdbotId, {
-      clawdbotId,
-      claudeSessionId,
-      createdAt: Date.now(),
-      lastUsedAt: Date.now(),
-    });
-
-    return claudeSessionId;
-  }
-
-  // Cleanup old sessions (older than 24 hours)
-  cleanup(): void {
-    const cutoff = Date.now() - (24 * 60 * 60 * 1000);
-    for (const [key, session] of this.sessions) {
-      if (session.lastUsedAt < cutoff) {
-        this.sessions.delete(key);
-      }
-    }
-  }
-}
-
-export const sessionManager = new SessionManager();
-```
+CLI runs are intentionally stateless. Each request gets a fresh temporary
+workspace, and no session transcript is resumed or persisted.
 
 ## Type Definitions
 

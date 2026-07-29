@@ -1,18 +1,17 @@
 /**
- * Registry mapping OpenAI model ids of the form `paperclip/<adapterType>` to a
- * Paperclip adapter's execute() + base config, plus the runner factory that
- * routes.ts uses to pick between PaperclipRunner and the direct ClaudeSubprocess.
+ * Registry mapping OpenAI model ids to Paperclip adapter specs. The route layer
+ * only knows the common AgentRunner contract; CLI spawn/parsing/termination stay
+ * owned by the published adapter packages.
  */
 import { execute as claudeLocalExecute } from "@paperclipai/adapter-claude-local/server";
 import { execute as codexLocalExecute } from "@paperclipai/adapter-codex-local/server";
 import {
   PaperclipRunner,
-  type AgentRunner,
   type AdapterExecute,
   type PromptInjection,
   type OutputMode,
 } from "./paperclip-runner.js";
-import { ClaudeSubprocess } from "../subprocess/manager.js";
+import type { AgentRunner } from "./agent-runner.js";
 
 export interface PaperclipModelSpec {
   adapterType: string;
@@ -28,16 +27,18 @@ export interface PaperclipModelSpec {
   authEngine: string;
 }
 
+const CLAUDE_LOCAL_SPEC: PaperclipModelSpec = {
+  adapterType: "claude_local",
+  execute: claudeLocalExecute as AdapterExecute,
+  baseConfig: { engine: "cli", command: "claude" },
+  promptInjection: "task-context",
+  outputMode: "stream-json",
+  cliFlags: ["--include-partial-messages", "--no-session-persistence"],
+  authEngine: "claude",
+};
+
 const REGISTRY: Record<string, PaperclipModelSpec> = {
-  "paperclip/claude_local": {
-    adapterType: "claude_local",
-    execute: claudeLocalExecute as AdapterExecute,
-    baseConfig: { engine: "cli", command: "claude" },
-    promptInjection: "task-context",
-    outputMode: "stream-json",
-    cliFlags: ["--include-partial-messages", "--no-session-persistence"],
-    authEngine: "claude",
-  },
+  "paperclip/claude_local": CLAUDE_LOCAL_SPEC,
   "paperclip/codex_local": {
     adapterType: "codex_local",
     execute: codexLocalExecute as AdapterExecute,
@@ -60,7 +61,7 @@ const REGISTRY: Record<string, PaperclipModelSpec> = {
 
 export const PAPERCLIP_MODEL_IDS: string[] = Object.keys(REGISTRY);
 
-/** Prefix that routes a request to a Paperclip adapter rather than the direct Claude proxy. */
+/** Prefix reserved for explicitly named Paperclip adapters. */
 export const PAPERCLIP_MODEL_PREFIX = "paperclip/";
 
 /**
@@ -84,12 +85,11 @@ export function resolvePaperclipModel(model: string): PaperclipModelSpec | null 
 }
 
 /**
- * Pick the runner for a request's model. Both PaperclipRunner and ClaudeSubprocess
- * satisfy AgentRunner.
+ * Pick a Paperclip-backed runner for every request.
  *
- * A `paperclip/*` model MUST resolve to a registered Paperclip adapter; an unknown
- * one throws UnknownPaperclipModelError rather than falling back to Claude. Only
- * non-`paperclip/*` models use the direct Claude proxy (this repo's default).
+ * A `paperclip/*` model MUST resolve to a registered adapter; an unknown one
+ * throws rather than silently running Claude. Existing non-paperclip model ids
+ * retain the proxy's historical behavior by using the claude_local adapter.
  */
 export function createRunner(model: string): AgentRunner {
   const spec = resolvePaperclipModel(model);
@@ -104,7 +104,12 @@ export function createRunner(model: string): AgentRunner {
   if (model.startsWith(PAPERCLIP_MODEL_PREFIX)) {
     throw new UnknownPaperclipModelError(model, PAPERCLIP_MODEL_IDS);
   }
-  return new ClaudeSubprocess();
+  return new PaperclipRunner(CLAUDE_LOCAL_SPEC.execute, CLAUDE_LOCAL_SPEC.baseConfig, {
+    promptInjection: CLAUDE_LOCAL_SPEC.promptInjection,
+    outputMode: CLAUDE_LOCAL_SPEC.outputMode,
+    cliFlags: CLAUDE_LOCAL_SPEC.cliFlags,
+    engine: CLAUDE_LOCAL_SPEC.authEngine,
+  });
 }
 
 /**

@@ -7,7 +7,6 @@ import {
   DEFAULT_TIMEOUT_MS,
   PROXY_ONLY_SECRET_VARS,
   takeProxySecret,
-  stripProxySecrets,
   blankedProxySecrets,
   resetCapturedProxySecrets,
 } from "./config.js";
@@ -142,14 +141,6 @@ describe("proxy-only secrets", () => {
     process.env.API_KEYS = "sk-two";
     assert.equal(takeProxySecret("API_KEYS"), "sk-two", "an operator re-setting the variable means to change the keys");
     assert.equal(takeProxySecret("API_KEYS"), "sk-two", "and the capture now holds the newer value");
-  });
-
-  it("stripProxySecrets copies without the proxy-only keys and without mutating the source", () => {
-    const source = { API_KEYS: "sk-caller", AUTH_ADMIN_KEYS: "admin", PATH: "/usr/bin" };
-    const stripped = stripProxySecrets(source);
-
-    assert.deepEqual(stripped, { PATH: "/usr/bin" });
-    assert.equal(source.API_KEYS, "sk-caller", "the process environment must be left intact");
   });
 
   it("blankedProxySecrets shadows every proxy-only key with an empty value", () => {

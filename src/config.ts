@@ -79,17 +79,6 @@ export function resetCapturedProxySecrets(): void {
 }
 
 /**
- * Copy of `env` without the proxy-only secrets, for a spawn site that builds its
- * child environment here. Belt-and-braces over takeProxySecret: this holds even
- * if the variable is set after boot, or if an embedder never calls the inits.
- */
-export function stripProxySecrets(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
-  const copy = { ...env };
-  for (const name of PROXY_ONLY_SECRET_VARS) delete copy[name];
-  return copy;
-}
-
-/**
  * Overrides that blank the proxy-only secrets, for a spawn site that does NOT
  * build the child env itself. The Paperclip adapters merge `{...process.env,
  * ...config.env}` internally, so the only way to reach that env from here is to

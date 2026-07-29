@@ -49,15 +49,6 @@ function unauthenticatedShape(engine?: string): OpenAIErrorShape {
 }
 
 /**
- * Build the same 401 the Paperclip path produces, for a runner that classifies
- * the failure itself instead of receiving an AdapterExecutionResult (the direct
- * ClaudeSubprocess). Shared so both paths advertise one contract.
- */
-export function engineUnauthenticatedError(message: string, engine: string): AdapterRunError {
-  return new AdapterRunError(message, unauthenticatedShape(engine));
-}
-
-/**
  * Map an adapter's classified failure to the OpenAI error contract. Prefer the
  * specific `errorCode`; fall back to the broader `errorFamily` (quota/transient)
  * so a run classified only at the family level still surfaces as a 429 rather

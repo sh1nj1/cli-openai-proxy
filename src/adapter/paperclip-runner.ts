@@ -1,7 +1,6 @@
 /**
  * PaperclipRunner — runs a Paperclip agent adapter's execute(ctx) and re-emits
- * its streamed output using the SAME EventEmitter contract as ClaudeSubprocess,
- * so src/server/routes.ts drives it without changes.
+ * normalized events for the OpenAI-compatible route layer.
  *
  * Option 1 (stateless): each run is fresh — no session resume.
  */
@@ -11,8 +10,8 @@ import os from "os";
 import fs from "fs/promises";
 import path from "path";
 import type { AdapterExecutionContext, AdapterExecutionResult } from "@paperclipai/adapter-utils";
-import type { SubprocessOptions } from "../subprocess/manager.js";
 import type { ClaudeCliResult, ClaudeCliStreamEvent } from "../types/claude-cli.js";
+import type { AgentRunner, RunnerOptions } from "./agent-runner.js";
 import { StreamJsonParser, type StreamJsonSink } from "./stream-json-parser.js";
 import { CodexJsonlParser } from "./codex-jsonl-parser.js";
 import { adapterRunError } from "./adapter-error.js";
@@ -60,11 +59,6 @@ export interface PaperclipRunnerOptions {
   engine?: string;
 }
 
-export interface AgentRunner extends EventEmitter {
-  start(prompt: string, options: SubprocessOptions): Promise<void>;
-  kill(signal?: NodeJS.Signals): void;
-}
-
 export class PaperclipRunner extends EventEmitter implements AgentRunner {
   private pid: number | null = null;
   private processGroupId: number | null = null;
@@ -97,7 +91,7 @@ export class PaperclipRunner extends EventEmitter implements AgentRunner {
     this.engine = options.engine;
   }
 
-  async start(prompt: string, options: SubprocessOptions): Promise<void> {
+  async start(prompt: string, options: RunnerOptions): Promise<void> {
     // Each adapter emits a different stdout dialect: claude speaks stream-json
     // (per-token deltas), codex speaks `codex exec --json` NDJSON (per-message
     // blocks). Pick the matching live parser; both expose push()/flush().
@@ -194,7 +188,7 @@ export class PaperclipRunner extends EventEmitter implements AgentRunner {
       },
     };
 
-    // Resolve immediately (like ClaudeSubprocess.start); drive execute in the background.
+    // Resolve immediately so the route can begin streaming while execute runs.
     void this.execute(ctx)
       .then((result) => {
         // Emit any buffered newline-less trailing line (e.g. a final codex

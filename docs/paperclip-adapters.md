@@ -1,8 +1,9 @@
 # Paperclip adapters behind the OpenAI endpoint
 
-Models named `paperclip/<adapterType>` route each request through a Paperclip
-agent adapter's `execute()` (reusing the published `@paperclipai/adapter-*`
-packages) instead of the built-in direct Claude spawn. Registered adapters:
+Every request runs through a Paperclip agent adapter's `execute()` using the
+published `@paperclipai/adapter-*` packages. Existing Claude model ids use
+`claude_local`; `paperclip/<adapterType>` ids select an adapter explicitly.
+Registered adapters:
 
 | Model id                 | Paperclip package                   | Requires (on PATH, authed) | Live streaming        |
 |--------------------------|-------------------------------------|----------------------------|-----------------------|
@@ -62,12 +63,12 @@ All adapters run `engine: "cli"`. Option 1 is **stateless** (no session resume).
 OpenAI SSE. A one-line factory (`runnerFactory.create(model)`) picks the runner
 by model id:
 
-- `paperclip/<adapterType>` → `PaperclipRunner`, which calls the adapter's
-  `execute(ctx)` with `config.engine: "cli"` pinned (adapters default to ACP).
-- everything else → the built-in `ClaudeSubprocess` (direct `claude` spawn).
+- `paperclip/<adapterType>` → the explicitly registered adapter.
+- everything else → the `claude_local` adapter, preserving the proxy's existing
+  Claude model ids.
 
-Because both runners satisfy the same `AgentRunner` contract, the proven
-SSE/keepalive/orphan-kill route layer is unchanged.
+Every execution uses the same `AgentRunner` contract, so the
+SSE/keepalive/orphan-kill route layer remains adapter-agnostic.
 
 ### Per-adapter strategies
 

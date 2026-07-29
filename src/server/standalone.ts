@@ -9,7 +9,7 @@
  */
 
 import { startServer, stopServer } from "./index.js";
-import { verifyClaude, verifyAuth } from "../subprocess/manager.js";
+import { verifyClaude, verifyAuth } from "../cli/claude.js";
 import { runPreflight } from "./preflight.js";
 import { PKG_VERSION, getTimeoutMs } from "../config.js";
 
@@ -30,7 +30,7 @@ async function main(): Promise<void> {
   const baseUrl = `http://${displayHost}:${port}`;
 
   // Preflight. Claude CLI / auth are non-fatal: the proxy also serves
-  // paperclip/* adapter models (e.g. codex) that never touch the Claude CLI,
+  // non-Claude adapter models (e.g. paperclip/codex_local),
   // so a codex-only host must still be able to start. Missing Claude is
   // surfaced as a warning; a claude-targeted request fails cleanly at request
   // time instead.
