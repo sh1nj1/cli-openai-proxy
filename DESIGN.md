@@ -230,8 +230,13 @@ real CLIs.
 
 1. **Tool visibility**: expose the CLIs' tool usage as response metadata
    instead of filtering it out.
-2. **More adapters**: any Paperclip adapter is one registry entry away
-   (`src/adapter/paperclip-registry.ts`).
+2. **More adapters**: an adapter whose CLI matches an existing strategy pair —
+   stdout in one of the two supported `OutputMode` formats (Claude `stream-json`
+   or Codex JSONL) and prompt delivery via one of the two `PromptInjection`
+   strategies — is one registry entry away
+   (`src/adapter/paperclip-registry.ts`). A CLI outside those pairs also needs
+   runner work: a new parser and `OutputMode` member (and possibly a new
+   injection strategy) in `PaperclipRunner` before a registry entry can use it.
 3. **Token-by-token codex streaming**: requires the ACP engine; the current
    `codex exec --json` lane streams per completed message block.
 4. **Model routing**: automatic adapter selection based on request shape.
