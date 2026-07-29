@@ -282,3 +282,139 @@ for (const stream of [true, false]) {
     }
   });
 }
+
+/** Every `data:` payload of an SSE body except the terminal [DONE] sentinel. */
+function sseChunks(body: string): Array<Record<string, any>> {
+  return body
+    .split("\n")
+    .filter((line) => line.startsWith("data: ") && line !== "data: [DONE]")
+    .map((line) => JSON.parse(line.slice("data: ".length)));
+}
+
+/** Drives one streaming request through the real route against a fake adapter. */
+async function streamThroughFakeAdapter(
+  body: Record<string, unknown>,
+  execute: AdapterExecute,
+): Promise<string> {
+  const orig = runnerFactory.create;
+  runnerFactory.create = (model: string) =>
+    model.startsWith("paperclip/")
+      ? new PaperclipRunner(execute, { engine: "cli" })
+      : orig(model);
+  try {
+    const req = { body: { stream: true, messages: [{ role: "user", content: "hi" }], ...body } } as unknown as Request;
+    const res = fakeRes();
+    await handleChatCompletions(req, res);
+    return res.body;
+  } finally {
+    runnerFactory.create = orig;
+  }
+}
+
+const cachedResultLine = JSON.stringify({
+  type: "result", subtype: "success", is_error: false, result: "Yo",
+  session_id: "s", total_cost_usd: 0, duration_ms: 1, duration_api_ms: 1,
+  num_turns: 1, modelUsage: {},
+  usage: {
+    input_tokens: 2, output_tokens: 7,
+    cache_read_input_tokens: 30_000, cache_creation_input_tokens: 500,
+  },
+}) + "\n";
+
+const streamUsageExecute: AdapterExecute = async (ctx) => {
+  await ctx.onLog("stdout", deltaLine);
+  await ctx.onLog("stdout", cachedResultLine);
+  return { exitCode: 0, signal: null, timedOut: false, sessionId: "s",
+    usage: { inputTokens: 2, outputTokens: 7, cachedInputTokens: 30_000 } };
+};
+
+test("stream_options.include_usage emits a terminal usage chunk before [DONE]", async () => {
+  const body = await streamThroughFakeAdapter(
+    { model: "paperclip/claude_local", stream_options: { include_usage: true } },
+    streamUsageExecute,
+  );
+
+  const usageChunks = sseChunks(body).filter((c) => c.usage);
+  assert.equal(usageChunks.length, 1, "exactly one usage chunk");
+  assert.deepEqual(usageChunks[0].choices, [], "usage rides a chunk with no choices");
+  assert.equal(usageChunks[0].usage.prompt_tokens, 30_502);
+  assert.equal(usageChunks[0].usage.completion_tokens, 7);
+  assert.equal(usageChunks[0].usage.total_tokens, 30_509);
+  assert.equal(usageChunks[0].usage.prompt_tokens_details.cached_tokens, 30_000);
+  assert.ok(
+    body.indexOf('"usage"') < body.indexOf("data: [DONE]"),
+    "usage chunk precedes the [DONE] sentinel",
+  );
+});
+
+test("stream_options.include_usage marks every other chunk usage:null", async () => {
+  // The OpenAI contract: when usage is requested, non-terminal chunks still carry
+  // the key so a client can read chunk.usage unconditionally.
+  const body = await streamThroughFakeAdapter(
+    { model: "paperclip/claude_local", stream_options: { include_usage: true } },
+    streamUsageExecute,
+  );
+
+  const contentChunks = sseChunks(body).filter((c) => c.choices.length > 0);
+  assert.ok(contentChunks.length >= 2, "content deltas plus the finish chunk");
+  for (const chunk of contentChunks) {
+    assert.ok("usage" in chunk, "non-terminal chunk carries the usage key");
+    assert.equal(chunk.usage, null);
+  }
+});
+
+test("streaming without stream_options emits no usage chunk", async () => {
+  // Spec default. A usage chunk has an empty choices array, which crashes SDKs
+  // that read chunk.choices[0] — so it must only appear when asked for.
+  const body = await streamThroughFakeAdapter(
+    { model: "paperclip/claude_local" },
+    streamUsageExecute,
+  );
+
+  assert.doesNotMatch(body, /"usage"/, "no usage field anywhere in the stream");
+  assert.match(body, /data: \[DONE\]/);
+});
+
+test("streaming JSON mode still emits the usage chunk when requested", async () => {
+  // jsonMode buffers deltas and flushes one chunk from the terminal result, a
+  // separate write path from the plain-delta one.
+  const body = await streamThroughFakeAdapter(
+    {
+      model: "paperclip/claude_local",
+      response_format: { type: "json_object" },
+      stream_options: { include_usage: true },
+    },
+    async (ctx) => {
+      await ctx.onLog("stdout", JSON.stringify({
+        type: "result", subtype: "success", is_error: false, result: '{"answer":42}',
+        session_id: "s", total_cost_usd: 0, duration_ms: 1, duration_api_ms: 1,
+        num_turns: 1, modelUsage: {}, usage: { input_tokens: 2, output_tokens: 7 },
+      }) + "\n");
+      return { exitCode: 0, signal: null, timedOut: false, sessionId: "s",
+        usage: { inputTokens: 2, outputTokens: 7 } };
+    },
+  );
+
+  const usageChunks = sseChunks(body).filter((c) => c.usage);
+  assert.equal(usageChunks.length, 1);
+  assert.equal(usageChunks[0].usage.total_tokens, 9);
+});
+
+test("non-streaming usage reports cache tokens in prompt_tokens", async () => {
+  const orig = runnerFactory.create;
+  runnerFactory.create = (model: string) =>
+    model.startsWith("paperclip/")
+      ? new PaperclipRunner(streamUsageExecute, { engine: "cli" })
+      : orig(model);
+  try {
+    const req = { body: { model: "paperclip/claude_local", stream: false,
+      messages: [{ role: "user", content: "hi" }] } } as unknown as Request;
+    const res = fakeRes();
+    await handleChatCompletions(req, res);
+    const payload = JSON.parse(res.body);
+    assert.equal(payload.usage.prompt_tokens, 30_502);
+    assert.equal(payload.usage.prompt_tokens_details.cached_tokens, 30_000);
+  } finally {
+    runnerFactory.create = orig;
+  }
+});

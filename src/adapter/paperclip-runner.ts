@@ -336,13 +336,28 @@ export class PaperclipRunner extends EventEmitter implements AgentRunner {
       result: text,
       session_id: sessionId,
       total_cost_usd: result.costUsd ?? 0,
-      usage: {
-        input_tokens: result.usage?.inputTokens ?? 0,
-        output_tokens: result.usage?.outputTokens ?? 0,
-      },
+      usage: this.synthesizeUsage(result.usage),
       modelUsage: {},
     };
     this.emit("result", synthesized);
+  }
+
+  /**
+   * Adapter UsageSummary -> the CLI result's token buckets.
+   *
+   * The two count the prompt differently: codex reports cached_input_tokens as a
+   * subset of input_tokens, while every consumer of ClaudeCliResult (usage
+   * tracker, OpenAI usage) treats input and cache-read as disjoint and sums them.
+   * So the cached share moves OUT of input rather than being added on top —
+   * keeping the prompt total identical while the cache split stops reading zero.
+   */
+  private synthesizeUsage(usage: AdapterExecutionResult["usage"]): ClaudeCliResult["usage"] {
+    const cached = usage?.cachedInputTokens ?? 0;
+    return {
+      input_tokens: Math.max(0, (usage?.inputTokens ?? 0) - cached),
+      output_tokens: usage?.outputTokens ?? 0,
+      cache_read_input_tokens: cached,
+    };
   }
 
   private buildSink(): StreamJsonSink {

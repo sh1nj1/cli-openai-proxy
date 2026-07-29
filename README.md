@@ -167,7 +167,12 @@ walkthrough: [docs/paperclip-adapters.md](docs/paperclip-adapters.md#collavre-in
 - **OpenAI-compatible API** — drop-in for any OpenAI client
 - **Any CLI model** — the model part of the id is passed to the CLI verbatim, so
   the proxy keeps no model catalog to fall out of date
-- **Streaming** — SSE deltas as the CLI produces output
+- **Streaming** — SSE deltas as the CLI produces output. Send
+  `"stream_options": {"include_usage": true}` to get the OpenAI terminal usage
+  chunk (empty `choices`) just before `[DONE]`
+- **Cache-aware token counts** — `prompt_tokens` covers the whole prompt, cache
+  reads included, with the cached share broken out as
+  `usage.prompt_tokens_details.cached_tokens`
 - **Image input** — OpenAI `image_url` parts (base64 data URLs) are materialized
   to temp files and handed to the CLI as inline links, so the agent can see them;
   works across all adapters

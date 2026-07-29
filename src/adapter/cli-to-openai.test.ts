@@ -2,7 +2,9 @@ import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import {
   createDoneChunk,
+  createUsageChunk,
   cliResultToOpenai,
+  cliUsageToOpenai,
   extractJsonFromText,
 } from "./cli-to-openai.js";
 import type { ClaudeCliResult } from "../types/claude-cli.js";
@@ -35,6 +37,59 @@ describe("createDoneChunk", () => {
     // chunk has to report the same model as the content chunks before it.
     const chunk = createDoneChunk("req-1", "paperclip/claude_local/opus");
     assert.equal(chunk.model, "paperclip/claude_local/opus");
+  });
+});
+
+describe("cliUsageToOpenai", () => {
+  it("counts cache tokens as prompt tokens", () => {
+    // Anthropic reports input_tokens EXCLUDING both cache fields, so echoing it
+    // as prompt_tokens undercounts a cache-heavy turn by orders of magnitude
+    // (2 vs 30k) for any client that budgets context or estimates cost.
+    const usage = cliUsageToOpenai({
+      input_tokens: 2,
+      output_tokens: 7,
+      cache_read_input_tokens: 30_000,
+      cache_creation_input_tokens: 500,
+    });
+    assert.equal(usage.prompt_tokens, 30_502);
+    assert.equal(usage.completion_tokens, 7);
+    assert.equal(usage.total_tokens, 30_509);
+  });
+
+  it("reports the cached portion as prompt_tokens_details.cached_tokens", () => {
+    const usage = cliUsageToOpenai({
+      input_tokens: 2,
+      output_tokens: 7,
+      cache_read_input_tokens: 30_000,
+      cache_creation_input_tokens: 500,
+    });
+    assert.equal(usage.prompt_tokens_details?.cached_tokens, 30_000);
+  });
+
+  it("reports zero cached tokens when the run had no cache hits", () => {
+    const usage = cliUsageToOpenai({ input_tokens: 100, output_tokens: 50 });
+    assert.equal(usage.prompt_tokens, 100);
+    assert.equal(usage.prompt_tokens_details?.cached_tokens, 0);
+  });
+
+  it("reports zeroes for a missing usage block", () => {
+    const usage = cliUsageToOpenai(undefined);
+    assert.equal(usage.prompt_tokens, 0);
+    assert.equal(usage.completion_tokens, 0);
+    assert.equal(usage.total_tokens, 0);
+  });
+});
+
+describe("createUsageChunk", () => {
+  it("carries usage with no choices", () => {
+    // The OpenAI streaming contract puts the terminal usage on a chunk whose
+    // choices array is empty — a client that reads choices[0] must see nothing.
+    const chunk = createUsageChunk("req-1", "paperclip/codex_local", makeResult("hi").usage);
+    assert.deepEqual(chunk.choices, []);
+    assert.equal(chunk.usage?.prompt_tokens, 100);
+    assert.equal(chunk.usage?.completion_tokens, 50);
+    assert.equal(chunk.object, "chat.completion.chunk");
+    assert.equal(chunk.model, "paperclip/codex_local");
   });
 });
 

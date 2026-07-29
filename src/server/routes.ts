@@ -14,6 +14,7 @@ import { openaiErrorFromError } from "../adapter/adapter-error.js";
 import {
   cliResultToOpenai,
   createDoneChunk,
+  createUsageChunk,
   extractJsonFromText,
 } from "../adapter/cli-to-openai.js";
 import type { OpenAIChatRequest } from "../types/openai.js";
@@ -60,7 +61,7 @@ export async function handleChatCompletions(
       const subprocess = runnerFactory.create(requestedModel);
 
       if (stream) {
-        await handleStreamingResponse(req, res, subprocess, cliInput, requestId, requestedModel, startTime, cliInput.jsonMode);
+        await handleStreamingResponse(req, res, subprocess, cliInput, requestId, requestedModel, startTime, cliInput.jsonMode, body.stream_options?.include_usage === true);
       } else {
         await handleNonStreamingResponse(res, subprocess, cliInput, requestId, requestedModel, startTime, cliInput.jsonMode);
       }
@@ -137,7 +138,8 @@ async function handleStreamingResponse(
   requestId: string,
   requestedModel: string,
   startTime: number,
-  jsonMode?: boolean
+  jsonMode?: boolean,
+  includeUsage = false
 ): Promise<void> {
   // Set SSE headers
   res.setHeader("Content-Type", "text/event-stream");
@@ -157,6 +159,11 @@ async function handleStreamingResponse(
     let isComplete = false;
     let jsonBuffer = "";
     let keepaliveInterval: NodeJS.Timeout | null = null;
+
+    // Once usage is requested, the OpenAI contract has every non-terminal chunk
+    // carry the key explicitly as null, so a client can read chunk.usage
+    // unconditionally instead of feature-detecting it.
+    const usagePlaceholder = includeUsage ? { usage: null } : {};
 
     const clearKeepalive = () => {
       if (keepaliveInterval) {
@@ -204,6 +211,7 @@ async function handleStreamingResponse(
               },
               finish_reason: null,
             }],
+            ...usagePlaceholder,
           };
           res.write(`data: ${JSON.stringify(chunk)}\n\n`);
           isFirst = false;
@@ -248,12 +256,18 @@ async function handleStreamingResponse(
               delta: { role: "assistant" as const, content: extracted },
               finish_reason: null,
             }],
+            ...usagePlaceholder,
           };
           res.write(`data: ${JSON.stringify(chunk)}\n\n`);
         }
         // Send final done chunk with finish_reason
-        const doneChunk = createDoneChunk(requestId, requestedModel);
+        const doneChunk = { ...createDoneChunk(requestId, requestedModel), ...usagePlaceholder };
         res.write(`data: ${JSON.stringify(doneChunk)}\n\n`);
+        // Totals ride their own trailing chunk (empty `choices`) so a client that
+        // never asked for them is not handed a chunk whose choices[0] is absent.
+        if (includeUsage) {
+          res.write(`data: ${JSON.stringify(createUsageChunk(requestId, requestedModel, result.usage))}\n\n`);
+        }
         res.write("data: [DONE]\n\n");
         res.end();
       }

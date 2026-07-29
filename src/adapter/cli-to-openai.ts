@@ -3,7 +3,50 @@
  */
 
 import type { ClaudeCliResult } from "../types/claude-cli.js";
-import type { OpenAIChatResponse, OpenAIChatChunk } from "../types/openai.js";
+import type { OpenAIChatResponse, OpenAIChatChunk, OpenAIUsage } from "../types/openai.js";
+
+/**
+ * Map CLI token counts onto the OpenAI usage object.
+ *
+ * The CLI reports the three input buckets disjointly (input_tokens excludes both
+ * cache fields), while OpenAI's prompt_tokens is the whole prompt with
+ * prompt_tokens_details.cached_tokens as the cached subset of it. Echoing
+ * input_tokens alone would report 2 prompt tokens for a 30k-token cached turn.
+ * Cache writes have no OpenAI counterpart, so they fold into prompt_tokens —
+ * which is where they are billed anyway.
+ */
+export function cliUsageToOpenai(usage: ClaudeCliResult["usage"] | undefined): OpenAIUsage {
+  const cachedTokens = usage?.cache_read_input_tokens || 0;
+  const promptTokens =
+    (usage?.input_tokens || 0) + cachedTokens + (usage?.cache_creation_input_tokens || 0);
+  const completionTokens = usage?.output_tokens || 0;
+
+  return {
+    prompt_tokens: promptTokens,
+    completion_tokens: completionTokens,
+    total_tokens: promptTokens + completionTokens,
+    prompt_tokens_details: { cached_tokens: cachedTokens },
+  };
+}
+
+/**
+ * Terminal usage chunk for a stream_options.include_usage request. Its `choices`
+ * is empty per the OpenAI contract — the answer already streamed.
+ */
+export function createUsageChunk(
+  requestId: string,
+  requestedModel: string,
+  usage: ClaudeCliResult["usage"] | undefined,
+): OpenAIChatChunk {
+  return {
+    id: `chatcmpl-${requestId}`,
+    object: "chat.completion.chunk",
+    created: Math.floor(Date.now() / 1000),
+    model: requestedModel,
+    choices: [],
+    usage: cliUsageToOpenai(usage),
+  };
+}
 
 /**
  * Create a final "done" chunk for streaming
@@ -52,12 +95,7 @@ export function cliResultToOpenai(
         finish_reason: "stop",
       },
     ],
-    usage: {
-      prompt_tokens: result.usage?.input_tokens || 0,
-      completion_tokens: result.usage?.output_tokens || 0,
-      total_tokens:
-        (result.usage?.input_tokens || 0) + (result.usage?.output_tokens || 0),
-    },
+    usage: cliUsageToOpenai(result.usage),
   };
 }
 

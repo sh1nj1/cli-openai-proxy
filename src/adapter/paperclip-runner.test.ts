@@ -208,6 +208,56 @@ test("codex-jsonl mode with no live agent_message falls back to result.summary",
   assert.equal(code, 0);
 });
 
+test("codex-jsonl mode reports cached tokens separately from fresh input tokens", async () => {
+  // codex counts cached_input_tokens INSIDE input_tokens, while every consumer of
+  // ClaudeCliResult (usage tracker, OpenAI usage) treats the two as disjoint —
+  // so the cached share has to move out of input_tokens, not be added on top.
+  const fakeExecute: AdapterExecute = async () => ({
+    exitCode: 0, signal: null, timedOut: false, sessionId: "s",
+    summary: "ok",
+    usage: { inputTokens: 17_664, outputTokens: 5, cachedInputTokens: 17_000 },
+  });
+  const runner = new PaperclipRunner(
+    fakeExecute,
+    { engine: "cli", command: "codex" },
+    { promptInjection: "prompt-template", outputMode: "codex-jsonl", cliFlags: [] },
+  );
+  const results: ClaudeCliResult[] = [];
+  const closed = new Promise<void>((resolve) => {
+    runner.on("result", (r: ClaudeCliResult) => { results.push(r); });
+    runner.on("close", () => resolve());
+  });
+
+  await runner.start("hi", {});
+  await closed;
+
+  assert.equal(results[0].usage.cache_read_input_tokens, 17_000);
+  assert.equal(results[0].usage.input_tokens, 664, "cached share removed from fresh input");
+});
+
+test("codex-jsonl mode reports zero cached tokens when the adapter reports none", async () => {
+  const fakeExecute: AdapterExecute = async () => ({
+    exitCode: 0, signal: null, timedOut: false, sessionId: "s",
+    summary: "ok", usage: { inputTokens: 7, outputTokens: 3 },
+  });
+  const runner = new PaperclipRunner(
+    fakeExecute,
+    { engine: "cli", command: "codex" },
+    { promptInjection: "prompt-template", outputMode: "codex-jsonl", cliFlags: [] },
+  );
+  const results: ClaudeCliResult[] = [];
+  const closed = new Promise<void>((resolve) => {
+    runner.on("result", (r: ClaudeCliResult) => { results.push(r); });
+    runner.on("close", () => resolve());
+  });
+
+  await runner.start("hi", {});
+  await closed;
+
+  assert.equal(results[0].usage.input_tokens, 7);
+  assert.equal(results[0].usage.cache_read_input_tokens, 0);
+});
+
 // Emulates the `codex exec --json` NDJSON stream (see src/adapter/codex-jsonl-parser.ts).
 const codexLine = (obj: unknown) => JSON.stringify(obj) + "\n";
 const codexAgentMessage = (text: string) =>

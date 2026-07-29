@@ -24,6 +24,7 @@ export interface OpenAIChatRequest {
   frequency_penalty?: number;
   presence_penalty?: number;
   response_format?: { type: "text" | "json_object" | "json_schema"; json_schema?: unknown };
+  stream_options?: { include_usage?: boolean };
   user?: string; // Used for session mapping
 }
 
@@ -36,17 +37,20 @@ export interface OpenAIChatResponseChoice {
   finish_reason: "stop" | "length" | "content_filter" | null;
 }
 
+export interface OpenAIUsage {
+  prompt_tokens: number;
+  completion_tokens: number;
+  total_tokens: number;
+  prompt_tokens_details?: { cached_tokens: number };
+}
+
 export interface OpenAIChatResponse {
   id: string;
   object: "chat.completion";
   created: number;
   model: string;
   choices: OpenAIChatResponseChoice[];
-  usage: {
-    prompt_tokens: number;
-    completion_tokens: number;
-    total_tokens: number;
-  };
+  usage: OpenAIUsage;
 }
 
 export interface OpenAIChatChunkDelta {
@@ -66,6 +70,11 @@ export interface OpenAIChatChunk {
   created: number;
   model: string;
   choices: OpenAIChatChunkChoice[];
+  /**
+   * Only present when the caller sent stream_options.include_usage: null on every
+   * chunk but the terminal one, which carries the totals and an empty `choices`.
+   */
+  usage?: OpenAIUsage | null;
 }
 
 export interface OpenAIModel {
