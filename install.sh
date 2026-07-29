@@ -141,6 +141,18 @@ service_executable_is_trusted() {
   path_metadata_is_trusted "$resolved" file
 }
 
+service_file_is_trusted() {
+  local file="$1"
+  local resolved
+
+  [[ "$file" == /* && -f "$file" ]] || return 1
+  service_path_is_trusted "$(dirname -- "$file")" || return 1
+  resolved="$("$REALPATH_BIN" --canonicalize-existing -- "$file" 2>/dev/null)" \
+    || return 1
+  service_path_is_trusted "$(dirname -- "$resolved")" || return 1
+  path_metadata_is_trusted "$resolved" file
+}
+
 prepare_trusted_directory() {
   local directory="$1"
   local description="$2"
@@ -157,12 +169,12 @@ prepare_trusted_directory() {
 append_service_path() {
   local directory="$1"
 
-  [[ "$directory" == /* ]] || return
-  [[ "$directory" != *:* && "$directory" != *$'\n'* && "$directory" != *$'\r'* ]] || return
-  [[ ":$SERVICE_PATH:" != *":$directory:"* ]] || return
+  [[ "$directory" == /* ]] || return 0
+  [[ "$directory" != *:* && "$directory" != *$'\n'* && "$directory" != *$'\r'* ]] || return 0
+  [[ ":$SERVICE_PATH:" != *":$directory:"* ]] || return 0
   if ! service_path_is_trusted "$directory"; then
     warn "Skipping service PATH directory writable by another user: $directory"
-    return
+    return 0
   fi
   if [[ -n "$SERVICE_PATH" ]]; then
     SERVICE_PATH="$SERVICE_PATH:$directory"
@@ -295,6 +307,8 @@ REALPATH_BIN="$(trusted_command_path realpath)"
 [[ -n "$REALPATH_BIN" ]] || die "realpath is required (GNU coreutils)"
 service_executable_is_trusted "$NODE_BIN" \
   || die "Refusing Node.js executable with untrusted ownership or permissions: $NODE_BIN"
+service_path_is_trusted "$PROJECT_DIR" \
+  || die "Refusing project directory with untrusted ownership or permissions: $PROJECT_DIR"
 
 SERVICE_USER="$("$ID_BIN" -un)"
 
@@ -322,10 +336,16 @@ CLAUDE_BIN="$(command_path claude)"
 if [[ -z "$CLAUDE_BIN" ]]; then
   warn "Claude Code CLI was not found; Claude requests will fail until it is installed and authenticated"
   warn "Install it with: npm install -g @anthropic-ai/claude-code"
+else
+  service_executable_is_trusted "$CLAUDE_BIN" \
+    || die "Refusing Claude Code executable with untrusted ownership or permissions: $CLAUDE_BIN"
 fi
 CODEX_BIN="$(command_path codex)"
 if [[ -z "$CODEX_BIN" ]]; then
   warn "Codex CLI was not found; Codex requests will fail until it is installed and authenticated"
+else
+  service_executable_is_trusted "$CODEX_BIN" \
+    || die "Refusing Codex executable with untrusted ownership or permissions: $CODEX_BIN"
 fi
 
 log "Installing dependencies"
@@ -334,6 +354,8 @@ log "Installing dependencies"
 log "Building production files"
 (cd "$PROJECT_DIR" && "$NPM_BIN" run build)
 [[ -f "$ENTRYPOINT" ]] || die "Build did not create $ENTRYPOINT"
+service_file_is_trusted "$ENTRYPOINT" \
+  || die "Refusing application entrypoint with untrusted ownership or permissions: $ENTRYPOINT"
 
 prepare_trusted_directory "$CONFIG_HOME" "configuration directory"
 prepare_trusted_directory "$SYSTEMD_USER_DIR" "systemd user unit directory"
