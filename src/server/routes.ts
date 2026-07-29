@@ -6,7 +6,7 @@
 
 import type { Request, Response } from "express";
 import { v4 as uuidv4 } from "uuid";
-import { runnerFactory, PAPERCLIP_MODEL_IDS, UnknownPaperclipModelError } from "../adapter/paperclip-registry.js";
+import { runnerFactory, PAPERCLIP_MODEL_IDS, UnknownPaperclipModelError, DEFAULT_MODEL } from "../adapter/paperclip-registry.js";
 import type { AgentRunner } from "../adapter/agent-runner.js";
 import { openaiToCli } from "../adapter/openai-to-cli.js";
 import { materializeImages, ImageValidationError } from "../adapter/image-materializer.js";
@@ -17,7 +17,7 @@ import {
   extractJsonFromText,
 } from "../adapter/cli-to-openai.js";
 import type { OpenAIChatRequest } from "../types/openai.js";
-import type { ClaudeCliAssistant, ClaudeCliResult, ClaudeCliStreamEvent } from "../types/claude-cli.js";
+import type { ClaudeCliResult, ClaudeCliStreamEvent } from "../types/claude-cli.js";
 import { usageTracker } from "../usage/tracker.js";
 import { isAuthEnabled } from "./auth.js";
 import { PKG_VERSION, getTimeoutMs, KEEPALIVE_INTERVAL_MS } from "../config.js";
@@ -34,7 +34,7 @@ export async function handleChatCompletions(
   const requestId = uuidv4().replace(/-/g, "").slice(0, 24);
   const body = req.body as OpenAIChatRequest;
   const stream = body.stream === true;
-  const requestedModel = body.model || "claude-opus-4";
+  const requestedModel = body.model || DEFAULT_MODEL;
   const startTime = Date.now();
 
   try {
@@ -154,7 +154,6 @@ async function handleStreamingResponse(
 
   return new Promise<void>((resolve, reject) => {
     let isFirst = true;
-    let lastModel = requestedModel;
     let isComplete = false;
     let jsonBuffer = "";
     let keepaliveInterval: NodeJS.Timeout | null = null;
@@ -212,11 +211,6 @@ async function handleStreamingResponse(
       }
     });
 
-    // Handle final assistant message
-    subprocess.on("assistant", (_message: ClaudeCliAssistant) => {
-      // We use requestedModel instead of CLI-returned model
-    });
-
     subprocess.on("result", (result: ClaudeCliResult) => {
       isComplete = true;
       clearKeepalive();
@@ -224,6 +218,7 @@ async function handleStreamingResponse(
       // Track usage
       usageTracker.record({
         model: requestedModel,
+        modelUsage: result.modelUsage,
         inputTokens: result.usage?.input_tokens || 0,
         outputTokens: result.usage?.output_tokens || 0,
         cacheReadTokens: result.usage?.cache_read_input_tokens || 0,
@@ -257,7 +252,7 @@ async function handleStreamingResponse(
           res.write(`data: ${JSON.stringify(chunk)}\n\n`);
         }
         // Send final done chunk with finish_reason
-        const doneChunk = createDoneChunk(requestId, lastModel);
+        const doneChunk = createDoneChunk(requestId, requestedModel);
         res.write(`data: ${JSON.stringify(doneChunk)}\n\n`);
         res.write("data: [DONE]\n\n");
         res.end();
@@ -310,7 +305,6 @@ async function handleStreamingResponse(
 
     // Start the subprocess
     subprocess.start(cliInput.prompt, {
-      model: cliInput.model,
       systemPrompt: cliInput.systemPrompt,
       sessionId: cliInput.sessionId,
       timeout: getTimeoutMs(),
@@ -382,6 +376,7 @@ async function handleNonStreamingResponse(
         // Track usage
         usageTracker.record({
           model: requestedModel,
+          modelUsage: finalResult.modelUsage,
           inputTokens: finalResult.usage?.input_tokens || 0,
           outputTokens: finalResult.usage?.output_tokens || 0,
           cacheReadTokens: finalResult.usage?.cache_read_input_tokens || 0,
@@ -408,7 +403,7 @@ async function handleNonStreamingResponse(
 
         res.status(500).json({
           error: {
-            message: `Claude CLI exited with code ${code} without response`,
+            message: `CLI exited with code ${code} without response`,
             type: "server_error",
             code: null,
           },
@@ -420,7 +415,6 @@ async function handleNonStreamingResponse(
     // Start the subprocess
     subprocess
       .start(cliInput.prompt, {
-        model: cliInput.model,
         systemPrompt: cliInput.systemPrompt,
         sessionId: cliInput.sessionId,
         timeout: getTimeoutMs(),
@@ -443,35 +437,23 @@ async function handleNonStreamingResponse(
  *
  * Returns available models
  */
+/**
+ * Only paperclip adapters are exposed, and anything unlisted is a 404 — so the
+ * advertised set and the accepted set both come from the registry.
+ *
+ * Each entry names an adapter. A model can be appended as `<id>/<cli-model>`, but
+ * the CLI owns the model list, so none are enumerated here.
+ */
 const MODELS_DATA = (() => {
   const now = Math.floor(Date.now() / 1000);
-  const baseModels = [
-    "claude-opus-4-6",
-    "claude-opus-4",
-    "claude-sonnet-4-5-20250929",
-    "claude-sonnet-4",
-    "claude-haiku-4-5-20251001",
-    "claude-haiku-4",
-  ];
-  const prefixes = ["", "openai/", "anthropic/", "claude-max/", "claude-code-cli/"];
   return Object.freeze({
     object: "list" as const,
-    data: [
-      ...prefixes.flatMap((prefix) =>
-        baseModels.map((id) => ({
-          id: `${prefix}${id}`,
-          object: "model" as const,
-          owned_by: "anthropic",
-          created: now,
-        }))
-      ),
-      ...PAPERCLIP_MODEL_IDS.map((id) => ({
-        id,
-        object: "model" as const,
-        owned_by: "paperclip",
-        created: now,
-      })),
-    ],
+    data: PAPERCLIP_MODEL_IDS.map((id) => ({
+      id,
+      object: "model" as const,
+      owned_by: "paperclip",
+      created: now,
+    })),
   });
 })();
 

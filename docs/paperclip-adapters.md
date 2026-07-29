@@ -1,9 +1,9 @@
 # Paperclip adapters behind the OpenAI endpoint
 
 Every request runs through a Paperclip agent adapter's `execute()` using the
-published `@paperclipai/adapter-*` packages. Existing Claude model ids use
-`claude_local`; `paperclip/<adapterType>` ids select an adapter explicitly.
-Registered adapters:
+published `@paperclipai/adapter-*` packages. A model id is
+`paperclip/<adapterType>[/<cliModel>]`: the adapter key selects the adapter and
+anything after it is the CLI's model string. Registered adapters:
 
 | Model id                 | Paperclip package                   | Requires (on PATH, authed) | Live streaming        |
 |--------------------------|-------------------------------------|----------------------------|-----------------------|
@@ -14,13 +14,15 @@ All adapters run `engine: "cli"`. Option 1 is **stateless** (no session resume).
 
 ## Notes & limitations
 
-- **The `<adapterType>` selects the adapter, not a specific model.** For
-  `paperclip/claude_local` the underlying Claude model resolves to the `opus`
-  default (the id after `paperclip/` isn't a `sonnet`/`haiku` alias). For other
-  adapters (e.g. `paperclip/codex_local`) the model id is **not** forwarded at
-  all — the adapter uses its own configured default — because the OpenAI model
-  id selected the adapter, not a model that adapter would understand. The tier /
-  sub-model is not selectable through the model id in Option 1.
+- **The CLI model is pass-through and unvalidated.** Everything after
+  `paperclip/<adapterType>/` becomes the adapter's `config.model` verbatim
+  (slashes included), which each adapter turns into its CLI's `--model` flag.
+  This proxy keeps no model catalog, so a model the CLI rejects surfaces as the
+  CLI's own error rather than a silent fallback. Omit the suffix and the key is
+  left off `config` entirely, so the CLI picks its own default model.
+- **An id outside `paperclip/<registered-adapter>` is a `404 model_not_found`.**
+  The adapter key must match exactly — a prefix match would route
+  `paperclip/codex_local_x` to the codex CLI.
 - **codex streams at message-block granularity (`codex-jsonl`), not token-by-token.**
   Its live stdout is `codex exec --json` NDJSON, not Claude stream-json, so the
   runner parses it live with a dedicated `CodexJsonlParser` and emits a content
@@ -63,9 +65,10 @@ All adapters run `engine: "cli"`. Option 1 is **stateless** (no session resume).
 OpenAI SSE. A one-line factory (`runnerFactory.create(model)`) picks the runner
 by model id:
 
-- `paperclip/<adapterType>` → the explicitly registered adapter.
-- everything else → the `claude_local` adapter, preserving the proxy's existing
-  Claude model ids.
+- `paperclip/<adapterType>` → that adapter, on its CLI's default model.
+- `paperclip/<adapterType>/<cliModel>` → that adapter, with `<cliModel>` handed
+  to the CLI verbatim.
+- everything else → `UnknownPaperclipModelError` → `404 model_not_found`.
 
 Every execution uses the same `AgentRunner` contract, so the
 SSE/keepalive/orphan-kill route layer remains adapter-agnostic.

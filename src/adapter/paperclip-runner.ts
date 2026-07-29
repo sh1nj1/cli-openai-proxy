@@ -48,6 +48,8 @@ export type PromptInjection = "task-context" | "prompt-template";
 export type OutputMode = "stream-json" | "codex-jsonl";
 
 export interface PaperclipRunnerOptions {
+  /** Passed to the CLI verbatim. Absent means the CLI picks its own default model. */
+  model?: string;
   /** Default "task-context" (claude-local). */
   promptInjection?: PromptInjection;
   /** Default "stream-json" (claude-local). */
@@ -74,6 +76,7 @@ export class PaperclipRunner extends EventEmitter implements AgentRunner {
   // wire) yet still falls back to a synthesized delta when nothing streamed.
   private codexStreamed = false;
 
+  private readonly model?: string;
   private readonly promptInjection: PromptInjection;
   private readonly outputMode: OutputMode;
   private readonly cliFlags: string[];
@@ -85,6 +88,7 @@ export class PaperclipRunner extends EventEmitter implements AgentRunner {
     options: PaperclipRunnerOptions = {},
   ) {
     super();
+    this.model = options.model;
     this.promptInjection = options.promptInjection ?? "task-context";
     this.outputMode = options.outputMode ?? "stream-json";
     this.cliFlags = options.cliFlags ?? CLAUDE_CLI_FLAGS;
@@ -147,10 +151,10 @@ export class PaperclipRunner extends EventEmitter implements AgentRunner {
         engine: "cli", // MUST pin CLI lane (adapter defaults to ACP)
         cwd: this.cwd,
         promptTemplate,
-        // Only forward the (claude-aliased) model on the claude path. For other
-        // adapters the OpenAI model id selected the adapter itself, not a model
-        // that adapter understands, so we let the adapter use its own default.
-        ...(this.promptInjection === "task-context" ? { model: options.model } : {}),
+        // Models are pass-through: this proxy keeps no catalog, so the CLI is the
+        // only authority on what is valid. Omit the key entirely when unset so each
+        // CLI falls back to its own default model.
+        ...(this.model ? { model: this.model } : {}),
         dangerouslySkipPermissions: true,
         timeoutSec,
         extraArgs,
