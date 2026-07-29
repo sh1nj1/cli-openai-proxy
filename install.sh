@@ -96,6 +96,7 @@ if [[ -z "$CLAUDE_BIN" ]]; then
   warn "Claude Code CLI was not found; Claude requests will fail until it is installed and authenticated"
   warn "Install it with: npm install -g @anthropic-ai/claude-code"
 fi
+CODEX_BIN="$(command_path codex)"
 
 log "Installing dependencies"
 (cd "$PROJECT_DIR" && "$NPM_BIN" ci)
@@ -143,9 +144,16 @@ CLAUDE_DIR=""
 if [[ -n "$CLAUDE_BIN" ]]; then
   CLAUDE_DIR="$(dirname -- "$CLAUDE_BIN")"
 fi
+CODEX_DIR=""
+if [[ -n "$CODEX_BIN" ]]; then
+  CODEX_DIR="$(dirname -- "$CODEX_BIN")"
+fi
 SERVICE_PATH="$NODE_DIR"
 if [[ -n "$CLAUDE_DIR" && "$CLAUDE_DIR" != "$NODE_DIR" ]]; then
   SERVICE_PATH="$SERVICE_PATH:$CLAUDE_DIR"
+fi
+if [[ -n "$CODEX_DIR" && "$CODEX_DIR" != "$NODE_DIR" && "$CODEX_DIR" != "$CLAUDE_DIR" ]]; then
+  SERVICE_PATH="$SERVICE_PATH:$CODEX_DIR"
 fi
 SERVICE_PATH="$SERVICE_PATH:/usr/local/bin:/usr/bin:/bin"
 
@@ -181,9 +189,10 @@ if [[ "$LINGER" != "yes" ]]; then
   "$SUDO_BIN" "$LOGINCTL_BIN" enable-linger "$SERVICE_USER"
 fi
 
-log "Enabling and starting $SERVICE_NAME"
+log "Enabling and restarting $SERVICE_NAME"
 "$SYSTEMCTL_BIN" --user daemon-reload
-"$SYSTEMCTL_BIN" --user enable --now "$SERVICE_NAME.service"
+"$SYSTEMCTL_BIN" --user enable "$SERVICE_NAME.service"
+"$SYSTEMCTL_BIN" --user restart "$SERVICE_NAME.service"
 "$SYSTEMCTL_BIN" --user --no-pager --full status "$SERVICE_NAME.service" || {
   warn "The service did not start successfully"
   warn "Inspect logs with: journalctl --user -u $SERVICE_NAME.service -n 100"
