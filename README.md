@@ -117,10 +117,11 @@ latest of a family (`opus`, `sonnet`, `fable`) or a full id
 correctness — an alias follows the CLI to each new model, a full id pins the one
 you tested against.
 
-An id outside this namespace returns `404 model_not_found`. That includes ids
-earlier versions accepted — `claude-opus-4`, `claude-max/…`, `anthropic/…`,
+An id outside this namespace returns `404 model_not_found`. That includes every
+id `1.x` accepted — `claude-opus-4`, `claude-max/…`, `anthropic/…`,
 `claude-code-cli/…`, and bare `opus`/`sonnet`/`haiku` — so a client configured
-against those needs its model id updated. Aliases are only meaningful as the
+against those needs its model id updated before moving to `2.0`; that break is
+why this is a major version. Aliases are only meaningful as the
 `<cli-model>` part, where the CLI resolves them: `paperclip/claude_local/opus`
 runs, bare `opus` is a `404`.
 
