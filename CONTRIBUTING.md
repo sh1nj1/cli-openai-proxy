@@ -1,4 +1,4 @@
-# Contributing to Claude Code CLI Provider
+# Contributing to cli-openai-proxy
 
 Thank you for your interest in contributing!
 
