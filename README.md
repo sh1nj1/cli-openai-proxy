@@ -32,7 +32,7 @@ curl http://localhost:3456/v1/models
 Or clone and run:
 
 ```bash
-git clone https://github.com/atalovesyou/claude-max-api-proxy.git
+git clone https://github.com/sh1nj1/claude-max-api-proxy.git
 cd claude-max-api-proxy
 npm install && npm run build
 npm start
@@ -300,6 +300,13 @@ That said, please review [Anthropic's Terms of Service](https://www.anthropic.co
 
 PRs welcome. Please include tests.
 
+## Credits
+
+Originally created by [Atal Ashutosh](https://github.com/atalovesyou) as
+[atalovesyou/claude-max-api-proxy](https://github.com/atalovesyou/claude-max-api-proxy).
+This repository continues that work with multi-CLI adapters (Claude Code, Codex,
+Paperclip), streaming, usage tracking, and remote auth provisioning.
+
 ## License
 
-MIT
+MIT — see [LICENSE](LICENSE). Copyright (c) 2026 Atal Ashutosh.
