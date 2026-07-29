@@ -89,25 +89,6 @@ export function displayCostUsd(usd: number): number {
   return Math.round(usd * PER_MILLION) / PER_MILLION;
 }
 
-/**
- * The pricing family that ran the main chain, when the run's own numbers name it.
- *
- * `modelUsage` never labels which entry is the main chain, but the top-level
- * totals are the main chain's alone — so the entry matching them on both input
- * and output is that chain. A main chain that itself spanned models matches
- * nothing (and two identical entries match ambiguously); the caller keeps its
- * own default then.
- */
-function mainChainFamily(
-  entries: [string, ModelUsage | undefined][],
-  mainChain: { inputTokens: number; outputTokens: number },
-): string | null {
-  const matches = entries.filter(([, usage]) =>
-    (usage?.inputTokens ?? 0) === mainChain.inputTokens
-    && (usage?.outputTokens ?? 0) === mainChain.outputTokens);
-  return matches.length === 1 ? pricingFamily(matches[0][0]) : null;
-}
-
 export type { ModelUsage };
 
 export interface BilledRun {
@@ -138,7 +119,10 @@ export interface BilledRun {
  * an Opus turn.
  */
 export function billRun(
-  result: { modelUsage?: Record<string, ModelUsage> } | null | undefined,
+  result:
+    | { modelUsage?: Record<string, ModelUsage>; mainChainModel?: string }
+    | null
+    | undefined,
   fallback: {
     model: string;
     inputTokens: number;
@@ -147,12 +131,16 @@ export function billRun(
     cacheWriteTokens?: number;
   },
 ): BilledRun {
-  const tokens = aggregateRunTokens(result?.modelUsage, {
-    inputTokens: fallback.inputTokens,
-    outputTokens: fallback.outputTokens,
-    cacheReadTokens: fallback.cacheReadTokens ?? 0,
-    cacheWriteTokens: fallback.cacheWriteTokens ?? 0,
-  });
+  const tokens = aggregateRunTokens(
+    result?.modelUsage,
+    {
+      inputTokens: fallback.inputTokens,
+      outputTokens: fallback.outputTokens,
+      cacheReadTokens: fallback.cacheReadTokens ?? 0,
+      cacheWriteTokens: fallback.cacheWriteTokens ?? 0,
+    },
+    result?.mainChainModel,
+  );
 
   const entries = Object.entries(result?.modelUsage ?? {});
   if (entries.length === 0) {
@@ -193,14 +181,18 @@ export function billRun(
   // Cache detail is optional per model, so the aggregate can carry run totals no
   // entry accounted for — otherwise cache tokens the record does report would
   // cost nothing. Those totals came from the main chain, so they are priced at
-  // its rate, not at the rate of whichever model happened to talk the most: a
-  // verbose Haiku sidechain must not decide what an Opus prompt cost.
-  costUsd += cost(mainChainFamily(entries, fallback) ?? model, {
-    inputTokens: 0,
-    outputTokens: 0,
-    cacheReadTokens: tokens.cacheReadTokens - pricedCacheRead,
-    cacheWriteTokens: tokens.cacheWriteTokens - pricedCacheWrite,
-  });
+  // the model the run named as running it, not at the rate of whichever model
+  // happened to talk the most: a verbose Haiku sidechain must not decide what an
+  // Opus prompt cost. An unnamed main chain leaves only the dominant model.
+  costUsd += cost(
+    result?.mainChainModel ? pricingFamily(result.mainChainModel) : model,
+    {
+      inputTokens: 0,
+      outputTokens: 0,
+      cacheReadTokens: tokens.cacheReadTokens - pricedCacheRead,
+      cacheWriteTokens: tokens.cacheWriteTokens - pricedCacheWrite,
+    },
+  );
 
   return { model, ...tokens, costUsd };
 }
@@ -295,6 +287,8 @@ export class UsageTracker {
     model: string;
     /** What the CLI reported running, when it reported anything. */
     modelUsage?: Record<string, ModelUsage>;
+    /** Which of those ran the main chain — whose tokens the run totals are. */
+    mainChainModel?: string;
     inputTokens: number;
     outputTokens: number;
     cacheReadTokens?: number;
@@ -303,7 +297,10 @@ export class UsageTracker {
     stream: boolean;
     success: boolean;
   }): void {
-    const billed = billRun({ modelUsage: entry.modelUsage }, entry);
+    const billed = billRun(
+      { modelUsage: entry.modelUsage, mainChainModel: entry.mainChainModel },
+      entry,
+    );
 
     const record: RequestRecord = {
       timestamp: Date.now(),

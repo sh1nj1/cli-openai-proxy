@@ -301,10 +301,9 @@ test("prices unreported cache against the main chain, not the loudest sidechain"
   // Those tokens come from the top-level totals, which are the main chain's — so
   // charging them to whichever model produced the most output prices an Opus
   // prompt at Haiku rates whenever a sidechain out-talks the turn that cached it.
-  // `modelUsage` never labels the main chain, but the entry matching the
-  // top-level input/output is it.
   const billed = billRun(
     {
+      mainChainModel: "claude-opus-5",
       modelUsage: {
         "claude-opus-5": { inputTokens: 0, outputTokens: 0 },
         "claude-haiku-4-5": { inputTokens: 0, outputTokens: 1_000_000 },
@@ -317,9 +316,30 @@ test("prices unreported cache against the main chain, not the loudest sidechain"
   assert.equal(billed.costUsd, 1.25 + 1.5);
 });
 
-test("prices unreported cache at the dominant rate when no entry is the main chain", () => {
-  // A main chain that itself spanned models matches no single entry. Nothing
-  // identifies it then, so the run keeps the model that did the most work.
+test("prices unreported cache against the main chain when a subagent shares its model", () => {
+  // `modelUsage` keys by model, not by chain, so an Opus main chain that spawns
+  // an Opus subagent lands in one entry that no longer equals the top-level
+  // totals. The run names its main chain outright, so nothing has to be inferred
+  // from those totals — the Opus entry covering 1M input is the subagent's work,
+  // and the cache still prices at Opus.
+  const billed = billRun(
+    {
+      mainChainModel: "claude-opus-5",
+      modelUsage: {
+        "claude-opus-5": { inputTokens: 1_000_000, outputTokens: 0 },
+        "claude-haiku-4-5": { inputTokens: 0, outputTokens: 1_000_000 },
+      },
+    },
+    { ...RUN_TOTALS, inputTokens: 400_000, cacheReadTokens: 1_000_000 },
+  );
+
+  assert.equal(billed.model, "haiku");
+  assert.equal(billed.costUsd, 15 + 1.25 + 1.5);
+});
+
+test("prices unreported cache at the dominant rate when the run named no main chain", () => {
+  // Nothing identifies the chain those totals came from, so the run keeps the
+  // model that did the most work.
   const billed = billRun(
     {
       modelUsage: {
@@ -327,7 +347,7 @@ test("prices unreported cache at the dominant rate when no entry is the main cha
         "claude-haiku-4-5": { inputTokens: 0, outputTokens: 1_000_000 },
       },
     },
-    { ...RUN_TOTALS, outputTokens: 100, cacheReadTokens: 1_000_000 },
+    { ...RUN_TOTALS, cacheReadTokens: 1_000_000 },
   );
 
   assert.equal(billed.costUsd, 1.25 + 0.025);

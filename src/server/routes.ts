@@ -227,6 +227,7 @@ async function handleStreamingResponse(
       usageTracker.record({
         model: requestedModel,
         modelUsage: result.modelUsage,
+        mainChainModel: result.mainChainModel,
         inputTokens: result.usage?.input_tokens || 0,
         outputTokens: result.usage?.output_tokens || 0,
         cacheReadTokens: result.usage?.cache_read_input_tokens || 0,
@@ -391,6 +392,7 @@ async function handleNonStreamingResponse(
         usageTracker.record({
           model: requestedModel,
           modelUsage: finalResult.modelUsage,
+          mainChainModel: finalResult.mainChainModel,
           inputTokens: finalResult.usage?.input_tokens || 0,
           outputTokens: finalResult.usage?.output_tokens || 0,
           cacheReadTokens: finalResult.usage?.cache_read_input_tokens || 0,

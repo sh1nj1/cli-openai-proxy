@@ -11,6 +11,7 @@ import fs from "fs/promises";
 import path from "path";
 import type { AdapterExecutionContext, AdapterExecutionResult } from "@paperclipai/adapter-utils";
 import type { ClaudeCliResult, ClaudeCliStreamEvent } from "../types/claude-cli.js";
+import { isSystemInit } from "../types/claude-cli.js";
 import type { AgentRunner, RunnerOptions } from "./agent-runner.js";
 import { StreamJsonParser, type StreamJsonSink } from "./stream-json-parser.js";
 import { CodexJsonlParser } from "./codex-jsonl-parser.js";
@@ -75,6 +76,9 @@ export class PaperclipRunner extends EventEmitter implements AgentRunner {
   // the terminal emit skips a duplicate content delta (the answer is already on the
   // wire) yet still falls back to a synthesized delta when nothing streamed.
   private codexStreamed = false;
+  // The model the run announced at init. Nothing later says which chain a
+  // modelUsage entry belongs to, so this is the only handle on the main chain.
+  private mainChainModel: string | null = null;
 
   private readonly model?: string;
   private readonly promptInjection: PromptInjection;
@@ -339,7 +343,17 @@ export class PaperclipRunner extends EventEmitter implements AgentRunner {
       usage: this.synthesizeUsage(result.usage),
       modelUsage: {},
     };
-    this.emit("result", synthesized);
+    this.emit("result", this.stampMainChain(synthesized));
+  }
+
+  /**
+   * Name the main chain on the result. The CLI reports per-model totals but
+   * never says which model ran the main chain, while the top-level `usage` is
+   * that chain's alone — so billing has to carry the name forward from init.
+   */
+  private stampMainChain(result: ClaudeCliResult): ClaudeCliResult {
+    if (this.mainChainModel) result.mainChainModel = this.mainChainModel;
+    return result;
   }
 
   /**
@@ -362,7 +376,10 @@ export class PaperclipRunner extends EventEmitter implements AgentRunner {
 
   private buildSink(): StreamJsonSink {
     return {
-      onMessage: (message) => this.emit("message", message),
+      onMessage: (message) => {
+        if (isSystemInit(message)) this.mainChainModel = message.model;
+        this.emit("message", message);
+      },
       onContentDelta: (event) => this.emit("content_delta", event),
       onAssistant: (message) => this.emit("assistant", message),
       onResult: (message) => {
@@ -384,7 +401,7 @@ export class PaperclipRunner extends EventEmitter implements AgentRunner {
             || `Paperclip adapter run failed (subtype: ${result.subtype})`;
           return;
         }
-        this.emit("result", message);
+        this.emit("result", this.stampMainChain(result));
       },
       onRaw: (line) => this.emit("raw", line),
     };
