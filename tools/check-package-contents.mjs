@@ -14,8 +14,8 @@ const SRC_DIR = 'src/';
 const EMIT_SUFFIXES = ['.d.ts.map', '.d.ts', '.js.map', '.js'];
 const SOURCE_EXTENSIONS = ['.ts', '.tsx'];
 
-function run(cmd, args) {
-  return execFileSync(cmd, args, { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 });
+function run(cmd, args, options = {}) {
+  return execFileSync(cmd, args, { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024, ...options });
 }
 
 // A build artifact is legitimate only if tsc could have emitted it from a source
@@ -28,8 +28,11 @@ function isEmittedFromTrackedSource(packedPath, tracked) {
   return SOURCE_EXTENSIONS.some((ext) => tracked.has(stem + ext));
 }
 
-const npm = process.platform === 'win32' ? 'npm.cmd' : 'npm';
-const packed = JSON.parse(run(npm, ['pack', '--dry-run', '--json']))[0].files.map((f) => f.path);
+// npm is `npm.cmd` on Windows, and Node refuses to execFile a .cmd without a shell.
+const isWindows = process.platform === 'win32';
+const packed = JSON.parse(
+  run(isWindows ? 'npm.cmd' : 'npm', ['pack', '--dry-run', '--json'], { shell: isWindows }),
+)[0].files.map((f) => f.path);
 const tracked = new Set(run('git', ['ls-files']).split('\n').filter(Boolean));
 
 const leaked = packed.filter((p) => {

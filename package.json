@@ -15,7 +15,7 @@
     "dev": "tsc --watch",
     "start": "node dist/server/standalone.js",
     "test": "find dist -name '*.test.js' -print0 | xargs -0 node --test",
-    "clean": "rm -rf dist",
+    "clean": "node tools/clean.mjs",
     "prepublishOnly": "npm run build && node tools/check-package-contents.mjs"
   },
   "keywords": [
