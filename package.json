@@ -11,6 +11,7 @@
   "scripts": {
     "postinstall": "node scripts/fix-node-pty-permissions.mjs",
     "build": "tsc",
+    "lint": "tsc --noEmit",
     "dev": "tsc --watch",
     "start": "node dist/server/standalone.js",
     "test": "find dist -name '*.test.js' -print0 | xargs -0 node --test",
