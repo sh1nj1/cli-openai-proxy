@@ -84,16 +84,27 @@ cli-openai-proxy/
 ```typescript
 import { emptyPluginConfigSchema } from "clawdbot/plugin-sdk";
 import { startServer, stopServer } from "./server/index.js";
+import { verifyClaude, verifyAuth } from "./cli/claude.js";
+import { runPreflight } from "./server/preflight.js";
+import {
+  PAPERCLIP_MODEL_IDS,
+  adapterCredentialNotes,
+  defaultModelForHost,
+} from "./adapter/paperclip-registry.js";
 
 const PROVIDER_ID = "claude-code-cli";
 const DEFAULT_PORT = 3456;
-const DEFAULT_MODEL = "claude-code-cli/claude-sonnet-4";
 
-const AVAILABLE_MODELS = [
-  { id: "claude-opus-4", name: "Claude Opus 4.5", alias: "opus" },
-  { id: "claude-sonnet-4", name: "Claude Sonnet 4", alias: "sonnet" },
-  { id: "claude-haiku-4", name: "Claude Haiku 4", alias: "haiku" },
-];
+// One entry per registered adapter, derived rather than hand-kept: the proxy
+// 404s any id it cannot resolve, so a stale entry here breaks every completion
+// routed through it. An entry names an adapter, not a CLI model — a caller
+// appends `/<cli-model>` to pick one, and omitting it uses the CLI's default.
+const PLUGIN_MODELS = PAPERCLIP_MODEL_IDS.map((id) => ({
+  id,                                       // paperclip/claude_local, paperclip/codex_local
+  name: `${adapterLabel(id)} (Paperclip)`,
+  // The CLI model is chosen per request, so no fixed capability is claimed here.
+  reasoning: false,
+}));
 
 const plugin = {
   id: "claude-code-cli",
@@ -120,11 +131,14 @@ const plugin = {
         run: async (ctx) => {
           const spin = ctx.prompter.progress("Checking Claude CLI...");
 
-          // 1. Verify claude CLI is installed and authenticated
-          const cliCheck = await verifyClaude();
-          if (!cliCheck.ok) {
-            spin.stop("Claude CLI not found");
-            throw new Error(cliCheck.error);
+          // 1. Check Claude, but do not require it: this provider also advertises
+          //    non-Claude adapters, so throwing here would lock a codex-only host
+          //    out of a model it is being offered. Missing Claude becomes a note,
+          //    and the default follows the host instead of naming Claude blindly.
+          const { claudeOk, warnings } = await runPreflight({ verifyClaude, verifyAuth });
+          const defaultModel = `${PROVIDER_ID}/${await defaultModelForHost(claudeOk)}`;
+          if (!claudeOk) {
+            await ctx.prompter.note(warnings.join("\n"), "Claude unavailable");
           }
 
           // 2. Start local server if not running
@@ -156,11 +170,11 @@ const plugin = {
                     apiKey: "local",
                     api: "openai-completions",
                     authHeader: false,
-                    models: AVAILABLE_MODELS.map(m => ({
+                    models: PLUGIN_MODELS.map(m => ({
                       id: m.id,
                       name: m.name,
                       api: "openai-completions",
-                      reasoning: m.id.includes("opus"),
+                      reasoning: m.reasoning,
                       input: ["text"],
                       cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
                       contextWindow: 200000,
@@ -172,16 +186,19 @@ const plugin = {
               agents: {
                 defaults: {
                   models: Object.fromEntries(
-                    AVAILABLE_MODELS.map(m => [`${PROVIDER_ID}/${m.id}`, {}])
+                    PLUGIN_MODELS.map(m => [`${PROVIDER_ID}/${m.id}`, {}])
                   ),
                 },
               },
             },
-            defaultModel: DEFAULT_MODEL,
+            defaultModel,
+            // Per adapter, not per provider: every advertised model stays selectable
+            // whatever the default is, and they do not spend the same credential.
             notes: [
-              "This uses your Claude Max subscription via Claude Code CLI.",
-              "Make sure you're logged into Claude Code (`claude auth login`).",
-              `Local server running at http://localhost:${port}`,
+              ...adapterCredentialNotes(),
+              `Default: ${defaultModel}. Any model above can be selected per request.`,
+              "Each CLI keeps its own credentials; none are exposed to this provider.",
+              `Local server running at http://127.0.0.1:${port}`,
             ],
           };
         },
@@ -202,9 +219,14 @@ export default plugin;
 
 ### 3. Agent Runner (`adapter/agent-runner.ts`)
 
-The OpenAI route layer depends only on `AgentRunner`. `createRunner()` maps
-existing Claude model ids to the Paperclip `claude_local` adapter and explicit
-`paperclip/*` ids to their registered adapters. CLI spawn, parsing, timeout, and
+The OpenAI route layer depends only on `AgentRunner`. `createRunner()` accepts
+exactly one syntax — `paperclip/<adapter>[/<cli-model>]` — and throws
+`UnknownPaperclipModelError` (a `404 model_not_found`) for anything else,
+including the bare `claude-*` and provider-prefixed ids accepted before 2.0. The
+adapter key matches the registry exactly; everything after it is passed to the
+CLI verbatim, because which models exist is the CLI's call and not this proxy's.
+There is deliberately no fallback: silently running Claude for an unrecognised id
+is the behaviour the namespace exists to remove. CLI spawn, parsing, timeout, and
 process-group termination are delegated to the pinned `@paperclipai/*` packages.
 
 ```typescript
@@ -221,23 +243,17 @@ interface AgentRunner extends EventEmitter {
 ```typescript
 import { OpenAIChatRequest } from "../types/openai.js";
 
+// No model field: the requested id is resolved by the registry
+// (`resolvePaperclipModel`), which picks the adapter and hands the CLI model
+// straight to it. This converter never interprets a model id.
 interface CliInput {
   prompt: string;
-  model: "opus" | "sonnet" | "haiku";
+  systemPrompt?: string;
   sessionId?: string;
+  jsonMode?: boolean;
 }
 
 export function openaiToCli(request: OpenAIChatRequest): CliInput {
-  // Extract model alias from model name
-  const modelMap: Record<string, "opus" | "sonnet" | "haiku"> = {
-    "claude-opus-4": "opus",
-    "claude-sonnet-4": "sonnet",
-    "claude-haiku-4": "haiku",
-  };
-
-  const modelId = request.model.replace("claude-code-cli/", "");
-  const model = modelMap[modelId] || "sonnet";
-
   // Convert messages to single prompt
   // Claude Code CLI expects a single user message in non-interactive mode
   const messages = request.messages;
@@ -256,7 +272,6 @@ export function openaiToCli(request: OpenAIChatRequest): CliInput {
 
   return {
     prompt: prompt.trim(),
-    model,
     sessionId: request.user, // Use user field for session mapping
   };
 }
@@ -272,7 +287,8 @@ let chunkIndex = 0;
 
 export function cliToOpenaiChunk(
   message: ClaudeCliAssistant,
-  requestId: string
+  requestId: string,
+  requestedModel: string
 ): OpenAIChatChunk {
   const text = message.message.content
     .filter(c => c.type === "text")
@@ -283,7 +299,10 @@ export function cliToOpenaiChunk(
     id: `chatcmpl-${requestId}`,
     object: "chat.completion.chunk",
     created: Math.floor(Date.now() / 1000),
-    model: message.message.model,
+    // Echoed verbatim, never taken from what the CLI reports: gateways route and
+    // validate on this field, so it has to stay an id the proxy itself accepts.
+    // The CLI answers `claude-opus-5`, which is a 404 here.
+    model: requestedModel,
     choices: [{
       index: 0,
       delta: {
@@ -297,13 +316,14 @@ export function cliToOpenaiChunk(
 
 export function cliResultToOpenai(
   result: ClaudeCliResult,
-  requestId: string
+  requestId: string,
+  requestedModel: string
 ): OpenAIChatResponse {
   return {
     id: `chatcmpl-${requestId}`,
     object: "chat.completion",
     created: Math.floor(Date.now() / 1000),
-    model: result.modelUsage ? Object.keys(result.modelUsage)[0] : "claude-sonnet-4",
+    model: requestedModel,
     choices: [{
       index: 0,
       message: {
@@ -343,15 +363,18 @@ export async function startServer(port: number): Promise<Server> {
   // OpenAI-compatible endpoints
   app.post("/v1/chat/completions", handleChatCompletions);
 
-  // Models list
+  // Models list — the advertised set and the accepted set are the same registry,
+  // so a caller cannot be shown an id that then 404s. Entries are adapters; the
+  // CLI owns its own model list, so no CLI model is enumerated here.
   app.get("/v1/models", (req, res) => {
     res.json({
       object: "list",
-      data: [
-        { id: "claude-opus-4", object: "model", owned_by: "anthropic" },
-        { id: "claude-sonnet-4", object: "model", owned_by: "anthropic" },
-        { id: "claude-haiku-4", object: "model", owned_by: "anthropic" },
-      ],
+      data: PAPERCLIP_MODEL_IDS.map((id) => ({
+        id,                          // paperclip/claude_local, paperclip/codex_local
+        object: "model",
+        owned_by: "paperclip",
+        created: Math.floor(Date.now() / 1000),
+      })),
     });
   });
 
@@ -376,7 +399,11 @@ export async function stopServer(instance: Server): Promise<void> {
 
 ```typescript
 import { Request, Response } from "express";
-import { runnerFactory } from "../adapter/paperclip-registry.js";
+import {
+  runnerFactory,
+  DEFAULT_MODEL,
+  UnknownPaperclipModelError,
+} from "../adapter/paperclip-registry.js";
 import { openaiToCli } from "../adapter/openai-to-cli.js";
 import { cliToOpenaiChunk, cliResultToOpenai } from "../adapter/cli-to-openai.js";
 import { v4 as uuidv4 } from "uuid";
@@ -384,10 +411,14 @@ import { v4 as uuidv4 } from "uuid";
 export async function handleChatCompletions(req: Request, res: Response) {
   const requestId = uuidv4();
   const stream = req.body.stream === true;
+  // An omitted model is the only case that falls back; a named one either
+  // resolves or 404s. Threaded through both converters so every response echoes
+  // an id the proxy accepts.
+  const requestedModel = req.body.model || DEFAULT_MODEL;
 
   try {
     const cliInput = openaiToCli(req.body);
-    const subprocess = runnerFactory.create(req.body.model);
+    const subprocess = runnerFactory.create(requestedModel);
 
     if (stream) {
       // SSE streaming response
@@ -396,7 +427,7 @@ export async function handleChatCompletions(req: Request, res: Response) {
       res.setHeader("Connection", "keep-alive");
 
       subprocess.on("assistant", (message) => {
-        const chunk = cliToOpenaiChunk(message, requestId);
+        const chunk = cliToOpenaiChunk(message, requestId, requestedModel);
         res.write(`data: ${JSON.stringify(chunk)}\n\n`);
       });
 
@@ -415,7 +446,7 @@ export async function handleChatCompletions(req: Request, res: Response) {
       let finalResult: any = null;
 
       subprocess.on("result", (result) => {
-        finalResult = cliResultToOpenai(result, requestId);
+        finalResult = cliResultToOpenai(result, requestId, requestedModel);
       });
 
       subprocess.on("close", () => {
@@ -431,12 +462,21 @@ export async function handleChatCompletions(req: Request, res: Response) {
       });
     }
 
+    // The runner already carries the adapter and CLI model resolved from the id.
     await subprocess.start(cliInput.prompt, {
-      model: cliInput.model,
+      systemPrompt: cliInput.systemPrompt,
       sessionId: cliInput.sessionId,
     });
 
   } catch (error) {
+    // An unresolvable id is the caller's mistake, not a server fault, so it is an
+    // OpenAI-style 404 rather than a 500.
+    if (error instanceof UnknownPaperclipModelError) {
+      res.status(404).json({
+        error: { message: error.message, type: "invalid_request_error", code: "model_not_found" },
+      });
+      return;
+    }
     res.status(500).json({ error: error.message });
   }
 }
@@ -657,7 +697,10 @@ interface PluginConfig {
 2. Package: `npm pack`
 3. Install in Clawdbot: `clawdbot plugins install ./cli-openai-proxy-<version>.tgz`
 4. Configure: `clawdbot models auth login --provider claude-code-cli`
-5. Set default model: Edit `~/.clawdbot/clawdbot.json`
+5. Set default model: Edit `~/.clawdbot/clawdbot.json`. Model ids are
+   `claude-code-cli/paperclip/<adapter>[/<cli-model>]` — e.g.
+   `claude-code-cli/paperclip/claude_local/opus`. Anything outside the
+   `paperclip/` namespace is rejected with `404 model_not_found`.
 
 ## Future Enhancements
 
