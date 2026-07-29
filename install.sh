@@ -360,7 +360,12 @@ service_file_is_trusted "$ENTRYPOINT" \
 prepare_trusted_directory "$CONFIG_HOME" "configuration directory"
 prepare_trusted_directory "$SYSTEMD_USER_DIR" "systemd user unit directory"
 
-if [[ ! -f "$ENV_FILE" ]]; then
+if [[ -e "$ENV_FILE" || -L "$ENV_FILE" ]]; then
+  service_file_is_trusted "$ENV_FILE" \
+    || die "Refusing existing configuration with untrusted ownership or permissions: $ENV_FILE"
+  chmod 600 "$ENV_FILE"
+  log "Keeping existing configuration: $ENV_FILE"
+else
   ENV_PORT="$(env_quote "$PORT")"
   ENV_HOST="$(env_quote "$HOST")"
   {
@@ -387,9 +392,6 @@ if [[ ! -f "$ENV_FILE" ]]; then
   } >"$ENV_FILE"
   chmod 600 "$ENV_FILE"
   log "Created configuration: $ENV_FILE"
-else
-  chmod 600 "$ENV_FILE"
-  log "Keeping existing configuration: $ENV_FILE"
 fi
 
 NODE_DIR="$(dirname -- "$NODE_BIN")"
