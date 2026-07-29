@@ -396,6 +396,46 @@ launchctl load ~/Library/LaunchAgents/com.cli-openai-proxy.plist
 
 See [docs/macos-setup.md](docs/macos-setup.md).
 
+## Auto-Start on Ubuntu
+
+Run the installer as the same user that authenticated the agent CLI(s). Do not
+run it with `sudo`.
+
+```bash
+git clone https://github.com/sh1nj1/cli-openai-proxy.git
+cd cli-openai-proxy
+./install.sh
+```
+
+The installer checks for Node.js 22.13.0 or newer, installs dependencies,
+builds the project, and enables the
+`com.cli-openai-proxy.service` systemd user service. It also enables
+systemd linger so the proxy starts at boot before login. On a minimal Ubuntu
+installation it also installs `build-essential` and Python 3, which are needed
+to compile `node-pty`. `sudo` is used only for those OS prerequisites and the
+linger setting; the proxy itself runs as the current user.
+
+The default listener is `127.0.0.1:3456`. Edit
+`${XDG_CONFIG_HOME:-$HOME/.config}/cli-openai-proxy.env` to configure
+`PORT`, `HOST`, `API_KEYS`, or remote CLI authentication, then restart the
+service. The installer also prints the effective path as `Config:`. If `HOST`
+is changed to a non-loopback address, set `API_KEYS` before exposing the port.
+The service PATH includes common user CLI locations and trusted absolute
+entries from PATH when the installer runs. Directories writable by users other
+than the service user are skipped. Rerun `./install.sh` after adding a new
+custom CLI installation directory to PATH.
+
+```bash
+systemctl --user restart com.cli-openai-proxy.service
+systemctl --user status com.cli-openai-proxy.service
+journalctl --user -u com.cli-openai-proxy.service -f
+curl http://127.0.0.1:3456/health
+```
+
+After pulling new code from `main`, rerun `./install.sh`. Existing environment
+configuration is preserved while dependencies, the build, and the service are
+updated.
+
 ## Architecture
 
 ```
