@@ -78,8 +78,11 @@ Vendor backend --> CLI output --> OpenAI format (SSE or JSON) --> Your app
 ```
 
 Every request runs through a [Paperclip](https://github.com/paperclipai/paperclip)
-adapter, in a fresh temporary working directory. Nothing persists between
-requests: no CLI session, no shared workspace. See
+adapter, in a fresh temporary working directory that is removed afterwards: no
+CLI session and no working directory carries over between requests. That is a
+*cwd*, not a sandbox — the CLIs run with approvals bypassed, so a request that
+tells the agent to touch a path outside its cwd (your home directory, a repo on
+disk) still does, and the next request can see it. See
 [docs/paperclip-adapters.md](docs/paperclip-adapters.md).
 
 ## Engines and Models
