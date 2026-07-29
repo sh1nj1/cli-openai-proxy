@@ -162,8 +162,13 @@ Final message with stats:
 }
 ```
 
-`usage`/`modelUsage` feed the proxy's usage tracker; `total_cost_usd` is
-subscription usage, not API billing.
+`usage`/`modelUsage` feed the proxy's usage tracker; `total_cost_usd` is the
+CLI-reported cost, and what it represents depends on how the CLI is
+authenticated. Under a subscription login (Claude Pro/Max) it is an informational
+API-rate equivalent, not a bill. But when the CLI runs with `ANTHROPIC_API_KEY` —
+a host credential the proxy recognizes (`src/auth/registry.ts`) and that
+completion subprocesses inherit — the run is API-key backed and the figure can
+reflect real API billing.
 
 ## Codex CLI (`exec --json` NDJSON)
 
