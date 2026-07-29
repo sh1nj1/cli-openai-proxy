@@ -38,7 +38,7 @@ npm install -g cli-openai-proxy
 # Start it (needs at least one supported CLI installed and logged in)
 cli-openai-proxy &
 
-# See which models/engines are available
+# See the supported model catalog (a static list — not a health check)
 curl http://localhost:3456/v1/models
 ```
 
@@ -98,6 +98,12 @@ existing OpenAI-style Claude ids keep working — including provider-prefixed
 forms (`anthropic/…`, `openai/…`, `claude-code-cli/…`). An unregistered
 `paperclip/<name>` returns `404 model_not_found` rather than silently running
 something else.
+
+This table — and `GET /v1/models` — is the catalog of what the proxy *accepts*,
+not of what this host can currently run. Neither checks whether the underlying
+CLI is installed or logged in, so a request can be accepted here and still fail
+at execution. For runtime availability, ask
+`GET /v1/auth/{engine}/status` (requires `AUTH_ADMIN_KEYS`; see below).
 
 Adding an engine is one registry entry in
 [`src/adapter/paperclip-registry.ts`](src/adapter/paperclip-registry.ts) plus its
@@ -214,7 +220,7 @@ See [docs/cli-auth-provisioning.md](docs/cli-auth-provisioning.md).
 | Endpoint | Method | Description |
 |----------|--------|-------------|
 | `/health` | GET | Health check + usage summary |
-| `/v1/models` | GET | List available models |
+| `/v1/models` | GET | Supported model catalog — static, does not check whether a CLI is installed or authenticated |
 | `/v1/chat/completions` | POST | Chat completions (streaming & non-streaming) |
 | `/v1/usage` | GET | Usage stats |
 | `/v1/usage/recent` | GET | Recent request log |
