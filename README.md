@@ -135,7 +135,9 @@ walkthrough: [docs/paperclip-adapters.md](docs/paperclip-adapters.md#collavre-in
   has already flushed `200`, so the same classified error arrives in-band as an
   SSE `{"error": {...}}` object carrying the same `type`/`code`
 - **Remote CLI auth provisioning** — log a CLI in over HTTP
-- **Usage tracking** — token counts, latency, and per-model request history
+- **Usage tracking** — token counts, latency, and request history. The stored
+  model label is bucketed to `opus`/`sonnet`/`haiku` for cost estimation, so it
+  does not identify which engine served a request
 - **API key auth** — optional Bearer tokens for shared deployments
 - **Stateless execution** — fresh isolated workspace per request
 - **Auto-start** — macOS LaunchAgent for an always-on service
@@ -157,6 +159,12 @@ walkthrough: [docs/paperclip-adapters.md](docs/paperclip-adapters.md#collavre-in
 `HOST=0.0.0.0` makes the proxy reachable from other machines. Set `API_KEYS`
 whenever you do: the CLIs run with approvals bypassed, so an unauthenticated
 caller effectively has code execution on the host.
+
+`API_KEYS` authenticates callers but does not encrypt anything. The proxy speaks
+plain HTTP, so the Bearer key and every prompt cross the network in the clear —
+anyone who can observe the traffic can replay the key. Beyond loopback, put it
+behind TLS (a reverse proxy terminating HTTPS) or an encrypted tunnel such as
+Tailscale or WireGuard; the plain `http://` examples below assume a trusted link.
 
 ```bash
 HOST=0.0.0.0 API_KEYS=sk-team-abc123 cli-openai-proxy
