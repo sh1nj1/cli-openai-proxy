@@ -61,7 +61,9 @@ injection, streaming granularity, flags), see
 │                        — or —                                   │
 │  codex exec --json --skip-git-repo-check [--model <m>]          │
 │                                                                 │
-│  Auth: whatever credential the CLI itself is logged in with     │
+│  Auth: host CLI login — or, for Claude, a /v1/auth-provisioned  │
+│        setup token injected per request when the operator sets  │
+│        AUTH_TRUST_COMPLETION_CALLERS (no host login needed)     │
 └─────────────────────────────────────────────────────────────────┘
 ```
 

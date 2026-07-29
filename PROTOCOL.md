@@ -203,10 +203,14 @@ OpenAI client request (POST /v1/chat/completions)
         │ ┌─────────────────────────────────┐
         │ │ StreamJsonParser /              │
         │ │ CodexJsonlParser                │
-        │ │ - filter system messages        │
         │ │ - emit content deltas           │
-        │ │ - claude only: in-band terminal │
-        │ │   result (text + usage stats)   │
+        │ │ - codex only: filter to         │
+        │ │   completed agent_message items │
+        │ │ - claude only: forward all      │
+        │ │   events unfiltered (routes.ts  │
+        │ │   keeps text deltas only) +     │
+        │ │   in-band terminal result       │
+        │ │   (text + usage stats)          │
         │ └─────────────────────────────────┘
         │             │
         └──▼ execute() resolves
@@ -245,7 +249,12 @@ lanes is also driven by this resolved result.
 2. **Stateless**: no `--session-id`/`--resume` is used; every request is a
    fresh run in a fresh temp directory.
 3. **Tools**: the CLIs may invoke their own tools (Bash, Read, Edit, …) during
-   a run; non-text tool events are filtered by the parsers. The non-streaming
+   a run; where tool events get dropped differs per lane. `CodexJsonlParser`
+   filters in the parser (only completed `agent_message` items are surfaced),
+   but `StreamJsonParser` forwards every parsed message and every
+   `content_block_delta` unfiltered — for the Claude lane it is the route
+   layer that omits tool events, by reading only `delta.text` when building
+   OpenAI chunks (`routes.ts`). The non-streaming
    response carries only the final text, but a streaming Codex run forwards
    each completed `agent_message` block as a content delta — so concatenating
    the SSE stream can include intermediate narrative, not just the final
