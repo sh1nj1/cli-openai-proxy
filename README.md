@@ -2,8 +2,9 @@
 
 **One OpenAI-compatible endpoint in front of the agentic coding CLIs you already have installed.**
 
-Claude Code, Codex, and any other [Paperclip](https://github.com/paperclipai/paperclip)
-adapter run behind a single `/v1/chat/completions` endpoint. Any OpenAI client —
+Claude Code and Codex — the two [Paperclip](https://github.com/paperclipai/paperclip)
+adapters registered here — run behind a single `/v1/chat/completions` endpoint,
+and adding another is one registry entry. Any OpenAI client —
 an SDK, an IDE plugin, [Collavre](#use-with-collavre), your own service — can
 drive them, from another machine if you want.
 
@@ -102,8 +103,11 @@ something else.
 This table — and `GET /v1/models` — is the catalog of what the proxy *accepts*,
 not of what this host can currently run. Neither checks whether the underlying
 CLI is installed or logged in, so a request can be accepted here and still fail
-at execution. For runtime availability, ask
-`GET /v1/auth/{engine}/status` (requires `AUTH_ADMIN_KEYS`; see below).
+at execution. `GET /v1/auth/{engine}/status` (requires `AUTH_ADMIN_KEYS`; see
+below) is an auth diagnostic, not an availability check: it never tests that the
+CLI can run, and on the ordinary Claude path — logged in on the host, credential
+in the keychain — it answers `unknown`, the same answer it gives when `claude`
+is not installed at all. The reliable test is a request.
 
 Adding an engine is one registry entry in
 [`src/adapter/paperclip-registry.ts`](src/adapter/paperclip-registry.ts) plus its
@@ -135,9 +139,11 @@ walkthrough: [docs/paperclip-adapters.md](docs/paperclip-adapters.md#collavre-in
 - **Image input** — OpenAI `image_url` parts (base64 data URLs) are materialized
   to temp files and handed to the CLI as inline links, so the agent can see them;
   works across all adapters
-- **OpenAI-shaped errors** — usage limits become `429 insufficient_quota` (with
-  `Retry-After`), an unauthenticated CLI becomes `401 engine_unauthenticated`.
-  Those statuses and headers apply to non-streaming requests; a streaming request
+- **OpenAI-shaped errors** — usage limits become `429 insufficient_quota`, an
+  unauthenticated CLI becomes `401 engine_unauthenticated`. `Retry-After` rides
+  along only when the adapter reported a reset time; otherwise the `429` has no
+  retry delay to advertise. Those statuses and headers apply to non-streaming
+  requests; a streaming request
   has already flushed `200`, so the same classified error arrives in-band as an
   SSE `{"error": {...}}` object carrying the same `type`/`code`
 - **Remote CLI auth provisioning** — log a CLI in over HTTP
@@ -175,7 +181,8 @@ Tailscale or WireGuard; the plain `http://` examples below assume a trusted link
 ```bash
 HOST=0.0.0.0 API_KEYS=sk-team-abc123 cli-openai-proxy
 
-curl http://<host>:3456/v1/chat/completions \
+PROXY_HOST=proxy.internal.example
+curl "http://$PROXY_HOST:3456/v1/chat/completions" \
   -H "Authorization: Bearer sk-team-abc123" \
   -H "Content-Type: application/json" \
   -d '{"model": "paperclip/claude_local", "messages": [{"role": "user", "content": "Hello!"}]}'
