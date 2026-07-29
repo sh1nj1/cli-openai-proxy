@@ -61,8 +61,9 @@ src/
    fresh `/tmp/paperclip-run-*` working directory, tees CLI stdout through the
    adapter's parser (`StreamJsonParser` or `CodexJsonlParser`), and re-emits
    the common event set.
-5. `routes.ts` maps events to the wire: SSE chunks + usage chunk + `[DONE]` for
-   streaming, one `chat.completion` for non-streaming. Client disconnects kill
+5. `routes.ts` maps events to the wire: SSE chunks + opt-in usage chunk
+   (`stream_options.include_usage`) + `[DONE]` for streaming, one
+   `chat.completion` for non-streaming. Client disconnects kill
    the subprocess (including its process group, even pre-spawn).
 6. `usage/tracker.ts` bills the run and serves the `/v1/usage` dashboards.
 

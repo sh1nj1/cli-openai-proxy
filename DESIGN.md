@@ -100,8 +100,10 @@ unrecognised id is the behaviour the namespace exists to remove.
    completes.
 3. **Convert**: `openaiToCli()` flattens the message array into a single prompt
    (Claude's `--print` mode takes a prompt, not a conversation). System and
-   developer messages are concatenated separately and delivered via
-   `--append-system-prompt`.
+   developer messages are concatenated separately; delivery is per-adapter —
+   Claude receives them via `--append-system-prompt`, while Codex (which
+   rejects Claude-only flags) gets them prepended to the user prompt through
+   the rendered prompt template.
 4. **Resolve and run**: `runnerFactory.create(model)` resolves the id through
    the registry and builds a `PaperclipRunner` carrying that adapter's strategy
    (prompt injection, output mode, CLI flags). The route layer only knows the
@@ -119,9 +121,10 @@ unrecognised id is the behaviour the namespace exists to remove.
    are delegated to the pinned `@paperclipai/*` adapter packages.
 5. **Respond**:
    - *Streaming* (`stream: true`): each `content_delta` becomes an SSE
-     `chat.completion.chunk`; the `result` event yields a usage chunk and
-     `data: [DONE]`. Keepalive comments hold the socket open across long
-     agentic runs.
+     `chat.completion.chunk`; the `result` event yields the final chunk, a
+     usage chunk only when the caller sent `stream_options.include_usage:
+     true`, and `data: [DONE]`. Keepalive comments hold the socket open across
+     long agentic runs.
    - *Non-streaming*: the `result` event is converted by `cliResultToOpenai()`
      into a single `chat.completion` response with token usage.
    - The response's `model` field echoes the requested id verbatim — never the

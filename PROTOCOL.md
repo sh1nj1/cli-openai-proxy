@@ -209,10 +209,17 @@ OpenAI response (SSE chunks + [DONE], or one chat.completion)
 
 ## Important Notes
 
-1. **Auth is the CLI's**: each CLI uses its own logged-in credential
-   automatically; the proxy never handles it on this path.
+1. **Auth is the CLI's** (for ordinary local login): each CLI uses its own
+   logged-in credential automatically and the proxy does not touch it. The
+   exception is the remote [auth provisioning flow](docs/cli-auth-provisioning.md):
+   a credential captured through `/v1/auth` is held in proxy memory and — only
+   when the operator sets `AUTH_TRUST_COMPLETION_CALLERS=1` — injected into the
+   completion subprocess environment.
 2. **Stateless**: no `--session-id`/`--resume` is used; every request is a
    fresh run in a fresh temp directory.
 3. **Tools**: the CLIs may invoke their own tools (Bash, Read, Edit, …) during
-   a run; the proxy returns only the final text, with tool chatter filtered by
-   the parsers.
+   a run; non-text tool events are filtered by the parsers. The non-streaming
+   response carries only the final text, but a streaming Codex run forwards
+   each completed `agent_message` block as a content delta — so concatenating
+   the SSE stream can include intermediate narrative, not just the final
+   answer.
