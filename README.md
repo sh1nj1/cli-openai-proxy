@@ -462,8 +462,9 @@ src/
 - Every run gets a fresh temporary working directory
 - CLIs run with approvals bypassed — **anyone who can call `/v1/chat/completions`
   can run code on the host.** Set `API_KEYS` on any non-loopback bind
-- Proxy access keys (`API_KEYS`, `AUTH_ADMIN_KEYS`) are captured at boot and
-  removed from the environment CLI children inherit
+- Proxy access keys (`API_KEYS`, `AUTH_ADMIN_KEYS`) are captured at server
+  init and removed from the environment completion subprocesses inherit
+  (startup preflight/probe children spawn before capture and still see them)
 - Codex provisioning forwards an API key to `codex login` over stdin; the CLI
   persists it in `~/.codex`
 - Claude provisioning captures the `setup-token` OAuth credential, keeps it in

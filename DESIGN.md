@@ -180,7 +180,11 @@ README):
    non-loopback bind.
 2. **No shell injection**: CLIs are spawned via `spawn()`, never a shell.
 3. **Secret hygiene**: proxy access keys (`API_KEYS`, `AUTH_ADMIN_KEYS`) are
-   captured at boot and removed from the environment CLI children inherit.
+   captured when the server initializes (`initAuth()`/`initAuthAdmin()`) and
+   removed from the environment that completion subprocesses inherit. This
+   guarantee covers completion runs only: the startup preflight
+   (`claude --version`) and the pre-server CLI presence probes spawn before
+   capture and still inherit the full environment, including these keys.
 4. **No credential storage**: each CLI keeps its own credentials. The optional
    auth-provisioning flow keeps a captured Claude `setup-token` credential in
    proxy memory only, and injects it only when
