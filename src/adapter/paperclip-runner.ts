@@ -11,6 +11,7 @@ import fs from "fs/promises";
 import path from "path";
 import type { AdapterExecutionContext, AdapterExecutionResult } from "@paperclipai/adapter-utils";
 import type { ClaudeCliResult, ClaudeCliStreamEvent } from "../types/claude-cli.js";
+import { isSystemInit } from "../types/claude-cli.js";
 import type { AgentRunner, RunnerOptions } from "./agent-runner.js";
 import { StreamJsonParser, type StreamJsonSink } from "./stream-json-parser.js";
 import { CodexJsonlParser } from "./codex-jsonl-parser.js";
@@ -75,6 +76,9 @@ export class PaperclipRunner extends EventEmitter implements AgentRunner {
   // the terminal emit skips a duplicate content delta (the answer is already on the
   // wire) yet still falls back to a synthesized delta when nothing streamed.
   private codexStreamed = false;
+  // The model the run announced at init. Nothing later says which chain a
+  // modelUsage entry belongs to, so this is the only handle on the main chain.
+  private mainChainModel: string | null = null;
 
   private readonly model?: string;
   private readonly promptInjection: PromptInjection;
@@ -336,18 +340,46 @@ export class PaperclipRunner extends EventEmitter implements AgentRunner {
       result: text,
       session_id: sessionId,
       total_cost_usd: result.costUsd ?? 0,
-      usage: {
-        input_tokens: result.usage?.inputTokens ?? 0,
-        output_tokens: result.usage?.outputTokens ?? 0,
-      },
+      usage: this.synthesizeUsage(result.usage),
       modelUsage: {},
     };
-    this.emit("result", synthesized);
+    this.emit("result", this.stampMainChain(synthesized));
+  }
+
+  /**
+   * Name the main chain on the result. The CLI reports per-model totals but
+   * never says which model ran the main chain, while the top-level `usage` is
+   * that chain's alone — so billing has to carry the name forward from init.
+   */
+  private stampMainChain(result: ClaudeCliResult): ClaudeCliResult {
+    if (this.mainChainModel) result.mainChainModel = this.mainChainModel;
+    return result;
+  }
+
+  /**
+   * Adapter UsageSummary -> the CLI result's token buckets.
+   *
+   * The two count the prompt differently: codex reports cached_input_tokens as a
+   * subset of input_tokens, while every consumer of ClaudeCliResult (usage
+   * tracker, OpenAI usage) treats input and cache-read as disjoint and sums them.
+   * So the cached share moves OUT of input rather than being added on top —
+   * keeping the prompt total identical while the cache split stops reading zero.
+   */
+  private synthesizeUsage(usage: AdapterExecutionResult["usage"]): ClaudeCliResult["usage"] {
+    const cached = usage?.cachedInputTokens ?? 0;
+    return {
+      input_tokens: Math.max(0, (usage?.inputTokens ?? 0) - cached),
+      output_tokens: usage?.outputTokens ?? 0,
+      cache_read_input_tokens: cached,
+    };
   }
 
   private buildSink(): StreamJsonSink {
     return {
-      onMessage: (message) => this.emit("message", message),
+      onMessage: (message) => {
+        if (isSystemInit(message)) this.mainChainModel = message.model;
+        this.emit("message", message);
+      },
       onContentDelta: (event) => this.emit("content_delta", event),
       onAssistant: (message) => this.emit("assistant", message),
       onResult: (message) => {
@@ -369,7 +401,7 @@ export class PaperclipRunner extends EventEmitter implements AgentRunner {
             || `Paperclip adapter run failed (subtype: ${result.subtype})`;
           return;
         }
-        this.emit("result", message);
+        this.emit("result", this.stampMainChain(result));
       },
       onRaw: (line) => this.emit("raw", line),
     };

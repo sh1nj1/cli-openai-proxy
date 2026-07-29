@@ -157,6 +157,48 @@ test("prices each model of a mixed run at its own rate", () => {
   assert.equal(billed.costUsd, 15 + 1.25);
 });
 
+test("keeps a sub-cent run at full precision", async () => {
+  // Rounding a run to the nearest microdollar is a third of what a short Haiku
+  // turn costs, and the error compounds across a workload of them: 10k such
+  // requests would read as $0.02 spent against $0.015 actually incurred.
+  const billed = billRun(
+    { modelUsage: { "claude-haiku-4-5": { inputTokens: 6, outputTokens: 0 } } },
+    RUN_TOTALS,
+  );
+  assert.equal(billed.costUsd, 0.0000015);
+
+  await withFakeHome(async (home) => {
+    const tracker = new UsageTracker(path.join(home, "usage"));
+    await tracker.load();
+
+    for (let i = 0; i < 10_000; i++) {
+      tracker.record({
+        model: "paperclip/claude_local",
+        modelUsage: { "claude-haiku-4-5": { inputTokens: 6, outputTokens: 0 } },
+        inputTokens: 6,
+        outputTokens: 0,
+        durationMs: 1,
+        stream: false,
+        success: true,
+      });
+    }
+
+    assert.equal(tracker.getSummary().estimatedApiCostSavedUsd, 0.015);
+  });
+});
+
+test("prices a cache-heavy run without float dust", () => {
+  // A rate of 0.1x is not binary-exact, so multiplying tokens by it leaves the
+  // dollars a ulp off (1.5000000000000002). Scaling the whole token count in
+  // one divide keeps the arithmetic exact instead of rounding the result after.
+  const billed = billRun(
+    { modelUsage: { "claude-opus-5": { inputTokens: 0, outputTokens: 0, cacheReadInputTokens: 3 } } },
+    RUN_TOTALS,
+  );
+
+  assert.equal(billed.costUsd, 0.0000045);
+});
+
 test("counts the tokens a subagent added", () => {
   // Verified against the real CLI: top-level `usage` covers the main chain only,
   // while `modelUsage` includes sidechains — pricing the main-chain totals drops
@@ -223,6 +265,104 @@ test("prefers a reported cache total of zero over the run total", () => {
 
   assert.equal(billed.cacheReadTokens, 0);
   assert.equal(billed.cacheWriteTokens, 20_005);
+});
+
+test("prices cached prompt tokens at their own API rates", () => {
+  // The saved-cost estimate answers "what would this have cost on the API", and
+  // there cached input is not free: a read bills at a tenth of the input rate,
+  // writing the cache at 1.25x. Pricing only uncached input reports a prompt
+  // served entirely from cache as costing nothing.
+  const read = billRun(
+    { modelUsage: { "claude-opus-5": { inputTokens: 0, outputTokens: 0, cacheReadInputTokens: 1_000_000 } } },
+    RUN_TOTALS,
+  );
+  assert.equal(read.costUsd, 1.5);
+
+  const write = billRun(
+    { modelUsage: { "claude-opus-5": { inputTokens: 0, outputTokens: 0, cacheCreationInputTokens: 1_000_000 } } },
+    RUN_TOTALS,
+  );
+  assert.equal(write.costUsd, 18.75);
+});
+
+test("prices cache totals the models left unreported", () => {
+  // billRun keeps the run's cache totals when no entry reports them, so those
+  // tokens are in the record; pricing only per-entry cache would bill them at 0.
+  const billed = billRun(
+    { modelUsage: { "claude-opus-5": { inputTokens: 0, outputTokens: 0 } } },
+    { ...RUN_TOTALS, cacheReadTokens: 1_000_000 },
+  );
+
+  assert.equal(billed.cacheReadTokens, 1_000_000);
+  assert.equal(billed.costUsd, 1.5);
+});
+
+test("prices unreported cache against the main chain, not the loudest sidechain", () => {
+  // Those tokens come from the top-level totals, which are the main chain's — so
+  // charging them to whichever model produced the most output prices an Opus
+  // prompt at Haiku rates whenever a sidechain out-talks the turn that cached it.
+  const billed = billRun(
+    {
+      mainChainModel: "claude-opus-5",
+      modelUsage: {
+        "claude-opus-5": { inputTokens: 0, outputTokens: 0 },
+        "claude-haiku-4-5": { inputTokens: 0, outputTokens: 1_000_000 },
+      },
+    },
+    { ...RUN_TOTALS, cacheReadTokens: 1_000_000 },
+  );
+
+  assert.equal(billed.model, "haiku");
+  assert.equal(billed.costUsd, 1.25 + 1.5);
+});
+
+test("prices unreported cache against the main chain when a subagent shares its model", () => {
+  // `modelUsage` keys by model, not by chain, so an Opus main chain that spawns
+  // an Opus subagent lands in one entry that no longer equals the top-level
+  // totals. The run names its main chain outright, so nothing has to be inferred
+  // from those totals — the Opus entry covering 1M input is the subagent's work,
+  // and the cache still prices at Opus.
+  const billed = billRun(
+    {
+      mainChainModel: "claude-opus-5",
+      modelUsage: {
+        "claude-opus-5": { inputTokens: 1_000_000, outputTokens: 0 },
+        "claude-haiku-4-5": { inputTokens: 0, outputTokens: 1_000_000 },
+      },
+    },
+    { ...RUN_TOTALS, inputTokens: 400_000, cacheReadTokens: 1_000_000 },
+  );
+
+  assert.equal(billed.model, "haiku");
+  assert.equal(billed.costUsd, 15 + 1.25 + 1.5);
+});
+
+test("prices unreported cache at the dominant rate when the run named no main chain", () => {
+  // Nothing identifies the chain those totals came from, so the run keeps the
+  // model that did the most work.
+  const billed = billRun(
+    {
+      modelUsage: {
+        "claude-opus-5": { inputTokens: 0, outputTokens: 0 },
+        "claude-haiku-4-5": { inputTokens: 0, outputTokens: 1_000_000 },
+      },
+    },
+    { ...RUN_TOTALS, cacheReadTokens: 1_000_000 },
+  );
+
+  assert.equal(billed.costUsd, 1.25 + 0.025);
+});
+
+test("prices a fully cached run that reported no model", () => {
+  // The codex adapter synthesizes an empty modelUsage, so its whole prompt is
+  // priced through the fallback — a cache-heavy turn there must not bill zero.
+  const billed = billRun(
+    { modelUsage: {} },
+    { ...RUN_TOTALS, model: "paperclip/codex_local", cacheReadTokens: 1_000_000 },
+  );
+
+  assert.equal(billed.model, "sonnet");
+  assert.equal(billed.costUsd, 0.3);
 });
 
 test("falls back to the requested id and run totals when no model was reported", () => {

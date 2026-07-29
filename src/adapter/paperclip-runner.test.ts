@@ -49,6 +49,34 @@ test("streams onLog stdout through the parser and emits events, then close(0)", 
   assert.equal(code, 0);
 });
 
+test("stamps the result with the main chain model the init message named", async () => {
+  // `modelUsage` keys by model rather than by chain, so nothing in the result
+  // says which model ran the main chain — but the run opens by announcing it,
+  // and the top-level `usage` totals that pricing has to attribute are that
+  // chain's alone.
+  const initLine = JSON.stringify({
+    type: "system", subtype: "init", model: "claude-opus-5", session_id: "s",
+  }) + "\n";
+  const fakeExecute: AdapterExecute = async (ctx) => {
+    await ctx.onLog("stdout", initLine);
+    await ctx.onLog("stdout", resultLine);
+    return { exitCode: 0, signal: null, timedOut: false, sessionId: "s",
+      usage: { inputTokens: 5, outputTokens: 1 } };
+  };
+
+  const runner = new PaperclipRunner(fakeExecute, { engine: "cli", command: "claude" });
+  const results: ClaudeCliResult[] = [];
+  const closed = new Promise<void>((resolve) => {
+    runner.on("result", (r: ClaudeCliResult) => { results.push(r); });
+    runner.on("close", () => resolve());
+  });
+
+  await runner.start("hello prompt", {});
+  await closed;
+
+  assert.equal(results[0].mainChainModel, "claude-opus-5");
+});
+
 test("preserves {{ }} template delimiters verbatim and disables session persistence", async () => {
   const rawPrompt = "Explain what {{agent.name}} means in a Handlebars {{template}}.";
   let captured: import("@paperclipai/adapter-utils").AdapterExecutionContext | undefined;
@@ -206,6 +234,56 @@ test("codex-jsonl mode with no live agent_message falls back to result.summary",
   assert.equal(results[0].usage.input_tokens, 7);
   assert.equal(results[0].usage.output_tokens, 3);
   assert.equal(code, 0);
+});
+
+test("codex-jsonl mode reports cached tokens separately from fresh input tokens", async () => {
+  // codex counts cached_input_tokens INSIDE input_tokens, while every consumer of
+  // ClaudeCliResult (usage tracker, OpenAI usage) treats the two as disjoint —
+  // so the cached share has to move out of input_tokens, not be added on top.
+  const fakeExecute: AdapterExecute = async () => ({
+    exitCode: 0, signal: null, timedOut: false, sessionId: "s",
+    summary: "ok",
+    usage: { inputTokens: 17_664, outputTokens: 5, cachedInputTokens: 17_000 },
+  });
+  const runner = new PaperclipRunner(
+    fakeExecute,
+    { engine: "cli", command: "codex" },
+    { promptInjection: "prompt-template", outputMode: "codex-jsonl", cliFlags: [] },
+  );
+  const results: ClaudeCliResult[] = [];
+  const closed = new Promise<void>((resolve) => {
+    runner.on("result", (r: ClaudeCliResult) => { results.push(r); });
+    runner.on("close", () => resolve());
+  });
+
+  await runner.start("hi", {});
+  await closed;
+
+  assert.equal(results[0].usage.cache_read_input_tokens, 17_000);
+  assert.equal(results[0].usage.input_tokens, 664, "cached share removed from fresh input");
+});
+
+test("codex-jsonl mode reports zero cached tokens when the adapter reports none", async () => {
+  const fakeExecute: AdapterExecute = async () => ({
+    exitCode: 0, signal: null, timedOut: false, sessionId: "s",
+    summary: "ok", usage: { inputTokens: 7, outputTokens: 3 },
+  });
+  const runner = new PaperclipRunner(
+    fakeExecute,
+    { engine: "cli", command: "codex" },
+    { promptInjection: "prompt-template", outputMode: "codex-jsonl", cliFlags: [] },
+  );
+  const results: ClaudeCliResult[] = [];
+  const closed = new Promise<void>((resolve) => {
+    runner.on("result", (r: ClaudeCliResult) => { results.push(r); });
+    runner.on("close", () => resolve());
+  });
+
+  await runner.start("hi", {});
+  await closed;
+
+  assert.equal(results[0].usage.input_tokens, 7);
+  assert.equal(results[0].usage.cache_read_input_tokens, 0);
 });
 
 // Emulates the `codex exec --json` NDJSON stream (see src/adapter/codex-jsonl-parser.ts).

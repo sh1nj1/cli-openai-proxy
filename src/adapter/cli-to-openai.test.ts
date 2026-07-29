@@ -2,7 +2,9 @@ import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import {
   createDoneChunk,
+  createUsageChunk,
   cliResultToOpenai,
+  cliUsageToOpenai,
   extractJsonFromText,
 } from "./cli-to-openai.js";
 import type { ClaudeCliResult } from "../types/claude-cli.js";
@@ -23,6 +25,23 @@ const makeResult = (text: string): ClaudeCliResult => ({
   },
 });
 
+/**
+ * A run that spawned a subagent: `usage` reports the main chain only, while
+ * `modelUsage` reports every model the run touched.
+ */
+const makeSidechainResult = (): ClaudeCliResult => ({
+  ...makeResult("Done"),
+  usage: { input_tokens: 2, output_tokens: 7, cache_read_input_tokens: 1_000 },
+  modelUsage: {
+    "claude-opus-5": {
+      inputTokens: 2, outputTokens: 7, cacheReadInputTokens: 1_000, costUSD: 0,
+    },
+    "claude-haiku-4-5": {
+      inputTokens: 40, outputTokens: 900, cacheReadInputTokens: 5_000, costUSD: 0,
+    },
+  },
+});
+
 describe("createDoneChunk", () => {
   it("creates a stop chunk", () => {
     const chunk = createDoneChunk("req-1", "paperclip/claude_local");
@@ -35,6 +54,65 @@ describe("createDoneChunk", () => {
     // chunk has to report the same model as the content chunks before it.
     const chunk = createDoneChunk("req-1", "paperclip/claude_local/opus");
     assert.equal(chunk.model, "paperclip/claude_local/opus");
+  });
+});
+
+describe("cliUsageToOpenai", () => {
+  it("counts cache tokens as prompt tokens", () => {
+    // Anthropic reports input_tokens EXCLUDING both cache fields, so echoing it
+    // as prompt_tokens undercounts a cache-heavy turn by orders of magnitude
+    // (2 vs 30k) for any client that budgets context or estimates cost.
+    const usage = cliUsageToOpenai({
+      input_tokens: 2,
+      output_tokens: 7,
+      cache_read_input_tokens: 30_000,
+      cache_creation_input_tokens: 500,
+    });
+    assert.equal(usage.prompt_tokens, 30_502);
+    assert.equal(usage.completion_tokens, 7);
+    assert.equal(usage.total_tokens, 30_509);
+  });
+
+  it("reports the cached portion as prompt_tokens_details.cached_tokens", () => {
+    const usage = cliUsageToOpenai({
+      input_tokens: 2,
+      output_tokens: 7,
+      cache_read_input_tokens: 30_000,
+      cache_creation_input_tokens: 500,
+    });
+    assert.equal(usage.prompt_tokens_details?.cached_tokens, 30_000);
+  });
+
+  it("reports zero cached tokens when the run had no cache hits", () => {
+    const usage = cliUsageToOpenai({ input_tokens: 100, output_tokens: 50 });
+    assert.equal(usage.prompt_tokens, 100);
+    assert.equal(usage.prompt_tokens_details?.cached_tokens, 0);
+  });
+
+  it("reports zeroes for a missing usage block", () => {
+    const usage = cliUsageToOpenai(undefined);
+    assert.equal(usage.prompt_tokens, 0);
+    assert.equal(usage.completion_tokens, 0);
+    assert.equal(usage.total_tokens, 0);
+  });
+});
+
+describe("createUsageChunk", () => {
+  it("carries usage with no choices", () => {
+    // The OpenAI streaming contract puts the terminal usage on a chunk whose
+    // choices array is empty — a client that reads choices[0] must see nothing.
+    const chunk = createUsageChunk("req-1", "paperclip/codex_local", makeResult("hi"));
+    assert.deepEqual(chunk.choices, []);
+    assert.equal(chunk.usage?.prompt_tokens, 100);
+    assert.equal(chunk.usage?.completion_tokens, 50);
+    assert.equal(chunk.object, "chat.completion.chunk");
+    assert.equal(chunk.model, "paperclip/codex_local");
+  });
+
+  it("counts subagent tokens the main chain never saw", () => {
+    const chunk = createUsageChunk("req-1", "paperclip/claude_local", makeSidechainResult());
+    assert.equal(chunk.usage?.prompt_tokens, 6_042);
+    assert.equal(chunk.usage?.completion_tokens, 907);
   });
 });
 
@@ -52,6 +130,38 @@ describe("cliResultToOpenai", () => {
     assert.equal(response.usage.prompt_tokens, 100);
     assert.equal(response.usage.completion_tokens, 50);
     assert.equal(response.usage.total_tokens, 150);
+  });
+
+  it("counts subagent tokens the main chain never saw", () => {
+    // Anything a subagent spent is billed to the caller but absent from `usage`,
+    // so reporting the main chain alone can undercount an agentic turn by orders
+    // of magnitude — here 907 completion tokens reported as 7.
+    const response = cliResultToOpenai(makeSidechainResult(), "req-1", "paperclip/claude_local");
+    assert.equal(response.usage.prompt_tokens, 6_042);
+    assert.equal(response.usage.completion_tokens, 907);
+    assert.equal(response.usage.total_tokens, 6_949);
+    assert.equal(response.usage.prompt_tokens_details?.cached_tokens, 6_000);
+  });
+
+  it("falls back to the run totals when no model was reported", () => {
+    // codex synthesizes an empty modelUsage, and a failed run reports none at all.
+    const result = { ...makeResult("Hello!"), modelUsage: {} };
+    const response = cliResultToOpenai(result, "req-1", "paperclip/codex_local");
+    assert.equal(response.usage.prompt_tokens, 100);
+    assert.equal(response.usage.completion_tokens, 50);
+  });
+
+  it("keeps run cache totals when no model reported a cache field", () => {
+    // An absent per-model field is a gap, not a measured zero — zeroing it would
+    // drop a cache count the run totals still carry.
+    const result: ClaudeCliResult = {
+      ...makeResult("Hello!"),
+      usage: { input_tokens: 100, output_tokens: 50, cache_read_input_tokens: 500 },
+      modelUsage: { "claude-opus-5": { inputTokens: 100, outputTokens: 50, costUSD: 0 } },
+    };
+    const response = cliResultToOpenai(result, "req-1", "paperclip/claude_local");
+    assert.equal(response.usage.prompt_tokens_details?.cached_tokens, 500);
+    assert.equal(response.usage.prompt_tokens, 600);
   });
 
   it("echoes the requested id verbatim", () => {

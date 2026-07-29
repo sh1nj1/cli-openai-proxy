@@ -90,6 +90,16 @@ export interface ClaudeCliResult {
   }>;
   /** Diagnostics the CLI attaches to a failed run; `result` is often empty then. */
   errors?: string[];
+  /**
+   * The model that ran the main chain, stamped by the runner from the run's
+   * `system/init` message — not a field the CLI puts on a result.
+   *
+   * `modelUsage` keys by model rather than by chain, so it never says which
+   * entry is the main chain, while the top-level `usage` totals are that chain's
+   * alone. Attributing those totals — pricing them, or telling whether an entry
+   * already reported them — needs the name.
+   */
+  mainChainModel?: string;
 }
 
 export interface ClaudeCliSystemMessage {

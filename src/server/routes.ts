@@ -14,11 +14,12 @@ import { openaiErrorFromError } from "../adapter/adapter-error.js";
 import {
   cliResultToOpenai,
   createDoneChunk,
+  createUsageChunk,
   extractJsonFromText,
 } from "../adapter/cli-to-openai.js";
 import type { OpenAIChatRequest } from "../types/openai.js";
 import type { ClaudeCliResult, ClaudeCliStreamEvent } from "../types/claude-cli.js";
-import { usageTracker } from "../usage/tracker.js";
+import { usageTracker, displayCostUsd } from "../usage/tracker.js";
 import { isAuthEnabled } from "./auth.js";
 import { PKG_VERSION, getTimeoutMs, KEEPALIVE_INTERVAL_MS } from "../config.js";
 
@@ -60,7 +61,7 @@ export async function handleChatCompletions(
       const subprocess = runnerFactory.create(requestedModel);
 
       if (stream) {
-        await handleStreamingResponse(req, res, subprocess, cliInput, requestId, requestedModel, startTime, cliInput.jsonMode);
+        await handleStreamingResponse(req, res, subprocess, cliInput, requestId, requestedModel, startTime, cliInput.jsonMode, body.stream_options?.include_usage === true);
       } else {
         await handleNonStreamingResponse(res, subprocess, cliInput, requestId, requestedModel, startTime, cliInput.jsonMode);
       }
@@ -137,7 +138,8 @@ async function handleStreamingResponse(
   requestId: string,
   requestedModel: string,
   startTime: number,
-  jsonMode?: boolean
+  jsonMode?: boolean,
+  includeUsage = false
 ): Promise<void> {
   // Set SSE headers
   res.setHeader("Content-Type", "text/event-stream");
@@ -157,6 +159,11 @@ async function handleStreamingResponse(
     let isComplete = false;
     let jsonBuffer = "";
     let keepaliveInterval: NodeJS.Timeout | null = null;
+
+    // Once usage is requested, the OpenAI contract has every non-terminal chunk
+    // carry the key explicitly as null, so a client can read chunk.usage
+    // unconditionally instead of feature-detecting it.
+    const usagePlaceholder = includeUsage ? { usage: null } : {};
 
     const clearKeepalive = () => {
       if (keepaliveInterval) {
@@ -204,6 +211,7 @@ async function handleStreamingResponse(
               },
               finish_reason: null,
             }],
+            ...usagePlaceholder,
           };
           res.write(`data: ${JSON.stringify(chunk)}\n\n`);
           isFirst = false;
@@ -219,6 +227,7 @@ async function handleStreamingResponse(
       usageTracker.record({
         model: requestedModel,
         modelUsage: result.modelUsage,
+        mainChainModel: result.mainChainModel,
         inputTokens: result.usage?.input_tokens || 0,
         outputTokens: result.usage?.output_tokens || 0,
         cacheReadTokens: result.usage?.cache_read_input_tokens || 0,
@@ -248,12 +257,18 @@ async function handleStreamingResponse(
               delta: { role: "assistant" as const, content: extracted },
               finish_reason: null,
             }],
+            ...usagePlaceholder,
           };
           res.write(`data: ${JSON.stringify(chunk)}\n\n`);
         }
         // Send final done chunk with finish_reason
-        const doneChunk = createDoneChunk(requestId, requestedModel);
+        const doneChunk = { ...createDoneChunk(requestId, requestedModel), ...usagePlaceholder };
         res.write(`data: ${JSON.stringify(doneChunk)}\n\n`);
+        // Totals ride their own trailing chunk (empty `choices`) so a client that
+        // never asked for them is not handed a chunk whose choices[0] is absent.
+        if (includeUsage) {
+          res.write(`data: ${JSON.stringify(createUsageChunk(requestId, requestedModel, result))}\n\n`);
+        }
         res.write("data: [DONE]\n\n");
         res.end();
       }
@@ -377,6 +392,7 @@ async function handleNonStreamingResponse(
         usageTracker.record({
           model: requestedModel,
           modelUsage: finalResult.modelUsage,
+          mainChainModel: finalResult.mainChainModel,
           inputTokens: finalResult.usage?.input_tokens || 0,
           outputTokens: finalResult.usage?.output_tokens || 0,
           cacheReadTokens: finalResult.usage?.cache_read_input_tokens || 0,
@@ -485,7 +501,12 @@ export function handleUsage(req: Request, res: Response): void {
 export function handleUsageRecent(req: Request, res: Response): void {
   const raw = req.query.limit ? parseInt(req.query.limit as string, 10) : 20;
   const limit = Math.min(Math.max(raw || 20, 1), 1000);
-  const records = usageTracker.getRecent(limit);
+  // Records hold the unrounded cost so totals do not drift; a reader gets it
+  // rounded, without the float dust a per-model sum can leave behind.
+  const records = usageTracker.getRecent(limit).map(record => ({
+    ...record,
+    estimatedApiCostUsd: displayCostUsd(record.estimatedApiCostUsd),
+  }));
 
   res.json({
     object: "list",

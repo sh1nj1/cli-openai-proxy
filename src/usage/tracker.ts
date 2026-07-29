@@ -7,6 +7,7 @@
 
 import fs from "fs/promises";
 import path from "path";
+import { aggregateRunTokens, type ModelUsage, type RunTokens } from "./run-usage.js";
 
 export interface RequestRecord {
   timestamp: number;
@@ -48,6 +49,15 @@ const PRICING: Record<string, { input: number; output: number }> = {
   haiku:  { input: 0.25,  output: 1.25  },
 };
 
+const PER_MILLION = 1_000_000;
+
+// Cached prompt tokens are billed off the input rate, not free: a cache read
+// costs a tenth of it, writing the cache 1.25x (5-minute TTL). The tenth is
+// applied as a divisor rather than a 0.1 multiplier because 0.1 is not
+// binary-exact — see cost().
+const CACHE_READ_DIVISOR = PER_MILLION * 10;
+const CACHE_WRITE_RATE = 1.25;
+
 /** Pricing family a model id belongs to. Unknown ids are priced as Sonnet. */
 function pricingFamily(model: string): string {
   const id = model.toLowerCase();
@@ -56,18 +66,30 @@ function pricingFamily(model: string): string {
   return "sonnet";
 }
 
-function cost(family: string, inputTokens: number, outputTokens: number): number {
+/**
+ * Token counts are integers and the per-million rates are binary-exact, so
+ * scaling each bucket by its rate first and dividing once keeps the dollars
+ * exact. Folding the buckets into a token subtotal via a 0.1 multiplier instead
+ * leaves a ulp of dust in every cached run.
+ */
+function cost(family: string, tokens: RunTokens): number {
   const pricing = PRICING[family];
-  return (inputTokens / 1_000_000) * pricing.input + (outputTokens / 1_000_000) * pricing.output;
+  return (tokens.inputTokens * pricing.input) / PER_MILLION
+    + (tokens.cacheReadTokens * pricing.input) / CACHE_READ_DIVISOR
+    + (tokens.cacheWriteTokens * pricing.input * CACHE_WRITE_RATE) / PER_MILLION
+    + (tokens.outputTokens * pricing.output) / PER_MILLION;
 }
 
-/** Per-model usage as the Claude CLI reports it in a result message. */
-export interface ModelUsage {
-  inputTokens?: number;
-  outputTokens?: number;
-  cacheReadInputTokens?: number;
-  cacheCreationInputTokens?: number;
+/**
+ * Round a cost for a reader. Only ever applied on the way out: rounding what a
+ * run stores would bias the running total, since a short Haiku turn costs less
+ * than the increment being rounded to.
+ */
+export function displayCostUsd(usd: number): number {
+  return Math.round(usd * PER_MILLION) / PER_MILLION;
 }
+
+export type { ModelUsage };
 
 export interface BilledRun {
   /** Pricing family the run is grouped under in `byModel`. */
@@ -90,19 +112,17 @@ export interface BilledRun {
  * sidechain would drag an Opus turn down, a short Opus answer would bill a large
  * Haiku sidechain up.
  *
- * Token totals come from `modelUsage` too. Measured against the CLI: top-level
- * `usage` covers the main chain only while `modelUsage` includes sidechains, and
- * they match exactly when no subagent ran — so the fallback totals are only for
- * runs that reported no model at all (a failure, or codex-jsonl's synthesized
- * empty `modelUsage`), plus a cache field no entry reported at all, which would
- * otherwise zero a count the run totals still carry.
+ * Token totals come from `modelUsage` too — see aggregateRunTokens.
  *
  * The run stays one record, labelled with the family that produced the most
  * output, so request counts stay honest and a Haiku sidechain does not relabel
  * an Opus turn.
  */
 export function billRun(
-  result: { modelUsage?: Record<string, ModelUsage> } | null | undefined,
+  result:
+    | { modelUsage?: Record<string, ModelUsage>; mainChainModel?: string }
+    | null
+    | undefined,
   fallback: {
     model: string;
     inputTokens: number;
@@ -111,60 +131,70 @@ export function billRun(
     cacheWriteTokens?: number;
   },
 ): BilledRun {
-  const entries = Object.entries(result?.modelUsage ?? {});
-
-  if (entries.length === 0) {
-    const family = pricingFamily(fallback.model);
-    return {
-      model: family,
+  const tokens = aggregateRunTokens(
+    result?.modelUsage,
+    {
       inputTokens: fallback.inputTokens,
       outputTokens: fallback.outputTokens,
       cacheReadTokens: fallback.cacheReadTokens ?? 0,
       cacheWriteTokens: fallback.cacheWriteTokens ?? 0,
-      costUsd: cost(family, fallback.inputTokens, fallback.outputTokens),
+    },
+    result?.mainChainModel,
+  );
+
+  const entries = Object.entries(result?.modelUsage ?? {});
+  if (entries.length === 0) {
+    const family = pricingFamily(fallback.model);
+    return {
+      model: family,
+      ...tokens,
+      costUsd: cost(family, tokens),
     };
   }
 
-  const billed: BilledRun = {
-    model: "sonnet",
-    inputTokens: 0,
-    outputTokens: 0,
-    cacheReadTokens: 0,
-    cacheWriteTokens: 0,
-    costUsd: 0,
-  };
+  let model = "sonnet";
   let dominantOutput = -1;
-  // Undefined until some entry reports the field, so an absent one keeps the
-  // run total rather than zeroing it — the cache fields are optional per model
-  // while input/output are not.
-  let cacheRead: number | undefined;
-  let cacheWrite: number | undefined;
+  let costUsd = 0;
+  let pricedCacheRead = 0;
+  let pricedCacheWrite = 0;
 
-  for (const [model, usage] of entries) {
-    const inputTokens = usage?.inputTokens ?? 0;
+  for (const [name, usage] of entries) {
     const outputTokens = usage?.outputTokens ?? 0;
+    const cacheReadTokens = usage?.cacheReadInputTokens ?? 0;
+    const cacheWriteTokens = usage?.cacheCreationInputTokens ?? 0;
+    pricedCacheRead += cacheReadTokens;
+    pricedCacheWrite += cacheWriteTokens;
 
-    billed.inputTokens += inputTokens;
-    billed.outputTokens += outputTokens;
-    billed.costUsd += cost(pricingFamily(model), inputTokens, outputTokens);
-
-    if (usage?.cacheReadInputTokens !== undefined) {
-      cacheRead = (cacheRead ?? 0) + usage.cacheReadInputTokens;
-    }
-    if (usage?.cacheCreationInputTokens !== undefined) {
-      cacheWrite = (cacheWrite ?? 0) + usage.cacheCreationInputTokens;
-    }
+    costUsd += cost(pricingFamily(name), {
+      inputTokens: usage?.inputTokens ?? 0,
+      outputTokens,
+      cacheReadTokens,
+      cacheWriteTokens,
+    });
 
     if (outputTokens > dominantOutput) {
       dominantOutput = outputTokens;
-      billed.model = pricingFamily(model);
+      model = pricingFamily(name);
     }
   }
 
-  billed.cacheReadTokens = cacheRead ?? fallback.cacheReadTokens ?? 0;
-  billed.cacheWriteTokens = cacheWrite ?? fallback.cacheWriteTokens ?? 0;
+  // Cache detail is optional per model, so the aggregate can carry run totals no
+  // entry accounted for — otherwise cache tokens the record does report would
+  // cost nothing. Those totals came from the main chain, so they are priced at
+  // the model the run named as running it, not at the rate of whichever model
+  // happened to talk the most: a verbose Haiku sidechain must not decide what an
+  // Opus prompt cost. An unnamed main chain leaves only the dominant model.
+  costUsd += cost(
+    result?.mainChainModel ? pricingFamily(result.mainChainModel) : model,
+    {
+      inputTokens: 0,
+      outputTokens: 0,
+      cacheReadTokens: tokens.cacheReadTokens - pricedCacheRead,
+      cacheWriteTokens: tokens.cacheWriteTokens - pricedCacheWrite,
+    },
+  );
 
-  return billed;
+  return { model, ...tokens, costUsd };
 }
 
 export const DATA_DIR_NAME = ".cli-openai-proxy";
@@ -257,6 +287,8 @@ export class UsageTracker {
     model: string;
     /** What the CLI reported running, when it reported anything. */
     modelUsage?: Record<string, ModelUsage>;
+    /** Which of those ran the main chain — whose tokens the run totals are. */
+    mainChainModel?: string;
     inputTokens: number;
     outputTokens: number;
     cacheReadTokens?: number;
@@ -265,7 +297,10 @@ export class UsageTracker {
     stream: boolean;
     success: boolean;
   }): void {
-    const billed = billRun({ modelUsage: entry.modelUsage }, entry);
+    const billed = billRun(
+      { modelUsage: entry.modelUsage, mainChainModel: entry.mainChainModel },
+      entry,
+    );
 
     const record: RequestRecord = {
       timestamp: Date.now(),
