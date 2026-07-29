@@ -47,8 +47,9 @@ injection, streaming granularity, flags), see
 │         │                                 │ events              │
 │         ▼                                 ▼                     │
 │  ┌───────────────────────┐   ┌────────────────────────────┐     │
-│  │ cli-to-openai         │◀──│ StreamJsonParser /         │     │
-│  │ (SSE chunks, usage)   │   │ CodexJsonlParser           │     │
+│  │ routes.ts (SSE inline;│◀──│ StreamJsonParser /         │     │
+│  │  cli-to-openai: done/ │   │ CodexJsonlParser           │     │
+│  │  usage + non-stream)  │   │ (runner-owned)             │     │
 │  └───────────────────────┘   └────────────────────────────┘     │
 └─────────────────────────────────────────────────────────────────┘
                             │ subprocess, fresh /tmp/paperclip-run-* cwd
@@ -141,9 +142,12 @@ unrecognised id is the behaviour the namespace exists to remove.
      long agentic runs.
    - *Non-streaming*: the `result` event is converted by `cliResultToOpenai()`
      into a single `chat.completion` response with token usage.
-   - The response's `model` field echoes the requested id verbatim — never the
-     model name the CLI reports — because gateways route and validate on this
-     field, so it has to stay an id the proxy itself accepts.
+   - The response's `model` field echoes the requested id when the caller
+     supplied one — never the model name the CLI reports — because gateways
+     route and validate on this field, so it has to stay an id the proxy
+     itself accepts. A missing or falsy `model` (absent, `""`, `null`) falls
+     back to the default (`body.model || DEFAULT_MODEL`), and the response
+     then reports that default, not the caller's literal input.
 6. **Track usage**: every run is billed to the usage tracker
    (`~/.cli-openai-proxy/`), which powers `GET /v1/usage` and
    `/v1/usage/recent`.

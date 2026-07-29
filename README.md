@@ -132,7 +132,9 @@ runs, bare `opus` is a `404`.
 
 The `model` field on a response echoes the id you requested, unchanged, on both
 the streaming and non-streaming paths — so a gateway that routes or validates on
-it always sees an id this proxy accepts.
+it always sees an id this proxy accepts. The one exception is a missing or
+falsy `model` (absent, `""`, `null`): the request falls back to the default
+adapter and the response reports that default id, not your literal input.
 
 This table — and `GET /v1/models` — is the set of adapters the proxy accepts,
 not what this host can currently run: neither checks whether the underlying CLI

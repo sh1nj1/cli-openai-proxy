@@ -221,7 +221,11 @@ OpenAI client request (POST /v1/chat/completions)
           │ - both: errors/timeout/signal   │
           └─────────────────────────────────┘
                       │
-                      ▼ PaperclipRunner events → cli-to-openai
+                      ▼ PaperclipRunner events → routes.ts
+                        (streaming: builds SSE chunks inline;
+                         cli-to-openai supplies only the terminal
+                         done/usage chunks and the non-streaming
+                         cliResultToOpenai conversion)
 OpenAI response (SSE chunks + [DONE], or one chat.completion)
 ```
 
