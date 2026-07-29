@@ -3,7 +3,7 @@
 set -Eeuo pipefail
 umask 077
 
-SERVICE_NAME="${SERVICE_NAME:-com.claude-code-provider}"
+SERVICE_NAME="${SERVICE_NAME:-com.cli-openai-proxy}"
 PORT="${INSTALL_PORT:-3456}"
 HOST="${INSTALL_HOST:-127.0.0.1}"
 MIN_NODE_VERSION="22.13.0"

@@ -373,7 +373,7 @@ cd cli-openai-proxy
 
 The installer checks for Node.js 22.13.0 or newer, installs dependencies,
 builds the project, and enables the
-`com.claude-code-provider.service` systemd user service. It also enables
+`com.cli-openai-proxy.service` systemd user service. It also enables
 systemd linger so the proxy starts at boot before login. On a minimal Ubuntu
 installation it also installs `build-essential` and Python 3, which are needed
 to compile `node-pty`. `sudo` is used only for those OS prerequisites and the
@@ -390,9 +390,9 @@ than the service user are skipped. Rerun `./install.sh` after adding a new
 custom CLI installation directory to PATH.
 
 ```bash
-systemctl --user restart com.claude-code-provider.service
-systemctl --user status com.claude-code-provider.service
-journalctl --user -u com.claude-code-provider.service -f
+systemctl --user restart com.cli-openai-proxy.service
+systemctl --user status com.cli-openai-proxy.service
+journalctl --user -u com.cli-openai-proxy.service -f
 curl http://127.0.0.1:3456/health
 ```
 
