@@ -174,8 +174,8 @@ AUTH_TRUST_COMPLETION_CALLERS=1 \
 cli-openai-proxy
 
 # 1. open a session — codex returns an API-key prompt, claude an OAuth URL
-curl -X POST -H "Authorization: Bearer sk-admin-xyz789" \
-  http://localhost:3456/v1/auth/codex/sessions
+SESSION_ID=$(curl -sX POST -H "Authorization: Bearer sk-admin-xyz789" \
+  http://localhost:3456/v1/auth/codex/sessions | jq -r .sessionId)
 
 # 2. submit the API key (claude: the code from the OAuth URL) to finish
 curl -X POST -H "Authorization: Bearer sk-admin-xyz789" \
