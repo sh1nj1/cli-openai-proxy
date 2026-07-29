@@ -48,6 +48,28 @@ const PRICING: Record<string, { input: number; output: number }> = {
   haiku:  { input: 0.25,  output: 1.25  },
 };
 
+/**
+ * The model id a run should be priced as.
+ *
+ * A requested id names an adapter, not a model — `paperclip/claude_local` runs
+ * whatever the CLI's own default currently is, and `record()` classifies by
+ * substring, so pricing the adapter id would bill an Opus run at Sonnet rates.
+ * The CLI reports what it actually ran in `modelUsage`, so that wins; the
+ * requested id is the fallback for runs that never got there (a failure, or an
+ * adapter that does not report per-model usage).
+ *
+ * Subagents can add entries, so the run is billed as whichever model produced
+ * the most output — a Haiku sidechain does not reclassify an Opus turn.
+ */
+export function billedModel(
+  result: { modelUsage?: Record<string, { outputTokens?: number }> } | null | undefined,
+  requestedModel: string,
+): string {
+  const entries = Object.entries(result?.modelUsage ?? {});
+  if (entries.length === 0) return requestedModel;
+  return entries.reduce((a, b) => ((b[1]?.outputTokens ?? 0) > (a[1]?.outputTokens ?? 0) ? b : a))[0];
+}
+
 export const DATA_DIR_NAME = ".cli-openai-proxy";
 // Pre-rename location. Kept only so an upgrade adopts existing history.
 export const LEGACY_DATA_DIR_NAME = ".claude-max-proxy";

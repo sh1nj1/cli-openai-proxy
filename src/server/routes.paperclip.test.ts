@@ -6,6 +6,7 @@ import { EventEmitter } from "events";
 // Import the module under test AND the registry we will stub.
 import { handleChatCompletions } from "./routes.js";
 import { runnerFactory } from "../adapter/paperclip-registry.js";
+import { usageTracker } from "../usage/tracker.js";
 import { PaperclipRunner, type AdapterExecute } from "../adapter/paperclip-runner.js";
 
 // NOTE on seam: the task-4 brief's plan reassigns the namespace-import binding
@@ -245,3 +246,39 @@ test("a model id outside the paperclip namespace is a 404 model_not_found", asyn
   assert.equal(status, 404);
   assert.equal(payload.error.code, "model_not_found");
 });
+
+// `paperclip/claude_local` names an adapter, not a model — the CLI picks the model.
+// Both response paths must bill what actually ran, or /v1/usage prices an Opus run
+// at Sonnet rates (the tracker classifies any id without "opus"/"haiku" as Sonnet).
+const opusResultLine = JSON.stringify({
+  type: "result", subtype: "success", is_error: false, result: "Yo",
+  session_id: "s", total_cost_usd: 0, duration_ms: 1, duration_api_ms: 1,
+  num_turns: 1, usage: { input_tokens: 3, output_tokens: 1 },
+  modelUsage: { "claude-opus-5[1m]": { inputTokens: 3, outputTokens: 1, costUSD: 0 } },
+}) + "\n";
+
+for (const stream of [true, false]) {
+  test(`${stream ? "streaming" : "non-streaming"} usage is billed by the model the CLI ran`, async () => {
+    const fakeExecute: AdapterExecute = async (ctx) => {
+      await ctx.onLog("stdout", deltaLine);
+      await ctx.onLog("stdout", opusResultLine);
+      return { exitCode: 0, signal: null, timedOut: false, sessionId: "s",
+        usage: { inputTokens: 3, outputTokens: 1 } };
+    };
+    const orig = runnerFactory.create;
+    runnerFactory.create = (model: string) =>
+      model.startsWith("paperclip/")
+        ? new PaperclipRunner(fakeExecute, { engine: "cli" })
+        : orig(model);
+
+    try {
+      const req = { body: { model: "paperclip/claude_local", stream,
+        messages: [{ role: "user", content: "hi" }] } } as unknown as Request;
+      await handleChatCompletions(req, fakeRes());
+      const [recorded] = usageTracker.getRecent(1);
+      assert.equal(recorded.model, "opus");
+    } finally {
+      runnerFactory.create = orig;
+    }
+  });
+}

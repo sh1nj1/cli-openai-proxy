@@ -6,6 +6,7 @@ import os from "node:os";
 import path from "node:path";
 import {
   UsageTracker,
+  billedModel,
   DATA_DIR_NAME,
   LEGACY_DATA_DIR_NAME,
 } from "./tracker.js";
@@ -116,5 +117,61 @@ test("never migrates into an explicitly supplied directory", async () => {
 
     assert.equal(tracker.getSummary().totalRequests, 0);
     await fs.access(path.join(home, LEGACY_DATA_DIR_NAME, "usage.json"));
+  });
+});
+
+// A request id names an adapter, not a model: `paperclip/claude_local` runs whatever
+// the CLI's current default is. Pricing must follow what actually ran, or /v1/usage
+// reports Sonnet rates for an Opus run and understates the saved cost ~5x.
+const modelUsage = (entries: Record<string, number>) =>
+  Object.fromEntries(
+    Object.entries(entries).map(([model, outputTokens]) => [
+      model,
+      { inputTokens: 0, outputTokens, costUSD: 0 },
+    ]),
+  );
+
+test("bills an adapter-only id by the model the CLI reported running", () => {
+  assert.equal(
+    billedModel({ modelUsage: modelUsage({ "claude-opus-5[1m]": 5 }) }, "paperclip/claude_local"),
+    "claude-opus-5[1m]",
+  );
+});
+
+test("bills the dominant model when subagents ran on another one", () => {
+  assert.equal(
+    billedModel(
+      { modelUsage: modelUsage({ "claude-haiku-4-5": 20, "claude-opus-5": 900 }) },
+      "paperclip/claude_local",
+    ),
+    "claude-opus-5",
+  );
+});
+
+test("falls back to the requested id when the run reported no model", () => {
+  // Failed runs produce no result at all, and codex-jsonl synthesizes an empty
+  // modelUsage — neither knows more than the request did.
+  assert.equal(billedModel(null, "paperclip/claude_local/opus"), "paperclip/claude_local/opus");
+  assert.equal(billedModel({ modelUsage: {} }, "paperclip/codex_local"), "paperclip/codex_local");
+});
+
+test("records an adapter-only Claude run at Opus pricing", async () => {
+  await withFakeHome(async (home) => {
+    const tracker = new UsageTracker(path.join(home, "usage"));
+    await tracker.load();
+
+    tracker.record({
+      model: billedModel({ modelUsage: modelUsage({ "claude-opus-5[1m]": 1_000_000 }) },
+        "paperclip/claude_local"),
+      inputTokens: 0,
+      outputTokens: 1_000_000,
+      durationMs: 1,
+      stream: false,
+      success: true,
+    });
+
+    const { byModel } = tracker.getSummary();
+    assert.deepEqual(Object.keys(byModel), ["opus"]);
+    assert.equal(byModel.opus.estimatedCostUsd, 75);
   });
 });
