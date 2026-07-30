@@ -126,7 +126,25 @@ $("createSession").onclick = async (e) => {
       $("sessionInfo").replaceChildren();
     }
     const created = await call("POST", `/v1/auth/${target}/sessions`, { base, key });
-    if (!created) return;
+    if (!created) {
+      // A same-engine recreation disposes the tracked session server-side
+      // before the new flow starts, so a failed POST may leave the record
+      // pointing at a dead session — but not always (a 401 or network error
+      // never reached the supersede). Ask the server instead of decoding the
+      // failure: probe quietly (not via call(), which would replace the create
+      // error on screen) and drop the record only on a confirmed 404.
+      if (session && session.engine === target && session.base === base) {
+        const probe = session;
+        const gone = await fetch(`${probe.base}/v1/auth/${probe.engine}/sessions/${probe.id}`, {
+          headers: { Authorization: `Bearer ${probe.key}` },
+        }).then((r) => r.status === 404, () => false);
+        if (gone && session && session.id === probe.id && session.base === probe.base) {
+          session = null;
+          $("sessionInfo").replaceChildren();
+        }
+      }
+      return;
+    }
     session = { id: created.sessionId, engine: created.engine ?? target, base, key };
     const info = $("sessionInfo");
     info.replaceChildren(`Session ${session.id} (${session.engine} @ ${session.base}) — ${created.instructions ?? ""} `);
