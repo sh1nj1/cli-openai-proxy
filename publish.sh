@@ -24,6 +24,18 @@ step() {
   echo -e "${YELLOW}[$1/8] $2${NC}"
 }
 
+# npm publish packages the working tree at publish time (prepublishOnly rebuilds),
+# so anything validated earlier must still hold right before publishing.
+verify_state_unchanged() {
+  local when=$1
+  [ "$(git rev-parse HEAD)" = "$CURRENT_COMMIT" ] ||
+    fail "HEAD changed ${when}."
+  [ -z "$(git status --porcelain)" ] ||
+    fail "Working tree changed ${when}."
+  [ "$(node -p "p = require('./package.json'), p.name + '@' + p.version")" = "${PACKAGE_NAME}@${PACKAGE_VERSION}" ] ||
+    fail "package.json name or version changed ${when}."
+}
+
 for command in git gh node npm; do
   require_command "$command"
 done
@@ -106,10 +118,7 @@ gh auth status >/dev/null 2>&1 || fail "Authenticate GitHub CLI with: gh auth lo
 if [ "$PUBLISHED" = false ]; then
   npm whoami >/dev/null 2>&1 || fail "Authenticate npm with: npm login"
 fi
-[ "$(git rev-parse HEAD)" = "$CURRENT_COMMIT" ] ||
-  fail "HEAD changed while release checks were running."
-[ -z "$(git status --porcelain)" ] ||
-  fail "Working tree changed while release checks were running."
+verify_state_unchanged "while release checks were running"
 REPOSITORY_URL=$(gh repo view --json url --jq .url)
 if gh release view "$TAG" >/dev/null 2>&1; then
   RELEASE_EXISTS=true
@@ -134,6 +143,7 @@ if ! read -r -p "Type '${EXPECTED_CONFIRMATION}' to continue: " CONFIRMATION; th
   fail "Interactive confirmation is required."
 fi
 [ "$CONFIRMATION" = "$EXPECTED_CONFIRMATION" ] || fail "Publish cancelled."
+verify_state_unchanged "while waiting for confirmation"
 
 step 8 "Publishing and creating the GitHub release..."
 if [ "$PUBLISHED" = false ]; then

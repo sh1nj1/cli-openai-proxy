@@ -30,7 +30,14 @@ case "${1:-} ${2:-}" in
   "rev-parse --show-toplevel") printf '%s\n' "$REPO_DIR" ;;
   "rev-parse HEAD"|"rev-parse origin/main") printf '%s\n' "$CURRENT_SHA" ;;
   "branch --show-current") printf '%s\n' main ;;
-  "status --porcelain") ;;
+  "status --porcelain")
+    STATUS_CALLS=$(( $(/bin/cat "$STATE_DIR/status-calls" 2>/dev/null || printf 0) + 1 ))
+    printf '%s' "$STATUS_CALLS" >"$STATE_DIR/status-calls"
+    if [ -f "$STATE_DIR/dirty-status-from" ] &&
+      [ "$STATUS_CALLS" -ge "$(/bin/cat "$STATE_DIR/dirty-status-from")" ]; then
+      printf ' M src/app.ts\n'
+    fi
+    ;;
   "remote get-url") printf '%s\n' git@github.com:sh1nj1/cli-openai-proxy.git ;;
   "fetch --quiet") ;;
   "show-ref --verify")
@@ -276,5 +283,15 @@ assert_not_called "npm publish"
 assert_not_called "npm whoami"
 assert_not_called "git tag -a"
 assert_called "gh release create v0.1.0"
+
+# The tree can change while the script waits at the confirmation prompt, so the
+# third status check (after confirmation) must abort before npm publish runs.
+reset_state
+printf '%s\n' 3 >"$STATE_DIR/dirty-status-from"
+NPM_PUBLISH_MODE=success
+run_publish "publish cli-openai-proxy@0.1.0"
+assert_failure
+grep -Fq "while waiting for confirmation" <<<"$OUTPUT"
+assert_not_called "npm publish"
 
 echo "publish flow tests passed"
