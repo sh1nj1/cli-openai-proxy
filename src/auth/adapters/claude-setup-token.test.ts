@@ -28,7 +28,10 @@ class FakePty implements PtyProcess {
 interface SpawnCall { file: string; args: string[]; env?: Record<string, string> }
 const spawnCalls: SpawnCall[] = [];
 
-function sessionWith(pty: FakePty, overrides: { urlTimeoutMs?: number; submitTimeoutMs?: number } = {}) {
+function sessionWith(
+  pty: FakePty,
+  overrides: { urlTimeoutMs?: number; submitTimeoutMs?: number; enterDelayMs?: number } = {},
+) {
   return new ClaudeSetupTokenSession({
     spawn: async (file, args, options) => {
       spawnCalls.push({ file, args, env: options?.env });
@@ -36,6 +39,7 @@ function sessionWith(pty: FakePty, overrides: { urlTimeoutMs?: number; submitTim
     },
     urlTimeoutMs: 200,
     submitTimeoutMs: 200,
+    enterDelayMs: 1,
     ...overrides,
   });
 }
@@ -123,23 +127,80 @@ describe("ClaudeSetupTokenSession", () => {
     assert.ok(Date.now() - begin < 1_000, "must not wait out the 5s URL timeout");
   });
 
-  test("submit writes the code with a carriage return and returns the token", async () => {
+  // The CLI's paste handling swallows a \r that arrives inside the code's chunk,
+  // leaving the prompt waiting forever — Enter must be its own input event.
+  test("submit writes the code and Enter as separate events and returns the token", async () => {
     const pty = new FakePty();
     const session = sessionWith(pty);
     const started = session.start();
     setTimeout(() => pty.emit(osc8(AUTHORIZE, "auth")), 5);
     await started;
 
-    pty.onWrite = (_data, p) => setTimeout(() => p.emit("\r\nsk-ant-oat01-ABCdef_123\r\n"), 5);
+    pty.onWrite = (data, p) => {
+      // The CLI only reacts to Enter; a token after the bare code would mean the
+      // fake is more lenient than the real CLI the fix exists for.
+      if (data === "\r") setTimeout(() => p.emit("\r\nsk-ant-oat01-ABCdef_123\r\n"), 5);
+    };
     const result = await session.submit("  code-123  ");
 
     // \r, not \n: the CLI reads Enter from a terminal.
-    assert.deepStrictEqual(pty.written, ["code-123\r"]);
+    assert.deepStrictEqual(pty.written, ["code-123", "\r"]);
     assert.deepStrictEqual(result.credential, {
       envVar: "CLAUDE_CODE_OAUTH_TOKEN",
       value: "sk-ant-oat01-ABCdef_123",
     });
     assert.strictEqual(pty.killed, true, "a completed session releases its child");
+  });
+
+  // The delay exists so the CLI's paste handling settles before Enter arrives;
+  // if the default silently stopped applying, the original stall would return
+  // for every caller that does not configure the option.
+  test("submit falls back to the default Enter delay when none is configured", async () => {
+    const pty = new FakePty();
+    const session = sessionWith(pty, { enterDelayMs: undefined });
+    const started = session.start();
+    setTimeout(() => pty.emit(osc8(AUTHORIZE, "auth")), 5);
+    await started;
+
+    const writtenAt: Record<string, number> = {};
+    pty.onWrite = (data, p) => {
+      writtenAt[data] = Date.now();
+      if (data === "\r") setTimeout(() => p.emit("\r\nsk-ant-oat01-ABCdef_123\r\n"), 5);
+    };
+    await session.submit("code-123");
+
+    assert.ok(
+      writtenAt["\r"] - writtenAt["code-123"] >= 450,
+      "Enter must wait out the 500ms default paste-settle delay",
+    );
+  });
+
+  // A rejected exchange does not exit the CLI: it prints an OAuth error and offers
+  // "Press Enter to retry". Without spotting the error line, every bad code would
+  // stall the caller until the full submit timeout.
+  test("an OAuth error without an exit fails fast as a rejected code", async () => {
+    const pty = new FakePty();
+    const session = sessionWith(pty, { submitTimeoutMs: 5_000 });
+    const started = session.start();
+    setTimeout(() => pty.emit(osc8(AUTHORIZE, "auth")), 5);
+    await started;
+
+    pty.onWrite = (data, p) => {
+      if (data === "\r") {
+        setTimeout(
+          () => p.emit("OAuth error: Request failed with status code 400\r\nPress Enter to retry.\r\n"),
+          5,
+        );
+      }
+    };
+    const begin = Date.now();
+    await assert.rejects(session.submit("stale-code"), (err: AuthProvisioningError) => {
+      assert.strictEqual(err.code, "code_rejected");
+      assert.match(err.message, /OAuth error/);
+      return true;
+    });
+    assert.ok(Date.now() - begin < 2_000, "must not wait out the 5s submit timeout");
+    assert.strictEqual(pty.killed, true, "a failed session releases its child");
   });
 
   test("submit fails fast when the CLI exits without printing a token", async () => {
