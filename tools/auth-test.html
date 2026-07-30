@@ -63,7 +63,9 @@
 "use strict";
 
 const $ = (id) => document.getElementById(id);
-let sessionId = null;
+// The server binds sessions to their engine, so remember the engine from
+// creation time — the selector may change (or reset on reload) afterwards.
+let session = null;
 
 function show(status, body) {
   const el = $("resultStatus");
@@ -101,14 +103,14 @@ $("checkStatus").onclick = () => call("GET", `/v1/auth/${engine()}/status`);
 $("forgetCredential").onclick = () => call("DELETE", `/v1/auth/${engine()}/credential`);
 
 $("createSession").onclick = async () => {
-  const session = await call("POST", `/v1/auth/${engine()}/sessions`);
-  if (!session) return;
-  sessionId = session.sessionId;
+  const created = await call("POST", `/v1/auth/${engine()}/sessions`);
+  if (!created) return;
+  session = { id: created.sessionId, engine: created.engine ?? engine() };
   const info = $("sessionInfo");
-  info.replaceChildren(`Session ${sessionId} — ${session.instructions ?? ""} `);
-  if (session.verificationUrl) {
+  info.replaceChildren(`Session ${session.id} (${session.engine}) — ${created.instructions ?? ""} `);
+  if (created.verificationUrl) {
     const a = document.createElement("a");
-    a.href = session.verificationUrl;
+    a.href = created.verificationUrl;
     a.target = "_blank";
     a.rel = "noreferrer";
     a.textContent = "Open verification URL";
@@ -117,24 +119,24 @@ $("createSession").onclick = async () => {
 };
 
 $("submitCode").onclick = async (e) => {
-  if (!sessionId) return show("!", "Create a session first.");
+  if (!session) return show("!", "Create a session first.");
   // One submission drives a session at a time (409 session_submitting) — and the
   // Claude token exchange can take up to ~2 minutes, so hold the button down.
   e.target.disabled = true;
   try {
-    const done = await call("POST", `/v1/auth/${engine()}/sessions/${sessionId}`, { value: $("codeInput").value });
+    const done = await call("POST", `/v1/auth/${session.engine}/sessions/${session.id}`, { value: $("codeInput").value });
     if (done && done.status !== "pending") $("codeInput").value = "";
   } finally {
     e.target.disabled = false;
   }
 };
 
-$("pollSession").onclick = () => sessionId
-  ? call("GET", `/v1/auth/${engine()}/sessions/${sessionId}`)
+$("pollSession").onclick = () => session
+  ? call("GET", `/v1/auth/${session.engine}/sessions/${session.id}`)
   : show("!", "Create a session first.");
 
-$("cancelSession").onclick = () => sessionId
-  ? call("DELETE", `/v1/auth/${engine()}/sessions/${sessionId}`)
+$("cancelSession").onclick = () => session
+  ? call("DELETE", `/v1/auth/${session.engine}/sessions/${session.id}`)
   : show("!", "Create a session first.");
 
 $("testCompletion").onclick = () => call("POST", "/v1/chat/completions", {
