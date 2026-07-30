@@ -63,9 +63,9 @@
 "use strict";
 
 const $ = (id) => document.getElementById(id);
-// The server binds sessions to their engine, so remember the engine and base
-// URL from creation time — the selector and connection fields may change
-// (or reset on reload) afterwards.
+// The server binds sessions to their engine, so remember the engine, base URL
+// and admin key from creation time — the selector and connection fields may
+// change (or reset on reload) afterwards.
 let session = null;
 
 function show(status, body) {
@@ -77,7 +77,7 @@ function show(status, body) {
 
 const currentBase = () => $("baseUrl").value.replace(/\/+$/, "");
 
-async function call(method, path, { body, key, base } = {}) {
+async function call(method, path, { body, key, base, okStatus } = {}) {
   base = base ?? currentBase();
   const headers = { Authorization: `Bearer ${key ?? $("adminKey").value}` };
   if (body) headers["Content-Type"] = "application/json";
@@ -86,7 +86,7 @@ async function call(method, path, { body, key, base } = {}) {
     const res = await fetch(base + path, { method, headers, body: body && JSON.stringify(body) });
     const json = await res.json().catch(() => "(no JSON body)");
     show(String(res.status), json);
-    return res.ok ? json : null;
+    return res.ok || res.status === okStatus ? json : null;
   } catch (err) {
     show("network error", String(err));
     return null;
@@ -108,17 +108,22 @@ $("forgetCredential").onclick = () => call("DELETE", `/v1/auth/${engine()}/crede
 $("createSession").onclick = async () => {
   const target = engine();
   const base = currentBase();
+  const key = $("adminKey").value;
   // The server supersedes only same-engine sessions on the same server; a
   // pending session for a different engine — or on a different server — would
-  // keep its CLI child alive until TTL, so cancel it where it was created.
+  // keep its CLI child alive until TTL, so cancel it where it was created,
+  // with the key it was created under. 404 means it is already gone; on any
+  // other failure keep the session tracked so cancellation can be retried.
   if (session && (session.engine !== target || session.base !== base)) {
-    await call("DELETE", `/v1/auth/${session.engine}/sessions/${session.id}`, { base: session.base });
+    const gone = await call("DELETE", `/v1/auth/${session.engine}/sessions/${session.id}`,
+      { base: session.base, key: session.key, okStatus: 404 });
+    if (!gone) return;
     session = null;
     $("sessionInfo").replaceChildren();
   }
-  const created = await call("POST", `/v1/auth/${target}/sessions`, { base });
+  const created = await call("POST", `/v1/auth/${target}/sessions`, { base, key });
   if (!created) return;
-  session = { id: created.sessionId, engine: created.engine ?? target, base };
+  session = { id: created.sessionId, engine: created.engine ?? target, base, key };
   const info = $("sessionInfo");
   info.replaceChildren(`Session ${session.id} (${session.engine} @ ${session.base}) — ${created.instructions ?? ""} `);
   if (created.verificationUrl) {
@@ -138,7 +143,7 @@ $("submitCode").onclick = async (e) => {
   e.target.disabled = true;
   try {
     const done = await call("POST", `/v1/auth/${session.engine}/sessions/${session.id}`,
-      { body: { value: $("codeInput").value }, base: session.base });
+      { body: { value: $("codeInput").value }, base: session.base, key: session.key });
     if (done && done.status !== "pending") $("codeInput").value = "";
   } finally {
     e.target.disabled = false;
@@ -146,11 +151,11 @@ $("submitCode").onclick = async (e) => {
 };
 
 $("pollSession").onclick = () => session
-  ? call("GET", `/v1/auth/${session.engine}/sessions/${session.id}`, { base: session.base })
+  ? call("GET", `/v1/auth/${session.engine}/sessions/${session.id}`, { base: session.base, key: session.key })
   : show("!", "Create a session first.");
 
 $("cancelSession").onclick = () => session
-  ? call("DELETE", `/v1/auth/${session.engine}/sessions/${session.id}`, { base: session.base })
+  ? call("DELETE", `/v1/auth/${session.engine}/sessions/${session.id}`, { base: session.base, key: session.key })
   : show("!", "Create a session first.");
 
 $("testCompletion").onclick = () => call("POST", "/v1/chat/completions", {
