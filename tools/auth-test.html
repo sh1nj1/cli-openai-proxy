@@ -174,14 +174,18 @@ $("pollSession").onclick = () => session
 
 $("cancelSession").onclick = async () => {
   if (!session) return show("!", "Create a session first.");
+  const cancelled = session;
   // Once the session is gone server-side (cancelled, or 404 = already gone),
   // drop the tracked record too — otherwise a later Create would try to cancel
   // it again at a server that may no longer be reachable and refuse to proceed.
-  const done = await call("DELETE", `/v1/auth/${session.engine}/sessions/${session.id}`,
-    { base: session.base, key: session.key, okStatus: 404 });
+  // Skip if Create already replaced the record while the DELETE was in flight.
+  const done = await call("DELETE", `/v1/auth/${cancelled.engine}/sessions/${cancelled.id}`,
+    { base: cancelled.base, key: cancelled.key, okStatus: 404 });
   if (!done) return;
-  session = null;
-  $("sessionInfo").replaceChildren();
+  if (session && session.id === cancelled.id && session.base === cancelled.base) {
+    session = null;
+    $("sessionInfo").replaceChildren();
+  }
 };
 
 $("testCompletion").onclick = () => call("POST", "/v1/chat/completions", {
