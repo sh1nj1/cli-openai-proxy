@@ -76,7 +76,7 @@ Built `cli-openai-proxy` — turns your Claude Max subscription into an OpenAI-c
 
 ## Hacker News
 
-**Title:** Show HN: Claude Max API Proxy – Use your $200/mo subscription as an OpenAI API
+**Title:** Show HN: cli-openai-proxy – Use your $200/mo Claude Max subscription as an OpenAI API
 
 **Text:**
 Claude Max gives you unlimited CLI access for $200/mo. But the CLI is the only way in — no API access for third-party tools.

@@ -7,7 +7,8 @@
 
 Claude Code and Codex — the two [Paperclip](https://github.com/paperclipai/paperclip)
 adapters registered here — run behind a single `/v1/chat/completions` endpoint,
-and adding another is one registry entry. Any OpenAI client —
+and adding another that matches a supported output format and prompt-injection
+strategy is one registry entry. Any OpenAI client —
 an SDK, an IDE plugin, [Collavre](#use-with-collavre), your own service — can
 drive them, from another machine if you want.
 
@@ -131,7 +132,9 @@ runs, bare `opus` is a `404`.
 
 The `model` field on a response echoes the id you requested, unchanged, on both
 the streaming and non-streaming paths — so a gateway that routes or validates on
-it always sees an id this proxy accepts.
+it always sees an id this proxy accepts. The one exception is a missing or
+falsy `model` (absent, `""`, `null`): the request falls back to the default
+adapter and the response reports that default id, not your literal input.
 
 This table — and `GET /v1/models` — is the set of adapters the proxy accepts,
 not what this host can currently run: neither checks whether the underlying CLI
@@ -142,9 +145,13 @@ CLI can run, and on the ordinary Claude path — logged in on the host, credenti
 in the keychain — it answers `unknown`, the same answer it gives when `claude`
 is not installed at all. The reliable test is a request.
 
-Adding an engine is one registry entry in
+Adding an engine whose CLI matches an existing output format (Claude
+`stream-json` or Codex JSONL) *and* an existing prompt-injection strategy
+(`task-context` or `prompt-template`) is one registry entry in
 [`src/adapter/paperclip-registry.ts`](src/adapter/paperclip-registry.ts) plus its
-published adapter package.
+published adapter package; a CLI that differs on either axis also needs the
+matching parser/`OutputMode` or injection strategy added to `PaperclipRunner`
+first.
 
 ## Use with Collavre
 
@@ -462,8 +469,9 @@ src/
 - Every run gets a fresh temporary working directory
 - CLIs run with approvals bypassed — **anyone who can call `/v1/chat/completions`
   can run code on the host.** Set `API_KEYS` on any non-loopback bind
-- Proxy access keys (`API_KEYS`, `AUTH_ADMIN_KEYS`) are captured at boot and
-  removed from the environment CLI children inherit
+- Proxy access keys (`API_KEYS`, `AUTH_ADMIN_KEYS`) are captured at server
+  init and removed from the environment completion subprocesses inherit
+  (startup preflight/probe children spawn before capture and still see them)
 - Codex provisioning forwards an API key to `codex login` over stdin; the CLI
   persists it in `~/.codex`
 - Claude provisioning captures the `setup-token` OAuth credential, keeps it in

@@ -1,734 +1,253 @@
-# Claude Code CLI Provider - Technical Design
+# cli-openai-proxy — Technical Design
 
 ## Overview
 
-This plugin enables Clawdbot to use Claude Max subscription through the Claude Code CLI, bypassing the OAuth token scope restrictions that block direct API access.
+cli-openai-proxy serves the agentic coding CLIs installed on a machine (Claude
+Code, Codex — registered as [Paperclip](https://github.com/paperclipai/paperclip)
+adapters) behind a single OpenAI-compatible HTTP API. Any OpenAI client can
+drive them by changing the `model` string; each CLI spends its own vendor
+credential — normally the one it is already logged in with on the host, or, for
+Claude, a setup token provisioned through `/v1/auth` that the proxy holds in
+memory and injects per request when `AUTH_TRUST_COMPLETION_CALLERS` is set (see
+[Security Considerations](#security-considerations)). Either way the proxy owns
+no vendor account and issues none.
+
+For the module-by-module map of the codebase, see
+[ARCHITECTURE.md](ARCHITECTURE.md). For adapter-specific behavior (prompt
+injection, streaming granularity, flags), see
+[docs/paperclip-adapters.md](docs/paperclip-adapters.md).
 
 ## Architecture
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│                         CLAWDBOT                                │
-│  ┌───────────────────┐    ┌──────────────────────────────────┐ │
-│  │ claude-code-cli   │    │     Model Provider System        │ │
-│  │ Provider Plugin   │───▶│  (registers as openai-completions)│ │
-│  └───────────────────┘    └──────────────────────────────────┘ │
+│                        OPENAI CLIENT                            │
+│     (SDK, IDE plugin, Collavre, curl — anything that speaks     │
+│              the chat.completions API)                          │
 └─────────────────────────────────────────────────────────────────┘
-                                       │
-                                       │ HTTP POST /v1/chat/completions
-                                       ▼
+                            │ HTTP POST /v1/chat/completions
+                            ▼
 ┌─────────────────────────────────────────────────────────────────┐
-│                    LOCAL WRAPPER SERVER                         │
-│                    (Express.js on port 3456)                    │
-│  ┌────────────────┐  ┌────────────────┐  ┌──────────────────┐  │
-│  │ Request Parser │─▶│ Format Adapter │─▶│ Subprocess Mgr   │  │
-│  │ (OpenAI → JSON)│  │ (OpenAI ↔ CLI) │  │ (spawn Claude)   │  │
-│  └────────────────┘  └────────────────┘  └──────────────────┘  │
-│                                                    │            │
-│  ┌────────────────┐  ┌────────────────┐           │            │
-│  │ Response Stream│◀─│ JSON Parser    │◀──────────┘            │
-│  │ (SSE format)   │  │ (stream-json)  │        stdout          │
-│  └────────────────┘  └────────────────┘                        │
-└─────────────────────────────────────────────────────────────────┘
-                                       │
-                                       │ subprocess
-                                       ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                      CLAUDE CODE CLI                            │
-│  claude --print --output-format stream-json --verbose           │
-│         --input-format stream-json --model <model>              │
-│         --session-id <uuid>                                     │
+│              cli-openai-proxy (Express, port 3456)              │
 │                                                                 │
-│  Uses: ~/.claude/credentials.json (OAuth from Claude Max)       │
+│  auth middleware (API_KEYS) ─▶ body parse (30MB)                │
+│         │                                                       │
+│         ▼                                                       │
+│  ┌──────────────┐  ┌───────────────────┐  ┌─────────────────┐   │
+│  │ routes.ts    │─▶│ image-materializer│─▶│ openai-to-cli   │   │
+│  │ (validate)   │  │ (data URLs→files) │  │ (msgs→prompt)   │   │
+│  └──────────────┘  └───────────────────┘  └─────────────────┘   │
+│         │                                                       │
+│         ▼                                                       │
+│  ┌───────────────────────┐   ┌────────────────────────────┐     │
+│  │ paperclip-registry    │──▶│ PaperclipRunner            │     │
+│  │ (model id → adapter)  │   │ (parse, cancel; spawn +    │     │
+│  │                       │   │  timeout in execute())     │     │
+│  └───────────────────────┘   └────────────────────────────┘     │
+│         │                                 │ events              │
+│         ▼                                 ▼                     │
+│  ┌───────────────────────┐   ┌────────────────────────────┐     │
+│  │ routes.ts (SSE inline;│◀──│ StreamJsonParser /         │     │
+│  │  cli-to-openai: done/ │   │ CodexJsonlParser           │     │
+│  │  usage + non-stream)  │   │ (runner-owned)             │     │
+│  └───────────────────────┘   └────────────────────────────┘     │
+└─────────────────────────────────────────────────────────────────┘
+                            │ subprocess, fresh /tmp/paperclip-run-* cwd
+                            ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                       AGENTIC CODING CLI                        │
+│  claude --print --output-format stream-json --verbose           │
+│         --include-partial-messages --no-session-persistence     │
+│         --dangerously-skip-permissions [--model <m>]            │
+│                        — or —                                   │
+│  codex exec --json --skip-git-repo-check [--model <m>]          │
+│                                                                 │
+│  Auth: host CLI login — or, for Claude, a /v1/auth-provisioned  │
+│        setup token injected per request when the operator sets  │
+│        AUTH_TRUST_COMPLETION_CALLERS (no host login needed)     │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
-## Component Design
-
-### 1. Plugin Structure
-
-```
-cli-openai-proxy/
-├── package.json
-├── tsconfig.json
-├── src/
-│   ├── index.ts              # Plugin entry point
-│   ├── server/
-│   │   ├── index.ts          # Express server setup
-│   │   ├── routes.ts         # API route handlers
-│   │   └── middleware.ts     # Request validation, logging
-│   ├── subprocess/
-│   │   ├── manager.ts        # Subprocess lifecycle
-│   │   ├── pool.ts           # Process pool for concurrent requests
-│   │   └── health.ts         # Health monitoring
-│   ├── adapter/
-│   │   ├── openai-to-cli.ts  # OpenAI request → CLI input
-│   │   ├── cli-to-openai.ts  # CLI output → OpenAI response
-│   │   └── stream.ts         # Streaming response handler
-│   ├── session/
-│   │   ├── manager.ts        # Session mapping & persistence
-│   │   └── store.ts          # Session storage
-│   └── types/
-│       ├── openai.ts         # OpenAI API types
-│       ├── claude-cli.ts     # Claude CLI message types
-│       └── config.ts         # Plugin configuration
-├── tests/
-│   ├── adapter.test.ts
-│   ├── subprocess.test.ts
-│   └── integration.test.ts
-└── README.md
-```
-
-### 2. Plugin Registration (index.ts)
-
-```typescript
-import { emptyPluginConfigSchema } from "clawdbot/plugin-sdk";
-import { startServer, stopServer } from "./server/index.js";
-import { verifyClaude, verifyAuth } from "./cli/claude.js";
-import { runPreflight } from "./server/preflight.js";
-import {
-  adapterCredentialNotes,
-  defaultModelForHost,
-  modelName,
-  parseSetupModelIds,
-  suggestedSetupModelIds,
-  validateSetupModelIds,
-} from "./adapter/paperclip-registry.js";
-
-const PROVIDER_ID = "claude-code-cli";
-const DEFAULT_PORT = 3456;
-
-// What setup offers, derived rather than hand-kept: the proxy 404s any id it
-// cannot resolve, so a stale entry here breaks every completion routed through
-// it. One entry per registered adapter plus the `<cli-model>` suffixes that
-// adapter suggests — the suffix is what picks a model, and a host that
-// enumerates its selectable models cannot select one it was never given.
-const SUGGESTED_MODEL_IDS = suggestedSetupModelIds();
-// -> paperclip/claude_local, paperclip/claude_local/opus, ..., paperclip/codex_local
-
-const plugin = {
-  id: "claude-code-cli",
-  name: "Claude Code CLI Provider",
-  description: "Use Claude Max subscription via Claude Code CLI",
-  configSchema: emptyPluginConfigSchema(),
-
-  register(api) {
-    // Start the local HTTP server when plugin loads
-    let serverInstance = null;
-
-    api.registerProvider({
-      id: PROVIDER_ID,
-      label: "Claude Code CLI",
-      docsPath: "/providers/claude-code-cli",
-      aliases: ["claude-cli", "claude-max"],
-
-      auth: [{
-        id: "local",
-        label: "Local Claude CLI",
-        hint: "Uses your existing Claude Code CLI authentication",
-        kind: "custom",
-
-        run: async (ctx) => {
-          const spin = ctx.prompter.progress("Checking Claude CLI...");
-
-          // 1. Check Claude, but do not require it: this provider also advertises
-          //    non-Claude adapters, so throwing here would lock a codex-only host
-          //    out of a model it is being offered. Missing Claude becomes a note,
-          //    and the default follows the host instead of naming Claude blindly.
-          const { claudeOk, warnings } = await runPreflight({ verifyClaude, verifyAuth });
-          const defaultAdapterId = await defaultModelForHost(claudeOk);
-          const defaultModel = `${PROVIDER_ID}/${defaultAdapterId}`;
-          if (!claudeOk) {
-            await ctx.prompter.note(warnings.join("\n"), "Claude unavailable");
-          }
-
-          // 2. Start local server if not running
-          const port = await ctx.prompter.text({
-            message: "Local server port",
-            initialValue: String(DEFAULT_PORT),
-            validate: (v) => isNaN(parseInt(v)) ? "Enter a valid port" : undefined,
-          });
-
-          // 3. Ask which models to register. Clawdbot selects from what its config
-          //    enumerates (`agents.defaults.models` is an allowlist and takes exact
-          //    keys, with no prefix form), so a `<cli-model>` suffix that is never
-          //    written here cannot be picked however cleanly the proxy resolves it.
-          //    Suggested ids come from the registry; the answer is validated with
-          //    resolvePaperclipModel so a typo fails at setup, not at first request.
-          const modelsInput = await ctx.prompter.text({
-            message: "Models to register (comma-separated)",
-            initialValue: SUGGESTED_MODEL_IDS.join(", "),
-            validate: validateSetupModelIds,
-          });
-          const chosen = parseSetupModelIds(modelsInput);
-          // The default is applied to the host config either way, and the allowlist
-          // would otherwise reject the provider's own default.
-          const modelIds = chosen.includes(defaultAdapterId)
-            ? chosen
-            : [defaultAdapterId, ...chosen];
-
-          serverInstance = await startServer(parseInt(port));
-          spin.stop("Claude CLI provider ready");
-
-          const baseUrl = `http://localhost:${port}/v1`;
-
-          return {
-            profiles: [{
-              profileId: `${PROVIDER_ID}:local`,
-              credential: {
-                type: "token",
-                provider: PROVIDER_ID,
-                token: "local", // Dummy token, CLI handles auth
-              },
-            }],
-            configPatch: {
-              models: {
-                providers: {
-                  [PROVIDER_ID]: {
-                    baseUrl,
-                    apiKey: "local",
-                    api: "openai-completions",
-                    authHeader: false,
-                    models: modelIds.map(id => ({
-                      id,                       // paperclip/claude_local[/opus]
-                      name: modelName(id),
-                      api: "openai-completions",
-                      reasoning: false,
-                      input: ["text"],
-                      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-                      contextWindow: 200000,
-                      maxTokens: 8192,
-                    })),
-                  },
-                },
-              },
-              agents: {
-                defaults: {
-                  models: Object.fromEntries(
-                    modelIds.map(id => [`${PROVIDER_ID}/${id}`, {}])
-                  ),
-                },
-              },
-            },
-            defaultModel,
-            // Per adapter, not per provider: every advertised model stays selectable
-            // whatever the default is, and they do not spend the same credential.
-            notes: [
-              ...adapterCredentialNotes(),
-              `Default: ${defaultModel}. Any registered model can be selected per request.`,
-              `Registered: ${modelIds.join(", ")}.`,
-              // The proxy takes any suffix; this host only takes what it was told about.
-              `Other CLI models work the same way — add paperclip/<adapter>/<cli-model> to`
-                + ` models.providers.${PROVIDER_ID} and agents.defaults.models to select one here.`,
-              "Each CLI keeps its own credentials; none are exposed to this provider.",
-              `Local server running at http://127.0.0.1:${port}`,
-            ],
-          };
-        },
-      }],
-    });
-
-    // Cleanup on plugin unload
-    api.on("plugin:unload", async () => {
-      if (serverInstance) {
-        await stopServer(serverInstance);
-      }
-    });
-  },
-};
-
-export default plugin;
-```
-
-### 3. Agent Runner (`adapter/agent-runner.ts`)
-
-The OpenAI route layer depends only on `AgentRunner`. `createRunner()` accepts
-exactly one syntax — `paperclip/<adapter>[/<cli-model>]` — and throws
-`UnknownPaperclipModelError` (a `404 model_not_found`) for anything else,
-including the bare `claude-*` and provider-prefixed ids accepted before 2.0. The
-adapter key matches the registry exactly; everything after it is passed to the
-CLI verbatim, because which models exist is the CLI's call and not this proxy's.
-There is deliberately no fallback: silently running Claude for an unrecognised id
-is the behaviour the namespace exists to remove. CLI spawn, parsing, timeout, and
-process-group termination are delegated to the pinned `@paperclipai/*` packages.
-
-```typescript
-interface AgentRunner extends EventEmitter {
-  start(prompt: string, options: RunnerOptions): Promise<void>;
-  kill(signal?: NodeJS.Signals): void;
-}
-```
-
-### 4. Format Adapters
-
-#### OpenAI Request → CLI Input (adapter/openai-to-cli.ts)
-
-```typescript
-import { OpenAIChatRequest } from "../types/openai.js";
-
-// No model field: the requested id is resolved by the registry
-// (`resolvePaperclipModel`), which picks the adapter and hands the CLI model
-// straight to it. This converter never interprets a model id.
-interface CliInput {
-  prompt: string;
-  systemPrompt?: string;
-  sessionId?: string;
-  jsonMode?: boolean;
-}
-
-export function openaiToCli(request: OpenAIChatRequest): CliInput {
-  // Convert messages to single prompt
-  // Claude Code CLI expects a single user message in non-interactive mode
-  const messages = request.messages;
-  let prompt = "";
-
-  for (const msg of messages) {
-    if (msg.role === "system") {
-      prompt += `[System]: ${msg.content}\n\n`;
-    } else if (msg.role === "user") {
-      prompt += `${msg.content}\n`;
-    } else if (msg.role === "assistant") {
-      // For context, include previous assistant responses
-      prompt += `[Previous response]: ${msg.content}\n\n`;
-    }
-  }
-
-  return {
-    prompt: prompt.trim(),
-    sessionId: request.user, // Use user field for session mapping
-  };
-}
-```
-
-#### CLI Output → OpenAI Response (adapter/cli-to-openai.ts)
-
-```typescript
-import { ClaudeCliAssistant, ClaudeCliResult } from "../types/claude-cli.js";
-import { OpenAIChatResponse, OpenAIChatChunk } from "../types/openai.js";
-
-let chunkIndex = 0;
-
-export function cliToOpenaiChunk(
-  message: ClaudeCliAssistant,
-  requestId: string,
-  requestedModel: string
-): OpenAIChatChunk {
-  const text = message.message.content
-    .filter(c => c.type === "text")
-    .map(c => c.text)
-    .join("");
-
-  return {
-    id: `chatcmpl-${requestId}`,
-    object: "chat.completion.chunk",
-    created: Math.floor(Date.now() / 1000),
-    // Echoed verbatim, never taken from what the CLI reports: gateways route and
-    // validate on this field, so it has to stay an id the proxy itself accepts.
-    // The CLI answers `claude-opus-5`, which is a 404 here.
-    model: requestedModel,
-    choices: [{
-      index: 0,
-      delta: {
-        role: chunkIndex === 0 ? "assistant" : undefined,
-        content: text,
-      },
-      finish_reason: message.message.stop_reason ? "stop" : null,
-    }],
-  };
-}
-
-export function cliResultToOpenai(
-  result: ClaudeCliResult,
-  requestId: string,
-  requestedModel: string
-): OpenAIChatResponse {
-  return {
-    id: `chatcmpl-${requestId}`,
-    object: "chat.completion",
-    created: Math.floor(Date.now() / 1000),
-    model: requestedModel,
-    choices: [{
-      index: 0,
-      message: {
-        role: "assistant",
-        content: result.result,
-      },
-      finish_reason: "stop",
-    }],
-    usage: {
-      prompt_tokens: result.usage?.input_tokens || 0,
-      completion_tokens: result.usage?.output_tokens || 0,
-      total_tokens: (result.usage?.input_tokens || 0) + (result.usage?.output_tokens || 0),
-    },
-  };
-}
-```
-
-### 5. HTTP Server (server/index.ts)
-
-```typescript
-import express from "express";
-import { createServer, Server } from "http";
-import { handleChatCompletions } from "./routes.js";
-
-let server: Server | null = null;
-
-export async function startServer(port: number): Promise<Server> {
-  const app = express();
-
-  app.use(express.json({ limit: "10mb" }));
-
-  // Health check
-  app.get("/health", (req, res) => {
-    res.json({ status: "ok", provider: "claude-code-cli" });
-  });
-
-  // OpenAI-compatible endpoints
-  app.post("/v1/chat/completions", handleChatCompletions);
-
-  // Models list — the advertised set and the accepted set are the same registry,
-  // so a caller cannot be shown an id that then 404s. Entries are adapters; the
-  // CLI owns its own model list, so no CLI model is enumerated here.
-  app.get("/v1/models", (req, res) => {
-    res.json({
-      object: "list",
-      data: PAPERCLIP_MODEL_IDS.map((id) => ({
-        id,                          // paperclip/claude_local, paperclip/codex_local
-        object: "model",
-        owned_by: "paperclip",
-        created: Math.floor(Date.now() / 1000),
-      })),
-    });
-  });
-
-  return new Promise((resolve, reject) => {
-    server = createServer(app);
-    server.listen(port, "127.0.0.1", () => {
-      console.log(`Claude Code CLI server running on port ${port}`);
-      resolve(server);
-    });
-    server.on("error", reject);
-  });
-}
-
-export async function stopServer(instance: Server): Promise<void> {
-  return new Promise((resolve) => {
-    instance.close(() => resolve());
-  });
-}
-```
-
-### 6. Route Handler (server/routes.ts)
-
-```typescript
-import { Request, Response } from "express";
-import {
-  runnerFactory,
-  DEFAULT_MODEL,
-  UnknownPaperclipModelError,
-} from "../adapter/paperclip-registry.js";
-import { openaiToCli } from "../adapter/openai-to-cli.js";
-import { cliToOpenaiChunk, cliResultToOpenai } from "../adapter/cli-to-openai.js";
-import { v4 as uuidv4 } from "uuid";
-
-export async function handleChatCompletions(req: Request, res: Response) {
-  const requestId = uuidv4();
-  const stream = req.body.stream === true;
-  // An omitted model is the only case that falls back; a named one either
-  // resolves or 404s. Threaded through both converters so every response echoes
-  // an id the proxy accepts.
-  const requestedModel = req.body.model || DEFAULT_MODEL;
-
-  try {
-    const cliInput = openaiToCli(req.body);
-    const subprocess = runnerFactory.create(requestedModel);
-
-    if (stream) {
-      // SSE streaming response
-      res.setHeader("Content-Type", "text/event-stream");
-      res.setHeader("Cache-Control", "no-cache");
-      res.setHeader("Connection", "keep-alive");
-
-      subprocess.on("assistant", (message) => {
-        const chunk = cliToOpenaiChunk(message, requestId, requestedModel);
-        res.write(`data: ${JSON.stringify(chunk)}\n\n`);
-      });
-
-      subprocess.on("result", (result) => {
-        res.write(`data: [DONE]\n\n`);
-        res.end();
-      });
-
-      subprocess.on("error", (error) => {
-        res.write(`data: ${JSON.stringify({ error: error.message })}\n\n`);
-        res.end();
-      });
-
-    } else {
-      // Non-streaming response
-      let finalResult: any = null;
-
-      subprocess.on("result", (result) => {
-        finalResult = cliResultToOpenai(result, requestId, requestedModel);
-      });
-
-      subprocess.on("close", () => {
-        if (finalResult) {
-          res.json(finalResult);
-        } else {
-          res.status(500).json({ error: "No response from Claude CLI" });
-        }
-      });
-
-      subprocess.on("error", (error) => {
-        res.status(500).json({ error: error.message });
-      });
-    }
-
-    // The runner already carries the adapter and CLI model resolved from the id.
-    await subprocess.start(cliInput.prompt, {
-      systemPrompt: cliInput.systemPrompt,
-      sessionId: cliInput.sessionId,
-    });
-
-  } catch (error) {
-    // An unresolvable id is the caller's mistake, not a server fault, so it is an
-    // OpenAI-style 404 rather than a 500.
-    if (error instanceof UnknownPaperclipModelError) {
-      res.status(404).json({
-        error: { message: error.message, type: "invalid_request_error", code: "model_not_found" },
-      });
-      return;
-    }
-    res.status(500).json({ error: error.message });
-  }
-}
-```
-
-### 7. Session Behavior
-
-CLI runs are intentionally stateless. Each request gets a fresh temporary
-workspace, and no session transcript is resumed or persisted.
-
-## Type Definitions
-
-### Claude CLI Types (types/claude-cli.ts)
-
-```typescript
-export interface ClaudeCliInit {
-  type: "system";
-  subtype: "init";
-  cwd: string;
-  session_id: string;
-  tools: string[];
-  model: string;
-  uuid: string;
-}
-
-export interface ClaudeCliAssistant {
-  type: "assistant";
-  message: {
-    model: string;
-    id: string;
-    type: "message";
-    role: "assistant";
-    content: Array<{ type: "text"; text: string }>;
-    stop_reason: string | null;
-    usage: {
-      input_tokens: number;
-      output_tokens: number;
-      cache_creation_input_tokens?: number;
-    };
-  };
-  session_id: string;
-  uuid: string;
-}
-
-export interface ClaudeCliResult {
-  type: "result";
-  subtype: "success" | "error";
-  is_error: boolean;
-  duration_ms: number;
-  num_turns: number;
-  result: string;
-  session_id: string;
-  total_cost_usd: number;
-  usage: {
-    input_tokens: number;
-    output_tokens: number;
-    cache_creation_input_tokens?: number;
-    cache_read_input_tokens?: number;
-  };
-  modelUsage: Record<string, {
-    inputTokens: number;
-    outputTokens: number;
-    costUSD: number;
-  }>;
-}
-
-export type ClaudeCliMessage = ClaudeCliInit | ClaudeCliAssistant | ClaudeCliResult | {
-  type: "system";
-  subtype: string;
-  [key: string]: any;
-};
-```
-
-### OpenAI Types (types/openai.ts)
-
-```typescript
-export interface OpenAIChatRequest {
-  model: string;
-  messages: Array<{
-    role: "system" | "user" | "assistant";
-    content: string;
-  }>;
-  stream?: boolean;
-  temperature?: number;
-  max_tokens?: number;
-  user?: string; // Used for session mapping
-}
-
-export interface OpenAIChatResponse {
-  id: string;
-  object: "chat.completion";
-  created: number;
-  model: string;
-  choices: Array<{
-    index: number;
-    message: {
-      role: "assistant";
-      content: string;
-    };
-    finish_reason: "stop" | "length" | null;
-  }>;
-  usage: {
-    prompt_tokens: number;
-    completion_tokens: number;
-    total_tokens: number;
-  };
-}
-
-export interface OpenAIChatChunk {
-  id: string;
-  object: "chat.completion.chunk";
-  created: number;
-  model: string;
-  choices: Array<{
-    index: number;
-    delta: {
-      role?: "assistant";
-      content?: string;
-    };
-    finish_reason: "stop" | "length" | null;
-  }>;
-}
-```
-
-## Edge Cases & Error Handling
-
-### 1. Claude CLI Not Installed
-
-Uses `spawn()` with proper error handling:
-
-```typescript
-import { spawn } from "child_process";
-
-async function verifyClaude(): Promise<{ ok: boolean; error?: string }> {
-  return new Promise((resolve) => {
-    const proc = spawn("claude", ["--version"], { stdio: "pipe" });
-
-    proc.on("error", (err) => {
-      resolve({
-        ok: false,
-        error: "Claude CLI not found. Install with: npm install -g @anthropic-ai/claude-code"
-      });
-    });
-
-    proc.on("close", (code) => {
-      resolve({ ok: code === 0 });
-    });
-  });
-}
-```
-
-### 2. OAuth Token Expired
-- Claude CLI handles token refresh automatically
-- If auth fails, user needs to run `claude auth login` manually
-
-### 3. Subprocess Timeout
-```typescript
-const TIMEOUT_MS = 300000; // 5 minutes
-
-setTimeout(() => {
-  subprocess.kill();
-  reject(new Error("Request timed out"));
-}, TIMEOUT_MS);
-```
-
-### 4. Concurrent Request Limits
-- Claude Max may have rate limits
-- Implement request queue with configurable concurrency
-
-### 5. Tool Calls
-- Claude Code CLI may invoke tools (Bash, Read, etc.)
-- For Clawdbot integration, we should:
-  - Filter out tool-related messages
-  - Only return final text responses
-  - Optionally: expose tool usage as metadata
-
-## Configuration Options
-
-```typescript
-interface PluginConfig {
-  port: number;              // Default: 3456
-  timeout: number;           // Default: 300000 (5 min)
-  maxConcurrent: number;     // Default: 3
-  sessionPersistence: boolean; // Default: false
-  debugMode: boolean;        // Default: false
-  cwd: string;               // Default: process.cwd()
-}
-```
+## Entry Points
+
+- **Standalone server** (`src/server/standalone.ts`, the `cli-openai-proxy`
+  bin): runs preflight, prints config, and starts the Express server. This is
+  the primary way the proxy is deployed.
+- **Library exports** (`src/index.ts`): `startServer`/`stopServer`/`getServer`,
+  the CLI verify helpers, and `usageTracker` are exported for programmatic use.
+  The default export is a model-provider plugin definition for agent hosts that
+  consume OpenAI-compatible providers; it registers the proxy as a provider and
+  starts the server during the host's interactive auth setup.
+
+## Model Namespace
+
+`createRunner()` accepts exactly one syntax — `paperclip/<adapter>[/<cli-model>]`
+— and throws `UnknownPaperclipModelError` (an OpenAI-style `404
+model_not_found`) for anything else, including the bare `claude-*` ids accepted
+before 2.0. There is deliberately no fallback: silently running Claude for an
+unrecognised id is the behaviour the namespace exists to remove.
+
+- The adapter key matches the registry exactly (`paperclip/claude_local`,
+  `paperclip/codex_local`); a prefix match would route `codex_local_x` to the
+  codex CLI.
+- Everything after the adapter key is passed to the CLI verbatim as its model
+  string. Which models exist is the CLI's call, not this proxy's — the proxy
+  keeps no model catalog.
+- A missing or falsy `model` value (omitted, `""`, `null`) falls back to
+  `DEFAULT_MODEL` (`paperclip/claude_local`) via `body.model || DEFAULT_MODEL` —
+  an empty string is not rejected, it silently runs the default CLI.
+- `GET /v1/models` enumerates the same registry that request routing resolves
+  against, so a caller cannot be shown an id that then 404s.
+
+## Request Flow (`src/server/routes.ts`)
+
+1. **Validate**: `messages` must be a non-empty array; otherwise a 400 with an
+   OpenAI-style error body.
+2. **Materialize images**: `image_url` parts become local temp files (data
+   URLs) or inline links (http URLs) before conversion, so every adapter sees
+   them uniformly. Per-request temp files are cleaned up when the response
+   completes.
+3. **Convert**: `openaiToCli()` flattens the message array into a single prompt
+   (Claude's `--print` mode takes a prompt, not a conversation). System and
+   developer messages are concatenated separately; delivery is per-adapter —
+   Claude receives them via `--append-system-prompt`, while Codex (which
+   rejects Claude-only flags) gets them prepended to the user prompt through
+   the rendered prompt template.
+4. **Resolve and run**: `runnerFactory.create(model)` resolves the id through
+   the registry and builds a `PaperclipRunner` carrying that adapter's strategy
+   (prompt injection, output mode, CLI flags). The route layer only knows the
+   `AgentRunner` contract:
+
+   ```typescript
+   interface AgentRunner extends EventEmitter {
+     start(prompt: string, options: RunnerOptions): Promise<void>;
+     kill(signal?: NodeJS.Signals): void;
+   }
+   ```
+
+   Implementations emit `content_delta`, `result`, `error`, and `close` — the
+   full contract the route layer consumes. (The Claude runner additionally
+   emits an `assistant` event for debugging only; Codex never emits it and
+   routes never subscribe to it, so new adapters must not rely on it.) Only
+   subprocess execution and timeout enforcement are delegated to
+   the pinned `@paperclipai/*` adapter packages through `execute()`; the runner
+   itself owns output parsing (it instantiates `StreamJsonParser` /
+   `CodexJsonlParser` and feeds them stdout) and cancellation (`kill()` signals
+   the process group directly).
+5. **Respond**:
+   - *Streaming* (`stream: true`): each `content_delta` becomes an SSE
+     `chat.completion.chunk`; the `result` event yields the final chunk, a
+     usage chunk only when the caller sent `stream_options.include_usage:
+     true`, and `data: [DONE]`. Keepalive comments hold the socket open across
+     long agentic runs.
+   - *Non-streaming*: the `result` event is converted by `cliResultToOpenai()`
+     into a single `chat.completion` response with token usage.
+   - The response's `model` field echoes the requested id when the caller
+     supplied one — never the model name the CLI reports — because gateways
+     route and validate on this field, so it has to stay an id the proxy
+     itself accepts. A missing or falsy `model` (absent, `""`, `null`) falls
+     back to the default (`body.model || DEFAULT_MODEL`), and the response
+     then reports that default, not the caller's literal input.
+6. **Track usage**: every run is billed to the usage tracker
+   (`~/.cli-openai-proxy/`), which powers `GET /v1/usage` and
+   `/v1/usage/recent`.
+
+## Session Behavior
+
+CLI runs are intentionally stateless from the proxy's point of view: each
+request gets a fresh temporary working directory (`/tmp/paperclip-run-*`,
+deliberately not a git repo) and no session is ever resumed. On-disk
+persistence differs by lane, though. Claude runs with
+`--no-session-persistence`, so no transcript is written. Codex is invoked
+without `--ephemeral` (the registry passes only `--skip-git-repo-check`), so
+the Codex CLI may still persist its own session files under `~/.codex` even
+though the proxy never reads them back. The OpenAI `user` field is accepted
+for contract compatibility but current runners do not map it to CLI sessions.
+
+## Error Handling
+
+| Condition | Response |
+|-----------|----------|
+| Unknown / non-`paperclip/*` model id | `404 model_not_found` — the caller's mistake, not a server fault |
+| Empty or missing `messages` | `400 invalid_messages` |
+| Oversized image (decoded > 20MB ceiling) | clean `400` from the image materializer, provided the encoded request still fits under the 30MB JSON body limit; a body so large that `express.json()` rejects it first never reaches the materializer and is currently surfaced as a `500` by the generic error handler |
+| CLI not logged in / auth failure | non-streaming: `401` naming the auth engine (`claude`, `codex`) so the caller knows which login flow to run — optionally via the [remote auth API](docs/cli-auth-provisioning.md). Streaming: the SSE response has already flushed a `200` header before the CLI starts, so the classified error (same `type`/`code`/`engine`) arrives in-band as a `data: {"error": ...}` event instead of an HTTP status — clients that trigger reauthentication from HTTP status alone will miss it |
+| CLI run failure / timeout | adapter error mapped to an OpenAI-style error body by `adapter-error.ts` |
+| Missing Claude CLI at startup | non-fatal: preflight warns and the server still starts, because the proxy also serves other adapters. The preflight checks Claude only (`verifyClaude`/`verifyAuth`); a missing Codex CLI (or any future adapter's CLI) produces no startup diagnostic and surfaces only when the first request targeting it fails cleanly at request time |
+
+## Configuration
+
+All configuration is via environment variables (see `src/config.ts` and the
+README):
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `PORT` (or argv) | `3456` | Listen port |
+| `HOST` | `127.0.0.1` | Bind address (`0.0.0.0` to expose; then set `API_KEYS`) |
+| `TIMEOUT` | `0` (unbounded) | Per-run subprocess timeout, also applied as socket inactivity timeout |
+| `API_KEYS` | unset (open access) | Comma-separated proxy access keys for the completion, model, and usage endpoints; `/v1/auth/*` is exempt and gated solely by `AUTH_ADMIN_KEYS` |
+| `AUTH_ADMIN_KEYS` | unset (feature off) | Enables the remote CLI auth provisioning API |
+| `AUTH_TRUST_COMPLETION_CALLERS` | unset | Opt-in trust boundary for injecting provisioned Claude credentials into completion runs |
+| `DEBUG` | unset | Request logging |
 
 ## Security Considerations
 
-1. **Local Only**: Server binds to 127.0.0.1 only, not exposed externally
-2. **No Auth Header**: Requests don't need API keys (uses local OAuth)
-3. **Session Isolation**: Each Clawdbot conversation maps to separate Claude session
-4. **No Credential Storage**: Plugin doesn't store or handle OAuth tokens directly
-5. **No Shell Injection**: Uses `spawn()` instead of `exec()` to prevent command injection
+1. **Loopback by default**: the server binds `127.0.0.1` unless `HOST` says
+   otherwise. CLIs run with approvals bypassed, so anyone who can call
+   `/v1/chat/completions` can run code on the host — set `API_KEYS` on any
+   non-loopback bind.
+2. **No shell injection**: CLIs are spawned via `spawn()`, never a shell.
+3. **Secret hygiene**: proxy access keys (`API_KEYS`, `AUTH_ADMIN_KEYS`) are
+   captured when the server initializes (`initAuth()`/`initAuthAdmin()`) and
+   removed from the environment that completion subprocesses inherit. This
+   guarantee covers completion runs only: the startup preflight
+   (`claude --version`) and the pre-server CLI presence probes spawn before
+   capture and still inherit the full environment, including these keys.
+4. **No credential storage**: each CLI keeps its own credentials. The optional
+   auth-provisioning flow keeps a captured Claude `setup-token` credential in
+   proxy memory only, and injects it only when
+   `AUTH_TRUST_COMPLETION_CALLERS` explicitly accepts that trust boundary
+   (see [docs/cli-auth-provisioning.md](docs/cli-auth-provisioning.md)).
+5. **Auth before body**: the auth middlewares run before the body parser, so an
+   unauthenticated request is rejected without buffering its up-to-30MB body.
 
 ## Testing Strategy
 
-### Unit Tests
-- Format adapters (OpenAI ↔ CLI conversion)
-- Session manager
-- Message parsing
+Tests are colocated `*.test.ts` files compiled with the source and run with the
+Node test runner against `dist/`:
 
-### Integration Tests
-- End-to-end request flow
-- Streaming responses
-- Error handling
+```bash
+npm run build
+npm test
+npm run test:coverage   # CI thresholds: 80% stmts/branches/lines, 85% functions
+```
 
-### Manual Testing
-- Telegram bot conversation
-- WhatsApp message handling
-- Multi-turn conversations
+Coverage areas include format converters, the stream parsers, route behavior
+(streaming, images, usage), the model registry, auth ordering/restart/shutdown,
+and the CLI auth provisioning flows. `runnerFactory` is a mutable holder around
+`createRunner` precisely so tests can substitute the runner without spawning
+real CLIs.
 
 ## Deployment
 
-1. Build: `npm run build`
-2. Package: `npm pack`
-3. Install in Clawdbot: `clawdbot plugins install ./cli-openai-proxy-<version>.tgz`
-4. Configure: `clawdbot models auth login --provider claude-code-cli`
-5. Set default model: Edit `~/.clawdbot/clawdbot.json`. Model ids are
-   `claude-code-cli/paperclip/<adapter>[/<cli-model>]` — e.g.
-   `claude-code-cli/paperclip/claude_local/opus`. Anything outside the
-   `paperclip/` namespace is rejected with `404 model_not_found`.
+- **npm**: `npm install -g cli-openai-proxy`, then run `cli-openai-proxy`.
+- **Linux service**: `./install.sh` builds the project and registers a
+  systemd user service (the script exits on any non-Linux `OSTYPE`); rerun it
+  after pulling new code.
+- **macOS service**: no installer — create a `launchd` LaunchAgent manually
+  following [docs/macos-setup.md](docs/macos-setup.md).
 
 ## Future Enhancements
 
-1. **Tool Bridging**: Expose Claude Code's tools (Bash, Read, etc.) to Clawdbot
-2. **Cost Tracking**: Track subscription usage across Clawdbot conversations
-3. **Model Routing**: Automatic model selection based on message complexity
-4. **Caching**: Response caching for repeated queries
-5. **Multi-User**: Support multiple Claude Max accounts
+1. **Tool visibility**: expose the CLIs' tool usage as response metadata
+   instead of filtering it out.
+2. **More adapters**: an adapter whose CLI matches an existing strategy pair —
+   stdout in one of the two supported `OutputMode` formats (Claude `stream-json`
+   or Codex JSONL) and prompt delivery via one of the two `PromptInjection`
+   strategies — is one registry entry away
+   (`src/adapter/paperclip-registry.ts`). A CLI outside those pairs also needs
+   runner work: a new parser and `OutputMode` member (and possibly a new
+   injection strategy) in `PaperclipRunner` before a registry entry can use it.
+3. **Token-by-token codex streaming**: requires the ACP engine; the current
+   `codex exec --json` lane streams per completed message block.
+4. **Model routing**: automatic adapter selection based on request shape.

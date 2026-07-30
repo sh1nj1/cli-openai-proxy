@@ -1,18 +1,25 @@
-# Claude Code CLI JSON Streaming Protocol
+# CLI Streaming Protocols
 
-Research findings for Task #1.
+Reference for the wire formats the proxy parses from its CLI subprocesses:
+Claude Code's `stream-json` (parsed by `src/adapter/stream-json-parser.ts`,
+typed in `src/types/claude-cli.ts`) and Codex's `exec --json` NDJSON (parsed by
+`src/adapter/codex-jsonl-parser.ts`). How each adapter delivers the prompt and
+which flags it passes is the adapter strategy's job — see
+[docs/paperclip-adapters.md](docs/paperclip-adapters.md).
 
-## CLI Flags for Programmatic Use
+## Claude Code CLI (`stream-json`)
+
+Flags used by the `paperclip/claude_local` lane:
 
 ```bash
 claude --print \
   --output-format stream-json \
-  --input-format stream-json \
   --verbose \
   --include-partial-messages \
-  --model <alias|full-id> \
-  --session-id <uuid> \
-  --resume <session-id>
+  --no-session-persistence \
+  --dangerously-skip-permissions \
+  [--append-system-prompt <text>] \
+  [--model <alias|full-id>]
 ```
 
 ### Key Flags
@@ -21,17 +28,18 @@ claude --print \
 |------|-------------|
 | `--print` | Non-interactive mode, required for piping |
 | `--output-format stream-json` | JSON line output (requires `--verbose`) |
-| `--input-format stream-json` | JSON line input for messages |
 | `--verbose` | Required for stream-json output |
-| `--include-partial-messages` | Get streaming chunks as they arrive |
-| `--session-id <uuid>` | Use specific session ID |
-| `--resume <id>` | Resume existing conversation |
-| `--model <alias>` | Family alias (`fable`, `opus`, `sonnet`, `haiku`) or a full id (`claude-opus-4-6`). The CLI owns this list; check `claude --help` |
-| `--no-session-persistence` | Don't save sessions to disk |
+| `--include-partial-messages` | Emits `stream_event` messages with token deltas |
+| `--no-session-persistence` | Don't save sessions to disk — runs are stateless |
+| `--dangerously-skip-permissions` | Approvals bypassed (why `API_KEYS` matters on non-loopback binds) |
+| `--append-system-prompt` | Carries the request's concatenated system/developer messages |
+| `--model <alias>` | Family alias (`fable`, `opus`, `sonnet`, `haiku`) or a full id. The CLI owns this list; omitted when the model id has no `<cli-model>` suffix |
 
-## Output Message Types
+### Output Message Types
 
-### 1. System Init (`type: "system", subtype: "init"`)
+Each stdout line is one JSON message.
+
+#### 1. System Init (`type: "system", subtype: "init"`)
 
 Sent at session start with full context:
 
@@ -39,20 +47,18 @@ Sent at session start with full context:
 {
   "type": "system",
   "subtype": "init",
-  "cwd": "/Users/atal/Desktop/ClaudeTest",
+  "cwd": "/tmp/paperclip-run-XXXXXX",
   "session_id": "72db4887-c10b-4445-89fa-26e4fc184df9",
   "tools": ["Task", "Bash", "Read", "Edit", ...],
   "mcp_servers": [...],
   "model": "claude-sonnet-4-5-20250929",
   "permissionMode": "bypassPermissions",
   "slash_commands": [...],
-  "skills": [...],
-  "plugins": [...],
   "uuid": "1121b09e-d912-4fd7-91b6-ff72a513e8e4"
 }
 ```
 
-### 2. Hook Messages (`type: "system", subtype: "hook_*"`)
+#### 2. Hook Messages (`type: "system", subtype: "hook_*"`)
 
 ```json
 {
@@ -76,9 +82,31 @@ Sent at session start with full context:
 }
 ```
 
-### 3. Assistant Message (`type: "assistant"`)
+#### 3. Stream Events (`type: "stream_event"`)
 
-Contains model response:
+With `--include-partial-messages`, token-level deltas arrive as Anthropic
+streaming events wrapped in a `stream_event` envelope. `content_block_delta`
+events are what the proxy turns into SSE chunks:
+
+```json
+{
+  "type": "stream_event",
+  "event": {
+    "type": "content_block_delta",
+    "index": 0,
+    "delta": { "type": "text_delta", "text": "Hello" }
+  },
+  "session_id": "...",
+  "uuid": "..."
+}
+```
+
+Other `event.type` values (`message_start`, `content_block_start`,
+`content_block_stop`, `message_delta`, `message_stop`) frame the deltas.
+
+#### 4. Assistant Message (`type: "assistant"`)
+
+The complete model response (also emitted when partial messages are off):
 
 ```json
 {
@@ -103,7 +131,7 @@ Contains model response:
 }
 ```
 
-### 4. Result Message (`type: "result"`)
+#### 5. Result Message (`type: "result"`)
 
 Final message with stats:
 
@@ -134,56 +162,104 @@ Final message with stats:
 }
 ```
 
-## Input Format (stream-json)
+`usage`/`modelUsage` feed the proxy's usage tracker; `total_cost_usd` is the
+CLI-reported cost, and what it represents depends on how the CLI is
+authenticated. Under a subscription login (Claude Pro/Max) it is an informational
+API-rate equivalent, not a bill. But when the CLI runs with `ANTHROPIC_API_KEY` —
+a host credential the proxy recognizes (`src/auth/registry.ts`) and that
+completion subprocesses inherit — the run is API-key backed and the figure can
+reflect real API billing.
 
-When using `--input-format stream-json`, send JSON lines to stdin:
+## Codex CLI (`exec --json` NDJSON)
 
-```json
-{"type": "user_message", "content": "Hello, how are you?"}
+The `paperclip/codex_local` lane runs `codex exec --json --skip-git-repo-check`
+and parses its NDJSON stdout. Codex prints each message as one JSONL line only
+once that message is fully generated — there are no token deltas — so the proxy
+emits one content delta per completed `agent_message` block. The canonical
+result text (non-streaming responses, JSON-mode extraction) is codex's final
+`agent_message`, surfaced as the normalized `result.summary`. See
+[docs/paperclip-adapters.md](docs/paperclip-adapters.md) for the full
+granularity and fallback rules.
+
+## Message Flow Through the Proxy
+
+```
+OpenAI client request (POST /v1/chat/completions)
+        │
+        ▼
+┌───────────────────────────┐
+│ openai-to-cli             │
+│ messages[] → prompt (+    │
+│ system prompt)            │
+└───────────────────────────┘
+        │
+        ▼ PaperclipRunner (adapter execute, fresh temp cwd)
+┌───────────────────────────┐
+│ CLI subprocess            │
+│ claude / codex            │
+└───────────────────────────┘
+        │
+        ├──▼ stdout (JSON lines / NDJSON)
+        │ ┌─────────────────────────────────┐
+        │ │ StreamJsonParser /              │
+        │ │ CodexJsonlParser                │
+        │ │ - emit content deltas           │
+        │ │ - codex only: filter to         │
+        │ │   completed agent_message items │
+        │ │ - claude only: forward all      │
+        │ │   events unfiltered (routes.ts  │
+        │ │   keeps text deltas only) +     │
+        │ │   in-band terminal result       │
+        │ │   (text + usage stats)          │
+        │ └─────────────────────────────────┘
+        │             │
+        └──▼ execute() resolves
+          ┌─────────────────────────────────┐
+          │ AdapterExecutionResult          │
+          │ (adapter-normalized)            │
+          │ - codex: final answer + usage   │
+          │ - both: errors/timeout/signal   │
+          └─────────────────────────────────┘
+                      │
+                      ▼ PaperclipRunner events → routes.ts
+                        (streaming: builds SSE chunks inline;
+                         cli-to-openai supplies only the terminal
+                         done/usage chunks and the non-streaming
+                         cliResultToOpenai conversion)
+OpenAI response (SSE chunks + [DONE], or one chat.completion)
 ```
 
-**TODO:** Need to verify exact input format with testing.
-
-## Session Management
-
-- Sessions are identified by UUID
-- Use `--session-id <uuid>` to specify
-- Use `--resume <id>` to continue conversation
-- Sessions persist by default; use `--no-session-persistence` to disable
+The parsers own live stdout only. For the Claude lane the terminal `result`
+message (final text + usage) arrives in-band through stdout, so
+`StreamJsonParser` surfaces it directly. For the Codex lane
+`CodexJsonlParser` surfaces only completed `agent_message` text; the terminal
+result, usage accounting, and error classification come from the adapter's
+normalized `AdapterExecutionResult`, which `PaperclipRunner` processes after
+`execute()` resolves (`emitCodexTerminal()`). Failure classification for both
+lanes is also driven by this resolved result.
 
 ## Important Notes
 
-1. **OAuth Token Usage**: Claude CLI uses the logged-in user's OAuth token automatically
-2. **Cost Tracking**: Each response includes `total_cost_usd` - this is subscription usage, not API billing
-3. **Tools**: Claude Code has its own tools (Bash, Read, Edit, etc.) - may need to disable or bridge
-4. **MCP Servers**: Session init includes MCP server status
-5. **Streaming**: With `--include-partial-messages`, get real-time chunks
-
-## Message Flow for Clawdbot Integration
-
-```
-Clawdbot User Message
-        │
-        ▼
-┌───────────────────────────┐
-│ Format as JSON input      │
-│ {"type":"user_message"..} │
-└───────────────────────────┘
-        │
-        ▼ (stdin)
-┌───────────────────────────┐
-│   Claude Code CLI         │
-│   (subprocess)            │
-└───────────────────────────┘
-        │
-        ▼ (stdout - JSON lines)
-┌───────────────────────────┐
-│ Parse JSON stream         │
-│ - Filter system messages  │
-│ - Extract assistant text  │
-│ - Capture result stats    │
-└───────────────────────────┘
-        │
-        ▼
-Clawdbot Response to User
-```
+1. **Auth is the CLI's** (for ordinary local login): each CLI uses its own
+   logged-in credential automatically and the proxy does not touch it. The
+   exception is the remote [auth provisioning flow](docs/cli-auth-provisioning.md),
+   whose persistence model differs per engine: a Claude `setup-token`
+   credential captured through `/v1/auth` is held in proxy memory
+   (`token-store.ts`) and — only when the operator sets
+   `AUTH_TRUST_COMPLETION_CALLERS=1` — injected into the completion subprocess
+   environment; a Codex API key is instead forwarded to
+   `codex login --with-api-key`, which persists it under `~/.codex` itself, so
+   no in-memory holding or trust flag is involved.
+2. **Stateless**: no `--session-id`/`--resume` is used; every request is a
+   fresh run in a fresh temp directory.
+3. **Tools**: the CLIs may invoke their own tools (Bash, Read, Edit, …) during
+   a run; where tool events get dropped differs per lane. `CodexJsonlParser`
+   filters in the parser (only completed `agent_message` items are surfaced),
+   but `StreamJsonParser` forwards every parsed message and every
+   `content_block_delta` unfiltered — for the Claude lane it is the route
+   layer that omits tool events, by reading only `delta.text` when building
+   OpenAI chunks (`routes.ts`). The non-streaming
+   response carries only the final text, but a streaming Codex run forwards
+   each completed `agent_message` block as a content delta — so concatenating
+   the SSE stream can include intermediate narrative, not just the final
+   answer.
