@@ -93,8 +93,16 @@ done
 systemctl daemon-reload
 systemctl enable --now cli-openai-proxy-provisioner.socket
 systemctl enable cli-openai-proxy-gateway.service
+if systemctl is-active --quiet cli-openai-proxy-provisioner.service; then
+  systemctl restart cli-openai-proxy-provisioner.service
+fi
+if systemctl is-active --quiet cli-openai-proxy-gateway.service; then
+  systemctl restart cli-openai-proxy-gateway.service
+  GATEWAY_MESSAGE="Restarted the active gateway on the new runtime."
+else
+  GATEWAY_MESSAGE="Configure ${CONFIG_DIR}/gateway.env, then run: systemctl start cli-openai-proxy-gateway.service"
+fi
 
 echo "Installed per-user worker units."
 echo "Runtime: ${RUNTIME_ROOT}"
-echo "Configure ${CONFIG_DIR}/gateway.env, then run:"
-echo "  systemctl start cli-openai-proxy-gateway.service"
+echo "${GATEWAY_MESSAGE}"

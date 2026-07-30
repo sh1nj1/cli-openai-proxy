@@ -37,6 +37,7 @@ export interface LinuxProvisionerConfig {
 export interface LinuxProvisionerDeps {
   run(command: string, args: string[]): Promise<{ stdout: string }>;
   secureHome(home: string, uid: number, gid: number): Promise<void>;
+  readTextFile(file: string): Promise<string>;
   now(): Date;
 }
 
@@ -55,6 +56,9 @@ const defaultDeps: LinuxProvisionerDeps = {
     if (!info.isDirectory()) throw new Error(`Provisioned HOME is not a directory: ${home}`);
     await chown(home, uid, gid);
     await chmod(home, 0o700);
+  },
+  async readTextFile(file) {
+    return readFile(file, "utf8");
   },
   now: () => new Date(),
 };
@@ -75,6 +79,7 @@ function assertIdentity(identity: UserIdentity): void {
 
 export class LinuxUserProvisioner {
   private readonly locks = new Map<string, Promise<WorkerTarget>>();
+  private stateQueue: Promise<void> = Promise.resolve();
 
   constructor(
     private readonly config: LinuxProvisionerConfig,
@@ -90,11 +95,20 @@ export class LinuxUserProvisioner {
     const fingerprint = this.fingerprint(identity);
     const running = this.locks.get(fingerprint);
     if (running) return running;
-    const operation = this.ensureLocked(fingerprint).finally(() => {
+    const operation = this.withStateLock(() => this.ensureLocked(fingerprint)).finally(() => {
       this.locks.delete(fingerprint);
     });
     this.locks.set(fingerprint, operation);
     return operation;
+  }
+
+  private withStateLock<T>(operation: () => Promise<T>): Promise<T> {
+    const result = this.stateQueue.then(operation);
+    this.stateQueue = result.then(
+      () => undefined,
+      () => undefined,
+    );
+    return result;
   }
 
   private fingerprint(identity: UserIdentity): string {
@@ -209,7 +223,7 @@ export class LinuxUserProvisioner {
 
   private async readState(): Promise<MappingState> {
     try {
-      const raw = await readFile(this.config.stateFile, "utf8");
+      const raw = await this.deps.readTextFile(this.config.stateFile);
       const value = JSON.parse(raw) as MappingState;
       if (value.version !== 1 || !value.users || typeof value.users !== "object" || Array.isArray(value.users)) {
         throw new Error("Provisioner state has an unsupported format");

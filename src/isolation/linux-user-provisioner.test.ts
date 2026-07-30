@@ -42,6 +42,7 @@ describe("LinuxUserProvisioner", () => {
         return { stdout: "" };
       },
       async secureHome() {},
+      async readTextFile(file) { return readFile(file, "utf8"); },
       now: () => new Date("2026-07-30T00:00:00.000Z"),
     };
   });
@@ -122,6 +123,32 @@ describe("LinuxUserProvisioner", () => {
       provisioner.ensureWorker({ tenantId: "tenant-a", userId: "user-b" }),
       /user limit \(1\) reached/,
     );
+  });
+
+  test("serializes state reads for distinct first requests", async () => {
+    let releaseRead!: () => void;
+    let firstReadStarted!: () => void;
+    let readCount = 0;
+    const readGate = new Promise<void>((resolve) => { releaseRead = resolve; });
+    const firstRead = new Promise<void>((resolve) => { firstReadStarted = resolve; });
+    const readTextFile = deps.readTextFile;
+    deps.readTextFile = async (file) => {
+      readCount += 1;
+      if (readCount === 1) { firstReadStarted(); await readGate; }
+      return readTextFile(file);
+    };
+    const provisioner = new LinuxUserProvisioner(config, deps);
+
+    const first = provisioner.ensureWorker({ tenantId: "tenant-a", userId: "user-a" });
+    await firstRead;
+    const second = provisioner.ensureWorker({ tenantId: "tenant-a", userId: "user-b" });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    const readsBeforeRelease = readCount;
+    releaseRead();
+    await Promise.all([first, second]);
+    assert.equal(readsBeforeRelease, 1);
+    const state = JSON.parse(await readFile(config.stateFile, "utf8")) as { users: Record<string, unknown> };
+    assert.equal(Object.keys(state.users).length, 2);
   });
 
   test("recovers a pending mapping after useradd succeeded but finalization failed", async () => {

@@ -1,12 +1,18 @@
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
+import { EventEmitter } from "node:events";
 import { rm } from "node:fs/promises";
 import http from "node:http";
 import type { AddressInfo } from "node:net";
 import { afterEach, test } from "node:test";
+import type { Request, Response } from "express";
 import { resetCapturedProxySecrets } from "../config.js";
 import { createApp } from "../server/index.js";
-import { resetRequestIdentityForTests } from "./request-identity.js";
+import {
+  initRequestIdentity,
+  requireRequestIdentity,
+  resetRequestIdentityForTests,
+} from "./request-identity.js";
 import type { WorkerProvisioner } from "./types.js";
 import { WorkerIsolationError } from "./types.js";
 import { UserWorkerProxy } from "./worker-proxy.js";
@@ -197,4 +203,50 @@ test("gateway normalizes platform, provisioning, and unavailable-worker failures
   } finally {
     await new Promise<void>((resolve) => secondGateway.close(() => resolve()));
   }
+});
+
+test("client disconnect during provisioning never reaches a worker", { timeout: 1_000 }, async () => {
+  process.env.USER_API_KEYS = JSON.stringify([
+    { key: "user-key-12345678", tenantId: "tenant-a", userId: "user-a" },
+  ]);
+  initRequestIdentity();
+  const headers = { authorization: "Bearer user-key-12345678", "content-type": "application/json" };
+  const request = {
+    method: "POST",
+    path: "/v1/chat/completions",
+    originalUrl: "/v1/chat/completions",
+    headers,
+    body: { messages: [{ role: "user", content: "hi" }] },
+    header(name: string) {
+      return headers[name.toLowerCase() as keyof typeof headers];
+    },
+  } as unknown as Request;
+  let statusCalls = 0;
+  const response = Object.assign(new EventEmitter(), {
+    headersSent: false,
+    status() { statusCalls += 1; return this; },
+    json() { return this; },
+  }) as unknown as Response & EventEmitter;
+  let identityAccepted = false;
+  requireRequestIdentity(request, response, () => { identityAccepted = true; });
+  assert.equal(identityAccepted, true);
+
+  let releaseProvisioning!: () => void;
+  let provisioningStarted!: () => void;
+  const gate = new Promise<void>((resolve) => { releaseProvisioning = resolve; });
+  const started = new Promise<void>((resolve) => { provisioningStarted = resolve; });
+  const provisioner: WorkerProvisioner = {
+    async ensureWorker() {
+      provisioningStarted();
+      await gate;
+      const address = `/tmp/cap-worker-missing-${randomUUID().slice(0, 8)}.sock`;
+      return { accountName: "cap_0123456789abcdef0123", endpoint: { kind: "unix", address } };
+    },
+  };
+  const forwarding = new UserWorkerProxy(provisioner).forward(request, response);
+  await started;
+  response.emit("close");
+  releaseProvisioning();
+  await forwarding;
+  assert.equal(statusCalls, 0);
 });

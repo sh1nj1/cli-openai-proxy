@@ -62,17 +62,27 @@ export class UserWorkerProxy {
   ) {}
 
   async forward(req: Request, res: Response): Promise<void> {
+    let upstream: http.ClientRequest | undefined;
+    let clientClosed = false;
+    const closeUpstream = () => {
+      clientClosed = true;
+      upstream?.destroy();
+    };
+    res.once("close", closeUpstream);
+
     let target: WorkerTarget;
     try {
       target = await this.provisioner.ensureWorker(requestIdentity(req));
     } catch (error) {
-      this.sendFailure(res, error);
+      res.off("close", closeUpstream);
+      if (!clientClosed && !res.destroyed) this.sendFailure(res, error);
       return;
     }
+    if (clientClosed || res.destroyed) return;
 
     const body = req.body === undefined ? Buffer.alloc(0) : Buffer.from(JSON.stringify(req.body));
     await new Promise<void>((resolve) => {
-      const upstream = http.request(
+      const request = http.request(
         {
           socketPath: target.endpoint.address,
           path: req.originalUrl,
@@ -91,9 +101,10 @@ export class UserWorkerProxy {
           });
         },
       );
+      upstream = request;
 
       let connected = false;
-      upstream.on("socket", (socket) => {
+      request.on("socket", (socket) => {
         if (socket.connecting) {
           socket.once("connect", () => {
             connected = true;
@@ -103,10 +114,9 @@ export class UserWorkerProxy {
           connected = true;
         }
       });
-      upstream.setTimeout(this.connectTimeoutMs, () => {
-        if (!connected) upstream.destroy(new Error(`Worker connect timed out after ${this.connectTimeoutMs}ms`));
-      });
-      upstream.on("error", (error) => {
+      const onTimeout = () => { if (!connected) request.destroy(new Error(`Worker connect timed out after ${this.connectTimeoutMs}ms`)); };
+      request.setTimeout(this.connectTimeoutMs, onTimeout);
+      request.on("error", (error) => {
         if (!res.headersSent) this.sendFailure(res, new WorkerIsolationError(
           `Worker ${target.accountName} unavailable: ${error.message}`,
           "worker_unavailable",
@@ -114,15 +124,13 @@ export class UserWorkerProxy {
         else res.destroy(error);
         resolve();
       });
-      res.on("close", () => {
-        if (!upstream.destroyed) upstream.destroy();
-      });
-      upstream.end(body);
+      request.end(body);
     });
+    res.off("close", closeUpstream);
   }
 
   private sendFailure(res: Response, error: unknown): void {
-    if (res.headersSent) return;
+    if (res.headersSent || res.destroyed) return;
     const isolationError =
       error instanceof WorkerIsolationError
         ? error
