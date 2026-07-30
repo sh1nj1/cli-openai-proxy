@@ -164,12 +164,13 @@ $("createSession").onclick = async (e) => {
 $("submitCode").onclick = async (e) => {
   if (!session) return show("!", "Create a session first.");
   const submitted = session;
+  const value = $("codeInput").value;
   // One submission drives a session at a time (409 session_submitting) — and the
   // Claude token exchange can take up to ~2 minutes, so hold the button down.
   e.target.disabled = true;
   try {
     const done = await call("POST", `/v1/auth/${submitted.engine}/sessions/${submitted.id}`,
-      { body: { value: $("codeInput").value }, base: submitted.base, key: submitted.key, okStatus: 404 });
+      { body: { value }, base: submitted.base, key: submitted.key, okStatus: 404 });
     if (!done) return;
     // A 404 (error envelope, not a session view) confirms the session no longer
     // exists server-side — expired or the server restarted — so drop the dead
@@ -185,7 +186,10 @@ $("submitCode").onclick = async (e) => {
       return;
     }
     if (done.status !== "pending") {
-      $("codeInput").value = "";
+      // Only clear what was consumed: during the up-to-2-minute exchange the
+      // user may have cancelled, created a replacement session and typed its
+      // code — a stale terminal response must not erase that credential.
+      if ($("codeInput").value === value) $("codeInput").value = "";
       // authorized and failed are terminal: the server disposes the session on
       // both, so drop the dead record — otherwise a later Create would try to
       // cancel it at a server that may no longer be reachable and refuse to
