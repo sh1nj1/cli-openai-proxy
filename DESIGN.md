@@ -232,7 +232,7 @@ real CLIs.
 ## Deployment
 
 - **npm**: `npm install -g cli-openai-proxy`, then run `cli-openai-proxy`.
-- **Linux service**: `./install.sh` builds the project and registers a
+- **Linux service**: `./scripts/install-linux-single-user.sh` builds the project and registers a
   systemd user service (the script exits on any non-Linux `OSTYPE`); rerun it
   after pulling new code.
 - **Multi-user Linux service**: `scripts/install-linux-user-workers.sh`

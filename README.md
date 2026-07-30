@@ -425,7 +425,7 @@ run it with `sudo`.
 ```bash
 git clone https://github.com/sh1nj1/cli-openai-proxy.git
 cd cli-openai-proxy
-./install.sh
+./scripts/install-linux-single-user.sh
 ```
 
 The installer checks for Node.js 22.13.0 or newer, installs dependencies,
@@ -443,7 +443,7 @@ service. The installer also prints the effective path as `Config:`. If `HOST`
 is changed to a non-loopback address, set `API_KEYS` before exposing the port.
 The service PATH includes common user CLI locations and trusted absolute
 entries from PATH when the installer runs. Directories writable by users other
-than the service user are skipped. Rerun `./install.sh` after adding a new
+than the service user are skipped. Rerun `./scripts/install-linux-single-user.sh` after adding a new
 custom CLI installation directory to PATH.
 
 ```bash
@@ -453,7 +453,7 @@ journalctl --user -u com.cli-openai-proxy.service -f
 curl http://127.0.0.1:3456/health
 ```
 
-After pulling new code from `main`, rerun `./install.sh`. Existing environment
+After pulling new code from `main`, rerun `./scripts/install-linux-single-user.sh`. Existing environment
 configuration is preserved while dependencies, the build, and the service are
 updated.
 

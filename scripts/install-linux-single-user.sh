@@ -398,7 +398,7 @@ read_effective_listener() {
 
 SCRIPT_DIR="${BASH_SOURCE[0]%/*}"
 [[ "$SCRIPT_DIR" != "${BASH_SOURCE[0]}" ]] || SCRIPT_DIR="."
-PROJECT_DIR="$(cd -- "$SCRIPT_DIR" && pwd -P)"
+PROJECT_DIR="$(cd -- "$SCRIPT_DIR/.." && pwd -P)"
 [[ "$PROJECT_DIR" != *:* && "$PROJECT_DIR" != *$'\n'* && "$PROJECT_DIR" != *$'\r'* ]] \
   || die "Project path must not contain a colon or newline: $PROJECT_DIR"
 ENTRYPOINT="$PROJECT_DIR/dist/server/standalone.js"

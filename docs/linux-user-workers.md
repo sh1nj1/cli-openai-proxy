@@ -45,7 +45,7 @@ sudo systemctl status cli-openai-proxy-gateway.service
 ```
 
 `USER_WORKER_MODE=enabled` is set by the gateway unit. Do not run the ordinary
-single-user `install.sh` at the same time; it installs a different systemd user
+single-user `scripts/install-linux-single-user.sh` at the same time; it installs a different systemd user
 service.
 
 The installer refuses a Node binary when the binary or any parent in its
