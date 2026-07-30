@@ -125,7 +125,7 @@ describe("LinuxUserProvisioner", () => {
     );
   });
 
-  test("serializes state reads for distinct first requests", async () => {
+  test("serializes mapping reservations for distinct first requests", async () => {
     let releaseRead!: () => void;
     let firstReadStarted!: () => void;
     let readCount = 0;
@@ -149,6 +149,37 @@ describe("LinuxUserProvisioner", () => {
     assert.equal(readsBeforeRelease, 1);
     const state = JSON.parse(await readFile(config.stateFile, "utf8")) as { users: Record<string, unknown> };
     assert.equal(Object.keys(state.users).length, 2);
+  });
+
+  test("does not block ready workers behind another identity's OS checks", async () => {
+    const provisioner = new LinuxUserProvisioner(config, deps);
+    const firstIdentity = { tenantId: "tenant-a", userId: "user-a" };
+    const secondIdentity = { tenantId: "tenant-a", userId: "user-b" };
+    await provisioner.ensureWorker(firstIdentity);
+    await provisioner.ensureWorker(secondIdentity);
+    const readyState = await readFile(config.stateFile, "utf8");
+    deps.readTextFile = async () => readyState;
+
+    let secureCalls = 0;
+    let releaseFirst!: () => void;
+    let firstCheckStarted!: () => void;
+    const firstGate = new Promise<void>((resolve) => { releaseFirst = resolve; });
+    const firstStarted = new Promise<void>((resolve) => { firstCheckStarted = resolve; });
+    deps.secureHome = async () => {
+      secureCalls += 1;
+      if (secureCalls === 1) {
+	firstCheckStarted();
+	await firstGate;
+      }
+    };
+
+    const first = provisioner.ensureWorker(firstIdentity);
+    await firstStarted;
+    const second = provisioner.ensureWorker(secondIdentity);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.equal(secureCalls, 2, "a ready identity must not wait for another identity's OS checks");
+    releaseFirst();
+    await Promise.all([first, second]);
   });
 
   test("recovers a pending mapping after useradd succeeded but finalization failed", async () => {

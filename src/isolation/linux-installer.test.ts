@@ -43,3 +43,19 @@ test("Linux runtime socket directories remain traversable after reboot", async (
   const enableSocket = script.indexOf("systemctl enable --now cli-openai-proxy-provisioner.socket");
   assert.ok(createDirectories >= 0 && createDirectories < enableSocket);
 });
+
+test("Linux installer protects the privileged Node executable path", async () => {
+  const script = await readFile(new URL("../../scripts/install-linux-user-workers.sh", import.meta.url), "utf8");
+  assert.match(
+    script,
+    /for component in "\$\{components\[@\]\}"; do[\s\S]*stat -Lc '%u' -- "\$\{current\}"[\s\S]*8#\$\{mode\} & 8#022/,
+  );
+  assert.match(script, /validate_privileged_path "\$\{NODE_PATH\}"/);
+  assert.match(
+    script,
+    /install -o root -g root -m 0755 "\$\{NODE_PATH\}" "\$\{RUNTIME_NODE\}"/,
+  );
+  assert.match(script, /validate_privileged_path "\$\{RUNTIME_NODE\}"/);
+  assert.match(script, /s\|@NODE@\|\$\{RUNTIME_NODE\}\|g/);
+  assert.doesNotMatch(script, /s\|@NODE@\|\$\{NODE_PATH\}\|g/);
+});

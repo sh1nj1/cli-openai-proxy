@@ -95,7 +95,7 @@ export class LinuxUserProvisioner {
     const fingerprint = this.fingerprint(identity);
     const running = this.locks.get(fingerprint);
     if (running) return running;
-    const operation = this.withStateLock(() => this.ensureLocked(fingerprint)).finally(() => {
+    const operation = this.ensureLocked(fingerprint).finally(() => {
       this.locks.delete(fingerprint);
     });
     this.locks.set(fingerprint, operation);
@@ -118,25 +118,7 @@ export class LinuxUserProvisioner {
   }
 
   private async ensureLocked(fingerprint: string): Promise<WorkerTarget> {
-    const state = await this.readState();
-    let record = state.users[fingerprint];
-    if (!record) {
-      if (Object.keys(state.users).length >= this.config.maxUsers) {
-        throw new Error(`Provisioner user limit (${this.config.maxUsers}) reached`);
-      }
-      const accountName = `cap_${fingerprint.slice(0, 20)}`;
-      if (!ACCOUNT_RE.test(accountName)) throw new Error("Generated account name is invalid");
-      const home = path.join(this.config.usersDir, accountName);
-      await mkdir(this.config.usersDir, { recursive: true, mode: 0o755 });
-      record = {
-        accountName,
-        home,
-        createdAt: this.deps.now().toISOString(),
-        status: "creating",
-      };
-      state.users[fingerprint] = record;
-      await this.writeState(state);
-    }
+    const record = await this.withStateLock(() => this.reserveRecord(fingerprint));
 
     if (record.status === "creating" || record.uid === undefined || record.gid === undefined) {
       this.assertPendingRecord(record);
@@ -157,7 +139,7 @@ export class LinuxUserProvisioner {
       record.gid = await this.numericId("-g", record.accountName);
       await this.deps.secureHome(record.home, record.uid, record.gid);
       record.status = "ready";
-      await this.writeState(state);
+      await this.withStateLock(() => this.persistReadyRecord(fingerprint, record));
     } else {
       this.assertRecord(record);
       const actualUid = await this.numericId("-u", record.accountName);
@@ -183,6 +165,46 @@ export class LinuxUserProvisioner {
         address: path.join(this.config.workerSocketDir, `${record.accountName}.sock`),
       },
     };
+  }
+
+  private async reserveRecord(fingerprint: string): Promise<UserRecord> {
+    const state = await this.readState();
+    let record = state.users[fingerprint];
+    if (!record) {
+      if (Object.keys(state.users).length >= this.config.maxUsers) {
+	throw new Error(`Provisioner user limit (${this.config.maxUsers}) reached`);
+      }
+      const accountName = `cap_${fingerprint.slice(0, 20)}`;
+      if (!ACCOUNT_RE.test(accountName)) throw new Error("Generated account name is invalid");
+      const home = path.join(this.config.usersDir, accountName);
+      await mkdir(this.config.usersDir, { recursive: true, mode: 0o755 });
+      record = {
+	accountName,
+	home,
+	createdAt: this.deps.now().toISOString(),
+	status: "creating",
+      };
+      state.users[fingerprint] = record;
+      await this.writeState(state);
+    }
+    return { ...record };
+  }
+
+  private async persistReadyRecord(fingerprint: string, record: UserRecord): Promise<void> {
+    this.assertRecord(record);
+    const state = await this.readState();
+    const reserved = state.users[fingerprint];
+    if (
+      !reserved
+      || reserved.accountName !== record.accountName
+      || reserved.home !== record.home
+      || reserved.createdAt !== record.createdAt
+    ) {
+      throw new Error("Provisioner state changed while creating an OS account");
+    }
+    this.assertPendingRecord(reserved);
+    state.users[fingerprint] = { ...record };
+    await this.writeState(state);
   }
 
   private async numericId(flag: "-u" | "-g", accountName: string): Promise<number> {

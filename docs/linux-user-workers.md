@@ -48,11 +48,13 @@ sudo systemctl status cli-openai-proxy-gateway.service
 single-user `install.sh` at the same time; it installs a different systemd user
 service.
 
-The installer refuses a Node binary that is not root-owned or is writable by
-group/other. Install Node and the supported CLIs system-wide; dynamically
-created users cannot execute binaries hidden in an administrator's HOME. Each
-new installation creates an immutable release directory under `/opt`; old
-release directories may be removed manually after the new services are healthy.
+The installer refuses a Node binary when the binary or any parent in its
+resolved path is not root-owned or is writable by group/other. It copies the
+validated binary into the immutable release used by every service. Install Node
+and the supported CLIs system-wide; dynamically created users cannot execute
+binaries hidden in an administrator's HOME. Each new installation creates an
+immutable release directory under `/opt`; old release directories may be
+removed manually after the new services are healthy.
 Re-running the installer stops an active gateway, restarts all active per-user
 workers and the provisioner on the new release, then starts the gateway again.
 Active CLI requests can be interrupted during this upgrade, so schedule it

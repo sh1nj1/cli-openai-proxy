@@ -20,6 +20,30 @@ CONFIG_DIR="/etc/cli-openai-proxy"
 STATE_DIR="/var/lib/cli-openai-proxy"
 RUNTIME_BASE="/opt/cli-openai-proxy/releases"
 RUNTIME_ROOT="${RUNTIME_BASE}/$(date -u +%Y%m%dT%H%M%SZ)-$$"
+RUNTIME_NODE="${RUNTIME_ROOT}/bin/node"
+
+validate_privileged_path() {
+  local target="$1"
+  local current="/"
+  local component mode owner
+  local -a components
+
+  if [[ "${target}" != /* ]]; then
+    echo "Refusing a non-absolute privileged executable path: ${target}" >&2
+    exit 1
+  fi
+  IFS='/' read -r -a components <<< "${target#/}"
+  for component in "${components[@]}"; do
+    [[ -n "${component}" ]] || continue
+    current="${current%/}/${component}"
+    owner="$(stat -Lc '%u' -- "${current}")"
+    mode="$(stat -Lc '%a' -- "${current}")"
+    if [[ "${owner}" -ne 0 || $((8#${mode} & 8#022)) -ne 0 ]]; then
+      echo "Refusing a privileged executable below a non-root-owned or group/world-writable path: ${current}" >&2
+      exit 1
+    fi
+  done
+}
 
 if [[ ! -f "${SOURCE_ROOT}/dist/server/worker-standalone.js" ]]; then
   echo "Build first: npm ci && npm run build" >&2
@@ -30,11 +54,7 @@ if [[ ! -d "${SOURCE_ROOT}/node_modules" ]]; then
   exit 1
 fi
 
-NODE_MODE="$(stat -Lc '%a' "${NODE_PATH}")"
-if [[ "$(stat -Lc '%u' "${NODE_PATH}")" -ne 0 || $((8#${NODE_MODE} & 8#022)) -ne 0 ]]; then
-  echo "Refusing a root service with a non-root-owned or group/world-writable Node binary: ${NODE_PATH}" >&2
-  exit 1
-fi
+validate_privileged_path "${NODE_PATH}"
 
 if ! getent group cli-openai-proxy >/dev/null; then
   groupadd --system cli-openai-proxy
@@ -59,6 +79,8 @@ chown root:root "${CONFIG_DIR}/provisioner-identity.key"
 chmod 0600 "${CONFIG_DIR}/provisioner-identity.key"
 
 install -d -o root -g root -m 0755 "${RUNTIME_ROOT}"
+install -d -o root -g root -m 0755 "${RUNTIME_ROOT}/bin"
+install -o root -g root -m 0755 "${NODE_PATH}" "${RUNTIME_NODE}"
 cp -a \
   "${SOURCE_ROOT}/dist" \
   "${SOURCE_ROOT}/node_modules" \
@@ -73,6 +95,7 @@ while IFS= read -r -d '' link; do
 done < <(find "${RUNTIME_ROOT}" -type l -print0)
 chown -R root:root "${RUNTIME_ROOT}"
 chmod -R go-w "${RUNTIME_ROOT}"
+validate_privileged_path "${RUNTIME_NODE}"
 
 if [[ ! -f "${CONFIG_DIR}/gateway.env" ]]; then
   install -o root -g cli-openai-proxy -m 0640 /dev/null "${CONFIG_DIR}/gateway.env"
@@ -86,7 +109,7 @@ for unit in \
   cli-openai-proxy-gateway.service
 do
   sed \
-    -e "s|@NODE@|${NODE_PATH}|g" \
+    -e "s|@NODE@|${RUNTIME_NODE}|g" \
     -e "s|@APP_ROOT@|${RUNTIME_ROOT}|g" \
     "${UNIT_SOURCE}/${unit}" > "${UNIT_TARGET}/${unit}"
   chmod 0644 "${UNIT_TARGET}/${unit}"
