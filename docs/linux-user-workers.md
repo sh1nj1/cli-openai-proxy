@@ -60,6 +60,15 @@ workers and the provisioner on the new release, then starts the gateway again.
 Active CLI requests can be interrupted during this upgrade, so schedule it
 during a maintenance window.
 
+## Integration test
+
+`npm run test:integration:linux-workers` builds a systemd-enabled Ubuntu image,
+runs the real installer inside it, and asserts the isolation boundaries end to
+end: dynamic `cap_*` account creation, worker UID/HOME, socket and state-file
+permissions, fail-closed auth, and that a chat completion's CLI process runs as
+the caller's dedicated account (via a stub `claude` that reports its own OS
+identity). It needs Docker and takes a few minutes; CI runs it on every PR.
+
 ## Trusted user identity
 
 The OpenAI request body's `user` field is session data and is never an authority.

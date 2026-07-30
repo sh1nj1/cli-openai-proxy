@@ -15,6 +15,7 @@
     "dev": "tsc --watch",
     "start": "node dist/server/standalone.js",
     "test": "find dist -name '*.test.js' -print0 | xargs -0 node --test && bash tools/publish-flow.test.sh",
+    "test:integration:linux-workers": "bash tools/linux-worker-integration/run.sh",
     "test:coverage": "c8 --exclude-after-remap --all --src=src --include='**/*.ts' --exclude='**/*.test.ts' --reporter=text --reporter=lcov --check-coverage --statements=80 --branches=80 --functions=85 --lines=80 node --test $(find dist -name '*.test.js' -print)",
     "clean": "node tools/clean.mjs",
     "prepublishOnly": "npm run build && node tools/check-package-contents.mjs"

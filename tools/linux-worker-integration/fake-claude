@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+# Stand-in Claude Code CLI for the per-user worker integration test. Instead of
+# spending real credentials it answers every prompt with the OS identity it is
+# running as, which is exactly the property the test needs to observe.
+set -euo pipefail
+
+for arg in "$@"; do
+  if [[ "${arg}" == "--version" ]]; then
+    echo "9.9.9 (fake-claude integration stub)"
+    exit 0
+  fi
+done
+
+# The adapter pipes the prompt through stdin; drain it so the writer never
+# sees EPIPE.
+cat > /dev/null || true
+
+run_user="$(id -un)"
+run_uid="$(id -u)"
+
+# Left behind for the test to check ownership of files a CLI run creates.
+printf 'user=%s uid=%s home=%s\n' "${run_user}" "${run_uid}" "${HOME}" \
+  > "${HOME}/fake-claude-ran.txt"
+
+text="FAKE_CLI_OK user=${run_user} uid=${run_uid} home=${HOME}"
+session="11111111-2222-4333-8444-555555555555"
+
+printf '%s\n' "{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"${session}\",\"model\":\"fake-claude\",\"tools\":[]}"
+printf '%s\n' "{\"type\":\"assistant\",\"message\":{\"id\":\"msg_fake_1\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"fake-claude\",\"content\":[{\"type\":\"text\",\"text\":\"${text}\"}],\"stop_reason\":\"end_turn\",\"stop_sequence\":null,\"usage\":{\"input_tokens\":1,\"output_tokens\":1}},\"session_id\":\"${session}\"}"
+printf '%s\n' "{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"duration_ms\":5,\"duration_api_ms\":5,\"num_turns\":1,\"result\":\"${text}\",\"session_id\":\"${session}\",\"total_cost_usd\":0,\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}"

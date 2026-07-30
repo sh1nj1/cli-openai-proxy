@@ -1,0 +1,9 @@
+# Integration-test image build context (tools/linux-worker-integration).
+# Host artifacts must not leak in: node_modules holds host-platform natives and
+# dist may be stale; both are rebuilt inside the image.
+.git
+node_modules
+dist
+coverage
+tmp
+*.log
