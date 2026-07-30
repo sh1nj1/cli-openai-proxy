@@ -28,7 +28,14 @@ set -euo pipefail
 printf 'git %s\n' "$*" >>"$STATE_DIR/calls"
 case "${1:-} ${2:-}" in
   "rev-parse --show-toplevel") printf '%s\n' "$REPO_DIR" ;;
-  "rev-parse HEAD"|"rev-parse origin/main") printf '%s\n' "$CURRENT_SHA" ;;
+  "rev-parse HEAD") printf '%s\n' "$CURRENT_SHA" ;;
+  "rev-parse origin/main")
+    if [ -f "$STATE_DIR/remote-main-changed" ]; then
+      printf '%s\n' 2222222222222222222222222222222222222222
+    else
+      printf '%s\n' "$CURRENT_SHA"
+    fi
+    ;;
   "branch --show-current") printf '%s\n' main ;;
   "status --porcelain")
     STATUS_CALLS=$(( $(/bin/cat "$STATE_DIR/status-calls" 2>/dev/null || printf 0) + 1 ))
@@ -39,7 +46,14 @@ case "${1:-} ${2:-}" in
     fi
     ;;
   "remote get-url") printf '%s\n' git@github.com:sh1nj1/cli-openai-proxy.git ;;
-  "fetch --quiet") ;;
+  "fetch --quiet")
+    FETCH_CALLS=$(( $(/bin/cat "$STATE_DIR/fetch-calls" 2>/dev/null || printf 0) + 1 ))
+    printf '%s' "$FETCH_CALLS" >"$STATE_DIR/fetch-calls"
+    if [ -f "$STATE_DIR/change-remote-on-fetch-call" ] &&
+      [ "$FETCH_CALLS" -ge "$(/bin/cat "$STATE_DIR/change-remote-on-fetch-call")" ]; then
+      : >"$STATE_DIR/remote-main-changed"
+    fi
+    ;;
   "show-ref --verify")
     [ -f "$STATE_DIR/tag" ]
     ;;
@@ -71,13 +85,20 @@ printf 'npm %s\n' "$*" >>"$STATE_DIR/calls"
 case "${1:-}" in
   view)
     if [ -f "$STATE_DIR/published" ]; then
+      if [ -f "$STATE_DIR/registry-warning" ]; then
+	printf 'npm warn Unknown project config "legacy-peer-deps"\n' >&2
+      fi
       if [ -f "$STATE_DIR/published-head" ]; then
         /bin/cat "$STATE_DIR/published-head"
       else
         printf '%s\n' "$CURRENT_SHA"
       fi
     else
-      printf 'npm error code E404\n' >&2
+      if [ -f "$STATE_DIR/registry-error" ]; then
+	/bin/cat "$STATE_DIR/registry-error" >&2
+      else
+	printf 'npm error code E404\n' >&2
+      fi
       exit 1
     fi
     ;;
@@ -284,6 +305,24 @@ assert_not_called "npm whoami"
 assert_not_called "git tag -a"
 assert_called "gh release create v0.1.0"
 
+# A benign npm warning on stderr must not contaminate the successful gitHead value.
+reset_state
+: >"$STATE_DIR/published"
+: >"$STATE_DIR/registry-warning"
+NPM_PUBLISH_MODE=failure
+run_publish "finalize cli-openai-proxy@0.1.0"
+assert_success
+assert_not_called "npm publish"
+assert_called "gh release create v0.1.0"
+
+# A failed npm lookup must still include stderr in the failure diagnostic.
+reset_state
+printf '%s\n' "npm error registry unavailable" >"$STATE_DIR/registry-error"
+run_publish ""
+assert_failure
+grep -Fq "npm error registry unavailable" <<<"$OUTPUT"
+assert_not_called "npm publish"
+
 # The tree can change while the script waits at the confirmation prompt, so the
 # third status check (after confirmation) must abort before npm publish runs.
 reset_state
@@ -292,6 +331,16 @@ NPM_PUBLISH_MODE=success
 run_publish "publish cli-openai-proxy@0.1.0"
 assert_failure
 grep -Fq "while waiting for confirmation" <<<"$OUTPUT"
+assert_not_called "npm publish"
+
+# origin/main can change while checks or confirmation are in progress. The
+# second fetch, immediately before publishing, must observe and reject it.
+reset_state
+printf '%s\n' 2 >"$STATE_DIR/change-remote-on-fetch-call"
+NPM_PUBLISH_MODE=success
+run_publish "publish cli-openai-proxy@0.1.0"
+assert_failure
+grep -Fq "origin/main changed while waiting for confirmation" <<<"$OUTPUT"
 assert_not_called "npm publish"
 
 echo "publish flow tests passed"

@@ -36,6 +36,12 @@ verify_state_unchanged() {
     fail "package.json name or version changed ${when}."
 }
 
+verify_remote_main_unchanged() {
+  git fetch --quiet origin main
+  [ "$(git rev-parse origin/main)" = "$CURRENT_COMMIT" ] ||
+    fail "origin/main changed while waiting for confirmation."
+}
+
 for command in git gh node npm; do
   require_command "$command"
 done
@@ -76,10 +82,15 @@ fi
 echo -e "${GREEN}  ✓ main is clean and matches origin/main${NC}"
 
 step 2 "Checking npm registry..."
+REGISTRY_ERROR_FILE=$(mktemp)
+trap 'rm -f "$REGISTRY_ERROR_FILE"' EXIT
 set +e
-REGISTRY_RESULT=$(npm view "${PACKAGE_NAME}@${PACKAGE_VERSION}" gitHead 2>&1)
+REGISTRY_RESULT=$(npm view "${PACKAGE_NAME}@${PACKAGE_VERSION}" gitHead 2>"$REGISTRY_ERROR_FILE")
 REGISTRY_STATUS=$?
 set -e
+REGISTRY_ERROR=$(<"$REGISTRY_ERROR_FILE")
+rm -f "$REGISTRY_ERROR_FILE"
+trap - EXIT
 if [ "$REGISTRY_STATUS" -eq 0 ]; then
   [ -n "$REGISTRY_RESULT" ] ||
     fail "${PACKAGE_NAME}@${PACKAGE_VERSION} is published without verifiable gitHead metadata."
@@ -88,8 +99,8 @@ if [ "$REGISTRY_STATUS" -eq 0 ]; then
   PUBLISHED=true
   echo -e "${GREEN}  ✓ npm package already matches this commit; missing release steps can resume${NC}"
 else
-  if [[ "$REGISTRY_RESULT" != *"E404"* ]] && [[ "$REGISTRY_RESULT" != *"is not in this registry"* ]]; then
-    fail "Could not verify the npm version is unpublished:\n${REGISTRY_RESULT}"
+  if [[ "$REGISTRY_ERROR" != *"E404"* ]] && [[ "$REGISTRY_ERROR" != *"is not in this registry"* ]]; then
+    fail "Could not verify the npm version is unpublished:\n${REGISTRY_ERROR}"
   fi
   [ "$TAG_EXISTS" = false ] ||
     fail "Git tag $TAG exists, but ${PACKAGE_NAME}@${PACKAGE_VERSION} is not published."
@@ -144,6 +155,7 @@ if ! read -r -p "Type '${EXPECTED_CONFIRMATION}' to continue: " CONFIRMATION; th
 fi
 [ "$CONFIRMATION" = "$EXPECTED_CONFIRMATION" ] || fail "Publish cancelled."
 verify_state_unchanged "while waiting for confirmation"
+verify_remote_main_unchanged
 
 step 8 "Publishing and creating the GitHub release..."
 if [ "$PUBLISHED" = false ]; then
