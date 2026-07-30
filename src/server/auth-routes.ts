@@ -90,14 +90,21 @@ function sendError(res: Response, err: unknown): void {
   res.status(500).json({ error: { message, type: "server_error", code: null } });
 }
 
+/**
+ * An engine's flows for a response body: `flows` lists every supported one,
+ * `flow` repeats the default — the shape callers relied on when engines had
+ * exactly one flow, kept so they keep working unchanged.
+ */
+function flowFields(engine: string): { flow: string; flows: string[] } {
+  const flows = resolveEngine(engine)!.flows.map((f) => f.flow);
+  return { flow: flows[0]!, flows };
+}
+
 /** GET /v1/auth/engines — lets the caller build its UI without hardcoding flows. */
 export function handleAuthEngines(_req: Request, res: Response): void {
   res.json({
     object: "list",
-    data: engineRegistry.ids().map((engine) => {
-      const descriptor = resolveEngine(engine)!;
-      return { engine, flow: descriptor.flow };
-    }),
+    data: engineRegistry.ids().map((engine) => ({ engine, ...flowFields(engine) })),
   });
 }
 
@@ -107,18 +114,23 @@ export async function handleAuthStatus(req: Request, res: Response): Promise<voi
   if (!engine) return;
   try {
     const status = await resolveEngine(engine)!.checkStatus();
-    res.json({ engine, flow: resolveEngine(engine)!.flow, ...status });
+    res.json({ engine, ...flowFields(engine), ...status });
   } catch (err) {
     sendError(res, err);
   }
 }
 
-/** POST /v1/auth/:engine/sessions */
+/** POST /v1/auth/:engine/sessions — body may name a `flow`; omitted means the engine's default. */
 export async function handleCreateAuthSession(req: Request, res: Response): Promise<void> {
   const engine = engineOf(req, res);
   if (!engine) return;
+  const flow = (req.body as Record<string, unknown> | undefined)?.flow;
+  if (flow !== undefined && typeof flow !== "string") {
+    fail(res, 400, "`flow` must be a string naming one of the engine's flows.", "invalid_flow");
+    return;
+  }
   try {
-    res.status(201).json(await createSession(engine));
+    res.status(201).json(await createSession(engine, flow));
   } catch (err) {
     sendError(res, err);
   }

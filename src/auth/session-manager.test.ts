@@ -17,8 +17,23 @@ import { AuthProvisioningError, type EngineAuthDescriptor, type EngineAuthSessio
 class FakeSession implements EngineAuthSession {
   cancelled = false;
   submitted: string[] = [];
+  /** Set for a self-completing session: the test plays the CLI's own verdict. */
+  finishWait: ((result: { credential?: { envVar: string; value: string } }) => void) | null = null;
+  failWait: ((err: Error) => void) | null = null;
+  wait?: () => Promise<{ credential?: { envVar: string; value: string } }>;
   private abortStart: ((err: Error) => void) | null = null;
-  constructor(private readonly behavior: Behavior = {}) {}
+
+  constructor(private readonly behavior: Behavior = {}) {
+    // Assigned, not declared: the manager keys "this flow takes no submission"
+    // on the method's presence, like it does for the real device-code adapter.
+    if (behavior.selfCompleting) {
+      this.wait = () =>
+        new Promise((resolve, reject) => {
+          this.finishWait = resolve;
+          this.failWait = reject;
+        });
+    }
+  }
 
   async start() {
     // Models the real gap between spawning the CLI and it printing its URL.
@@ -29,6 +44,13 @@ class FakeSession implements EngineAuthSession {
         if (this.behavior.startFailsOnCancel) this.abortStart = reject;
         setTimeout(resolve, this.behavior.startDelayMs);
       });
+    }
+    if (this.behavior.selfCompleting) {
+      return {
+        verificationUrl: "https://example.test/device",
+        userCode: "ABCD-1234",
+        instructions: "enter the code at the URL",
+      };
     }
     return { verificationUrl: "https://example.test/authorize", instructions: "open it" };
   }
@@ -57,6 +79,7 @@ interface Behavior {
   startDelayMs?: number;
   startFailsOnCancel?: boolean;
   submitDelayMs?: number;
+  selfCompleting?: boolean;
 }
 
 let created: FakeSession[] = [];
@@ -65,17 +88,33 @@ const realResolve = engineRegistry.resolve;
 
 const fakeDescriptor: EngineAuthDescriptor = {
   engine: "fake",
-  flow: "paste-code",
-  // Matches what this fake actually does: it hands a credential back, so like the
-  // real claude adapter it is gated on the operator's trust declaration.
-  injectsCredential: true,
-  createSession: () => {
-    const s = new FakeSession(behavior);
-    created.push(s);
-    return s;
-  },
+  flows: [
+    {
+      flow: "paste-code",
+      // Matches what this fake actually does: it hands a credential back, so like the
+      // real claude adapter it is gated on the operator's trust declaration.
+      injectsCredential: true,
+      createSession: () => {
+        const s = new FakeSession(behavior);
+        created.push(s);
+        return s;
+      },
+    },
+    // Self-completing and ungated, like the real codex device-code flow.
+    {
+      flow: "device-code",
+      createSession: () => {
+        const s = new FakeSession({ ...behavior, selfCompleting: true });
+        created.push(s);
+        return s;
+      },
+    },
+  ],
   checkStatus: async () => ({ state: "unknown" }),
 };
+
+/** Let the settleWhenDone continuation attached to a resolved wait() run. */
+const settle = () => new Promise((r) => setImmediate(r));
 
 describe("session-manager", () => {
   beforeEach(() => {
@@ -113,7 +152,9 @@ describe("session-manager", () => {
   test("an engine that injects nothing is provisioned without a trust declaration", async () => {
     delete process.env[TRUST_COMPLETION_CALLERS_VAR];
     engineRegistry.resolve = (engine) =>
-      engine === "fake" ? { ...fakeDescriptor, injectsCredential: false } : realResolve(engine);
+      engine === "fake"
+        ? { ...fakeDescriptor, flows: [{ ...fakeDescriptor.flows[0]!, injectsCredential: false }] }
+        : realResolve(engine);
     const view = await createSession("fake");
     assert.strictEqual(view.status, "pending");
   });
@@ -263,6 +304,111 @@ describe("session-manager", () => {
     assert.strictEqual(cancelSession("fake", view.sessionId).status, "cancelled");
     assert.strictEqual(created[0].cancelled, true);
     assert.throws(() => getSession("fake", view.sessionId));
+  });
+
+  test("a named flow selects among the engine's flows; omitted means the first", async () => {
+    const named = await createSession("fake", "device-code");
+    assert.strictEqual(named.flow, "device-code");
+    assert.strictEqual(named.verificationUrl, "https://example.test/device");
+    assert.strictEqual(named.userCode, "ABCD-1234");
+
+    const defaulted = await createSession("fake");
+    assert.strictEqual(defaulted.flow, "paste-code");
+    assert.strictEqual(defaulted.userCode, undefined);
+  });
+
+  test("an unsupported flow is refused before any session starts", async () => {
+    await assert.rejects(createSession("fake", "bogus"), (err: AuthProvisioningError) => {
+      assert.strictEqual(err.code, "unsupported_flow");
+      assert.match(err.message, /paste-code, device-code/);
+      return true;
+    });
+    assert.strictEqual(created.length, 0);
+  });
+
+  // The trust gate is per flow, not per engine: codex's device-code flow persists
+  // its own credential and must not inherit another flow's injection gate.
+  test("the trust declaration gates only the flow that injects", async () => {
+    delete process.env[TRUST_COMPLETION_CALLERS_VAR];
+    await assert.rejects(createSession("fake", "paste-code"), (err: AuthProvisioningError) => {
+      assert.strictEqual(err.code, "caller_trust_not_declared");
+      return true;
+    });
+    assert.strictEqual((await createSession("fake", "device-code")).status, "pending");
+  });
+
+  test("a self-completing session turns authorized once its CLI succeeds", async () => {
+    const view = await createSession("fake", "device-code");
+    assert.strictEqual(getSession("fake", view.sessionId).status, "pending");
+
+    created[0].finishWait!({});
+    await settle();
+
+    // Still queryable: the poll that discovers the outcome needs something to read.
+    assert.strictEqual(getSession("fake", view.sessionId).status, "authorized");
+  });
+
+  test("a self-completing session that fails carries the CLI's reason", async () => {
+    const view = await createSession("fake", "device-code");
+    created[0].failWait!(new AuthProvisioningError("the device code was denied", "login_failed"));
+    await settle();
+
+    const failed = getSession("fake", view.sessionId);
+    assert.strictEqual(failed.status, "failed");
+    assert.deepStrictEqual(failed.error, { message: "the device code was denied", code: "login_failed" });
+  });
+
+  test("a credential returned by a self-completing session is stored", async () => {
+    await createSession("fake", "device-code");
+    created[0].finishWait!({ credential: { envVar: "FAKE_TOKEN", value: "tok-device" } });
+    await settle();
+    assert.deepStrictEqual(getProvisionedAuthEnv("fake"), { FAKE_TOKEN: "tok-device" });
+  });
+
+  // The adapter's submit() would throw the same error — but through the failure
+  // path that concludes the session, killing a login still waiting for the user.
+  test("submitting to a self-completing session is refused without concluding it", async () => {
+    const view = await createSession("fake", "device-code");
+    await assert.rejects(submitSession("fake", view.sessionId, "code"), (err: AuthProvisioningError) => {
+      assert.strictEqual(err.code, "submission_not_supported");
+      return true;
+    });
+    assert.strictEqual(getSession("fake", view.sessionId).status, "pending");
+    assert.strictEqual(created[0].cancelled, false);
+  });
+
+  test("a concluded session releases its engine slot but keeps its outcome", async () => {
+    const first = await createSession("fake", "device-code");
+    created[0].finishWait!({});
+    await settle();
+
+    // A new login starts without superseding the concluded record...
+    const second = await createSession("fake", "device-code");
+    assert.strictEqual(getSession("fake", second.sessionId).status, "pending");
+    // ...whose outcome an in-flight poll can still read.
+    assert.strictEqual(getSession("fake", first.sessionId).status, "authorized");
+  });
+
+  test("cancelling a concluded session reports the outcome it earned, then forgets it", async () => {
+    const view = await createSession("fake", "device-code");
+    created[0].finishWait!({});
+    await settle();
+
+    assert.strictEqual(cancelSession("fake", view.sessionId).status, "authorized");
+    assert.throws(() => getSession("fake", view.sessionId));
+  });
+
+  // dispose() cancelled the handle, so the late verdict describes a login that
+  // was already torn down — resurrecting the record would contradict the caller.
+  test("a verdict arriving after the session was cancelled is ignored", async () => {
+    const view = await createSession("fake", "device-code");
+    cancelSession("fake", view.sessionId);
+    created[0].finishWait!({});
+    await settle();
+    assert.throws(() => getSession("fake", view.sessionId), (err: AuthProvisioningError) => {
+      assert.strictEqual(err.code, "unknown_session");
+      return true;
+    });
   });
 
   test("an abandoned session is reaped after its TTL, killing the child", async () => {
