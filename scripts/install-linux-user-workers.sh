@@ -100,11 +100,32 @@ systemd-tmpfiles --create "${TMPFILES_TARGET}/cli-openai-proxy.conf"
 systemctl daemon-reload
 systemctl enable --now cli-openai-proxy-provisioner.socket
 systemctl enable cli-openai-proxy-gateway.service
+
+GATEWAY_WAS_ACTIVE=false
+if systemctl is-active --quiet cli-openai-proxy-gateway.service; then
+  GATEWAY_WAS_ACTIVE=true
+  systemctl stop cli-openai-proxy-gateway.service
+fi
+
+# The gateway stays stopped while every loaded worker switches to this release,
+# preventing requests from crossing mixed gateway/worker versions.
+systemctl list-units \
+  --type=service \
+  --state=active \
+  --no-legend \
+  --plain \
+  'cli-openai-proxy-worker@*.service' |
+  while read -r worker_unit _; do
+    if [[ -n "${worker_unit}" ]]; then
+      systemctl restart "${worker_unit}"
+    fi
+  done
+
 if systemctl is-active --quiet cli-openai-proxy-provisioner.service; then
   systemctl restart cli-openai-proxy-provisioner.service
 fi
-if systemctl is-active --quiet cli-openai-proxy-gateway.service; then
-  systemctl restart cli-openai-proxy-gateway.service
+if [[ "${GATEWAY_WAS_ACTIVE}" == true ]]; then
+  systemctl start cli-openai-proxy-gateway.service
   GATEWAY_MESSAGE="Restarted the active gateway on the new runtime."
 else
   GATEWAY_MESSAGE="Configure ${CONFIG_DIR}/gateway.env, then run: systemctl start cli-openai-proxy-gateway.service"

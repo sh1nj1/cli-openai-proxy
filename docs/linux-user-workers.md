@@ -53,6 +53,10 @@ group/other. Install Node and the supported CLIs system-wide; dynamically
 created users cannot execute binaries hidden in an administrator's HOME. Each
 new installation creates an immutable release directory under `/opt`; old
 release directories may be removed manually after the new services are healthy.
+Re-running the installer stops an active gateway, restarts all active per-user
+workers and the provisioner on the new release, then starts the gateway again.
+Active CLI requests can be interrupted during this upgrade, so schedule it
+during a maintenance window.
 
 ## Trusted user identity
 
