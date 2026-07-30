@@ -103,9 +103,17 @@ $("checkStatus").onclick = () => call("GET", `/v1/auth/${engine()}/status`);
 $("forgetCredential").onclick = () => call("DELETE", `/v1/auth/${engine()}/credential`);
 
 $("createSession").onclick = async () => {
-  const created = await call("POST", `/v1/auth/${engine()}/sessions`);
+  const target = engine();
+  // The server supersedes only same-engine sessions; a pending session for a
+  // different engine would keep its CLI child alive until TTL, so cancel it.
+  if (session && session.engine !== target) {
+    await call("DELETE", `/v1/auth/${session.engine}/sessions/${session.id}`);
+    session = null;
+    $("sessionInfo").replaceChildren();
+  }
+  const created = await call("POST", `/v1/auth/${target}/sessions`);
   if (!created) return;
-  session = { id: created.sessionId, engine: created.engine ?? engine() };
+  session = { id: created.sessionId, engine: created.engine ?? target };
   const info = $("sessionInfo");
   info.replaceChildren(`Session ${session.id} (${session.engine}) — ${created.instructions ?? ""} `);
   if (created.verificationUrl) {
