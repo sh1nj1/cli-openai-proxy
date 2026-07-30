@@ -5,6 +5,7 @@ import { rm } from "node:fs/promises";
 import http from "node:http";
 import type { AddressInfo } from "node:net";
 import { afterEach, test } from "node:test";
+import { gzipSync } from "node:zlib";
 import type { Request, Response } from "express";
 import { resetCapturedProxySecrets } from "../config.js";
 import { createApp } from "../server/index.js";
@@ -87,6 +88,72 @@ test("gateway provisions by authenticated identity and strips private headers", 
     ]);
     assert.equal(seenHeaders.authorization, undefined);
     assert.equal(seenHeaders["x-cli-proxy-user-key"], undefined);
+  } finally {
+    await new Promise<void>((resolve) => gateway.close(() => resolve()));
+    await new Promise<void>((resolve) => worker.close(() => resolve()));
+    await rm(socketPath, { force: true });
+  }
+});
+
+test("gateway strips content encoding after Express inflates and reserializes JSON", async () => {
+  const socketPath = `/tmp/cap-worker-${randomUUID().slice(0, 8)}.sock`;
+  let seenEncoding: string | undefined;
+  let seenBody = "";
+  const worker = http.createServer((request, response) => {
+    seenEncoding = request.headers["content-encoding"];
+    request.setEncoding("utf8");
+    request.on("data", (chunk) => { seenBody += chunk; });
+    request.on("end", () => {
+      response.writeHead(200, { "content-type": "application/json" });
+      response.end("{}");
+    });
+  });
+  await new Promise<void>((resolve) => worker.listen(socketPath, resolve));
+
+  const provisioner: WorkerProvisioner = {
+    async ensureWorker() {
+      return {
+        accountName: "cap_0123456789abcdef0123",
+        endpoint: { kind: "unix", address: socketPath },
+      };
+    },
+  };
+  process.env.USER_API_KEYS = JSON.stringify([
+    { key: "user-key-12345678", tenantId: "tenant-a", userId: "user-a" },
+  ]);
+  const gateway = createApp({ userWorkerProxy: new UserWorkerProxy(provisioner) }).listen(0);
+  await new Promise<void>((resolve) => gateway.once("listening", resolve));
+
+  try {
+    const port = (gateway.address() as AddressInfo).port;
+    const payload = { messages: [{ role: "user", content: "compressed" }] };
+    const body = gzipSync(JSON.stringify(payload));
+    const result = await new Promise<{ status: number; body: string }>((resolve, reject) => {
+      const request = http.request({
+        host: "127.0.0.1",
+        port,
+        path: "/v1/chat/completions",
+        method: "POST",
+        headers: {
+          authorization: "Bearer user-key-12345678",
+          "content-type": "application/json",
+          "content-encoding": "gzip",
+          "content-length": String(body.length),
+        },
+      }, (response) => {
+        let responseBody = "";
+        response.setEncoding("utf8");
+        response.on("data", (chunk) => { responseBody += chunk; });
+        response.on("end", () => resolve({ status: response.statusCode ?? 0, body: responseBody }));
+      });
+      request.on("error", reject);
+      request.end(body);
+    });
+
+    assert.equal(result.status, 200);
+    assert.equal(result.body, "{}");
+    assert.equal(seenEncoding, undefined);
+    assert.deepEqual(JSON.parse(seenBody), payload);
   } finally {
     await new Promise<void>((resolve) => gateway.close(() => resolve()));
     await new Promise<void>((resolve) => worker.close(() => resolve()));

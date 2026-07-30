@@ -25,6 +25,8 @@ const PRIVATE_HEADERS = new Set([
   "x-cli-proxy-identity-signature",
 ]);
 
+const REGENERATED_BODY_HEADERS = new Set(["content-encoding", "content-length"]);
+
 const PUBLIC_FAILURE_MESSAGES: Record<WorkerIsolationError["code"], string> = {
   identity_required: "A trusted user identity is required",
   identity_invalid: "The trusted user identity is invalid",
@@ -38,7 +40,12 @@ function outgoingHeaders(headers: IncomingHttpHeaders, body: Buffer): IncomingHt
   const result: IncomingHttpHeaders = {};
   for (const [name, value] of Object.entries(headers)) {
     const lower = name.toLowerCase();
-    if (!HOP_BY_HOP_HEADERS.has(lower) && !PRIVATE_HEADERS.has(lower) && lower !== "host" && lower !== "content-length") {
+    if (
+      !HOP_BY_HOP_HEADERS.has(lower)
+      && !PRIVATE_HEADERS.has(lower)
+      && !REGENERATED_BODY_HEADERS.has(lower)
+      && lower !== "host"
+    ) {
       result[lower] = value;
     }
   }
