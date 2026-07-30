@@ -1,0 +1,36 @@
+[Unit]
+Description=cli-openai-proxy worker for %i
+Requires=cli-openai-proxy-worker@%i.socket
+After=cli-openai-proxy-worker@%i.socket
+
+[Service]
+Type=simple
+User=%i
+Group=%i
+WorkingDirectory=%h
+ExecStart=@NODE@ @APP_ROOT@/dist/server/worker-standalone.js
+Environment=HOME=%h
+Environment=WORKER_LISTEN_FD=3
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+# The gateway guarantees that only this OS user's authenticated requests reach
+# this socket, so a credential provisioned here is exposed only to the same user.
+Environment=AUTH_TRUST_COMPLETION_CALLERS=true
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ReadWritePaths=%h
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+SystemCallArchitectures=native
+LockPersonality=yes
+UMask=0077
+KillMode=control-group
+TimeoutStopSec=30
+MemoryMax=4G
+CPUQuota=200%
+TasksMax=512

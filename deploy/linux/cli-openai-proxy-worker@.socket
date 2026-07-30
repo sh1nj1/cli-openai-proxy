@@ -1,0 +1,13 @@
+[Unit]
+Description=cli-openai-proxy worker socket for %i
+
+[Socket]
+ListenStream=/run/cli-openai-proxy/workers/%i.sock
+SocketUser=cli-openai-proxy
+SocketGroup=cli-openai-proxy
+SocketMode=0600
+DirectoryMode=0750
+RemoveOnStop=yes
+
+[Install]
+WantedBy=sockets.target

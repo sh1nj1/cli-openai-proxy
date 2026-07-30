@@ -11,6 +11,7 @@
 import type { Request, Response, NextFunction } from "express";
 import { takeProxySecret } from "../config.js";
 import { AUTH_PROVISIONING_PREFIX } from "./auth-routes.js";
+import { mappedCompletionKeys } from "../isolation/request-identity.js";
 
 let validKeys: Set<string> | null = null;
 
@@ -22,11 +23,19 @@ export function initAuth(): { enabled: boolean; keyCount: number } {
   // in process.env would inherit it into every CLI child (see takeProxySecret).
   const keysEnv = takeProxySecret("API_KEYS");
   if (keysEnv) {
-    const keys = keysEnv.split(",").map(k => k.trim()).filter(Boolean);
+    const keys = [
+      ...keysEnv.split(",").map(k => k.trim()).filter(Boolean),
+      ...mappedCompletionKeys(),
+    ];
     if (keys.length > 0) {
       validKeys = new Set(keys);
       return { enabled: true, keyCount: keys.length };
     }
+  }
+  const mappedKeys = mappedCompletionKeys();
+  if (mappedKeys.length > 0) {
+    validKeys = new Set(mappedKeys);
+    return { enabled: true, keyCount: mappedKeys.length };
   }
   validKeys = null;
   return { enabled: false, keyCount: 0 };

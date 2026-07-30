@@ -188,6 +188,10 @@ README):
 | `API_KEYS` | unset (open access) | Comma-separated proxy access keys for the completion, model, and usage endpoints; `/v1/auth/*` is exempt and gated solely by `AUTH_ADMIN_KEYS` |
 | `AUTH_ADMIN_KEYS` | unset (feature off) | Enables the remote CLI auth provisioning API |
 | `AUTH_TRUST_COMPLETION_CALLERS` | unset | Opt-in trust boundary for injecting provisioned Claude credentials into completion runs |
+| `USER_WORKER_MODE` | unset | Fail-closed per-user worker routing |
+| `USER_API_KEYS` | unset | Opaque key to stable tenant/user identity mappings |
+| `USER_IDENTITY_HMAC_SECRET` | unset | HMAC key for trusted upstream identity headers |
+| `USER_WORKER_PROVISIONER_ENDPOINT` | platform default | Privileged provisioner IPC endpoint |
 | `DEBUG` | unset | Request logging |
 
 ## Security Considerations
@@ -197,12 +201,9 @@ README):
    `/v1/chat/completions` can run code on the host — set `API_KEYS` on any
    non-loopback bind.
 2. **No shell injection**: CLIs are spawned via `spawn()`, never a shell.
-3. **Secret hygiene**: proxy access keys (`API_KEYS`, `AUTH_ADMIN_KEYS`) are
-   captured when the server initializes (`initAuth()`/`initAuthAdmin()`) and
-   removed from the environment that completion subprocesses inherit. This
-   guarantee covers completion runs only: the startup preflight
-   (`claude --version`) and the pre-server CLI presence probes spawn before
-   capture and still inherit the full environment, including these keys.
+3. **Secret hygiene**: proxy access keys and identity secrets are captured
+   before startup preflight and removed from the environment every CLI
+   subprocess inherits.
 4. **No credential storage**: each CLI keeps its own credentials. The optional
    auth-provisioning flow keeps a captured Claude `setup-token` credential in
    proxy memory only, and injects it only when
@@ -234,6 +235,10 @@ real CLIs.
 - **Linux service**: `./install.sh` builds the project and registers a
   systemd user service (the script exits on any non-Linux `OSTYPE`); rerun it
   after pulling new code.
+- **Multi-user Linux service**: `scripts/install-linux-user-workers.sh`
+  installs the low-privilege gateway, root provisioner socket, and systemd
+  worker templates documented in
+  [docs/linux-user-workers.md](docs/linux-user-workers.md).
 - **macOS service**: no installer — create a `launchd` LaunchAgent manually
   following [docs/macos-setup.md](docs/macos-setup.md).
 

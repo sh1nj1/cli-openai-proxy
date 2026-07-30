@@ -6,7 +6,12 @@
  * CLI is already logged into instead of an API key with OAuth scope restrictions.
  */
 
-import { startServer, stopServer, getServer } from "./server/index.js";
+import {
+  initializeGatewaySecurity,
+  startServer,
+  stopServer,
+  getServer,
+} from "./server/index.js";
 import { verifyClaude, verifyAuth } from "./cli/claude.js";
 import { commandRuns } from "./cli/command.js";
 import { runPreflight } from "./server/preflight.js";
@@ -98,6 +103,9 @@ export async function runLocalAuthSetup(
   ctx: any,
   deps: LocalAuthSetupDeps = DEFAULT_SETUP_DEPS
 ): Promise<{ port: number; auth: any }> {
+  // The probes below launch CLI children. Capture gateway-only credentials
+  // first so plugin-host startup has the same secret boundary as standalone.
+  initializeGatewaySecurity();
   const spin = ctx.prompter.progress("Checking Claude CLI...");
 
   try {

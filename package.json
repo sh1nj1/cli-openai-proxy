@@ -75,6 +75,7 @@
   "files": [
     "dist",
     "scripts",
+    "deploy",
     "docs",
     "!docs/superpowers",
     "README.md",

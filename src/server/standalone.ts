@@ -8,11 +8,14 @@
  *   node dist/server/standalone.js [port]
  */
 
-import { startServer, stopServer } from "./index.js";
+import { initializeGatewaySecurity, startServer, stopServer } from "./index.js";
 import { verifyClaude, verifyAuth } from "../cli/claude.js";
 import { runPreflight } from "./preflight.js";
 import { PKG_VERSION, getTimeoutMs } from "../config.js";
 import { defaultModelForHost } from "../adapter/paperclip-registry.js";
+import { userWorkerModeEnabled } from "../config.js";
+import { createPlatformProvisioner } from "../isolation/provisioner-client.js";
+import { UserWorkerProxy } from "../isolation/worker-proxy.js";
 
 const DEFAULT_PORT = 3456;
 
@@ -30,24 +33,34 @@ async function main(): Promise<void> {
   const displayHost = host === "0.0.0.0" ? "localhost" : host;
   const baseUrl = `http://${displayHost}:${port}`;
 
+  // Capture gateway-only credentials before preflight launches any CLI child.
+  // createApp re-initializes from the in-memory capture when the listener starts.
+  const security = initializeGatewaySecurity();
+
   // Preflight. Claude CLI / auth are non-fatal: the proxy also serves
   // non-Claude adapter models (e.g. paperclip/codex_local),
   // so a codex-only host must still be able to start. Missing Claude is
   // surfaced as a warning; a claude-targeted request fails cleanly at request
   // time instead.
   console.log("\n[Preflight]");
-  const { claudeOk } = await runPreflight({
-    verifyClaude,
-    verifyAuth,
-    log: (m) => console.log(m),
-    warn: (m) => console.error(m),
-  });
+  const perUserWorkers = userWorkerModeEnabled();
+  const { claudeOk } = perUserWorkers
+    ? { claudeOk: true }
+    : await runPreflight({
+        verifyClaude,
+        verifyAuth,
+        log: (m) => console.log(m),
+        warn: (m) => console.error(m),
+      });
+  if (perUserWorkers) {
+    console.log("  Skipped gateway CLI probe; CLIs run only inside user workers.");
+  }
 
   // Show configuration
   console.log("\n[Config]");
   console.log(`  Host:      ${host}`);
   console.log(`  Port:      ${port}`);
-  console.log(`  API keys:  ${process.env.API_KEYS ? "enabled" : "disabled (open access)"}`);
+  console.log(`  API keys:  ${security.auth.enabled ? "enabled" : "disabled (open access)"}`);
   console.log(`  Debug:     ${process.env.DEBUG ? "enabled" : "disabled"}`);
   const timeoutMs = getTimeoutMs();
   console.log(`  Timeout:   ${timeoutMs}ms (${(timeoutMs / 60000).toFixed(1)} min)`);
@@ -60,7 +73,10 @@ async function main(): Promise<void> {
 
   // Start server
   try {
-    await startServer({ port, host });
+    const userWorkerProxy = perUserWorkers
+      ? new UserWorkerProxy(createPlatformProvisioner())
+      : undefined;
+    await startServer({ port, host, userWorkerProxy });
 
     console.log("\n[Endpoints]");
     console.log(`  POST ${baseUrl}/v1/chat/completions`);

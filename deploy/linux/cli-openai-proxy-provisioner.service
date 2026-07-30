@@ -1,0 +1,33 @@
+[Unit]
+Description=cli-openai-proxy privileged user provisioner
+Requires=cli-openai-proxy-provisioner.socket
+After=cli-openai-proxy-provisioner.socket
+
+[Service]
+Type=simple
+User=root
+Group=root
+ExecStart=@NODE@ @APP_ROOT@/dist/server/provisioner-standalone.js
+Environment=PROVISIONER_IDENTITY_SECRET_FILE=/etc/cli-openai-proxy/provisioner-identity.key
+Environment=PROVISIONER_STATE_FILE=/var/lib/cli-openai-proxy/provisioner/users.json
+Environment=PROVISIONER_USERS_DIR=/var/lib/cli-openai-proxy/users
+Environment=PROVISIONER_WORKER_SOCKET_DIR=/run/cli-openai-proxy/workers
+Environment=PROVISIONER_MAX_USERS=1000
+NoNewPrivileges=yes
+CapabilityBoundingSet=CAP_CHOWN CAP_DAC_OVERRIDE CAP_FOWNER CAP_SETGID CAP_SETUID
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+ProtectKernelLogs=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictAddressFamilies=AF_UNIX
+SystemCallArchitectures=native
+RestrictRealtime=yes
+LockPersonality=yes
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

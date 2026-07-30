@@ -1,0 +1,34 @@
+[Unit]
+Description=cli-openai-proxy public gateway
+Requires=cli-openai-proxy-provisioner.socket
+After=network.target cli-openai-proxy-provisioner.socket
+
+[Service]
+Type=simple
+User=cli-openai-proxy
+Group=cli-openai-proxy
+WorkingDirectory=/var/lib/cli-openai-proxy/gateway
+ExecStart=@NODE@ @APP_ROOT@/dist/server/standalone.js
+EnvironmentFile=-/etc/cli-openai-proxy/gateway.env
+Environment=USER_WORKER_MODE=enabled
+Environment=USER_WORKER_PROVISIONER_ENDPOINT=/run/cli-openai-proxy/provisioner.sock
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+PrivateTmp=yes
+ProtectSystem=strict
+ReadWritePaths=/var/lib/cli-openai-proxy/gateway
+ProtectHome=read-only
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+SystemCallArchitectures=native
+LockPersonality=yes
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target
