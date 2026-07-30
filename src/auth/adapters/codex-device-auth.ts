@@ -120,6 +120,9 @@ export class CodexDeviceAuthSession implements EngineAuthSession {
       this.wake();
     });
     this.proc.onExit(({ exitCode }) => {
+      // A terminal device-code session remains queryable until its TTL. Drop the
+      // handle now so later disposal cannot signal a reused POSIX process-group ID.
+      this.proc = null;
       this.exited = true;
       this.exitCode = exitCode;
       this.wake();

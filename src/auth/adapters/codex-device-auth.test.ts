@@ -127,6 +127,20 @@ describe("codex device-auth adapter", () => {
     assert.deepStrictEqual(await waited, {});
   });
 
+  test("cancelling a completed session does not signal its exited process", async () => {
+    const { proc, session } = startSession();
+    const started = session.start();
+    proc.emit(DEVICE_PROMPT);
+    await started;
+    const waited = session.wait();
+    proc.exit(0);
+    await waited;
+
+    // The manager disposes terminal sessions at TTL; the old PID may be reused.
+    session.cancel();
+    assert.strictEqual(proc.killed, false);
+  });
+
   test("wait fails with the CLI's last words when the login is denied", async () => {
     const { proc, session } = startSession();
     const started = session.start();

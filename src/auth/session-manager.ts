@@ -110,7 +110,7 @@ export async function createSession(engine: string, flow?: string): Promise<Sess
   if (!descriptor) {
     throw new AuthProvisioningError(`Unknown engine "${engine}"`, "unknown_engine");
   }
-  const flowDescriptor = flow
+  const flowDescriptor = flow !== undefined
     ? descriptor.flows.find((f) => f.flow === flow)
     : descriptor.flows[0];
   if (!flowDescriptor) {

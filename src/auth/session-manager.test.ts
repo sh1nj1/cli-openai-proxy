@@ -326,6 +326,19 @@ describe("session-manager", () => {
     assert.strictEqual(created.length, 0);
   });
 
+  test("an explicitly empty flow is rejected without superseding the active session", async () => {
+    const active = await createSession("fake", "device-code");
+
+    await assert.rejects(createSession("fake", ""), (err: AuthProvisioningError) => {
+      assert.strictEqual(err.code, "unsupported_flow");
+      return true;
+    });
+
+    assert.strictEqual(created.length, 1);
+    assert.strictEqual(created[0].cancelled, false);
+    assert.strictEqual(getSession("fake", active.sessionId).status, "pending");
+  });
+
   // The trust gate is per flow, not per engine: codex's device-code flow persists
   // its own credential and must not inherit another flow's injection gate.
   test("the trust declaration gates only the flow that injects", async () => {

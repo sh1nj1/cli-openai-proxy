@@ -225,6 +225,16 @@ describe("auth-routes", () => {
     assert.match(errorOf(res).message, /paste-code/);
   });
 
+  test("an explicitly empty flow is unsupported rather than defaulted", async () => {
+    const res = fakeRes();
+    await handleCreateAuthSession(
+      fakeReq({ params: { engine: "fake" } as any, body: { flow: "" } }),
+      res,
+    );
+    assert.equal(res.statusCode, 400);
+    assert.equal(errorOf(res).code, "unsupported_flow");
+  });
+
   test("submit accepts `code` and `api_key` as aliases of `value`", async () => {
     for (const body of [{ value: "a" }, { code: "b" }, { api_key: "c" }]) {
       const created = fakeRes();
