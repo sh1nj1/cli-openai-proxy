@@ -8,6 +8,7 @@ import { resetCapturedProxySecrets } from "../config.js";
 import { createApp } from "../server/index.js";
 import { resetRequestIdentityForTests } from "./request-identity.js";
 import type { WorkerProvisioner } from "./types.js";
+import { WorkerIsolationError } from "./types.js";
 import { UserWorkerProxy } from "./worker-proxy.js";
 
 afterEach(() => {
@@ -111,5 +112,89 @@ test("shared API key cannot select a worker or force JSON parsing without signed
     assert.equal(provisioned, false);
   } finally {
     await new Promise<void>((resolve) => gateway.close(() => resolve()));
+  }
+});
+
+test("gateway normalizes platform, provisioning, and unavailable-worker failures without fallback", async () => {
+  process.env.USER_API_KEYS = JSON.stringify([
+    { key: "user-key-12345678", tenantId: "tenant-a", userId: "user-a" },
+  ]);
+  const unsupported: WorkerProvisioner = {
+    async ensureWorker() {
+      throw new WorkerIsolationError("platform unavailable", "platform_unsupported");
+    },
+  };
+  const gateway = createApp({ userWorkerProxy: new UserWorkerProxy(unsupported) }).listen(0);
+  await new Promise<void>((resolve) => gateway.once("listening", resolve));
+  try {
+    const port = (gateway.address() as AddressInfo).port;
+    const response = await fetch(`http://127.0.0.1:${port}/v1/chat/completions`, {
+      method: "POST",
+      headers: { authorization: "Bearer user-key-12345678", connection: "close", "content-type": "application/json" },
+      body: JSON.stringify({ messages: [{ role: "user", content: "hi" }] }),
+    });
+    assert.equal(response.status, 501);
+    const payload = await response.json() as { error: { code: string; message: string } };
+    assert.equal(payload.error.code, "platform_unsupported");
+    assert.equal(payload.error.message, "Per-user workers are not supported on this platform");
+  } finally {
+    await new Promise<void>((resolve) => gateway.close(() => resolve()));
+  }
+
+  resetCapturedProxySecrets();
+  resetRequestIdentityForTests();
+  process.env.USER_API_KEYS = JSON.stringify([
+    { key: "user-key-12345678", tenantId: "tenant-a", userId: "user-a" },
+  ]);
+  const failedProvisioner: WorkerProvisioner = {
+    async ensureWorker() {
+      throw new WorkerIsolationError("useradd failed at /var/lib/private/path", "provisioning_failed");
+    },
+  };
+  const failedGateway = createApp({ userWorkerProxy: new UserWorkerProxy(failedProvisioner) }).listen(0);
+  await new Promise<void>((resolve) => failedGateway.once("listening", resolve));
+  try {
+    const port = (failedGateway.address() as AddressInfo).port;
+    const response = await fetch(`http://127.0.0.1:${port}/v1/chat/completions`, {
+      method: "POST",
+      headers: { authorization: "Bearer user-key-12345678", connection: "close", "content-type": "application/json" },
+      body: JSON.stringify({ messages: [{ role: "user", content: "hi" }] }),
+    });
+    assert.equal(response.status, 503);
+    const payload = await response.json() as { error: { code: string; message: string } };
+    assert.equal(payload.error.code, "provisioning_failed");
+    assert.equal(payload.error.message, "Unable to provision user worker");
+    assert.equal(payload.error.message.includes("/var/lib/private/path"), false);
+  } finally {
+    await new Promise<void>((resolve) => failedGateway.close(() => resolve()));
+  }
+
+  resetCapturedProxySecrets();
+  resetRequestIdentityForTests();
+  process.env.USER_API_KEYS = JSON.stringify([
+    { key: "user-key-12345678", tenantId: "tenant-a", userId: "user-a" },
+  ]);
+  const missingSocket = `/tmp/cap-worker-missing-${randomUUID().slice(0, 8)}.sock`;
+  const unavailable: WorkerProvisioner = {
+    async ensureWorker() {
+      return { accountName: "cap_0123456789abcdef0123", endpoint: { kind: "unix", address: missingSocket } };
+    },
+  };
+  const secondGateway = createApp({ userWorkerProxy: new UserWorkerProxy(unavailable, 50) }).listen(0);
+  await new Promise<void>((resolve) => secondGateway.once("listening", resolve));
+  try {
+    const port = (secondGateway.address() as AddressInfo).port;
+    const response = await fetch(`http://127.0.0.1:${port}/v1/chat/completions`, {
+      method: "POST",
+      headers: { authorization: "Bearer user-key-12345678", connection: "close", "content-type": "application/json" },
+      body: JSON.stringify({ messages: [{ role: "user", content: "hi" }] }),
+    });
+    assert.equal(response.status, 503);
+    const payload = await response.json() as { error: { code: string; message: string } };
+    assert.equal(payload.error.code, "worker_unavailable");
+    assert.equal(payload.error.message, "User worker unavailable");
+    assert.equal(payload.error.message.includes("cap_0123456789abcdef0123"), false);
+  } finally {
+    await new Promise<void>((resolve) => secondGateway.close(() => resolve()));
   }
 });

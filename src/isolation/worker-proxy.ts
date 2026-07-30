@@ -25,6 +25,15 @@ const PRIVATE_HEADERS = new Set([
   "x-cli-proxy-identity-signature",
 ]);
 
+const PUBLIC_FAILURE_MESSAGES: Record<WorkerIsolationError["code"], string> = {
+  identity_required: "A trusted user identity is required",
+  identity_invalid: "The trusted user identity is invalid",
+  platform_unsupported: "Per-user workers are not supported on this platform",
+  provisioning_failed: "Unable to provision user worker",
+  provisioner_unavailable: "User worker provisioner unavailable",
+  worker_unavailable: "User worker unavailable",
+};
+
 function outgoingHeaders(headers: IncomingHttpHeaders, body: Buffer): IncomingHttpHeaders {
   const result: IncomingHttpHeaders = {};
   for (const [name, value] of Object.entries(headers)) {
@@ -119,12 +128,9 @@ export class UserWorkerProxy {
         ? error
         : new WorkerIsolationError(error instanceof Error ? error.message : "Worker unavailable", "worker_unavailable");
     const status = isolationError.code === "platform_unsupported" ? 501 : 503;
+    console.error(`[UserWorkerProxy] ${isolationError.code}: ${isolationError.message}`);
     res.status(status).json({
-      error: {
-        message: isolationError.message,
-        type: "server_error",
-        code: isolationError.code,
-      },
+      error: { message: PUBLIC_FAILURE_MESSAGES[isolationError.code], type: "server_error", code: isolationError.code },
     });
   }
 }

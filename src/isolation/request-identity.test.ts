@@ -5,7 +5,9 @@ import type { Request, Response } from "express";
 import { resetCapturedProxySecrets } from "../config.js";
 import {
   initRequestIdentity,
+  mappedCompletionKeys,
   requestIdentity,
+  resolveRequestIdentity,
   requireRequestIdentity,
   resetRequestIdentityForTests,
 } from "./request-identity.js";
@@ -101,5 +103,57 @@ describe("request identity", () => {
   test("fails closed on malformed mapping configuration", () => {
     process.env.USER_API_KEYS = JSON.stringify([{ key: "short", tenantId: "tenant-a" }]);
     assert.throws(() => initRequestIdentity(), /requires key, tenantId, and userId/);
+  });
+
+  test("rejects malformed, non-array, non-object, and duplicate mapping entries", () => {
+    process.env.USER_API_KEYS = "{";
+    assert.throws(() => initRequestIdentity(), /valid JSON/);
+
+    resetCapturedProxySecrets();
+    process.env.USER_API_KEYS = JSON.stringify({});
+    assert.throws(() => initRequestIdentity(), /JSON array/);
+
+    resetCapturedProxySecrets();
+    process.env.USER_API_KEYS = JSON.stringify(["not-an-object"]);
+    assert.throws(() => initRequestIdentity(), /entry must be an object/);
+
+    resetCapturedProxySecrets();
+    process.env.USER_API_KEYS = JSON.stringify([
+      { key: "user-key-12345678", tenantId: "tenant-a", userId: "user-a" },
+      { key: "user-key-12345678", tenantId: "tenant-b", userId: "user-b" },
+    ]);
+    assert.throws(() => initRequestIdentity(), /duplicate key/);
+  });
+
+  test("rejects a short HMAC secret and stale or malformed signatures", () => {
+    process.env.USER_IDENTITY_HMAC_SECRET = "too-short";
+    assert.throws(() => initRequestIdentity(), /at least 32 bytes/);
+
+    resetCapturedProxySecrets();
+    process.env.USER_IDENTITY_HMAC_SECRET = "identity-secret-that-is-long-enough";
+    initRequestIdentity();
+    const stale = String(Math.floor(Date.now() / 1000) - 301);
+    const staleRequest = fakeRequest({
+      "x-cli-proxy-tenant-id": "tenant-a",
+      "x-cli-proxy-user-id": "user-a",
+      "x-cli-proxy-identity-timestamp": stale,
+      "x-cli-proxy-identity-signature": "0".repeat(64),
+    });
+    assert.equal(resolveRequestIdentity(staleRequest), null);
+    assert.equal(resolveRequestIdentity(fakeRequest({
+      "x-cli-proxy-tenant-id": "tenant-a",
+      "x-cli-proxy-user-id": "user-a",
+      "x-cli-proxy-identity-timestamp": "invalid",
+      "x-cli-proxy-identity-signature": "invalid",
+    })), null);
+  });
+
+  test("exposes mapped keys and refuses identity lookup before middleware", () => {
+    process.env.USER_API_KEYS = JSON.stringify([
+      { key: "user-key-12345678", tenantId: "tenant-a", userId: "user-a" },
+    ]);
+    initRequestIdentity();
+    assert.deepEqual(mappedCompletionKeys(), ["user-key-12345678"]);
+    assert.throws(() => requestIdentity(fakeRequest({})), /middleware did not run/);
   });
 });

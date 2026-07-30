@@ -15,9 +15,7 @@ export function createProvisionerApp(service: UserProvisioningService): Express 
     } catch (error) {
       const message = error instanceof Error ? error.message : "Provisioning failed";
       console.error(`[Provisioner] ${message}`);
-      res.status(500).json({
-        error: { message, type: "server_error", code: "provisioning_failed" },
-      });
+      res.status(500).json({ error: { message: "Provisioning failed", type: "server_error", code: "provisioning_failed" } });
     }
   });
   app.use((_req, res) => {
