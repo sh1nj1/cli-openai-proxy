@@ -1,0 +1,147 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>cli-openai-proxy — auth flow test</title>
+<style>
+  body { font-family: system-ui, sans-serif; max-width: 640px; margin: 2rem auto; padding: 0 1rem; line-height: 1.5; }
+  fieldset { margin-bottom: 1rem; border: 1px solid #ccc; }
+  label { display: block; margin: 0.5rem 0 0.125rem; }
+  input, select { width: 100%; box-sizing: border-box; padding: 0.375rem; font: inherit; }
+  button { margin: 0.5rem 0.25rem 0 0; padding: 0.375rem 0.75rem; font: inherit; }
+  pre { background: #f4f4f4; padding: 0.75rem; overflow-x: auto; white-space: pre-wrap; word-break: break-all; }
+  .error { color: #b00020; }
+  .ok { color: #087443; }
+</style>
+</head>
+<body>
+<h1>Auth flow test</h1>
+<p>Local test page for the <code>/v1/auth</code> provisioning API. Open this file directly in a browser (the server sends <code>Access-Control-Allow-Origin: *</code>).</p>
+
+<fieldset>
+  <legend>Connection</legend>
+  <label for="baseUrl">Base URL</label>
+  <input id="baseUrl" value="http://localhost:3456">
+  <label for="adminKey">Admin key (AUTH_ADMIN_KEYS)</label>
+  <input id="adminKey" type="password" autocomplete="off">
+</fieldset>
+
+<fieldset>
+  <legend>Engine</legend>
+  <button id="loadEngines">Load engines</button>
+  <label for="engine">Engine</label>
+  <select id="engine"></select>
+  <button id="checkStatus">Check status</button>
+  <button id="forgetCredential">Forget credential</button>
+</fieldset>
+
+<fieldset>
+  <legend>Session</legend>
+  <button id="createSession">Create session</button>
+  <p id="sessionInfo"></p>
+  <label for="codeInput">Code / API key</label>
+  <input id="codeInput" autocomplete="off">
+  <button id="submitCode">Submit</button>
+  <button id="pollSession">Poll</button>
+  <button id="cancelSession">Cancel</button>
+</fieldset>
+
+<fieldset>
+  <legend>Completion test</legend>
+  <label for="apiKey">API key (API_KEYS)</label>
+  <input id="apiKey" type="password" autocomplete="off">
+  <label for="model">Model</label>
+  <input id="model" value="paperclip/claude_local">
+  <button id="testCompletion">Send test completion</button>
+</fieldset>
+
+<h2>Result <span id="resultStatus"></span></h2>
+<pre id="result">—</pre>
+
+<script>
+"use strict";
+
+const $ = (id) => document.getElementById(id);
+let sessionId = null;
+
+function show(status, body) {
+  const el = $("resultStatus");
+  el.textContent = status;
+  el.className = /^2/.test(status) ? "ok" : "error";
+  $("result").textContent = typeof body === "string" ? body : JSON.stringify(body, null, 2);
+}
+
+async function call(method, path, body, key) {
+  const base = $("baseUrl").value.replace(/\/+$/, "");
+  const headers = { Authorization: `Bearer ${key ?? $("adminKey").value}` };
+  if (body) headers["Content-Type"] = "application/json";
+  show("…", `${method} ${path}`);
+  try {
+    const res = await fetch(base + path, { method, headers, body: body && JSON.stringify(body) });
+    const json = await res.json().catch(() => "(no JSON body)");
+    show(String(res.status), json);
+    return res.ok ? json : null;
+  } catch (err) {
+    show("network error", String(err));
+    return null;
+  }
+}
+
+const engine = () => $("engine").value;
+
+$("loadEngines").onclick = async () => {
+  const list = await call("GET", "/v1/auth/engines");
+  if (!list) return;
+  $("engine").replaceChildren(...list.data.map(({ engine, flow }) =>
+    new Option(`${engine} (${flow})`, engine)));
+};
+
+$("checkStatus").onclick = () => call("GET", `/v1/auth/${engine()}/status`);
+$("forgetCredential").onclick = () => call("DELETE", `/v1/auth/${engine()}/credential`);
+
+$("createSession").onclick = async () => {
+  const session = await call("POST", `/v1/auth/${engine()}/sessions`);
+  if (!session) return;
+  sessionId = session.sessionId;
+  const info = $("sessionInfo");
+  info.replaceChildren(`Session ${sessionId} — ${session.instructions ?? ""} `);
+  if (session.verificationUrl) {
+    const a = document.createElement("a");
+    a.href = session.verificationUrl;
+    a.target = "_blank";
+    a.rel = "noreferrer";
+    a.textContent = "Open verification URL";
+    info.append(a);
+  }
+};
+
+$("submitCode").onclick = async (e) => {
+  if (!sessionId) return show("!", "Create a session first.");
+  // One submission drives a session at a time (409 session_submitting) — and the
+  // Claude token exchange can take up to ~2 minutes, so hold the button down.
+  e.target.disabled = true;
+  try {
+    const done = await call("POST", `/v1/auth/${engine()}/sessions/${sessionId}`, { value: $("codeInput").value });
+    if (done && done.status !== "pending") $("codeInput").value = "";
+  } finally {
+    e.target.disabled = false;
+  }
+};
+
+$("pollSession").onclick = () => sessionId
+  ? call("GET", `/v1/auth/${engine()}/sessions/${sessionId}`)
+  : show("!", "Create a session first.");
+
+$("cancelSession").onclick = () => sessionId
+  ? call("DELETE", `/v1/auth/${engine()}/sessions/${sessionId}`)
+  : show("!", "Create a session first.");
+
+$("testCompletion").onclick = () => call("POST", "/v1/chat/completions", {
+  model: $("model").value,
+  messages: [{ role: "user", content: "Reply with exactly: AUTH_OK" }],
+  stream: false,
+}, $("apiKey").value);
+</script>
+</body>
+</html>
