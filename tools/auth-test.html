@@ -63,8 +63,9 @@
 "use strict";
 
 const $ = (id) => document.getElementById(id);
-// The server binds sessions to their engine, so remember the engine from
-// creation time — the selector may change (or reset on reload) afterwards.
+// The server binds sessions to their engine, so remember the engine and base
+// URL from creation time — the selector and connection fields may change
+// (or reset on reload) afterwards.
 let session = null;
 
 function show(status, body) {
@@ -74,8 +75,10 @@ function show(status, body) {
   $("result").textContent = typeof body === "string" ? body : JSON.stringify(body, null, 2);
 }
 
-async function call(method, path, body, key) {
-  const base = $("baseUrl").value.replace(/\/+$/, "");
+const currentBase = () => $("baseUrl").value.replace(/\/+$/, "");
+
+async function call(method, path, { body, key, base } = {}) {
+  base = base ?? currentBase();
   const headers = { Authorization: `Bearer ${key ?? $("adminKey").value}` };
   if (body) headers["Content-Type"] = "application/json";
   show("…", `${method} ${path}`);
@@ -104,18 +107,20 @@ $("forgetCredential").onclick = () => call("DELETE", `/v1/auth/${engine()}/crede
 
 $("createSession").onclick = async () => {
   const target = engine();
-  // The server supersedes only same-engine sessions; a pending session for a
-  // different engine would keep its CLI child alive until TTL, so cancel it.
-  if (session && session.engine !== target) {
-    await call("DELETE", `/v1/auth/${session.engine}/sessions/${session.id}`);
+  const base = currentBase();
+  // The server supersedes only same-engine sessions on the same server; a
+  // pending session for a different engine — or on a different server — would
+  // keep its CLI child alive until TTL, so cancel it where it was created.
+  if (session && (session.engine !== target || session.base !== base)) {
+    await call("DELETE", `/v1/auth/${session.engine}/sessions/${session.id}`, { base: session.base });
     session = null;
     $("sessionInfo").replaceChildren();
   }
-  const created = await call("POST", `/v1/auth/${target}/sessions`);
+  const created = await call("POST", `/v1/auth/${target}/sessions`, { base });
   if (!created) return;
-  session = { id: created.sessionId, engine: created.engine ?? target };
+  session = { id: created.sessionId, engine: created.engine ?? target, base };
   const info = $("sessionInfo");
-  info.replaceChildren(`Session ${session.id} (${session.engine}) — ${created.instructions ?? ""} `);
+  info.replaceChildren(`Session ${session.id} (${session.engine} @ ${session.base}) — ${created.instructions ?? ""} `);
   if (created.verificationUrl) {
     const a = document.createElement("a");
     a.href = created.verificationUrl;
@@ -132,7 +137,8 @@ $("submitCode").onclick = async (e) => {
   // Claude token exchange can take up to ~2 minutes, so hold the button down.
   e.target.disabled = true;
   try {
-    const done = await call("POST", `/v1/auth/${session.engine}/sessions/${session.id}`, { value: $("codeInput").value });
+    const done = await call("POST", `/v1/auth/${session.engine}/sessions/${session.id}`,
+      { body: { value: $("codeInput").value }, base: session.base });
     if (done && done.status !== "pending") $("codeInput").value = "";
   } finally {
     e.target.disabled = false;
@@ -140,18 +146,21 @@ $("submitCode").onclick = async (e) => {
 };
 
 $("pollSession").onclick = () => session
-  ? call("GET", `/v1/auth/${session.engine}/sessions/${session.id}`)
+  ? call("GET", `/v1/auth/${session.engine}/sessions/${session.id}`, { base: session.base })
   : show("!", "Create a session first.");
 
 $("cancelSession").onclick = () => session
-  ? call("DELETE", `/v1/auth/${session.engine}/sessions/${session.id}`)
+  ? call("DELETE", `/v1/auth/${session.engine}/sessions/${session.id}`, { base: session.base })
   : show("!", "Create a session first.");
 
 $("testCompletion").onclick = () => call("POST", "/v1/chat/completions", {
-  model: $("model").value,
-  messages: [{ role: "user", content: "Reply with exactly: AUTH_OK" }],
-  stream: false,
-}, $("apiKey").value);
+  body: {
+    model: $("model").value,
+    messages: [{ role: "user", content: "Reply with exactly: AUTH_OK" }],
+    stream: false,
+  },
+  key: $("apiKey").value,
+});
 </script>
 </body>
 </html>
