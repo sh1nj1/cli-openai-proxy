@@ -89,6 +89,11 @@ export class UserWorkerProxy {
 
     const body = req.body === undefined ? Buffer.alloc(0) : Buffer.from(JSON.stringify(req.body));
     await new Promise<void>((resolve) => {
+      let readinessTimer: ReturnType<typeof setTimeout> | undefined;
+      const clearReadinessTimer = () => {
+        if (readinessTimer !== undefined) clearTimeout(readinessTimer);
+        readinessTimer = undefined;
+      };
       const request = http.request(
         {
           socketPath: target.endpoint.address,
@@ -97,6 +102,7 @@ export class UserWorkerProxy {
           headers: outgoingHeaders(req.headers, body),
         },
         (workerResponse) => {
+          clearReadinessTimer();
           res.status(workerResponse.statusCode ?? 502);
           copyResponseHeaders(workerResponse.headers, res);
           workerResponse.pipe(res);
@@ -110,20 +116,11 @@ export class UserWorkerProxy {
       );
       upstream = request;
 
-      let connected = false;
-      request.on("socket", (socket) => {
-        if (socket.connecting) {
-          socket.once("connect", () => {
-            connected = true;
-            socket.setTimeout(0);
-          });
-        } else {
-          connected = true;
-        }
-      });
-      const onTimeout = () => { if (!connected) request.destroy(new Error(`Worker connect timed out after ${this.connectTimeoutMs}ms`)); };
-      request.setTimeout(this.connectTimeoutMs, onTimeout);
+      readinessTimer = setTimeout(() => {
+        request.destroy(new Error(`Worker readiness timed out after ${this.connectTimeoutMs}ms`));
+      }, this.connectTimeoutMs);
       request.on("error", (error) => {
+        clearReadinessTimer();
         if (!res.headersSent) this.sendFailure(res, new WorkerIsolationError(
           `Worker ${target.accountName} unavailable: ${error.message}`,
           "worker_unavailable",

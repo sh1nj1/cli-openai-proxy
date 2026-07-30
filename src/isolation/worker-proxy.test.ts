@@ -335,3 +335,76 @@ test("client disconnect during provisioning never reaches a worker", { timeout: 
   await forwarding;
   assert.equal(statusCalls, 0);
 });
+
+test("gateway times out when a connected worker never sends response headers", { timeout: 1_000 }, async () => {
+  const socketPath = `/tmp/cap-worker-hung-${randomUUID().slice(0, 8)}.sock`;
+  let workerAccepted!: () => void;
+  const accepted = new Promise<void>((resolve) => { workerAccepted = resolve; });
+  const worker = http.createServer(() => { workerAccepted(); });
+  await new Promise<void>((resolve) => worker.listen(socketPath, resolve));
+
+  process.env.USER_API_KEYS = JSON.stringify([
+    { key: "user-key-12345678", tenantId: "tenant-a", userId: "user-a" },
+  ]);
+  const provisioner: WorkerProvisioner = {
+    async ensureWorker() {
+      return { accountName: "cap_0123456789abcdef0123", endpoint: { kind: "unix", address: socketPath } };
+    },
+  };
+  const gateway = createApp({ userWorkerProxy: new UserWorkerProxy(provisioner, 100) }).listen(0);
+  await new Promise<void>((resolve) => gateway.once("listening", resolve));
+
+  try {
+    const port = (gateway.address() as AddressInfo).port;
+    const responsePromise = fetch(`http://127.0.0.1:${port}/v1/chat/completions`, {
+      method: "POST",
+      headers: { authorization: "Bearer user-key-12345678", "content-type": "application/json" },
+      body: JSON.stringify({ messages: [{ role: "user", content: "hi" }] }),
+    });
+    await accepted;
+    const response = await responsePromise;
+    assert.equal(response.status, 503);
+    const payload = await response.json() as { error: { code: string } };
+    assert.equal(payload.error.code, "worker_unavailable");
+  } finally {
+    await new Promise<void>((resolve) => gateway.close(() => resolve()));
+    await new Promise<void>((resolve) => worker.close(() => resolve()));
+    await rm(socketPath, { force: true });
+  }
+});
+
+test("gateway removes the readiness timeout after worker response headers", { timeout: 1_000 }, async () => {
+  const socketPath = `/tmp/cap-worker-stream-${randomUUID().slice(0, 8)}.sock`;
+  const worker = http.createServer((_request, response) => {
+    response.writeHead(200, { "content-type": "text/plain" });
+    response.flushHeaders();
+    setTimeout(() => response.end("finished"), 250);
+  });
+  await new Promise<void>((resolve) => worker.listen(socketPath, resolve));
+
+  process.env.USER_API_KEYS = JSON.stringify([
+    { key: "user-key-12345678", tenantId: "tenant-a", userId: "user-a" },
+  ]);
+  const provisioner: WorkerProvisioner = {
+    async ensureWorker() {
+      return { accountName: "cap_0123456789abcdef0123", endpoint: { kind: "unix", address: socketPath } };
+    },
+  };
+  const gateway = createApp({ userWorkerProxy: new UserWorkerProxy(provisioner, 100) }).listen(0);
+  await new Promise<void>((resolve) => gateway.once("listening", resolve));
+
+  try {
+    const port = (gateway.address() as AddressInfo).port;
+    const response = await fetch(`http://127.0.0.1:${port}/v1/chat/completions`, {
+      method: "POST",
+      headers: { authorization: "Bearer user-key-12345678", "content-type": "application/json" },
+      body: JSON.stringify({ messages: [{ role: "user", content: "hi" }] }),
+    });
+    assert.equal(response.status, 200);
+    assert.equal(await response.text(), "finished");
+  } finally {
+    await new Promise<void>((resolve) => gateway.close(() => resolve()));
+    await new Promise<void>((resolve) => worker.close(() => resolve()));
+    await rm(socketPath, { force: true });
+  }
+});
