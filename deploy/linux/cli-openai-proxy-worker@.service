@@ -7,9 +7,12 @@ After=cli-openai-proxy-worker@%i.socket
 Type=simple
 User=%i
 Group=%i
-WorkingDirectory=%h
+# Not %h: in system units %h is the service manager's home (/root), never the
+# home of User=. Spell the provisioned home out so cwd/HOME/write scope all
+# land inside this user's directory.
+WorkingDirectory=/var/lib/cli-openai-proxy/users/%i
 ExecStart=@NODE@ @APP_ROOT@/dist/server/worker-standalone.js
-Environment=HOME=%h
+Environment=HOME=/var/lib/cli-openai-proxy/users/%i
 Environment=WORKER_LISTEN_FD=3
 Environment=PATH=/usr/local/bin:/usr/bin:/bin
 # The gateway guarantees that only this OS user's authenticated requests reach
@@ -20,7 +23,7 @@ CapabilityBoundingSet=
 PrivateTmp=yes
 PrivateDevices=yes
 ProtectSystem=strict
-ReadWritePaths=%h
+ReadWritePaths=/var/lib/cli-openai-proxy/users/%i
 ProtectKernelTunables=yes
 ProtectKernelModules=yes
 ProtectControlGroups=yes
