@@ -15,6 +15,7 @@ SOURCE_ROOT="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
 NODE_PATH="$(readlink -f "$(command -v node)")"
 UNIT_SOURCE="${SOURCE_ROOT}/deploy/linux"
 UNIT_TARGET="/etc/systemd/system"
+TMPFILES_TARGET="/etc/tmpfiles.d"
 CONFIG_DIR="/etc/cli-openai-proxy"
 STATE_DIR="/var/lib/cli-openai-proxy"
 RUNTIME_BASE="/opt/cli-openai-proxy/releases"
@@ -45,6 +46,7 @@ fi
 
 install -d -o root -g root -m 0755 "${CONFIG_DIR}"
 install -d -o root -g root -m 0755 "${RUNTIME_BASE}"
+install -d -o root -g root -m 0755 "${TMPFILES_TARGET}"
 install -d -o root -g root -m 0700 "${STATE_DIR}/provisioner"
 install -d -o root -g root -m 0755 "${STATE_DIR}/users"
 install -d -o cli-openai-proxy -g cli-openai-proxy -m 0700 "${STATE_DIR}/gateway"
@@ -89,6 +91,11 @@ do
     "${UNIT_SOURCE}/${unit}" > "${UNIT_TARGET}/${unit}"
   chmod 0644 "${UNIT_TARGET}/${unit}"
 done
+
+install -o root -g root -m 0644 \
+  "${UNIT_SOURCE}/cli-openai-proxy-tmpfiles.conf" \
+  "${TMPFILES_TARGET}/cli-openai-proxy.conf"
+systemd-tmpfiles --create "${TMPFILES_TARGET}/cli-openai-proxy.conf"
 
 systemctl daemon-reload
 systemctl enable --now cli-openai-proxy-provisioner.socket

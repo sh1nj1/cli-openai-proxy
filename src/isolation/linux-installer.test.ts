@@ -14,3 +14,16 @@ test("Linux installer restarts active services after replacing their runtime", a
   );
   assert.doesNotMatch(script, /systemctl enable --now cli-openai-proxy-gateway\.service/);
 });
+
+test("Linux runtime socket directories remain traversable after reboot", async () => {
+  const script = await readFile(new URL("../../scripts/install-linux-user-workers.sh", import.meta.url), "utf8");
+  const tmpfiles = await readFile(
+    new URL("../../deploy/linux/cli-openai-proxy-tmpfiles.conf", import.meta.url),
+    "utf8",
+  );
+  assert.match(tmpfiles, /^d \/run\/cli-openai-proxy 0750 root cli-openai-proxy -$/m);
+  assert.match(tmpfiles, /^d \/run\/cli-openai-proxy\/workers 0750 root cli-openai-proxy -$/m);
+  const createDirectories = script.indexOf("systemd-tmpfiles --create");
+  const enableSocket = script.indexOf("systemctl enable --now cli-openai-proxy-provisioner.socket");
+  assert.ok(createDirectories >= 0 && createDirectories < enableSocket);
+});
