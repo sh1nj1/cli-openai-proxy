@@ -80,7 +80,8 @@ function signedIdentity(req: Request): UserIdentity | null {
   }
   const now = Math.floor(Date.now() / 1000);
   if (Math.abs(now - Number(timestamp)) > MAX_CLOCK_SKEW_SECONDS) return null;
-  const payload = ["v1", req.method.toUpperCase(), req.path, timestamp, tenantId, userId].join("\n");
+  const requestPath = req.originalUrl.split("?", 1)[0] || "/";
+  const payload = ["v1", req.method.toUpperCase(), requestPath, timestamp, tenantId, userId].join("\n");
   const expected = createHmac("sha256", hmacSecret).update(payload).digest();
   const actual = Buffer.from(signature, "hex");
   return actual.length === expected.length && timingSafeEqual(actual, expected) ? identity : null;

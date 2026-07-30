@@ -17,6 +17,7 @@ function fakeRequest(headers: Record<string, string>, path = "/v1/chat/completio
   return {
     method: "POST",
     path,
+    originalUrl: path,
     headers: normalized,
     header(name: string) {
       return normalized[name.toLowerCase()];
@@ -98,6 +99,24 @@ describe("request identity", () => {
     const response = fakeResponse();
     requireRequestIdentity(tampered, response, () => assert.fail("tampered identity must not pass"));
     assert.equal(response.statusCode, 401);
+  });
+
+  test("binds HMAC identity to the original path without its query string", () => {
+    const secret = "identity-secret-that-is-long-enough";
+    process.env.USER_IDENTITY_HMAC_SECRET = secret;
+    initRequestIdentity();
+    const timestamp = String(Math.floor(Date.now() / 1000));
+    const payload = ["v1", "POST", "/v1/chat/completions", timestamp, "tenant-a", "user-a"].join("\n");
+    const signature = createHmac("sha256", secret).update(payload).digest("hex");
+    const request = fakeRequest({
+      "x-cli-proxy-tenant-id": "tenant-a",
+      "x-cli-proxy-user-id": "user-a",
+      "x-cli-proxy-identity-timestamp": timestamp,
+      "x-cli-proxy-identity-signature": signature,
+    }, "/");
+    request.originalUrl = "/v1/chat/completions?stream=true";
+
+    assert.deepEqual(resolveRequestIdentity(request), { tenantId: "tenant-a", userId: "user-a" });
   });
 
   test("fails closed on malformed mapping configuration", () => {
