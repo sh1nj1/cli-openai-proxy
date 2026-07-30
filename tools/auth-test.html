@@ -169,8 +169,22 @@ $("submitCode").onclick = async (e) => {
   e.target.disabled = true;
   try {
     const done = await call("POST", `/v1/auth/${submitted.engine}/sessions/${submitted.id}`,
-      { body: { value: $("codeInput").value }, base: submitted.base, key: submitted.key });
-    if (done && done.status !== "pending") {
+      { body: { value: $("codeInput").value }, base: submitted.base, key: submitted.key, okStatus: 404 });
+    if (!done) return;
+    // A 404 (error envelope, not a session view) confirms the session no longer
+    // exists server-side — expired or the server restarted — so drop the dead
+    // record just like poll does; the code input is left alone since nothing
+    // was consumed. The envelope is told apart by the missing `status`, not by
+    // `error`: a terminal "failed" view carries an error field too. Skip if
+    // Create already replaced the record mid-request.
+    if (!done.status) {
+      if (session && session.id === submitted.id && session.base === submitted.base) {
+        session = null;
+        $("sessionInfo").replaceChildren();
+      }
+      return;
+    }
+    if (done.status !== "pending") {
       $("codeInput").value = "";
       // authorized and failed are terminal: the server disposes the session on
       // both, so drop the dead record — otherwise a later Create would try to
@@ -194,9 +208,11 @@ $("pollSession").onclick = async () => {
   // A 404 (error envelope, not a session view) confirms the session no longer
   // exists server-side — expired or the server restarted — so drop the dead
   // record; otherwise a later Create would try to cancel it at a server that
-  // may have become unreachable and refuse to proceed. Skip if Create already
-  // replaced the record while the poll was in flight.
-  if (res && res.error && session && session.id === polled.id && session.base === polled.base) {
+  // may have become unreachable and refuse to proceed. The envelope is told
+  // apart by the missing `status` (session views can carry an error field
+  // too). Skip if Create already replaced the record while the poll was in
+  // flight.
+  if (res && !res.status && session && session.id === polled.id && session.base === polled.base) {
     session = null;
     $("sessionInfo").replaceChildren();
   }
