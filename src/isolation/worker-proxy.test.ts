@@ -21,9 +21,27 @@ import { UserWorkerProxy } from "./worker-proxy.js";
 afterEach(() => {
   resetCapturedProxySecrets();
   resetRequestIdentityForTests();
-  for (const name of ["API_KEYS", "AUTH_ADMIN_KEYS", "USER_API_KEYS", "USER_IDENTITY_HMAC_SECRET"]) {
+  for (const name of [
+    "API_KEYS",
+    "AUTH_ADMIN_KEYS",
+    "USER_API_KEYS",
+    "USER_IDENTITY_HMAC_SECRET",
+    "USER_WORKER_MODE",
+  ]) {
     delete process.env[name];
   }
+});
+
+test("identity configuration fails closed without active worker routing", () => {
+  process.env.USER_WORKER_MODE = "enabled";
+  process.env.USER_API_KEYS = JSON.stringify([
+    { key: "user-key-12345678", tenantId: "tenant-a", userId: "user-a" },
+  ]);
+  assert.throws(
+    () => createApp(),
+    /require active per-user worker routing/,
+    "the mode flag alone must not authorize mapped keys on the shared gateway",
+  );
 });
 
 test("gateway provisions by authenticated identity and strips private headers", async () => {

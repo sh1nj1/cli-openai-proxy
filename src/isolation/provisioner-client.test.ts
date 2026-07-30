@@ -118,6 +118,23 @@ test("provisioner client fails closed when its IPC endpoint is unavailable", asy
   );
 });
 
+test("provisioner client rejects a response truncated before completion", { timeout: 1_000 }, async () => {
+  const endpoint = await listen(http.createServer((_request, response) => {
+    response.writeHead(200, { "content-type": "application/json" });
+    response.flushHeaders();
+    response.write('{"accountName":"cap_0123"');
+    setImmediate(() => response.destroy());
+  }));
+  const client = new IpcProvisionerClient({ kind: "unix", address: endpoint }, 500);
+  await assert.rejects(
+    client.ensureWorker({ tenantId: "tenant-a", userId: "user-a" }),
+    (error) =>
+      error instanceof WorkerIsolationError
+      && error.code === "provisioner_unavailable"
+      && error.message.includes("response interrupted"),
+  );
+});
+
 test("platform factory creates Linux and Windows IPC clients", () => {
   assert.ok(createPlatformProvisioner("linux", "/tmp/provisioner.sock") instanceof IpcProvisionerClient);
   assert.ok(createPlatformProvisioner("win32", "\\\\.\\pipe\\provisioner") instanceof IpcProvisionerClient);

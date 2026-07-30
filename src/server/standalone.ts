@@ -35,7 +35,8 @@ async function main(): Promise<void> {
 
   // Capture gateway-only credentials before preflight launches any CLI child.
   // createApp re-initializes from the in-memory capture when the listener starts.
-  const security = initializeGatewaySecurity();
+  const perUserWorkers = userWorkerModeEnabled();
+  const security = initializeGatewaySecurity(perUserWorkers);
 
   // Preflight. Claude CLI / auth are non-fatal: the proxy also serves
   // non-Claude adapter models (e.g. paperclip/codex_local),
@@ -43,7 +44,6 @@ async function main(): Promise<void> {
   // surfaced as a warning; a claude-targeted request fails cleanly at request
   // time instead.
   console.log("\n[Preflight]");
-  const perUserWorkers = userWorkerModeEnabled();
   const { claudeOk } = perUserWorkers
     ? { claudeOk: true }
     : await runPreflight({

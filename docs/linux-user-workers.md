@@ -62,6 +62,8 @@ during a maintenance window.
 
 The OpenAI request body's `user` field is session data and is never an authority.
 Worker mode fails closed unless one of these identity mechanisms succeeds.
+The gateway also refuses to start when either identity mechanism is configured
+without active per-user worker routing.
 
 ### Per-user API keys
 

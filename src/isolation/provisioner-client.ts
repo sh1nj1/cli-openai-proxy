@@ -65,6 +65,21 @@ export class IpcProvisionerClient implements WorkerProvisioner {
         (response) => {
           const chunks: Buffer[] = [];
           let length = 0;
+	  const rejectInterrupted = (detail: string) => {
+	    reject(new WorkerIsolationError(
+	      `Provisioner response interrupted: ${detail}`,
+	      "provisioner_unavailable",
+	    ));
+	  };
+	  response.once("aborted", () => {
+	    rejectInterrupted("connection aborted");
+	  });
+	  response.once("error", (error) => {
+	    rejectInterrupted(error.message);
+	  });
+	  response.once("close", () => {
+	    if (!response.complete) rejectInterrupted("connection closed before completion");
+	  });
           response.on("data", (chunk: Buffer) => {
             length += chunk.length;
             if (length > 64 * 1024) {

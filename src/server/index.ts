@@ -40,8 +40,16 @@ export interface AppConfig {
 
 let serverInstance: Server | null = null;
 
-export function initializeGatewaySecurity() {
+export function initializeGatewaySecurity(userWorkerRoutingActive = false) {
   const identity = initRequestIdentity();
+  if (
+    !userWorkerRoutingActive
+    && (identity.mappedKeyCount > 0 || identity.signedHeadersEnabled)
+  ) {
+    throw new Error(
+      "USER_API_KEYS and USER_IDENTITY_HMAC_SECRET require active per-user worker routing",
+    );
+  }
   const auth = initAuth();
   const admin = initAuthAdmin();
   return { identity, auth, admin };
@@ -59,7 +67,7 @@ export function createApp(config: AppConfig = {}): Express {
     // Identity mappings must initialize first: mapped user keys are also valid
     // completion keys, and initAuth captures that combined set.
     const { identity: identityStatus, auth: authStatus, admin: adminStatus } =
-      initializeGatewaySecurity();
+      initializeGatewaySecurity(userWorkerProxy !== undefined);
     if (authStatus.enabled) {
       console.log(`[Server] API key auth enabled (${authStatus.keyCount} key(s))`);
     }
