@@ -41,7 +41,7 @@
   <button id="createSession">Create session</button>
   <p id="sessionInfo"></p>
   <label for="codeInput">Code / API key</label>
-  <input id="codeInput" autocomplete="off">
+  <input id="codeInput" type="password" autocomplete="off">
   <button id="submitCode">Submit</button>
   <button id="pollSession">Poll</button>
   <button id="cancelSession">Cancel</button>
@@ -105,34 +105,41 @@ $("loadEngines").onclick = async () => {
 $("checkStatus").onclick = () => call("GET", `/v1/auth/${engine()}/status`);
 $("forgetCredential").onclick = () => call("DELETE", `/v1/auth/${engine()}/credential`);
 
-$("createSession").onclick = async () => {
-  const target = engine();
-  const base = currentBase();
-  const key = $("adminKey").value;
-  // The server supersedes only same-engine sessions on the same server; a
-  // pending session for a different engine — or on a different server — would
-  // keep its CLI child alive until TTL, so cancel it where it was created,
-  // with the key it was created under. 404 means it is already gone; on any
-  // other failure keep the session tracked so cancellation can be retried.
-  if (session && (session.engine !== target || session.base !== base)) {
-    const gone = await call("DELETE", `/v1/auth/${session.engine}/sessions/${session.id}`,
-      { base: session.base, key: session.key, okStatus: 404 });
-    if (!gone) return;
-    session = null;
-    $("sessionInfo").replaceChildren();
-  }
-  const created = await call("POST", `/v1/auth/${target}/sessions`, { base, key });
-  if (!created) return;
-  session = { id: created.sessionId, engine: created.engine ?? target, base, key };
-  const info = $("sessionInfo");
-  info.replaceChildren(`Session ${session.id} (${session.engine} @ ${session.base}) — ${created.instructions ?? ""} `);
-  if (created.verificationUrl) {
-    const a = document.createElement("a");
-    a.href = created.verificationUrl;
-    a.target = "_blank";
-    a.rel = "noreferrer";
-    a.textContent = "Open verification URL";
-    info.append(a);
+$("createSession").onclick = async (e) => {
+  // A Claude create waits for the CLI to print its URL, so a second click could
+  // race this one and orphan whichever session record loses the overwrite.
+  e.target.disabled = true;
+  try {
+    const target = engine();
+    const base = currentBase();
+    const key = $("adminKey").value;
+    // The server supersedes only same-engine sessions on the same server; a
+    // pending session for a different engine — or on a different server — would
+    // keep its CLI child alive until TTL, so cancel it where it was created,
+    // with the key it was created under. 404 means it is already gone; on any
+    // other failure keep the session tracked so cancellation can be retried.
+    if (session && (session.engine !== target || session.base !== base)) {
+      const gone = await call("DELETE", `/v1/auth/${session.engine}/sessions/${session.id}`,
+        { base: session.base, key: session.key, okStatus: 404 });
+      if (!gone) return;
+      session = null;
+      $("sessionInfo").replaceChildren();
+    }
+    const created = await call("POST", `/v1/auth/${target}/sessions`, { base, key });
+    if (!created) return;
+    session = { id: created.sessionId, engine: created.engine ?? target, base, key };
+    const info = $("sessionInfo");
+    info.replaceChildren(`Session ${session.id} (${session.engine} @ ${session.base}) — ${created.instructions ?? ""} `);
+    if (created.verificationUrl) {
+      const a = document.createElement("a");
+      a.href = created.verificationUrl;
+      a.target = "_blank";
+      a.rel = "noreferrer";
+      a.textContent = "Open verification URL";
+      info.append(a);
+    }
+  } finally {
+    e.target.disabled = false;
   }
 };
 
