@@ -46,8 +46,7 @@ class FakeSession implements EngineAuthSession {
 
 const fakeDescriptor: EngineAuthDescriptor = {
   engine: "fake",
-  flow: "paste-code",
-  createSession: () => new FakeSession(),
+  flows: [{ flow: "paste-code", createSession: () => new FakeSession() }],
   checkStatus: async () => ({ state: "authenticated", source: "provisioned" }),
 };
 
@@ -164,12 +163,17 @@ describe("auth-routes", () => {
     assert.equal(nexted, true);
   });
 
-  test("GET engines advertises each engine's flow so the caller can branch its UI", () => {
+  test("GET engines advertises each engine's flows so the caller can branch its UI", () => {
     const res = fakeRes();
     handleAuthEngines(fakeReq(), res);
-    const data = (res.payload as { data: Array<{ engine: string; flow: string }> }).data;
-    assert.deepEqual(data.find((e) => e.engine === "claude"), { engine: "claude", flow: "paste-code" });
-    assert.deepEqual(data.find((e) => e.engine === "codex"), { engine: "codex", flow: "api-key" });
+    const data = (res.payload as { data: Array<{ engine: string; flow: string; flows: string[] }> }).data;
+    // `flow` stays the default so a caller written against single-flow engines keeps working.
+    assert.deepEqual(data.find((e) => e.engine === "claude"), {
+      engine: "claude", flow: "paste-code", flows: ["paste-code"],
+    });
+    assert.deepEqual(data.find((e) => e.engine === "codex"), {
+      engine: "codex", flow: "api-key", flows: ["api-key", "device-code"],
+    });
   });
 
   test("an unregistered engine answers 404 rather than starting anything", async () => {
@@ -201,6 +205,34 @@ describe("auth-routes", () => {
     assert.equal(view.status, "pending");
     assert.equal(view.verificationUrl, "https://example.test/authorize");
     assert.ok(view.sessionId);
+  });
+
+  test("a non-string `flow` is refused before reaching the session manager", async () => {
+    const res = fakeRes();
+    await handleCreateAuthSession(fakeReq({ params: { engine: "fake" } as any, body: { flow: 42 } }), res);
+    assert.equal(res.statusCode, 400);
+    assert.equal(errorOf(res).code, "invalid_flow");
+  });
+
+  test("a flow the engine does not offer answers 400 naming the supported ones", async () => {
+    const res = fakeRes();
+    await handleCreateAuthSession(
+      fakeReq({ params: { engine: "fake" } as any, body: { flow: "device-code" } }),
+      res,
+    );
+    assert.equal(res.statusCode, 400);
+    assert.equal(errorOf(res).code, "unsupported_flow");
+    assert.match(errorOf(res).message, /paste-code/);
+  });
+
+  test("an explicitly empty flow is unsupported rather than defaulted", async () => {
+    const res = fakeRes();
+    await handleCreateAuthSession(
+      fakeReq({ params: { engine: "fake" } as any, body: { flow: "" } }),
+      res,
+    );
+    assert.equal(res.statusCode, 400);
+    assert.equal(errorOf(res).code, "unsupported_flow");
   });
 
   test("submit accepts `code` and `api_key` as aliases of `value`", async () => {
@@ -242,7 +274,7 @@ describe("auth-routes", () => {
     const res = fakeRes();
     await handleAuthStatus(fakeReq({ params: { engine: "fake" } as any }), res);
     assert.deepEqual(res.payload, {
-      engine: "fake", flow: "paste-code", state: "authenticated", source: "provisioned",
+      engine: "fake", flow: "paste-code", flows: ["paste-code"], state: "authenticated", source: "provisioned",
     });
   });
 

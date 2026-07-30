@@ -79,8 +79,9 @@ person. Without it, `POST /v1/auth/claude/sessions` answers `403
 caller_trust_not_declared` (refused before you complete a login, so no token is
 minted), and any credential already held is withheld from CLI children.
 
-`codex` is not gated: `codex login --with-api-key` persists to `~/.codex`
-itself, so nothing of its is injected into an environment this proxy builds.
+`codex` is not gated: both of its flows (`codex login --with-api-key` and
+`codex login --device-auth`) persist to `~/.codex` themselves, so nothing of
+codex's is injected into an environment this proxy builds.
 Note that the file it writes is still readable by a completion caller's shell —
 but that is the host's own pre-existing posture, identical to logging in at the
 console, and unchanged by this API.
@@ -88,14 +89,30 @@ console, and unchanged by this API.
 ## Flows
 
 Each engine declares the shape of its login, so the client branches its UI on
-`flow` rather than on the engine name:
+`flow` rather than on the engine name. An engine may offer several flows; the
+first is its default, and `POST …/sessions` picks one by name:
 
 | Engine | `flow` | CLI command | Credential ends up |
 | --- | --- | --- | --- |
-| `codex` | `api-key` | `codex login --with-api-key` (key over stdin) | in `~/.codex`, written by the CLI |
+| `codex` | `api-key` (default) | `codex login --with-api-key` (key over stdin) | in `~/.codex`, written by the CLI |
+| `codex` | `device-code` | `codex login --device-auth` | in `~/.codex`, written by the CLI |
 | `claude` | `paste-code` | `claude setup-token` | in proxy memory, injected per run — requires `AUTH_TRUST_COMPLETION_CALLERS` |
 
 **`api-key`** — no verification URL. Submit the key; the CLI stores it itself.
+
+**`device-code`** — the ChatGPT *subscription* login for codex. Plain
+`codex login` cannot work remotely: its OAuth redirect targets localhost on the
+proxy host, unreachable from the user's browser. Device auth has no redirect —
+the CLI prints a verification URL and a one-time `userCode`, the user enters
+the code at the URL, and the CLI polls OpenAI until the login is approved.
+
+The direction is the reverse of paste-code: the user carries the code *from*
+the session *to* the browser, so nothing is ever submitted back — a POST to the
+session answers `400 submission_not_supported`. Instead the session concludes
+on its own when the CLI reaches its verdict, and the client polls
+`GET …/sessions/{id}` until `status` leaves `pending`. A concluded device-code
+session stays readable until its TTL (the poll that discovers the outcome needs
+something to read), but releases the engine's session slot immediately.
 
 **`paste-code`** — `claude setup-token` prints an OAuth URL and then blocks
 waiting for the code the user gets back from it. Its redirect target is
@@ -124,10 +141,14 @@ All require `Authorization: Bearer <AUTH_ADMIN_KEYS entry>`.
 
 ```json
 { "object": "list", "data": [
-  { "engine": "claude", "flow": "paste-code" },
-  { "engine": "codex",  "flow": "api-key" }
+  { "engine": "claude", "flow": "paste-code", "flows": ["paste-code"] },
+  { "engine": "codex",  "flow": "api-key",    "flows": ["api-key", "device-code"] }
 ] }
 ```
+
+`flows` lists every supported flow; `flow` repeats the default — the shape
+callers relied on when engines had exactly one flow, kept so they keep working
+unchanged. The status endpoint carries the same two fields.
 
 ### `GET /v1/auth/{engine}/status`
 
@@ -149,7 +170,9 @@ runs cannot use. An explicit host credential can still make the status
 
 ### `POST /v1/auth/{engine}/sessions` → `201`
 
-Starts an attempt, superseding any existing one for that engine.
+Starts an attempt, superseding any existing pending one for that engine. The
+body may name a `flow` (`{"flow": "device-code"}`); omitted means the engine's
+default. A flow the engine does not offer answers `400 unsupported_flow`.
 
 The engine's single session slot is claimed before the CLI is asked for its URL,
 so two overlapping starts cannot both take it. The loser is answered `409
@@ -168,7 +191,21 @@ expires — and its CLI child is killed immediately. Retry to get the slot back.
 }
 ```
 
-`verificationUrl` is present only for `paste-code`.
+`verificationUrl` is present for `paste-code` and `device-code`; `userCode`
+(the one-time code the user enters at the URL) only for `device-code`:
+
+```json
+{
+  "sessionId": "41d3adfe-…",
+  "engine": "codex",
+  "flow": "device-code",
+  "status": "pending",
+  "verificationUrl": "https://auth.openai.com/codex/device",
+  "userCode": "YQVF-8EBLA",
+  "instructions": "Open the URL, sign in to ChatGPT, and enter the one-time code…",
+  "expiresAt": "2026-07-30T09:12:44.120Z"
+}
+```
 
 ### `POST /v1/auth/{engine}/sessions/{sessionId}`
 
@@ -192,8 +229,11 @@ races the first to replace the host credential. Retry once the first completes.
 
 ### `GET /v1/auth/{engine}/sessions/{sessionId}`
 
-Poll a pending session. Completed and cancelled sessions are forgotten, so they
-answer `404 unknown_session`.
+Poll a pending session. Sessions completed by a submit and cancelled sessions
+are forgotten, so they answer `404 unknown_session` — the submit response
+already carried the outcome. A `device-code` session has no such response, so
+its terminal `status` (with `error` on failure) remains readable here until the
+session's TTL reaps it.
 
 ### `DELETE /v1/auth/{engine}/sessions/{sessionId}`
 

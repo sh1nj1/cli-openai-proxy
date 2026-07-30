@@ -5,6 +5,7 @@
  */
 
 import { CodexApiKeySession, commandRunner } from "./adapters/codex-api-key.js";
+import { CodexDeviceAuthSession } from "./adapters/codex-device-auth.js";
 import { CLAUDE_OAUTH_TOKEN_ENV, ClaudeSetupTokenSession } from "./adapters/claude-setup-token.js";
 import { hasInjectableCredential } from "./token-store.js";
 import type { EngineAuthDescriptor, EngineAuthStatus } from "./types.js";
@@ -60,17 +61,26 @@ async function codexStatus(): Promise<EngineAuthStatus> {
 const REGISTRY: Record<string, EngineAuthDescriptor> = {
   claude: {
     engine: "claude",
-    flow: "paste-code",
-    // `claude setup-token` prints its token instead of persisting it, so the
-    // proxy must hold it and inject it into every run.
-    injectsCredential: true,
-    createSession: () => new ClaudeSetupTokenSession(),
+    flows: [
+      {
+        flow: "paste-code",
+        // `claude setup-token` prints its token instead of persisting it, so the
+        // proxy must hold it and inject it into every run.
+        injectsCredential: true,
+        createSession: () => new ClaudeSetupTokenSession(),
+      },
+    ],
     checkStatus: claudeStatus,
   },
   codex: {
     engine: "codex",
-    flow: "api-key",
-    createSession: () => new CodexApiKeySession(),
+    flows: [
+      // api-key stays first: it was this engine's only flow before device-code
+      // existed, and the default is what a caller naming no flow still gets.
+      { flow: "api-key", createSession: () => new CodexApiKeySession() },
+      // ChatGPT subscription login. Both flows end in ~/.codex, written by the CLI.
+      { flow: "device-code", createSession: () => new CodexDeviceAuthSession() },
+    ],
     checkStatus: codexStatus,
   },
 };

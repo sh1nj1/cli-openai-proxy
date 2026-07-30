@@ -1,10 +1,15 @@
 /**
  * In-memory registry of in-flight auth attempts.
  *
- * The "paste-code" flow holds a live CLI child between the start and submit
- * requests, so an abandoned session is a leaked process. Two invariants keep
- * that bounded: at most one session per engine (a new start cancels the old),
- * every session is reaped after a TTL, and server shutdown drops them all.
+ * The "paste-code" and "device-code" flows hold a live CLI child after start —
+ * so an abandoned session is a leaked process. Two invariants keep that
+ * bounded: at most one *pending* session per engine (a new start cancels the
+ * old), every session is reaped after a TTL, and server shutdown drops them all.
+ *
+ * "device-code" sessions finish without a submit request, so their terminal
+ * status arrives asynchronously (see settleWhenDone). A concluded session stays
+ * queryable until its TTL — the poll that discovers the outcome needs something
+ * to read — but releases its engine slot immediately.
  *
  * Sessions are not persisted. A proxy restart drops them and the caller simply
  * restarts the flow — the same trade-off as the memory-only token store. That
@@ -32,6 +37,8 @@ export interface SessionView {
   flow: AuthFlow;
   status: SessionStatus;
   verificationUrl?: string;
+  /** "device-code" only: the one-time code the user enters at the URL. */
+  userCode?: string;
   instructions: string;
   expiresAt: string;
   error?: { message: string; code: string };
@@ -96,15 +103,25 @@ function supersededError(engine: string): AuthProvisioningError {
  * Start a new attempt for `engine`, superseding any existing one. Rejects with
  * AuthProvisioningError for an unknown engine or a flow that fails to start —
  * no record is kept in that case, so a failed start leaves nothing to reap.
+ * `flow` picks among the engine's flows; omitted means the engine's default.
  */
-export async function createSession(engine: string): Promise<SessionView> {
+export async function createSession(engine: string, flow?: string): Promise<SessionView> {
   const descriptor = resolveEngine(engine);
   if (!descriptor) {
     throw new AuthProvisioningError(`Unknown engine "${engine}"`, "unknown_engine");
   }
+  const flowDescriptor = flow !== undefined
+    ? descriptor.flows.find((f) => f.flow === flow)
+    : descriptor.flows[0];
+  if (!flowDescriptor) {
+    throw new AuthProvisioningError(
+      `Engine "${engine}" does not support flow "${flow}". Supported: ${descriptor.flows.map((f) => f.flow).join(", ")}.`,
+      "unsupported_flow",
+    );
+  }
   // Refused before the flow starts, not after: the caller would otherwise mint a
   // real token through the OAuth dance and only then learn we will not use it.
-  if (descriptor.injectsCredential && !trustsCompletionCallers()) {
+  if (flowDescriptor.injectsCredential && !trustsCompletionCallers()) {
     throw new AuthProvisioningError(
       `Provisioning "${engine}" is refused: its credential can only reach the CLI through a ` +
         `completion child's environment, which any completion caller can read. Set ` +
@@ -127,7 +144,7 @@ export async function createSession(engine: string): Promise<SessionView> {
     superseded.handle.cancel();
   }
 
-  const handle = descriptor.createSession();
+  const handle = flowDescriptor.createSession();
   const reservation = { handle };
   starting.set(engine, reservation);
 
@@ -168,9 +185,10 @@ export async function createSession(engine: string): Promise<SessionView> {
   const record: SessionRecord = {
     sessionId,
     engine,
-    flow: descriptor.flow,
+    flow: flowDescriptor.flow,
     status: "pending",
     verificationUrl: started.verificationUrl,
+    userCode: started.userCode,
     instructions: started.instructions,
     expiresAt,
     handle,
@@ -179,7 +197,35 @@ export async function createSession(engine: string): Promise<SessionView> {
   };
   byId.set(sessionId, record);
   byEngine.set(engine, sessionId);
+  if (handle.wait) settleWhenDone(record);
   return view(record);
+}
+
+/**
+ * Consume a self-completing flow's outcome (see EngineAuthSession.wait). The
+ * record keeps its terminal status until the TTL reaper drops it, so the caller's
+ * poll can still read it — but the engine slot is released at once: a concluded
+ * attempt holds no child worth superseding, and must not block the next login.
+ */
+function settleWhenDone(record: SessionRecord): void {
+  const conclude = (status: SessionStatus, error?: SessionView["error"]) => {
+    // A session that was cancelled, superseded, or reaped already told its story.
+    if (byId.get(record.sessionId) !== record || record.status !== "pending") return;
+    record.status = status;
+    record.error = error;
+    if (byEngine.get(record.engine) === record.sessionId) byEngine.delete(record.engine);
+  };
+  record.handle.wait!().then(
+    (result) => {
+      if (result.credential) setCredential(record.engine, result.credential);
+      conclude("authorized");
+    },
+    (err) => {
+      const message = err instanceof Error ? err.message : String(err);
+      const code = err instanceof AuthProvisioningError ? err.code : "login_failed";
+      conclude("failed", { message, code });
+    },
+  );
 }
 
 function requireSession(engine: string, sessionId: string): SessionRecord {
@@ -202,6 +248,15 @@ export async function submitSession(
     throw new AuthProvisioningError(
       `Session is already ${record.status}`,
       "session_not_pending",
+    );
+  }
+  // Refused WITHOUT touching the session: the adapter's submit() would throw
+  // the same error, but through the catch below — concluding a login that is
+  // still waiting for the user because someone POSTed to the wrong endpoint.
+  if (record.handle.wait) {
+    throw new AuthProvisioningError(
+      "This flow takes no submission: enter the code at the verification URL, then poll the session.",
+      "submission_not_supported",
     );
   }
   // `status` alone cannot gate this: it stays "pending" until submit() resolves,
@@ -242,9 +297,13 @@ export function getSession(engine: string, sessionId: string): SessionView {
 
 export function cancelSession(engine: string, sessionId: string): SessionView {
   const record = requireSession(engine, sessionId);
-  const cancelled: SessionView = { ...view(record), status: "cancelled" };
-  dispose(record, "cancelled");
-  return cancelled;
+  // A concluded device-code session has nothing left to cancel; deleting it
+  // early is fine, but reporting "cancelled" would contradict the outcome the
+  // caller may already have seen. Keep the terminal status it earned.
+  const status: SessionStatus = record.status === "pending" ? "cancelled" : record.status;
+  const result: SessionView = { ...view(record), status };
+  dispose(record, status);
+  return result;
 }
 
 /**

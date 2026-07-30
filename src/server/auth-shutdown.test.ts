@@ -37,12 +37,16 @@ const realResolve = engineRegistry.resolve;
 
 const fakeDescriptor: EngineAuthDescriptor = {
   engine: "fake",
-  flow: "paste-code",
-  createSession: () => {
-    const s = new FakeSession();
-    created.push(s);
-    return s;
-  },
+  flows: [
+    {
+      flow: "paste-code",
+      createSession: () => {
+        const s = new FakeSession();
+        created.push(s);
+        return s;
+      },
+    },
+  ],
   checkStatus: async () => ({ state: "unknown" }),
 };
 

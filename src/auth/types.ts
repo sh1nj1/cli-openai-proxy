@@ -6,13 +6,17 @@
  * let a per-engine adapter declare WHICH flow shape it needs, so the caller can
  * branch its UI without knowing anything CLI-specific:
  *
- *  - "api-key":    caller submits a key; no verification URL. Stateless-ish.
- *  - "paste-code": caller opens a verification URL, gets a code back, submits
- *                  it. Requires holding a live CLI process between the two
- *                  requests (the CLI itself blocks on stdin waiting for it).
+ *  - "api-key":     caller submits a key; no verification URL. Stateless-ish.
+ *  - "paste-code":  caller opens a verification URL, gets a code back, submits
+ *                   it. Requires holding a live CLI process between the two
+ *                   requests (the CLI itself blocks on stdin waiting for it).
+ *  - "device-code": caller opens a verification URL and types the code the CLI
+ *                   printed INTO it — the reverse of paste-code. Nothing is
+ *                   submitted back; the CLI polls the vendor and finishes on its
+ *                   own, so the caller polls the session for the outcome.
  */
 
-export type AuthFlow = "api-key" | "paste-code";
+export type AuthFlow = "api-key" | "paste-code" | "device-code";
 
 /**
  * A credential the CLI hands BACK to us instead of persisting itself.
@@ -27,8 +31,10 @@ export interface StoredCredential {
 }
 
 export interface AuthStartResult {
-  /** Present only for "paste-code": the URL the user must open. */
+  /** Present for "paste-code" and "device-code": the URL the user must open. */
   verificationUrl?: string;
+  /** Present only for "device-code": the one-time code the user types at the URL. */
+  userCode?: string;
   /** Human-readable next step, safe to render verbatim in the caller's UI. */
   instructions: string;
 }
@@ -47,6 +53,14 @@ export interface EngineAuthSession {
   start(): Promise<AuthStartResult>;
   submit(input: string): Promise<AuthSubmitResult>;
   cancel(): void;
+  /**
+   * Present only for flows that complete without a submission ("device-code"):
+   * the CLI decides the outcome on its own once the user acts at the
+   * verification URL. Resolves when it reports success, rejects when it fails —
+   * and, because there is no submit request to carry the outcome, the session
+   * manager consumes this to move the session to its terminal status.
+   */
+  wait?(): Promise<AuthSubmitResult>;
 }
 
 /**
@@ -63,18 +77,24 @@ export interface EngineAuthStatus {
   detail?: string;
 }
 
-export interface EngineAuthDescriptor {
-  engine: string;
+/** One way to log an engine in. An engine may offer several (codex: api-key or device-code). */
+export interface EngineFlowDescriptor {
   flow: AuthFlow;
   /**
-   * True when this engine hands its credential back for the proxy to inject into
+   * True when this flow hands its credential back for the proxy to inject into
    * completion children (see StoredCredential) — which publishes it to whoever
    * writes a prompt, so provisioning it requires the operator's explicit trust
-   * declaration. False for an engine whose CLI persists its own credential: that
+   * declaration. False for a flow whose CLI persists its own credential: that
    * one never enters a child environment we build.
    */
   injectsCredential?: boolean;
   createSession(): EngineAuthSession;
+}
+
+export interface EngineAuthDescriptor {
+  engine: string;
+  /** Supported login flows. The first is the default when the caller names none. */
+  flows: EngineFlowDescriptor[];
   checkStatus(): Promise<EngineAuthStatus>;
 }
 
