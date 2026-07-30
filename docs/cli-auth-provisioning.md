@@ -13,6 +13,10 @@ The intended loop:
 3. The user completes it (opens a URL, or pastes a key).
 4. The client submits the result; the next completion works.
 
+To walk the whole loop by hand, open [`tools/auth-test.html`](../tools/auth-test.html)
+in a browser — a dependency-free page that drives every endpoint below against
+any base URL.
+
 ## Enabling it
 
 Disabled unless `AUTH_ADMIN_KEYS` is set. These endpoints mutate host

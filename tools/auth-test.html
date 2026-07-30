@@ -1,0 +1,251 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>cli-openai-proxy — auth flow test</title>
+<style>
+  body { font-family: system-ui, sans-serif; max-width: 640px; margin: 2rem auto; padding: 0 1rem; line-height: 1.5; }
+  fieldset { margin-bottom: 1rem; border: 1px solid #ccc; }
+  label { display: block; margin: 0.5rem 0 0.125rem; }
+  input, select { width: 100%; box-sizing: border-box; padding: 0.375rem; font: inherit; }
+  button { margin: 0.5rem 0.25rem 0 0; padding: 0.375rem 0.75rem; font: inherit; }
+  pre { background: #f4f4f4; padding: 0.75rem; overflow-x: auto; white-space: pre-wrap; word-break: break-all; }
+  .error { color: #b00020; }
+  .ok { color: #087443; }
+</style>
+</head>
+<body>
+<h1>Auth flow test</h1>
+<p>Local test page for the <code>/v1/auth</code> provisioning API. Open this file directly in a browser (the server sends <code>Access-Control-Allow-Origin: *</code>).</p>
+
+<fieldset>
+  <legend>Connection</legend>
+  <label for="baseUrl">Base URL</label>
+  <input id="baseUrl" value="http://localhost:3456">
+  <label for="adminKey">Admin key (AUTH_ADMIN_KEYS)</label>
+  <input id="adminKey" type="password" autocomplete="off">
+</fieldset>
+
+<fieldset>
+  <legend>Engine</legend>
+  <button id="loadEngines">Load engines</button>
+  <label for="engine">Engine</label>
+  <select id="engine"></select>
+  <button id="checkStatus">Check status</button>
+  <button id="forgetCredential">Forget credential</button>
+</fieldset>
+
+<fieldset>
+  <legend>Session</legend>
+  <button id="createSession">Create session</button>
+  <p id="sessionInfo"></p>
+  <label for="codeInput">Code / API key</label>
+  <input id="codeInput" type="password" autocomplete="off">
+  <button id="submitCode">Submit</button>
+  <button id="pollSession">Poll</button>
+  <button id="cancelSession">Cancel</button>
+</fieldset>
+
+<fieldset>
+  <legend>Completion test</legend>
+  <label for="apiKey">API key (API_KEYS)</label>
+  <input id="apiKey" type="password" autocomplete="off">
+  <label for="model">Model</label>
+  <input id="model" value="paperclip/claude_local">
+  <button id="testCompletion">Send test completion</button>
+</fieldset>
+
+<h2>Result <span id="resultStatus"></span></h2>
+<pre id="result">—</pre>
+
+<script>
+"use strict";
+
+const $ = (id) => document.getElementById(id);
+// The server binds sessions to their engine, so remember the engine, base URL
+// and admin key from creation time — the selector and connection fields may
+// change (or reset on reload) afterwards.
+let session = null;
+
+function show(status, body) {
+  const el = $("resultStatus");
+  el.textContent = status;
+  el.className = /^2/.test(status) ? "ok" : "error";
+  $("result").textContent = typeof body === "string" ? body : JSON.stringify(body, null, 2);
+}
+
+const currentBase = () => $("baseUrl").value.replace(/\/+$/, "");
+
+async function call(method, path, { body, key, base, okStatus } = {}) {
+  base = base ?? currentBase();
+  const headers = { Authorization: `Bearer ${key ?? $("adminKey").value}` };
+  if (body) headers["Content-Type"] = "application/json";
+  show("…", `${method} ${path}`);
+  try {
+    const res = await fetch(base + path, { method, headers, body: body && JSON.stringify(body) });
+    const json = await res.json().catch(() => "(no JSON body)");
+    show(String(res.status), json);
+    return res.ok || res.status === okStatus ? json : null;
+  } catch (err) {
+    show("network error", String(err));
+    return null;
+  }
+}
+
+const engine = () => $("engine").value;
+
+$("loadEngines").onclick = async () => {
+  const list = await call("GET", "/v1/auth/engines");
+  if (!list) return;
+  $("engine").replaceChildren(...list.data.map(({ engine, flow }) =>
+    new Option(`${engine} (${flow})`, engine)));
+};
+
+$("checkStatus").onclick = () => call("GET", `/v1/auth/${engine()}/status`);
+$("forgetCredential").onclick = () => call("DELETE", `/v1/auth/${engine()}/credential`);
+
+$("createSession").onclick = async (e) => {
+  // A Claude create waits for the CLI to print its URL, so a second click could
+  // race this one and orphan whichever session record loses the overwrite.
+  e.target.disabled = true;
+  try {
+    const target = engine();
+    const base = currentBase();
+    const key = $("adminKey").value;
+    // The server supersedes only same-engine sessions on the same server; a
+    // pending session for a different engine — or on a different server — would
+    // keep its CLI child alive until TTL, so cancel it where it was created,
+    // with the key it was created under. 404 means it is already gone; on any
+    // other failure keep the session tracked so cancellation can be retried.
+    if (session && (session.engine !== target || session.base !== base)) {
+      const gone = await call("DELETE", `/v1/auth/${session.engine}/sessions/${session.id}`,
+        { base: session.base, key: session.key, okStatus: 404 });
+      if (!gone) return;
+      session = null;
+      $("sessionInfo").replaceChildren();
+    }
+    const created = await call("POST", `/v1/auth/${target}/sessions`, { base, key });
+    if (!created) {
+      // A same-engine recreation disposes the tracked session server-side
+      // before the new flow starts, so a failed POST may leave the record
+      // pointing at a dead session — but not always (a 401 or network error
+      // never reached the supersede). Ask the server instead of decoding the
+      // failure: probe quietly (not via call(), which would replace the create
+      // error on screen) and drop the record only on a confirmed 404.
+      if (session && session.engine === target && session.base === base) {
+        const probe = session;
+        const gone = await fetch(`${probe.base}/v1/auth/${probe.engine}/sessions/${probe.id}`, {
+          headers: { Authorization: `Bearer ${probe.key}` },
+        }).then((r) => r.status === 404, () => false);
+        if (gone && session && session.id === probe.id && session.base === probe.base) {
+          session = null;
+          $("sessionInfo").replaceChildren();
+        }
+      }
+      return;
+    }
+    session = { id: created.sessionId, engine: created.engine ?? target, base, key };
+    const info = $("sessionInfo");
+    info.replaceChildren(`Session ${session.id} (${session.engine} @ ${session.base}) — ${created.instructions ?? ""} `);
+    if (created.verificationUrl) {
+      const a = document.createElement("a");
+      a.href = created.verificationUrl;
+      a.target = "_blank";
+      a.rel = "noreferrer";
+      a.textContent = "Open verification URL";
+      info.append(a);
+    }
+  } finally {
+    e.target.disabled = false;
+  }
+};
+
+$("submitCode").onclick = async (e) => {
+  if (!session) return show("!", "Create a session first.");
+  const submitted = session;
+  const value = $("codeInput").value;
+  // One submission drives a session at a time (409 session_submitting) — and the
+  // Claude token exchange can take up to ~2 minutes, so hold the button down.
+  e.target.disabled = true;
+  try {
+    const done = await call("POST", `/v1/auth/${submitted.engine}/sessions/${submitted.id}`,
+      { body: { value }, base: submitted.base, key: submitted.key, okStatus: 404 });
+    if (!done) return;
+    // A 404 (error envelope, not a session view) confirms the session no longer
+    // exists server-side — expired or the server restarted — so drop the dead
+    // record just like poll does; the code input is left alone since nothing
+    // was consumed. The envelope is told apart by the missing `status`, not by
+    // `error`: a terminal "failed" view carries an error field too. Skip if
+    // Create already replaced the record mid-request.
+    if (!done.status) {
+      if (session && session.id === submitted.id && session.base === submitted.base) {
+        session = null;
+        $("sessionInfo").replaceChildren();
+      }
+      return;
+    }
+    if (done.status !== "pending") {
+      // Only clear what was consumed: during the up-to-2-minute exchange the
+      // user may have cancelled, created a replacement session and typed its
+      // code — a stale terminal response must not erase that credential.
+      if ($("codeInput").value === value) $("codeInput").value = "";
+      // authorized and failed are terminal: the server disposes the session on
+      // both, so drop the dead record — otherwise a later Create would try to
+      // cancel it at a server that may no longer be reachable and refuse to
+      // proceed. Skip if Create already replaced the record during the exchange.
+      if (session && session.id === submitted.id && session.base === submitted.base) {
+        session = null;
+        $("sessionInfo").replaceChildren();
+      }
+    }
+  } finally {
+    e.target.disabled = false;
+  }
+};
+
+$("pollSession").onclick = async () => {
+  if (!session) return show("!", "Create a session first.");
+  const polled = session;
+  const res = await call("GET", `/v1/auth/${polled.engine}/sessions/${polled.id}`,
+    { base: polled.base, key: polled.key, okStatus: 404 });
+  // A 404 (error envelope, not a session view) confirms the session no longer
+  // exists server-side — expired or the server restarted — so drop the dead
+  // record; otherwise a later Create would try to cancel it at a server that
+  // may have become unreachable and refuse to proceed. The envelope is told
+  // apart by the missing `status` (session views can carry an error field
+  // too). Skip if Create already replaced the record while the poll was in
+  // flight.
+  if (res && !res.status && session && session.id === polled.id && session.base === polled.base) {
+    session = null;
+    $("sessionInfo").replaceChildren();
+  }
+};
+
+$("cancelSession").onclick = async () => {
+  if (!session) return show("!", "Create a session first.");
+  const cancelled = session;
+  // Once the session is gone server-side (cancelled, or 404 = already gone),
+  // drop the tracked record too — otherwise a later Create would try to cancel
+  // it again at a server that may no longer be reachable and refuse to proceed.
+  // Skip if Create already replaced the record while the DELETE was in flight.
+  const done = await call("DELETE", `/v1/auth/${cancelled.engine}/sessions/${cancelled.id}`,
+    { base: cancelled.base, key: cancelled.key, okStatus: 404 });
+  if (!done) return;
+  if (session && session.id === cancelled.id && session.base === cancelled.base) {
+    session = null;
+    $("sessionInfo").replaceChildren();
+  }
+};
+
+$("testCompletion").onclick = () => call("POST", "/v1/chat/completions", {
+  body: {
+    model: $("model").value,
+    messages: [{ role: "user", content: "Reply with exactly: AUTH_OK" }],
+    stream: false,
+  },
+  key: $("apiKey").value,
+});
+</script>
+</body>
+</html>
