@@ -21,7 +21,10 @@ services:
       - /run
       - /run/lock
     ports:
-      - "${HOST_PORT:-3456}:3456"
+      # Loopback by default to match the bare-metal gateway (plain HTTP —
+      # bearer keys are interceptable on shared networks). Set
+      # HOST_BIND=0.0.0.0 to opt into remote exposure.
+      - "${HOST_BIND:-127.0.0.1}:${HOST_PORT:-3456}:3456"
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://127.0.0.1:3456/health"]

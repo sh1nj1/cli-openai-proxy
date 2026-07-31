@@ -38,7 +38,10 @@ container on first boot (see [`gateway.env.example`](../deploy/docker/gateway.en
 for the `USER_API_KEYS` shape). `docker compose up -d --build` builds the
 image from the repo root and starts the `proxy` service defined in
 [`deploy/docker/docker-compose.yml`](../deploy/docker/docker-compose.yml),
-publishing port 3456 by default (override with `HOST_PORT`).
+publishing port 3456 on the host loopback by default (override the port with
+`HOST_PORT`). The gateway speaks plain HTTP, so remote exposure is opt-in:
+set `HOST_BIND=0.0.0.0` (or a specific host address) to publish on other
+interfaces, matching the bare-metal default of binding `127.0.0.1`.
 
 ## CLI authentication
 

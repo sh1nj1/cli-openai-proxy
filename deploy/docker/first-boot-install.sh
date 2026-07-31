@@ -36,5 +36,9 @@ systemctl daemon-reload
 
 if [[ -f "${SEED}" && -s "${SEED}" ]]; then
   install -o root -g cli-openai-proxy -m 0640 "${SEED}" /etc/cli-openai-proxy/gateway.env
-  systemctl start cli-openai-proxy-gateway.service
+  # restart, not start: after the first boot the gateway is enabled and may
+  # already be running with the previously persisted gateway.env (the installer
+  # above stop/starts it before this seed lands), so a plain start would be a
+  # no-op and rotated keys in the seed would never take effect.
+  systemctl restart cli-openai-proxy-gateway.service
 fi
