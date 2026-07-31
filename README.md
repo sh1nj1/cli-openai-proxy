@@ -200,6 +200,9 @@ walkthrough: [docs/paperclip-adapters.md](docs/paperclip-adapters.md#collavre-in
 - **API key auth** — optional Bearer tokens for shared deployments
 - **Per-user Linux workers** — first request creates a non-login OS account and
   socket-activated worker; CLI processes, HOME, credentials, and usage stay per user
+- **Docker deployment** — one image for production and CI, giving macOS and
+  Windows hosts the same per-user Linux isolation via Docker Desktop's Linux
+  VM; see [docs/docker.md](docs/docker.md)
 - **Stateless execution** — fresh isolated workspace per request
 - **Auto-start** — macOS LaunchAgent for an always-on service
 
