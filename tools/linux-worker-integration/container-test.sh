@@ -16,8 +16,8 @@ fail() { echo "FAIL: $*" >&2; exit 1; }
 
 dump_logs() {
   echo "---- journal (last 120 lines per unit) ----" >&2
-  for unit in cli-openai-proxy-gateway cli-openai-proxy-provisioner \
-      'cli-openai-proxy-worker@*'; do
+  for unit in cli-openai-proxy-first-boot cli-openai-proxy-gateway \
+      cli-openai-proxy-provisioner 'cli-openai-proxy-worker@*'; do
     journalctl -u "${unit}" --no-pager -n 120 >&2 || true
   done
 }
@@ -48,8 +48,16 @@ timeout 90 bash -c \
   'until state="$(systemctl is-system-running 2>/dev/null)"; [[ "$state" == running || "$state" == degraded ]]; do sleep 1; done' \
   || fail "systemd never reached running/degraded: $(systemctl is-system-running || true)"
 
-step "Running the real installer"
-/opt/src/scripts/install-linux-user-workers.sh
+step "Waiting for the first-boot installer"
+timeout 120 bash -c \
+  'until systemctl is-active --quiet cli-openai-proxy-first-boot.service; do
+     systemctl is-failed --quiet cli-openai-proxy-first-boot.service && exit 2
+     sleep 1
+   done' || fail "first-boot installer did not complete"
+
+step "Production image ships no devDependencies"
+[[ ! -e /opt/app/node_modules/typescript ]] \
+  || fail "devDependencies leaked into the runtime image"
 
 step "Configuring per-user API keys and starting the gateway"
 cat > /etc/cli-openai-proxy/gateway.env <<EOF
