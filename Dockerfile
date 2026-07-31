@@ -72,6 +72,10 @@ COPY --from=build /opt/app/node_modules node_modules
 COPY package.json package-lock.json ./
 COPY scripts scripts
 COPY deploy/linux deploy/linux
+COPY deploy/docker/first-boot-install.sh /usr/local/lib/cli-openai-proxy/first-boot-install.sh
+COPY deploy/docker/cli-openai-proxy-first-boot.service /etc/systemd/system/cli-openai-proxy-first-boot.service
+RUN chmod 0755 /usr/local/lib/cli-openai-proxy/first-boot-install.sh \
+    && systemctl enable cli-openai-proxy-first-boot.service
 
 STOPSIGNAL SIGRTMIN+3
 CMD ["/lib/systemd/systemd"]

@@ -1,0 +1,11 @@
+[Unit]
+Description=cli-openai-proxy container first-boot install
+After=network.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/lib/cli-openai-proxy/first-boot-install.sh
+
+[Install]
+WantedBy=multi-user.target
