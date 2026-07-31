@@ -54,3 +54,15 @@ jobs:
         with:
           name: coverage-lcov
           path: coverage/lcov.info
+
+  linux-worker-integration:
+    name: Linux per-user worker integration
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Run systemd container integration test
+        run: bash tools/linux-worker-integration/run.sh

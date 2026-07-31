@@ -9,6 +9,9 @@ import {
   takeProxySecret,
   blankedProxySecrets,
   resetCapturedProxySecrets,
+  getProvisionerEndpoint,
+  getWorkerConnectTimeoutMs,
+  userWorkerModeEnabled,
 } from "./config.js";
 
 const ENV_KEY = "CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS";
@@ -146,5 +149,53 @@ describe("proxy-only secrets", () => {
   it("blankedProxySecrets shadows every proxy-only key with an empty value", () => {
     const blanked = blankedProxySecrets();
     for (const key of PROXY_ONLY_SECRET_VARS) assert.equal(blanked[key], "");
+  });
+});
+
+describe("per-user worker configuration", () => {
+  const keys = [
+    "USER_WORKER_MODE",
+    "USER_WORKER_PROVISIONER_ENDPOINT",
+    "USER_WORKER_CONNECT_TIMEOUT_MS",
+  ] as const;
+  const saved: Record<string, string | undefined> = {};
+
+  beforeEach(() => {
+    for (const key of keys) saved[key] = process.env[key];
+  });
+
+  afterEach(() => {
+    for (const key of keys) {
+      if (saved[key] === undefined) delete process.env[key];
+      else process.env[key] = saved[key];
+    }
+  });
+
+  it("enables worker mode only for explicit affirmative values", () => {
+    delete process.env.USER_WORKER_MODE;
+    assert.equal(userWorkerModeEnabled(), false);
+    process.env.USER_WORKER_MODE = " Enabled ";
+    assert.equal(userWorkerModeEnabled(), true);
+    process.env.USER_WORKER_MODE = "off";
+    assert.equal(userWorkerModeEnabled(), false);
+  });
+
+  it("selects platform IPC defaults and honors an override", () => {
+    delete process.env.USER_WORKER_PROVISIONER_ENDPOINT;
+    assert.equal(getProvisionerEndpoint("linux"), "/run/cli-openai-proxy/provisioner.sock");
+    assert.equal(getProvisionerEndpoint("win32"), "\\\\.\\pipe\\cli-openai-proxy-provisioner");
+    process.env.USER_WORKER_PROVISIONER_ENDPOINT = " /tmp/custom.sock ";
+    assert.equal(getProvisionerEndpoint("linux"), "/tmp/custom.sock");
+  });
+
+  it("validates the worker connection timeout", () => {
+    delete process.env.USER_WORKER_CONNECT_TIMEOUT_MS;
+    assert.equal(getWorkerConnectTimeoutMs(), 15_000);
+    process.env.USER_WORKER_CONNECT_TIMEOUT_MS = "2500";
+    assert.equal(getWorkerConnectTimeoutMs(), 2500);
+    for (const invalid of ["0", "-1", "not-a-number"]) {
+      process.env.USER_WORKER_CONNECT_TIMEOUT_MS = invalid;
+      assert.equal(getWorkerConnectTimeoutMs(), 15_000);
+    }
   });
 });

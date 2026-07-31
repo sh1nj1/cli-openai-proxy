@@ -40,7 +40,12 @@ export function getTimeoutMs(): number {
  * /v1/auth routes — defeating its separation from API_KEYS — and API_KEYS would
  * hand it every other caller's completion key.
  */
-export const PROXY_ONLY_SECRET_VARS = ["API_KEYS", "AUTH_ADMIN_KEYS"] as const;
+export const PROXY_ONLY_SECRET_VARS = [
+  "API_KEYS",
+  "AUTH_ADMIN_KEYS",
+  "USER_API_KEYS",
+  "USER_IDENTITY_HMAC_SECRET",
+] as const;
 
 /** What each secret was at boot, so a re-init survives its own removal from the env. */
 const captured = new Map<string, string>();
@@ -123,4 +128,25 @@ export function getBgWaitCeilingMs(): number {
   if (raw === undefined || raw === "") return DEFAULT_BG_WAIT_CEILING_MS;
   const parsed = parseInt(raw, 10);
   return Number.isFinite(parsed) && parsed >= 0 ? parsed : DEFAULT_BG_WAIT_CEILING_MS;
+}
+
+export function userWorkerModeEnabled(): boolean {
+  const raw = process.env.USER_WORKER_MODE;
+  if (raw === undefined) return false;
+  return ["1", "true", "yes", "enabled"].includes(raw.trim().toLowerCase());
+}
+
+export function getProvisionerEndpoint(platform = process.platform): string {
+  const configured = process.env.USER_WORKER_PROVISIONER_ENDPOINT?.trim();
+  if (configured) return configured;
+  return platform === "win32"
+    ? "\\\\.\\pipe\\cli-openai-proxy-provisioner"
+    : "/run/cli-openai-proxy/provisioner.sock";
+}
+
+export function getWorkerConnectTimeoutMs(): number {
+  const raw = process.env.USER_WORKER_CONNECT_TIMEOUT_MS;
+  if (!raw) return 15_000;
+  const parsed = Number.parseInt(raw, 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : 15_000;
 }

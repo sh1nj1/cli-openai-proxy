@@ -1,0 +1,13 @@
+[Unit]
+Description=cli-openai-proxy privileged user provisioner socket
+
+[Socket]
+ListenStream=/run/cli-openai-proxy/provisioner.sock
+SocketUser=root
+SocketGroup=cli-openai-proxy
+SocketMode=0660
+DirectoryMode=0750
+RemoveOnStop=yes
+
+[Install]
+WantedBy=sockets.target

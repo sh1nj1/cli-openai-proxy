@@ -36,6 +36,13 @@ src/
 │   ├── routes.ts               # /v1/chat/completions, /v1/models, /v1/usage, /health
 │   ├── auth.ts                 # API_KEYS bearer auth (skips /health and /v1/auth/*)
 │   ├── auth-routes.ts          # /v1/auth/* provisioning API (AUTH_ADMIN_KEYS gated)
+│   ├── worker-standalone.ts     # socket-activated per-user worker entry point
+│   └── provisioner-standalone.ts # root Linux account provisioner entry point
+├── isolation/
+│   ├── request-identity.ts      # mapped keys / signed immutable user identity
+│   ├── worker-proxy.ts          # stream-preserving gateway -> worker forwarding
+│   ├── provisioner-client.ts    # platform IPC adapter boundary
+│   └── linux-user-provisioner.ts # useradd, mapping, systemd socket lifecycle
 │   └── preflight.ts            # shared startup/setup Claude checks (non-fatal)
 ├── usage/
 │   ├── tracker.ts              # per-request records + summary; ~/.cli-openai-proxy/
@@ -66,6 +73,13 @@ src/
    `chat.completion` for non-streaming. Client disconnects kill
    the subprocess (including its process group, even pre-spawn).
 6. `usage/tracker.ts` bills the run and serves the `/v1/usage` dashboards.
+
+With `USER_WORKER_MODE=enabled`, user-scoped routes first resolve a trusted
+`tenantId + userId`, ask the platform provisioner for a worker endpoint, and
+forward the HTTP stream. The same route stack then runs inside the user's
+socket-activated worker, so image files, CLI processes, credentials, and usage
+are all created under that user's UID and HOME. See
+[docs/linux-user-workers.md](docs/linux-user-workers.md).
 
 ## Runner Event Contract
 

@@ -198,6 +198,8 @@ walkthrough: [docs/paperclip-adapters.md](docs/paperclip-adapters.md#collavre-in
   model label is bucketed to `opus`/`sonnet`/`haiku` for cost estimation, so it
   does not identify which engine served a request
 - **API key auth** — optional Bearer tokens for shared deployments
+- **Per-user Linux workers** — first request creates a non-login OS account and
+  socket-activated worker; CLI processes, HOME, credentials, and usage stay per user
 - **Stateless execution** — fresh isolated workspace per request
 - **Auto-start** — macOS LaunchAgent for an always-on service
 
@@ -210,6 +212,10 @@ walkthrough: [docs/paperclip-adapters.md](docs/paperclip-adapters.md#collavre-in
 | `API_KEYS` | *(unset)* | Comma-separated Bearer tokens for callers. Unset = open access |
 | `AUTH_ADMIN_KEYS` | *(unset)* | Separate key set gating `/v1/auth/*`. Unset = those routes are disabled |
 | `AUTH_TRUST_COMPLETION_CALLERS` | *(unset)* | Declares completion callers trusted with a provisioned Claude credential |
+| `USER_WORKER_MODE` | *(unset)* | Route user-scoped APIs to isolated OS-user workers |
+| `USER_API_KEYS` | *(unset)* | JSON mapping of opaque caller keys to stable `tenantId` + `userId` |
+| `USER_IDENTITY_HMAC_SECRET` | *(unset)* | Shared secret for trusted upstream identity headers |
+| `USER_WORKER_PROVISIONER_ENDPOINT` | platform default | Provisioner Unix socket or Windows Named Pipe |
 | `TIMEOUT` | `0` (none) | Per-request ceiling in ms |
 | `DEBUG` | *(unset)* | Verbose logging |
 
@@ -419,7 +425,7 @@ run it with `sudo`.
 ```bash
 git clone https://github.com/sh1nj1/cli-openai-proxy.git
 cd cli-openai-proxy
-./install.sh
+./scripts/install-linux-single-user.sh
 ```
 
 The installer checks for Node.js 22.13.0 or newer, installs dependencies,
@@ -437,7 +443,7 @@ service. The installer also prints the effective path as `Config:`. If `HOST`
 is changed to a non-loopback address, set `API_KEYS` before exposing the port.
 The service PATH includes common user CLI locations and trusted absolute
 entries from PATH when the installer runs. Directories writable by users other
-than the service user are skipped. Rerun `./install.sh` after adding a new
+than the service user are skipped. Rerun `./scripts/install-linux-single-user.sh` after adding a new
 custom CLI installation directory to PATH.
 
 ```bash
@@ -447,9 +453,26 @@ journalctl --user -u com.cli-openai-proxy.service -f
 curl http://127.0.0.1:3456/health
 ```
 
-After pulling new code from `main`, rerun `./install.sh`. Existing environment
+After pulling new code from `main`, rerun `./scripts/install-linux-single-user.sh`. Existing environment
 configuration is preserved while dependencies, the build, and the service are
 updated.
+
+### Multi-user Linux service
+
+For a shared gateway where each authenticated caller's CLI must run as a
+different Linux account, use the root provisioner + per-user worker installer:
+
+```bash
+npm ci && npm run build
+sudo ./scripts/install-linux-user-workers.sh
+```
+
+The first request creates a locked, non-login Linux account and starts its
+systemd socket. The public gateway remains a dedicated low-privilege service
+account, and the root provisioner executes only the root-owned runtime copied
+under `/opt`. See [Per-user Linux workers](docs/linux-user-workers.md) for identity
+signing, systemd configuration, auth provisioning, and the multi-OS adapter
+boundary.
 
 ## Architecture
 
@@ -458,6 +481,7 @@ src/
 ├── adapter/          # OpenAI <-> CLI conversion, adapter registry, output parsers
 ├── auth/             # Remote CLI login flows, pty driver, in-memory token store
 ├── cli/              # CLI presence checks
+├── isolation/        # User identity, IPC proxy, OS provisioner adapters
 ├── server/           # Express server, routes, proxy auth
 ├── usage/            # Token tracking and analytics
 └── types/            # TypeScript type definitions
@@ -469,9 +493,10 @@ src/
 - Every run gets a fresh temporary working directory
 - CLIs run with approvals bypassed — **anyone who can call `/v1/chat/completions`
   can run code on the host.** Set `API_KEYS` on any non-loopback bind
-- Proxy access keys (`API_KEYS`, `AUTH_ADMIN_KEYS`) are captured at server
-  init and removed from the environment completion subprocesses inherit
-  (startup preflight/probe children spawn before capture and still see them)
+- Proxy access keys and user-identity secrets are captured before startup
+  preflight and removed from every CLI subprocess environment
+- Per-user mode never trusts the OpenAI `user` field, and never falls back to a
+  shared account when identity, provisioning, or worker connection fails
 - Codex provisioning forwards an API key to `codex login` over stdin; the CLI
   persists it in `~/.codex`
 - Claude provisioning captures the `setup-token` OAuth credential, keeps it in
