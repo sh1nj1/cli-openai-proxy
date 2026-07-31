@@ -8,6 +8,16 @@ set -euo pipefail
 SEED="/run/host-config/gateway.env"
 GATEWAY_UNIT_DIR="/etc/systemd/system/cli-openai-proxy-gateway.service.d"
 
+# Docker creates /run/host-config as 0755 on the container's writable tmpfs
+# (the ro bind mount only applies to the file inside it), so any cap_* worker
+# process could otherwise read the host-provided seed file directly and get
+# every tenant's API key, bypassing the 0640 root:cli-openai-proxy protection
+# applied to the installed copy below. Guarded for set -e: a missing dir
+# (e.g. bare-metal reuse of this script) must not abort the boot.
+if [[ -d /run/host-config ]]; then
+  chmod 0700 /run/host-config
+fi
+
 /opt/app/scripts/install-linux-user-workers.sh
 
 # The gateway defaults to HOST=127.0.0.1 (deploy/linux/cli-openai-proxy-gateway.service),
@@ -24,7 +34,7 @@ EOF
 chmod 0644 "${GATEWAY_UNIT_DIR}/docker-bind.conf"
 systemctl daemon-reload
 
-if [[ -s "${SEED}" ]]; then
+if [[ -f "${SEED}" && -s "${SEED}" ]]; then
   install -o root -g cli-openai-proxy -m 0640 "${SEED}" /etc/cli-openai-proxy/gateway.env
   systemctl start cli-openai-proxy-gateway.service
 fi

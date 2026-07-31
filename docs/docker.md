@@ -20,9 +20,18 @@ Linux hosts can use the container too, or install directly with
 ```bash
 cd deploy/docker
 cp gateway.env.example gateway.env   # edit keys
+chmod 600 gateway.env                # keep real keys off other local users' reach
 docker compose up -d --build
 curl http://127.0.0.1:3456/health
 ```
+
+If you forget to create `gateway.env` before `docker compose up`, Docker
+materializes an empty directory in its place (both at this path and at
+`/run/host-config/gateway.env` inside the container), and the gateway stays
+down with no seed to install — the failure is silent by design, but if you
+expected the gateway to start: `docker compose down`, `rm -rf
+deploy/docker/gateway.env` (removing the directory Docker created), create
+the real file, then `docker compose up -d` again.
 
 `gateway.env` becomes `/etc/cli-openai-proxy/gateway.env` inside the
 container on first boot (see [`gateway.env.example`](../deploy/docker/gateway.env.example)
@@ -96,13 +105,15 @@ The `state` volume persists each account's HOME and the root-only mapping
 database (UID, GID, account name, HMAC fingerprint) across container
 recreation, but the OS-level account itself does not: a fresh container has a
 fresh `/etc/passwd` with no `cap_*` entries. On the next request for an
-already-provisioned identity, the provisioner re-runs `useradd` for that
-account, gets a new UID/GID from the OS, finds it does not match the UID/GID
-recorded in the mapping database, and fails hard
-(`src/isolation/linux-user-provisioner.ts:145-148`: `OS account … no longer
-matches its provisioned UID/GID`). Restarting with `docker compose stop` /
-`docker compose start` keeps the same container and its writable layer, so
-this does not happen — only recreation does.
+already-provisioned (`ready`) identity, the provisioner does not re-run
+`useradd` — that only happens for a still-`creating` record. Instead it goes
+straight to re-verifying the existing account's UID/GID via `id -u`/`id -g`
+(`src/isolation/linux-user-provisioner.ts:145-146`), and since the account
+does not exist in the fresh container's `/etc/passwd`, that `id` lookup
+itself fails, throwing before the UID/GID comparison on line 147 is ever
+reached. Restarting with `docker compose stop` / `docker compose start`
+keeps the same container and its writable layer, so this does not happen —
+only recreation does.
 
 **v1 rule:** since an upgrade always recreates the container, there is no
 safe in-place upgrade path in this release. The correct v1 upgrade procedure
@@ -129,6 +140,14 @@ upgrade.
 Re-creating `cap_*` accounts with their previously recorded UID/GID (e.g. via
 `useradd -u`) instead of requiring a fresh mapping is known follow-up work
 that would make in-place upgrades possible; not implemented in this release.
+
+**Release accumulation.** `first-boot-install.sh` runs the installer on every
+container boot, and the installer creates a fresh immutable release under
+`/opt/cli-openai-proxy/releases` each time — on bare metal this is pruned
+over time, but inside a container nobody prunes it, so a container that gets
+restarted or recreated frequently will accumulate releases in the writable
+layer. Manual cleanup only for now; automatic pruning in a container context
+is unimplemented.
 
 ## Integration test relationship
 

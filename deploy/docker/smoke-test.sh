@@ -36,7 +36,7 @@ expect() {
   local got
   got="$(curl -s -o /dev/null -w '%{http_code}' "$@")"
   [[ "${got}" == "${want}" ]] \
-    || { echo "FAIL: expected HTTP ${want}, got ${got} for: $*" >&2; exit 1; }
+    || { compose logs; echo "FAIL: expected HTTP ${want}, got ${got} for: $*" >&2; exit 1; }
 }
 
 expect 401 "${BASE_URL}/v1/usage"
