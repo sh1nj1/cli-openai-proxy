@@ -6,8 +6,23 @@
 set -euo pipefail
 
 SEED="/run/host-config/gateway.env"
+GATEWAY_UNIT_DIR="/etc/systemd/system/cli-openai-proxy-gateway.service.d"
 
 /opt/app/scripts/install-linux-user-workers.sh
+
+# The gateway defaults to HOST=127.0.0.1 (deploy/linux/cli-openai-proxy-gateway.service),
+# correct for the bare-metal install this unit is shared with. In a container,
+# docker's published-port forwarding connects to the container's external
+# interface, not its loopback, so a container deployment must bind all
+# interfaces; the compose port mapping is the actual access boundary. This
+# drop-in is container-only and never touches the shared bare-metal unit.
+install -d -o root -g root -m 0755 "${GATEWAY_UNIT_DIR}"
+cat > "${GATEWAY_UNIT_DIR}/docker-bind.conf" <<'EOF'
+[Service]
+Environment=HOST=0.0.0.0
+EOF
+chmod 0644 "${GATEWAY_UNIT_DIR}/docker-bind.conf"
+systemctl daemon-reload
 
 if [[ -s "${SEED}" ]]; then
   install -o root -g cli-openai-proxy -m 0640 "${SEED}" /etc/cli-openai-proxy/gateway.env
