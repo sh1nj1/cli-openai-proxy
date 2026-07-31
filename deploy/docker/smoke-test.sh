@@ -42,4 +42,21 @@ expect() {
 expect 401 "${BASE_URL}/v1/usage"
 expect 200 -H "Authorization: Bearer ${KEY}" "${BASE_URL}/v1/usage"
 
+# Key rotation across a restart: the gateway is ordered after the first-boot
+# oneshot, so the rotated seed must be live before the gateway ever answers —
+# the old key may never be accepted again, even transiently.
+echo "==> rotating key and restarting"
+ROTATED_KEY="smoke-key-rotated-89abcdef0123456789abcdef"
+printf 'USER_API_KEYS=%s\n' \
+  "'[{\"key\":\"${ROTATED_KEY}\",\"tenantId\":\"smoke\",\"userId\":\"user-a\"}]'" > "${ENV_FILE}"
+compose restart --timeout 30
+
+echo "==> waiting for /health after restart"
+timeout 180 bash -c \
+  "until curl -fsS ${BASE_URL}/health >/dev/null 2>&1; do sleep 2; done" \
+  || { compose logs; echo "FAIL: gateway never became healthy after restart" >&2; exit 1; }
+
+expect 401 -H "Authorization: Bearer ${KEY}" "${BASE_URL}/v1/usage"
+expect 200 -H "Authorization: Bearer ${ROTATED_KEY}" "${BASE_URL}/v1/usage"
+
 echo "PASS: compose smoke test"

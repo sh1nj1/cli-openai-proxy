@@ -36,9 +36,12 @@ systemctl daemon-reload
 
 if [[ -f "${SEED}" && -s "${SEED}" ]]; then
   install -o root -g cli-openai-proxy -m 0640 "${SEED}" /etc/cli-openai-proxy/gateway.env
-  # restart, not start: after the first boot the gateway is enabled and may
-  # already be running with the previously persisted gateway.env (the installer
-  # above stop/starts it before this seed lands), so a plain start would be a
-  # no-op and rotated keys in the seed would never take effect.
-  systemctl restart cli-openai-proxy-gateway.service
+  # restart, not start: on first boot the gateway is installed but not yet
+  # started, and outside boot (manual re-run) it may be running with a stale
+  # env — restart covers both. --no-block is required: the gateway is ordered
+  # After this oneshot (unit Before=), so a blocking restart issued while this
+  # unit is still activating would deadlock waiting for its own caller. At
+  # boot the queued gateway job starts it after this unit anyway, always with
+  # the seed already in place.
+  systemctl restart --no-block cli-openai-proxy-gateway.service
 fi
