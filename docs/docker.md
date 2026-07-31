@@ -143,11 +143,12 @@ that would make in-place upgrades possible; not implemented in this release.
 
 **Release accumulation.** `first-boot-install.sh` runs the installer on every
 container boot, and the installer creates a fresh immutable release under
-`/opt/cli-openai-proxy/releases` each time — on bare metal this is pruned
-over time, but inside a container nobody prunes it, so a container that gets
-restarted or recreated frequently will accumulate releases in the writable
-layer. Manual cleanup only for now; automatic pruning in a container context
-is unimplemented.
+`/opt/cli-openai-proxy/releases` each time. On bare metal, old release
+directories may be removed manually (see `docs/linux-user-workers.md`); inside
+a container the same manual cleanup applies, but containers make it easier to
+forget, so a container that gets restarted or recreated frequently will
+accumulate releases in the writable layer. Manual cleanup only for now;
+automatic pruning in a container context is unimplemented.
 
 ## Integration test relationship
 
