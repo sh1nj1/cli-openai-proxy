@@ -663,6 +663,8 @@ function removeManagedTree(
     afterFileHash?: (relative: string) => void;
     /** Test seam for a namespace mutation after root ownership validation. */
     afterRootAudit?: (root: string) => void;
+    /** Test seam for a namespace mutation after the owned root is isolated. */
+    afterRootIsolation?: (root: string) => void;
     /** Keep isolated inodes linked so writes through already-open descriptors survive. */
     preserveIsolatedFiles?: boolean;
     /** Place retained inode links outside root so an uninstall can remove its visible target. */
@@ -704,10 +706,7 @@ function removeManagedTree(
     && opts.recoveryId
   ) {
     opts.afterRootAudit?.(root);
-    isolatedOwnedRoot = path.join(
-      opts.quarantineParent,
-      `.provision-removing-${opts.recoveryId}`,
-    );
+    isolatedOwnedRoot = path.join(opts.quarantineParent, `${REMOVAL_RECOVERY_PREFIX}${opts.recoveryId}`);
     if (!moveDirectoryNoReplace(root, isolatedOwnedRoot)) {
       throw new ProvisionError(
 	`Removal could not isolate "${path.basename(root)}" without replacing another entry`,
@@ -724,6 +723,13 @@ function removeManagedTree(
       return { clean: false };
     }
     managedRoot = isolatedOwnedRoot;
+    opts.afterRootIsolation?.(isolatedOwnedRoot);
+    if (opts.preserveIsolatedFiles) {
+      // The writable sibling name cannot stay bound to the inode verified
+      // above. Retain the complete isolated tree for explicit cleanup instead
+      // of traversing a pathname that another same-UID process can replace.
+      return { clean: true, recoveryPath: isolatedOwnedRoot };
+    }
   }
 
   const removed: string[] = [];
@@ -929,6 +935,8 @@ export function removeSkill(
     fileHashes?: Record<string, string | string[]>;
     /** Test seam for a namespace mutation after root ownership validation. */
     afterRootAudit?: (root: string) => void;
+    /** Test seam for a namespace mutation after the owned root is isolated. */
+    afterRootIsolation?: (root: string) => void;
     /** New identity preclaimed in the lockfile before this removal begins. */
     recoveryId?: string;
   },

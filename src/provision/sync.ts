@@ -77,6 +77,7 @@ let shuttingDown = false;
 let shutdownPromise: Promise<void> | null = null;
 let afterFirstInstallMove: ((target: string) => void) | undefined;
 let afterRemovalAudit: ((target: string) => void) | undefined;
+let afterRemovalIsolation: ((target: string) => void) | undefined;
 
 function serialize<T>(operation: () => Promise<T> | T): Promise<T> {
   pendingOperations += 1;
@@ -110,6 +111,8 @@ export function initProvisioning(hooks: {
   afterFirstInstallMove?: (target: string) => void;
   /** Test seam for a namespace mutation after removal validates ownership. */
   afterRemovalAudit?: (target: string) => void;
+  /** Test seam for a namespace mutation after removal isolates the owned root. */
+  afterRemovalIsolation?: (target: string) => void;
 } = {}): {
   enabled: boolean;
   autoApply: "auto" | "approve";
@@ -118,6 +121,7 @@ export function initProvisioning(hooks: {
   resetProvisioning();
   afterFirstInstallMove = hooks.afterFirstInstallMove;
   afterRemovalAudit = hooks.afterRemovalAudit;
+  afterRemovalIsolation = hooks.afterRemovalIsolation;
   const raw = process.env.PROVISION_SYNC?.trim().toLowerCase() ?? "";
   enabled = ["1", "true", "yes", "enabled"].includes(raw);
   autoApply = process.env.PROVISION_AUTOAPPLY?.trim().toLowerCase() === "auto" ? "auto" : "approve";
@@ -617,6 +621,7 @@ async function runSync(): Promise<ProvisionStatusView> {
 	    ...snapshot,
 	    ...recovery,
 	    afterRootAudit: afterRemovalAudit,
+	    afterRootIsolation: afterRemovalIsolation,
 	  });
 	} finally {
 	  finalizeRemovalRecoveries(state);
@@ -725,6 +730,7 @@ export function deleteItem(type: string, name: string): Promise<{ removed: boole
 	  ...snapshot,
 	  ...recovery,
 	  afterRootAudit: afterRemovalAudit,
+	  afterRootIsolation: afterRemovalIsolation,
 	});
       } finally {
 	finalizeRemovalRecoveries(state);
@@ -774,6 +780,7 @@ function clearProvisioningState(): void {
   shuttingDown = false;
   afterFirstInstallMove = undefined;
   afterRemovalAudit = undefined;
+  afterRemovalIsolation = undefined;
 }
 
 /**

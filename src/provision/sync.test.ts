@@ -847,6 +847,56 @@ describe("provision sync", () => {
     assert.equal(readFileSync(path.join(displaced, "SKILL.md"), "utf8"), "managed");
   });
 
+  test("DELETE preserves a recovery sibling swapped in after isolation", async () => {
+    process.env.PROVISION_AUTOAPPLY = "auto";
+    initProvisioning();
+    const name = "delete-isolation-swap";
+    const skill = serveSkill("/delete-isolation-swap.tgz", "managed");
+    registerManifestUrl(serveManifest([{ type: "skill", name, ...skill }]));
+    await syncNow();
+    let recovery = "";
+    let displaced = "";
+    initProvisioning({
+      afterRemovalIsolation: (isolated) => {
+	recovery = isolated;
+	displaced = `${isolated}-displaced`;
+	renameSync(isolated, displaced);
+	mkdirSync(isolated);
+      },
+    });
+
+    assert.deepEqual(await deleteItem("skill", name), { removed: true });
+
+    assert.deepEqual(readdirSync(recovery), []);
+    assert.equal(readFileSync(path.join(displaced, "SKILL.md"), "utf8"), "managed");
+  });
+
+  test("manifest removal preserves a recovery sibling swapped in after isolation", async () => {
+    process.env.PROVISION_AUTOAPPLY = "auto";
+    initProvisioning();
+    const name = "manifest-isolation-swap";
+    const skill = serveSkill("/manifest-isolation-swap.tgz", "managed");
+    registerManifestUrl(serveManifest([{ type: "skill", name, ...skill }]));
+    await syncNow();
+    let recovery = "";
+    let displaced = "";
+    initProvisioning({
+      afterRemovalIsolation: (isolated) => {
+	recovery = isolated;
+	displaced = `${isolated}-displaced`;
+	renameSync(isolated, displaced);
+	mkdirSync(isolated);
+      },
+    });
+    registerManifestUrl(serveManifest([]));
+
+    const view = await syncNow();
+
+    assert.equal(statusOf(view, name), "removed");
+    assert.deepEqual(readdirSync(recovery), []);
+    assert.equal(readFileSync(path.join(displaced, "SKILL.md"), "utf8"), "managed");
+  });
+
   test("removal accepts either hash for a path shared by upgrade journal snapshots", async () => {
     process.env.PROVISION_AUTOAPPLY = "auto";
     initProvisioning();

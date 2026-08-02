@@ -860,6 +860,30 @@ describe("provision installer", () => {
     assert.equal(readFileSync(path.join(displaced, "SKILL.md"), "utf8"), "managed");
   });
 
+  test("removeSkill does not clean a recovery path swapped after isolation", async () => {
+    const { url, sha256 } = serve("/remove-isolation-swap.tgz", makeTarGz([
+      { name: "SKILL.md", content: "managed" },
+    ]));
+    const result = await installSkill({ name: "demo", url, sha256 }, { skillsDir });
+    let displaced = "";
+
+    const { recoveryPath } = removeSkill("demo", {
+      skillsDir,
+      files: result.files,
+      fileHashes: result.fileHashes,
+      directories: result.directories,
+      afterRootIsolation: (isolated) => {
+	displaced = `${isolated}-displaced`;
+	renameSync(isolated, displaced);
+	mkdirSync(isolated);
+      },
+    });
+
+    assert.equal(recoveryPath, displaced.replace(/-displaced$/, ""));
+    assert.deepEqual(readdirSync(recoveryPath!), []);
+    assert.equal(readFileSync(path.join(displaced, "SKILL.md"), "utf8"), "managed");
+  });
+
   test("removeSkill preserves writes through a descriptor opened before removal", async () => {
     const { url, sha256 } = serve("/remove-open-fd.tgz", makeTarGz([
       { name: "SKILL.md", content: "before removal" },
@@ -883,7 +907,7 @@ describe("provision installer", () => {
 
     assert.equal(existsSync(path.join(skillsDir, "demo")), false);
     assert.notEqual(recoveryPath, undefined);
-    assert.equal(readFileSync(path.join(recoveryPath!, "0"), "utf8"), "written after removal");
+    assert.equal(readFileSync(path.join(recoveryPath!, "SKILL.md"), "utf8"), "written after removal");
   });
 
   test("removeSkill retains every recovery for explicit cleanup", async () => {
@@ -952,7 +976,10 @@ describe("provision installer", () => {
     }
 
     assert.notEqual(firstRecovery, undefined);
-    assert.equal(readFileSync(path.join(firstRecovery!, "0"), "utf8"), "user change after later removals");
+    assert.equal(
+      readFileSync(path.join(firstRecovery!, "SKILL.md"), "utf8"),
+      "user change after later removals",
+    );
   });
 
   test("removeSkill deletes empty directories owned by the archive", async () => {
