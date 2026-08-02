@@ -190,6 +190,27 @@ describe("provision installer", () => {
     assert.equal(existsSync(target), false);
   });
 
+  test("normalizes a restrictive archive root before inspecting its entries", async () => {
+    const { url, sha256 } = serve("/restrictive-root.tgz", makeTarGz([
+      { name: "./", type: "dir", mode: 0o000 },
+      { name: "./SKILL.md", content: "managed" },
+    ]));
+
+    const result = await installSkill({ name: "demo", url, sha256 }, { skillsDir });
+    const target = path.join(skillsDir, "demo");
+    assert.deepEqual(result.files, ["SKILL.md"]);
+    assert.equal(lstatSync(target).mode & 0o700, 0o700);
+    assert.equal(readFileSync(path.join(target, "SKILL.md"), "utf-8"), "managed");
+
+    removeSkill("demo", {
+      skillsDir,
+      files: result.files,
+      fileHashes: result.fileHashes,
+      directories: result.directories,
+    });
+    assert.equal(existsSync(target), false);
+  });
+
   test("a sha256 mismatch refuses the archive and installs nothing", async () => {
     const { url } = serve("/c.tgz", makeTarGz([{ name: "SKILL.md", content: "x" }]));
     const code = await codeOf(() =>

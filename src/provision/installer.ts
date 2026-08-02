@@ -188,10 +188,14 @@ function auditTree(root: string): InstallResult {
 }
 
 /** Ensure the gateway can audit, replace, and remove every extracted directory. */
+function normalizeDirectoryMode(directory: string): void {
+  const stat = lstatSync(directory);
+  chmodSync(directory, stat.mode | 0o700);
+}
+
 function normalizeDirectoryModes(root: string): void {
   const walk = (dir: string): void => {
-    const stat = lstatSync(dir);
-    chmodSync(dir, stat.mode | 0o700);
+    normalizeDirectoryMode(dir);
     for (const entry of readdirSync(dir)) {
       const full = path.join(dir, entry);
       if (lstatSync(full).isDirectory()) walk(full);
@@ -252,6 +256,10 @@ export async function installSkill(
     } catch {
       throw new ProvisionError("Extraction failed", "archive_rejected");
     }
+
+    // A root `./` entry can overwrite extractDir's mode. Restore access before
+    // reading it; the selected tree is normalized recursively below.
+    normalizeDirectoryMode(extractDir);
 
     // Accept both layouts: files at the archive root, or everything under one
     // top-level directory (the common `name-version/` tarball convention).
