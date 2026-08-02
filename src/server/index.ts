@@ -20,8 +20,17 @@ import {
   handleSubmitAuthSession,
   initAuthAdmin,
 } from "./auth-routes.js";
+import {
+  PROVISION_PREFIX,
+  handleProvisionApprove,
+  handleProvisionDelete,
+  handleProvisionStatus,
+  handleProvisionSync,
+  provisionAdminMiddleware,
+} from "./provision-routes.js";
 import { getTimeoutMs } from "../config.js";
 import { resetSessions } from "../auth/session-manager.js";
+import { initProvisioning, resetProvisioning } from "../provision/sync.js";
 import { initRequestIdentity, requireRequestIdentity } from "../isolation/request-identity.js";
 import type { UserWorkerProxy } from "../isolation/worker-proxy.js";
 
@@ -76,6 +85,13 @@ export function createApp(config: AppConfig = {}): Express {
         ? `[Server] CLI auth provisioning enabled (${adminStatus.keyCount} admin key(s))`
         : "[Server] CLI auth provisioning disabled (set AUTH_ADMIN_KEYS to enable)",
     );
+    const provisionStatus = initProvisioning();
+    console.log(
+      provisionStatus.enabled
+        ? `[Server] Agent provisioning enabled (mode: ${provisionStatus.autoApply}`
+          + `${provisionStatus.manifestUrl ? `, manifest: ${provisionStatus.manifestUrl}` : ""})`
+        : "[Server] Agent provisioning disabled (set PROVISION_SYNC=1 to enable)",
+    );
     if (userWorkerProxy) {
       console.log(
         `[Server] Per-user workers enabled (${identityStatus.mappedKeyCount} mapped key(s), `
@@ -126,6 +142,10 @@ export function createApp(config: AppConfig = {}): Express {
   // wrong admin key (or one sent while the feature is off) before its body is buffered.
   if (role === "gateway") app.use(AUTH_PROVISIONING_PREFIX, authAdminMiddleware);
 
+  // And for agent provisioning — its own opt-in (PROVISION_SYNC) plus the same
+  // admin keys, checked before any body is buffered.
+  if (role === "gateway") app.use(PROVISION_PREFIX, provisionAdminMiddleware);
+
   // A valid shared API key alone cannot select an OS user. Resolve the immutable
   // identity before buffering JSON, preserving the same unauthenticated-body DoS
   // boundary as the two API-key gates above.
@@ -170,6 +190,13 @@ export function createApp(config: AppConfig = {}): Express {
   app.post(`${AUTH_PROVISIONING_PREFIX}/:engine/sessions/:sessionId`, ...scoped(handleSubmitAuthSession));
   app.delete(`${AUTH_PROVISIONING_PREFIX}/:engine/sessions/:sessionId`, ...scoped(handleCancelAuthSession));
   app.delete(`${AUTH_PROVISIONING_PREFIX}/:engine/credential`, ...scoped(handleForgetCredential));
+
+  // Agent provisioning (gated above). Deliberately NOT scoped(): artifacts
+  // install onto the gateway host's filesystem, which per-user workers share.
+  app.get(PROVISION_PREFIX, handleProvisionStatus);
+  app.post(`${PROVISION_PREFIX}/sync`, handleProvisionSync);
+  app.post(`${PROVISION_PREFIX}/items/:type/:name/approve`, handleProvisionApprove);
+  app.delete(`${PROVISION_PREFIX}/items/:type/:name`, handleProvisionDelete);
 
   // 404 handler
   app.use((_req: Request, res: Response) => {
@@ -261,6 +288,10 @@ export async function stopServer(): Promise<void> {
   // startServer(). Cancelling first also unblocks an in-flight submit, which
   // close() would otherwise wait on.
   resetSessions();
+
+  // Also module state: the refetch timer and registered manifest URL would
+  // otherwise survive into (and act during) the next startServer().
+  resetProvisioning();
 
   if (!serverInstance) {
     return;

@@ -215,6 +215,7 @@ walkthrough: [docs/paperclip-adapters.md](docs/paperclip-adapters.md#collavre-in
 | `API_KEYS` | *(unset)* | Comma-separated Bearer tokens for callers. Unset = open access |
 | `AUTH_ADMIN_KEYS` | *(unset)* | Separate key set gating `/v1/auth/*`. Unset = those routes are disabled |
 | `AUTH_TRUST_COMPLETION_CALLERS` | *(unset)* | Declares completion callers trusted with a provisioned Claude credential |
+| `PROVISION_SYNC` | *(unset)* | Enables the `/v1/provision/*` agent-provisioning routes; see [docs/provisioning.md](docs/provisioning.md) |
 | `USER_WORKER_MODE` | *(unset)* | Route user-scoped APIs to isolated OS-user workers |
 | `USER_API_KEYS` | *(unset)* | JSON mapping of opaque caller keys to stable `tenantId` + `userId` |
 | `USER_IDENTITY_HMAC_SECRET` | *(unset)* | Shared secret for trusted upstream identity headers |
@@ -298,6 +299,10 @@ See [docs/cli-auth-provisioning.md](docs/cli-auth-provisioning.md).
 | `/v1/auth/{engine}/sessions` | POST | Start a login flow |
 | `/v1/auth/{engine}/sessions/{id}` | GET / POST / DELETE | Poll / submit / abandon |
 | `/v1/auth/{engine}/credential` | DELETE | Forget a provisioned credential |
+| `/v1/provision` | GET | Agent provisioning status (needs `PROVISION_SYNC=1` + `AUTH_ADMIN_KEYS`) |
+| `/v1/provision/sync` | POST | Re-fetch the provisioning manifest and apply it |
+| `/v1/provision/items/{type}/{name}/approve` | POST | Approve a first-seen provisioned item |
+| `/v1/provision/items/{type}/{name}` | DELETE | Uninstall an item and revoke its approval |
 
 ## Integration Examples
 

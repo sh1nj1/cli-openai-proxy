@@ -95,6 +95,15 @@ function sendError(res: Response, err: unknown): void {
  * `flow` repeats the default — the shape callers relied on when engines had
  * exactly one flow, kept so they keep working unchanged.
  */
+function parseable(url: string): boolean {
+  try {
+    new URL(url);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 function flowFields(engine: string): { flow: string; flows: string[] } {
   const flows = resolveEngine(engine)!.flows.map((f) => f.flow);
   return { flow: flows[0]!, flows };
@@ -120,17 +129,29 @@ export async function handleAuthStatus(req: Request, res: Response): Promise<voi
   }
 }
 
-/** POST /v1/auth/:engine/sessions — body may name a `flow`; omitted means the engine's default. */
+/**
+ * POST /v1/auth/:engine/sessions — body may name a `flow` (omitted means the
+ * engine's default) and a `provisioning_url`: a manifest the proxy pulls and
+ * applies once this login succeeds (see src/provision/sync.ts). The URL is
+ * validated here but acted on only if PROVISION_SYNC=1 — with provisioning off
+ * it is accepted and ignored, so one Collavre client works against both setups.
+ */
 export async function handleCreateAuthSession(req: Request, res: Response): Promise<void> {
   const engine = engineOf(req, res);
   if (!engine) return;
-  const flow = (req.body as Record<string, unknown> | undefined)?.flow;
+  const body = req.body as Record<string, unknown> | undefined;
+  const flow = body?.flow;
   if (flow !== undefined && typeof flow !== "string") {
     fail(res, 400, "`flow` must be a string naming one of the engine's flows.", "invalid_flow");
     return;
   }
+  const provisioningUrl = body?.provisioning_url;
+  if (provisioningUrl !== undefined && (typeof provisioningUrl !== "string" || !parseable(provisioningUrl))) {
+    fail(res, 400, "`provisioning_url` must be a valid URL.", "invalid_provisioning_url");
+    return;
+  }
   try {
-    res.status(201).json(await createSession(engine, flow));
+    res.status(201).json(await createSession(engine, flow, { provisioningUrl }));
   } catch (err) {
     sendError(res, err);
   }

@@ -20,6 +20,7 @@
 
 import { randomUUID } from "crypto";
 import { TRUST_COMPLETION_CALLERS_VAR, trustsCompletionCallers } from "../config.js";
+import { handleAuthorizedSession } from "../provision/sync.js";
 import { resolveEngine } from "./registry.js";
 import { setCredential } from "./token-store.js";
 import {
@@ -48,6 +49,13 @@ interface SessionRecord extends Omit<SessionView, "expiresAt"> {
   expiresAt: number;
   handle: EngineAuthSession;
   timer: NodeJS.Timeout;
+  /**
+   * Manifest URL the caller asked to sync once this login succeeds. Held on the
+   * record (not in SessionView) because it only matters at the authorized
+   * transition — and the device-code flow reaches that transition without a
+   * request to carry it.
+   */
+  provisioningUrl?: string;
   /**
    * Set for the duration of submit(). Not part of SessionView: the session is
    * still "pending" to an observer — nothing has been decided yet — and this only
@@ -79,7 +87,14 @@ function ttlMs(): number {
 }
 
 function view(record: SessionRecord): SessionView {
-  const { handle: _handle, timer: _timer, submitting: _submitting, expiresAt, ...rest } = record;
+  const {
+    handle: _handle,
+    timer: _timer,
+    submitting: _submitting,
+    provisioningUrl: _provisioningUrl,
+    expiresAt,
+    ...rest
+  } = record;
   return { ...rest, expiresAt: new Date(expiresAt).toISOString() };
 }
 
@@ -105,7 +120,11 @@ function supersededError(engine: string): AuthProvisioningError {
  * no record is kept in that case, so a failed start leaves nothing to reap.
  * `flow` picks among the engine's flows; omitted means the engine's default.
  */
-export async function createSession(engine: string, flow?: string): Promise<SessionView> {
+export async function createSession(
+  engine: string,
+  flow?: string,
+  opts: { provisioningUrl?: string } = {},
+): Promise<SessionView> {
   const descriptor = resolveEngine(engine);
   if (!descriptor) {
     throw new AuthProvisioningError(`Unknown engine "${engine}"`, "unknown_engine");
@@ -194,6 +213,7 @@ export async function createSession(engine: string, flow?: string): Promise<Sess
     handle,
     timer,
     submitting: false,
+    provisioningUrl: opts.provisioningUrl,
   };
   byId.set(sessionId, record);
   byEngine.set(engine, sessionId);
@@ -219,6 +239,9 @@ function settleWhenDone(record: SessionRecord): void {
     (result) => {
       if (result.credential) setCredential(record.engine, result.credential);
       conclude("authorized");
+      // Only on the transition this call made: a session already concluded (or
+      // superseded) must not re-trigger a sync from a stale outcome.
+      if (record.status === "authorized") void handleAuthorizedSession(record.provisioningUrl);
     },
     (err) => {
       const message = err instanceof Error ? err.message : String(err);
@@ -277,6 +300,9 @@ export async function submitSession(
     // Snapshot before dispose(), which removes the record from the maps.
     const authorized: SessionView = { ...view(record), status: "authorized" };
     dispose(record, "authorized");
+    // Fire-and-forget: provisioning is a follow-on to a successful login, and
+    // its failure must not turn this response into an error (see sync.ts).
+    void handleAuthorizedSession(record.provisioningUrl);
     return authorized;
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);

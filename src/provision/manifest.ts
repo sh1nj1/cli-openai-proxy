@@ -1,0 +1,140 @@
+/**
+ * Manifest parsing and URL policy.
+ *
+ * Everything here is validation of REMOTE input: the manifest is fetched from a
+ * URL an admin registered, but its contents (and the artifact URLs inside it)
+ * are whatever that server chose to send. Parse errors are ProvisionError so
+ * routes can answer with a code instead of a stack trace.
+ */
+
+import {
+  ProvisionError,
+  SUPPORTED_PROVISION_TYPES,
+  type ProvisionItem,
+  type ProvisionManifest,
+} from "./types.js";
+
+export const MANIFEST_SCHEMA = "agent-provisioning/v1";
+
+/**
+ * Names become directory segments under a type's sandbox, so the charset is the
+ * whole traversal defense at this layer: no separators, no dots, bounded length.
+ */
+const NAME_PATTERN = /^[a-z0-9][a-z0-9_-]{0,63}$/i;
+
+/** Route params share the manifest's name rules — one charset, one traversal defense. */
+export function isValidItemName(name: string): boolean {
+  return NAME_PATTERN.test(name);
+}
+
+const SHA256_PATTERN = /^[0-9a-f]{64}$/i;
+
+function invalidItem(index: number, reason: string): ProvisionError {
+  return new ProvisionError(`items[${index}]: ${reason}`, "invalid_item");
+}
+
+export function parseManifest(raw: unknown): ProvisionManifest {
+  if (typeof raw !== "object" || raw === null || Array.isArray(raw)) {
+    throw new ProvisionError("Manifest must be a JSON object", "invalid_manifest");
+  }
+  const obj = raw as Record<string, unknown>;
+  if (obj.schema !== MANIFEST_SCHEMA) {
+    throw new ProvisionError(
+      `Manifest schema must be "${MANIFEST_SCHEMA}"`,
+      "invalid_manifest",
+    );
+  }
+  if (!Array.isArray(obj.items)) {
+    throw new ProvisionError("Manifest must carry an `items` array", "invalid_manifest");
+  }
+
+  const seen = new Set<string>();
+  const items: ProvisionItem[] = obj.items.map((entry, index) => {
+    if (typeof entry !== "object" || entry === null) {
+      throw invalidItem(index, "must be an object");
+    }
+    const item = entry as Record<string, unknown>;
+    if (typeof item.type !== "string" || !item.type.trim()) {
+      throw invalidItem(index, "missing `type`");
+    }
+    if (typeof item.name !== "string" || !NAME_PATTERN.test(item.name)) {
+      throw invalidItem(index, "`name` must match [a-z0-9][a-z0-9_-]{0,63}");
+    }
+    const key = `${item.type}/${item.name}`;
+    if (seen.has(key)) throw invalidItem(index, `duplicate item "${key}"`);
+    seen.add(key);
+
+    // Only supported types get their artifact fields enforced: an unknown type
+    // may carry a shape this version cannot judge, and it only ever reports
+    // `unsupported` — it never reaches a download.
+    if (SUPPORTED_PROVISION_TYPES.has(item.type)) {
+      if (typeof item.url !== "string" || !item.url.trim()) {
+        throw invalidItem(index, "missing `url`");
+      }
+      if (typeof item.sha256 !== "string" || !SHA256_PATTERN.test(item.sha256)) {
+        throw invalidItem(index, "`sha256` must be 64 hex chars");
+      }
+    }
+    return {
+      type: item.type,
+      name: item.name,
+      url: typeof item.url === "string" ? item.url : undefined,
+      sha256: typeof item.sha256 === "string" ? item.sha256.toLowerCase() : undefined,
+    };
+  });
+
+  return { schema: MANIFEST_SCHEMA, items };
+}
+
+const LOOPBACK_HOSTS = new Set(["localhost", "127.0.0.1", "::1", "[::1]"]);
+
+/**
+ * URL policy for both the manifest and every artifact inside it.
+ *
+ * With no PROVISION_ALLOWLIST, artifacts must come from the manifest's own
+ * host — registering a manifest URL is the trust decision, and the default
+ * must not let that manifest fan out to arbitrary origins. An explicit
+ * allowlist replaces that rule for both kinds of URL. Plain http is refused
+ * except on loopback (local testing), since sha256 pinning cannot protect the
+ * request that carries the manifest itself.
+ */
+export function checkUrlAllowed(
+  rawUrl: string,
+  opts: { manifestUrl?: string; allowlist: string[] | null },
+): void {
+  let url: URL;
+  try {
+    url = new URL(rawUrl);
+  } catch {
+    throw new ProvisionError(`Not a valid URL: ${rawUrl}`, "invalid_url");
+  }
+  const host = url.hostname.toLowerCase();
+  if (url.protocol !== "https:" && !(url.protocol === "http:" && LOOPBACK_HOSTS.has(host))) {
+    throw new ProvisionError(`Refusing non-https URL: ${rawUrl}`, "url_not_allowed");
+  }
+  if (opts.allowlist !== null) {
+    if (!opts.allowlist.includes(host)) {
+      throw new ProvisionError(
+        `Host "${host}" is not in PROVISION_ALLOWLIST`,
+        "url_not_allowed",
+      );
+    }
+    return;
+  }
+  if (opts.manifestUrl !== undefined) {
+    const manifestHost = new URL(opts.manifestUrl).hostname.toLowerCase();
+    if (host !== manifestHost) {
+      throw new ProvisionError(
+        `Host "${host}" differs from the manifest host "${manifestHost}"; set PROVISION_ALLOWLIST to allow it`,
+        "url_not_allowed",
+      );
+    }
+  }
+}
+
+/** PROVISION_ALLOWLIST as lowercased hostnames; unset (null) means same-host-as-manifest. */
+export function getAllowlist(): string[] | null {
+  const raw = process.env.PROVISION_ALLOWLIST;
+  if (raw === undefined || !raw.trim()) return null;
+  return raw.split(",").map((h) => h.trim().toLowerCase()).filter(Boolean);
+}
