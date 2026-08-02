@@ -310,10 +310,23 @@ async function runSync(): Promise<ProvisionStatusView> {
 	      fileHashes: candidate.fileHashes,
 	      installedAt: new Date().toISOString(),
 	    };
-	    state.installed[key] = previousRecord
+	    const nextRecord: InstalledRecord = previousRecord
 	      ? { ...stableSnapshot(previousRecord), pending: candidateRecord }
 	      : candidateRecord;
-	    saveState(state);
+	    state.installed[key] = nextRecord;
+	    try {
+	      saveState(state);
+	    } catch (err) {
+	      if (previousRecord) state.installed[key] = previousRecord;
+	      else delete state.installed[key];
+	      throw err;
+	    }
+	    if (!previousRecord) {
+	      return () => {
+		delete state.installed[key];
+		saveState(state);
+	      };
+	    }
 	  },
 	},
       );

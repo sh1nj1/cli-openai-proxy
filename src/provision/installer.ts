@@ -191,8 +191,8 @@ export async function installSkill(
   opts: {
     skillsDir: string;
     checkUrl?: (url: string) => void;
-    /** Persist ownership before the staged directory becomes externally visible. */
-    beforeCommit?: (result: InstallResult) => void;
+    /** Persist ownership before exposure; return an undo for a failed first-install rename. */
+    beforeCommit?: (result: InstallResult) => void | (() => void);
     /** Existing managed paths; an upgrade must not erase additions outside this set. */
     managedFiles?: string[];
     /** Existing managed directories; omitted for legacy lockfiles that did not track them. */
@@ -261,14 +261,22 @@ export async function installSkill(
 	"untracked_content",
       );
     }
-    // The lockfile pre-claim happens before either the old or new target moves.
-    // A failed write leaves the target untouched; a crash after the write is
-    // recoverable because the next sync recognizes the path as proxy-owned.
-    opts.beforeCommit?.(result);
+    // Persist ownership before either the old or new target moves. First
+    // installs recheck after this write and undo the preclaim if exposure fails;
+    // upgrades retain their stable+pending recovery journal on swap failures.
+    const rollbackCommit = opts.beforeCommit?.(result);
     if (firstInstall) {
+      if (targetExists(target)) {
+	rollbackCommit?.();
+	throw new ProvisionError(
+	  `Refusing to replace "${item.name}" because the target appeared during installation`,
+	  "untracked_content",
+	);
+      }
       try {
 	renameSync(root, target);
       } catch (err) {
+	rollbackCommit?.();
 	if (["EEXIST", "ENOTEMPTY"].includes((err as NodeJS.ErrnoException).code ?? "")) {
 	  throw new ProvisionError(
 	    `Refusing to replace "${item.name}" because the target appeared during installation`,
@@ -286,6 +294,18 @@ export async function installSkill(
       hadPrevious = true;
     } catch (err) {
       if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
+    }
+    if (hadPrevious && hasUntrackedContent(
+      previous,
+      new Set(opts.managedFiles!),
+      opts.managedDirectories !== undefined ? new Set(opts.managedDirectories) : undefined,
+    )) {
+      renameSync(previous, target);
+      hadPrevious = false;
+      throw new ProvisionError(
+	`Refusing to replace "${item.name}" because content was added during installation`,
+	"untracked_content",
+      );
     }
     try {
       renameSync(root, target);
