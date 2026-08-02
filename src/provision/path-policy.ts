@@ -13,6 +13,7 @@ export function managedPathParts(value: unknown): string[] | null {
     typeof value !== "string"
     || !value
     || value.length > MAX_MANAGED_PATH_LENGTH
+    || value.includes("\0")
     || path.isAbsolute(value)
     || (path.sep === "\\" && value.includes("\\"))
   ) {

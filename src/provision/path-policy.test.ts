@@ -20,3 +20,8 @@ test("managed paths reject traversal and platform-absolute paths", () => {
   assert.equal(managedPathParts("nested/../outside"), null);
   assert.equal(managedPathParts(path.resolve("absolute")), null);
 });
+
+test("managed paths reject NUL bytes", () => {
+  assert.equal(managedPathParts("SKILL.md\0"), null);
+  assert.equal(managedPathParts("nested/\0/file.md"), null);
+});

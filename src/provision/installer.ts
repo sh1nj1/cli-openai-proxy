@@ -244,7 +244,14 @@ export async function installSkill(
     }
 
     const target = path.join(opts.skillsDir, item.name);
-    if (opts.managedFiles && hasUntrackedContent(
+    const firstInstall = opts.managedFiles === undefined;
+    if (firstInstall && targetExists(target)) {
+      throw new ProvisionError(
+	`Refusing to replace "${item.name}" because the target appeared during installation`,
+	"untracked_content",
+      );
+    }
+    if (!firstInstall && hasUntrackedContent(
       target,
       new Set(opts.managedFiles),
       opts.managedDirectories !== undefined ? new Set(opts.managedDirectories) : undefined,
@@ -258,6 +265,20 @@ export async function installSkill(
     // A failed write leaves the target untouched; a crash after the write is
     // recoverable because the next sync recognizes the path as proxy-owned.
     opts.beforeCommit?.(result);
+    if (firstInstall) {
+      try {
+	renameSync(root, target);
+      } catch (err) {
+	if (["EEXIST", "ENOTEMPTY"].includes((err as NodeJS.ErrnoException).code ?? "")) {
+	  throw new ProvisionError(
+	    `Refusing to replace "${item.name}" because the target appeared during installation`,
+	    "untracked_content",
+	  );
+	}
+	throw err;
+      }
+      return result;
+    }
     const previous = path.join(staging, "previous");
     let hadPrevious = false;
     try {
@@ -276,6 +297,16 @@ export async function installSkill(
   } finally {
     rmSync(staging, { recursive: true, force: true });
     rmSync(archiveDir, { recursive: true, force: true });
+  }
+}
+
+function targetExists(target: string): boolean {
+  try {
+    lstatSync(target);
+    return true;
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") return false;
+    throw err;
   }
 }
 

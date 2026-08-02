@@ -86,6 +86,11 @@ describe("provision state", () => {
 	  directories: ["../outside"],
 	  installedAt: new Date().toISOString(),
 	},
+	"skill/nul-path": {
+	  sha256: "a".repeat(64),
+	  files: ["SKILL.md\0"],
+	  installedAt: new Date().toISOString(),
+	},
 	"../escape": { sha256: "a".repeat(64), files: ["../outside"], installedAt: new Date().toISOString() },
 	"skill/good": {
 	  sha256: "b".repeat(64),

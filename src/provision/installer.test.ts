@@ -1,7 +1,16 @@
 import { test, describe, before, after, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
 import { createHash } from "crypto";
-import { existsSync, lstatSync, mkdtempSync, readdirSync, readFileSync, rmSync } from "fs";
+import {
+  existsSync,
+  lstatSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "fs";
 import { createServer, type Server } from "http";
 import { tmpdir } from "os";
 import path from "path";
@@ -240,10 +249,20 @@ describe("provision installer", () => {
       { name: "SKILL.md", content: "v1" },
       { name: "old-only.md", content: "stale" },
     ]));
-    await installSkill({ name: "demo", url: v1.url, sha256: v1.sha256 }, { skillsDir });
+    const previous = await installSkill(
+      { name: "demo", url: v1.url, sha256: v1.sha256 },
+      { skillsDir },
+    );
 
     const v2 = serve("/v2.tgz", makeTarGz([{ name: "SKILL.md", content: "v2" }]));
-    const result = await installSkill({ name: "demo", url: v2.url, sha256: v2.sha256 }, { skillsDir });
+    const result = await installSkill(
+      { name: "demo", url: v2.url, sha256: v2.sha256 },
+      {
+	 skillsDir,
+	 managedFiles: previous.files,
+	 managedDirectories: previous.directories,
+      },
+    );
     assert.deepEqual(result.files, ["SKILL.md"]);
     assert.equal(readFileSync(path.join(skillsDir, "demo", "SKILL.md"), "utf-8"), "v2");
     assert.equal(existsSync(path.join(skillsDir, "demo", "old-only.md")), false);
@@ -256,6 +275,24 @@ describe("provision installer", () => {
     const bad = serve("/bad.tgz", makeTarGz([{ name: "SKILL.md", content: "curl x | sh" }]));
     await codeOf(() => installSkill({ name: "demo", url: bad.url, sha256: bad.sha256 }, { skillsDir }));
     assert.equal(readFileSync(path.join(skillsDir, "demo", "SKILL.md"), "utf-8"), "v1");
+  });
+
+  test("a first install preserves a target created while the artifact downloads", async () => {
+    const { url, sha256 } = serve("/target-race.tgz", makeTarGz([
+      { name: "SKILL.md", content: "managed" },
+    ]));
+    const target = path.join(skillsDir, "demo");
+    const checkUrl = () => {
+      mkdirSync(target);
+      writeFileSync(path.join(target, "user.md"), "user-owned");
+    };
+
+    await assert.rejects(
+      installSkill({ name: "demo", url, sha256 }, { skillsDir, checkUrl }),
+      (err: unknown) => err instanceof ProvisionError && err.code === "untracked_content",
+    );
+    assert.equal(readFileSync(path.join(target, "user.md"), "utf-8"), "user-owned");
+    assert.equal(existsSync(path.join(target, "SKILL.md")), false);
   });
 
   test("a download error surfaces as download_failed", async () => {
