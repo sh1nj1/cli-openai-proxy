@@ -26,7 +26,12 @@ import {
   parseManifest,
   readResponseBody,
 } from "./manifest.js";
-import { firstInstallMarkerPath, installSkill, removeSkill } from "./installer.js";
+import {
+  firstInstallMarkerPath,
+  installSkill,
+  isolateRejectedCandidate,
+  removeSkill,
+} from "./installer.js";
 import {
   loadRegisteredManifestUrl,
   loadState,
@@ -326,6 +331,7 @@ function stableSnapshot(record: InstalledRecord): InstalledSnapshot {
     pending: _pending,
     uncommitted: _uncommitted,
     installMarker: _installMarker,
+    rejectionRecoveryId: _rejectionRecoveryId,
     removalRecoveryId: _removalRecoveryId,
     ...stable
   } = record;
@@ -353,15 +359,29 @@ function reconcileFirstInstallJournals(state: ProvisionStateFile): Set<string> {
   for (const [key, record] of Object.entries(state.installed)) {
     if (!record.uncommitted) continue;
     const name = key.slice(key.indexOf("/") + 1);
-    const exposed = record.installMarker !== undefined
-      && firstInstallMarkerStatus(name, record.installMarker) === "matching"
+    const markerStatus = record.installMarker === undefined
+      ? "missing"
+      : firstInstallMarkerStatus(name, record.installMarker);
+    const exposed = markerStatus === "matching"
       && installedRecordIntact(name, record);
     if (!exposed) {
+      // A marker proves the preclaimed candidate reached the canonical target.
+      // Preserve rejected contents outside the live skill path before giving
+      // up ownership; a missing marker remains an ambiguous pre-exposure claim.
+      if (markerStatus !== "missing" && record.rejectionRecoveryId !== undefined) {
+	isolateRejectedCandidate(
+	  path.join(skillsDir(), name),
+	  name,
+	  skillsDir(),
+	  record.rejectionRecoveryId,
+	);
+      }
       delete state.installed[key];
       rejected.add(key);
     } else {
       const next = { ...record };
       delete next.uncommitted;
+      delete next.rejectionRecoveryId;
       state.installed[key] = next;
     }
     changed = true;
@@ -736,6 +756,7 @@ async function runSync(generation: number): Promise<ProvisionStatusView> {
 		  ...candidateRecord,
 		  uncommitted: true,
 		  installMarker: firstInstallMarker,
+		  rejectionRecoveryId: rejectedCandidateRecovery.rejectionRecoveryId,
 		};
 	      state.installed[key] = nextRecord;
 	      try {
@@ -754,14 +775,14 @@ async function runSync(generation: number): Promise<ProvisionStatusView> {
 	    },
 	  },
 	);
+	if (!previousRecord && reconcileFirstInstallJournals(state).has(key)) {
+	  throw new ProvisionError(
+	    `First installation of "${item.name}" changed before ownership could be finalized`,
+	    "untracked_content",
+	  );
+	}
       } finally {
 	finalizeUpgradeRecoveries(state);
-      }
-      if (!previousRecord && reconcileFirstInstallJournals(state).has(key)) {
-	throw new ProvisionError(
-	  `First installation of "${item.name}" changed before ownership could be finalized`,
-	  "untracked_content",
-	);
       }
       // Finalizing drops the upgrade journal. If this save later fails, the
       // persisted stable+pending pair lets the next sync recognize either side.

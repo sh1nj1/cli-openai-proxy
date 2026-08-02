@@ -64,6 +64,8 @@ export interface InstalledRecord extends InstalledSnapshot {
    * preclaim whose rename never ran.
    */
   installMarker?: string;
+  /** Rejected-candidate recovery preclaimed before the first install is exposed. */
+  rejectionRecoveryId?: string;
   /**
    * Upgrade journal written before the directory swap. The stable snapshot is
    * retained alongside it so either side of an interrupted swap stays owned.

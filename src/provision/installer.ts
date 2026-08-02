@@ -691,7 +691,7 @@ function assertPublishedCandidate(
   }
 }
 
-function isolateRejectedCandidate(
+export function isolateRejectedCandidate(
   target: string,
   itemName: string,
   skillsDir: string,

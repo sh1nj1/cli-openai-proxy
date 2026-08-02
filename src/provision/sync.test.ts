@@ -699,12 +699,62 @@ describe("provision sync", () => {
     const view = await syncNow();
 
     assert.equal(statusOf(view, "changed-after-exposure"), "failed");
+    const target = path.join(skillsDir, "changed-after-exposure");
+    assert.equal(existsSync(target), false);
+    const recoveries = readdirSync(skillsDir)
+      .filter((entry) => entry.startsWith(".provision-rejected-"));
+    assert.equal(recoveries.length, 1);
     assert.equal(
-      readFileSync(path.join(skillsDir, "changed-after-exposure", "SKILL.md"), "utf8"),
+      readFileSync(path.join(skillsDir, recoveries[0]!, "SKILL.md"), "utf8"),
       "changed after exposure",
     );
     const state = JSON.parse(readFileSync(path.join(stateDir, "provision.lock.json"), "utf8"));
     assert.equal(state.installed["skill/changed-after-exposure"], undefined);
+    assert.deepEqual(
+      state.upgradeRecoveries,
+      [recoveries[0]!.slice(".provision-rejected-".length)],
+    );
+  });
+
+  test("restart isolates a changed exposed first-install journal before repair", async () => {
+    process.env.PROVISION_AUTOAPPLY = "auto";
+    const name = "restart-changed-exposure";
+    const key = `skill/${name}`;
+    const marker = "a".repeat(32);
+    const recoveryId = "b".repeat(32);
+    const target = path.join(skillsDir, name);
+    mkdirSync(target);
+    writeFileSync(path.join(target, "SKILL.md"), "changed after exposure");
+    writeFileSync(firstInstallMarkerPath(target, marker), marker);
+    const skill = serveSkill("/restart-changed-exposure.tgz", "registry contents");
+    writeFileSync(path.join(stateDir, "provision.lock.json"), JSON.stringify({
+      version: 1,
+      approved: [key],
+      revoked: [],
+      upgradeRecoveries: [recoveryId],
+      installed: {
+	[key]: {
+	  sha256: skill.sha256,
+	  files: ["SKILL.md"],
+	  directories: [],
+	  fileHashes: { "SKILL.md": sha(Buffer.from("registry contents")) },
+	  installedAt: new Date().toISOString(),
+	  uncommitted: true,
+	  installMarker: marker,
+	  rejectionRecoveryId: recoveryId,
+	},
+      },
+    }));
+    registerManifestUrl(serveManifest([{ type: "skill", name, ...skill }]));
+
+    assert.equal(statusOf(await syncNow(), name), "installed");
+    assert.equal(readFileSync(path.join(target, "SKILL.md"), "utf8"), "registry contents");
+    const recovery = path.join(skillsDir, `.provision-rejected-${recoveryId}`);
+    assert.equal(readFileSync(path.join(recovery, "SKILL.md"), "utf8"), "changed after exposure");
+    const state = JSON.parse(readFileSync(path.join(stateDir, "provision.lock.json"), "utf8"));
+    assert.deepEqual(state.upgradeRecoveries, [recoveryId]);
+    assert.equal(state.installed[key].uncommitted, undefined);
+    assert.equal(state.installed[key].rejectionRecoveryId, undefined);
   });
 
   test("a committed upgrade is recovered from a pending ownership transaction", async () => {
