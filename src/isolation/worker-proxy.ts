@@ -5,6 +5,7 @@ import path from "node:path";
 import type { Request, Response } from "express";
 import { v7 as uuidv7 } from "uuid";
 import { getWorkerConnectTimeoutMs } from "../config.js";
+import { checkUrlAllowed, getAllowlist } from "../provision/manifest.js";
 import { provisionStateDir } from "../provision/state.js";
 import { requestIdentity } from "./request-identity.js";
 import type { WorkerProvisioner, WorkerTarget } from "./types.js";
@@ -78,11 +79,11 @@ function provisioningGenerationTimestamp(generation: string): number {
   return Number.parseInt(`${generation.slice(0, 8)}${generation.slice(9, 13)}`, 16);
 }
 
-function hasValidProvisioningUrl(body: unknown): boolean {
+function hasAllowedProvisioningUrl(body: unknown): boolean {
   const url = (body as Record<string, unknown> | undefined)?.provisioning_url;
   if (typeof url !== "string" || !provisioningUrlFitsHeader(url)) return false;
   try {
-    new URL(url);
+    checkUrlAllowed(url, { allowlist: getAllowlist() });
     return true;
   } catch {
     return false;
@@ -165,7 +166,7 @@ export class UserWorkerProxy {
     let provisioningGeneration: string | undefined;
     if (
       onAuthorizedProvisioningUrl
-      && hasValidProvisioningUrl(req.body)
+      && hasAllowedProvisioningUrl(req.body)
       && req.method === "POST"
       && /^\/v1\/auth\/[^/]+\/sessions\/?$/.test(req.path)
     ) {
@@ -289,6 +290,11 @@ export class UserWorkerProxy {
     generation: string,
     callback: (url: string) => void | Promise<void>,
   ): void {
+    try {
+      checkUrlAllowed(url, { allowlist: getAllowlist() });
+    } catch {
+      return;
+    }
     if (this.latestProvisioningGeneration && generation < this.latestProvisioningGeneration) return;
     if (!this.latestProvisioningGeneration || generation > this.latestProvisioningGeneration) {
       try {
