@@ -33,10 +33,20 @@ ConditionPathExists=${CONFIG_OK_FLAG}
 EOF
 chmod 0644 "${GATEWAY_UNIT_DIR}/docker-config-gate.conf"
 
-if [[ -f "${SEED}" ]]; then
+if [[ -e "${SEED}" || -L "${SEED}" ]]; then
   rm -f "${CONFIG_OK_FLAG}"
 fi
 systemctl daemon-reload
+
+# Compose always manages this path. If its host source is missing, Docker
+# materializes a directory here; symlinks and other special files are invalid
+# too. Do not let any of those cases fall through to the intentionally
+# unmanaged (absent-path) mode, which would reopen the gateway with a stale
+# persisted env on a later boot.
+if [[ -L "${SEED}" || ( -e "${SEED}" && ! -f "${SEED}" ) ]]; then
+  echo "first-boot: seed gateway.env is not a regular file — gateway held down this boot" >&2
+  exit 1
+fi
 
 /opt/app/scripts/install-linux-user-workers.sh
 

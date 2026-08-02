@@ -28,7 +28,8 @@ curl http://127.0.0.1:3456/health
 If you forget to create `gateway.env` before `docker compose up`, Docker
 materializes an empty directory in its place (both at this path and at
 `/run/host-config/gateway.env` inside the container), and the gateway stays
-down with no seed to install — the failure is silent by design, but if you
+down with no seed to install. The first-boot unit fails and its config gate
+prevents any persisted credentials from being served. If you
 expected the gateway to start: `docker compose down`, `rm -rf
 deploy/docker/gateway.env` (removing the directory Docker created), create
 the real file, then `docker compose up -d` again.
@@ -204,7 +205,9 @@ exercises the full seed lifecycle across restarts: key rotation (old key
 `401`, rotated key `200`), revoke-everything via an emptied seed (gateway
 held down, persisted env cleared, port refusing connections), and recovery
 after the seed is repopulated. It tears the stack down (`down -v`) on exit,
-so it never leaves state behind.
+then also replaces the seed with a directory and verifies the first-boot unit
+fails closed without serving the still-persisted credentials. It never leaves
+state behind.
 
 The smoke test and the production compose file both build the same image tag,
 `cli-openai-proxy:local` — running the smoke test rebuilds and overwrites that

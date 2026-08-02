@@ -31,7 +31,15 @@ compose() {
     docker compose -p "${PROJECT}" -f "${DIR}/docker-compose.yml" "$@"
 }
 
-cleanup() { compose down -v --timeout 20 >/dev/null 2>&1 || true; rm -f "${ENV_FILE}" "${ENV_FILE}.next"; }
+cleanup() {
+  compose down -v --timeout 20 >/dev/null 2>&1 || true
+  if [[ -d "${ENV_FILE}" && ! -L "${ENV_FILE}" ]]; then
+    rmdir "${ENV_FILE}" 2>/dev/null || true
+  else
+    rm -f "${ENV_FILE}"
+  fi
+  rm -f "${ENV_FILE}.next"
+}
 trap cleanup EXIT
 
 compose up -d --build
@@ -113,5 +121,30 @@ timeout 180 bash -c \
   "until curl -fsS ${BASE_URL}/health >/dev/null 2>&1; do sleep 2; done" \
   || { compose logs; echo "FAIL: gateway never became healthy after restore" >&2; exit 1; }
 expect 200 -H "Authorization: Bearer ${ROTATED_KEY}" "${BASE_URL}/v1/usage"
+
+# Invalid seed mount: if the host path is missing, Docker materializes a
+# directory at the file target. Preserve the persisted credentials to prove
+# that this malformed managed seed cannot fall through to unmanaged mode and
+# reactivate them on the next boot.
+echo "==> replacing seed with a directory and restarting"
+compose stop --timeout 30
+rm -f "${ENV_FILE}"
+mkdir "${ENV_FILE}"
+compose start
+
+echo "==> waiting for first-boot to reject the invalid seed"
+deadline=$((SECONDS + 180))
+until [[ "$(unit_state cli-openai-proxy-first-boot.service)" == "failed" ]]; do
+  (( SECONDS < deadline )) \
+    || { compose logs; echo "FAIL: first-boot did not reject the directory seed" >&2; exit 1; }
+  sleep 2
+done
+
+[[ "$(unit_state cli-openai-proxy-gateway.service)" != "active" ]] \
+  || { compose logs; echo "FAIL: gateway is serving with a directory seed" >&2; exit 1; }
+compose exec -T proxy test -s /etc/cli-openai-proxy/gateway.env \
+  || { compose logs; echo "FAIL: invalid-seed test requires persisted credentials" >&2; exit 1; }
+expect 000 "${BASE_URL}/health"
+expect 000 -H "Authorization: Bearer ${ROTATED_KEY}" "${BASE_URL}/v1/usage"
 
 echo "PASS: compose smoke test"
