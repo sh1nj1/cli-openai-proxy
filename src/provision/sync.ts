@@ -365,10 +365,9 @@ function reconcileFirstInstallJournals(state: ProvisionStateFile): Set<string> {
     const exposed = markerStatus === "matching"
       && installedRecordIntact(name, record);
     if (!exposed) {
-      // A marker proves the preclaimed candidate reached the canonical target.
-      // Preserve rejected contents outside the live skill path before giving
-      // up ownership; a missing marker remains an ambiguous pre-exposure claim.
-      if (markerStatus !== "missing" && record.rejectionRecoveryId !== undefined) {
+      // Only the journal's exact marker proves the preclaimed candidate reached
+      // the canonical target; a missing or changed marker may be user-owned.
+      if (markerStatus === "matching" && record.rejectionRecoveryId !== undefined) {
 	isolateRejectedCandidate(
 	  path.join(skillsDir(), name),
 	  name,

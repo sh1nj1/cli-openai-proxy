@@ -537,43 +537,54 @@ describe("provision sync", () => {
     assert.equal(existsSync(path.join(skillsDir, "ownership")), false);
   });
 
-  test("a restarted first-install preclaim never owns an ambiguous target", async () => {
+  test("a restarted first-install preclaim preserves a target with a forged marker", async () => {
     process.env.PROVISION_AUTOAPPLY = "auto";
     initProvisioning();
-    const target = path.join(skillsDir, "interrupted-first-install");
+    const name = "interrupted-first-install";
+    const marker = "a".repeat(32);
+    const recoveryId = "b".repeat(32);
+    const target = path.join(skillsDir, name);
     mkdirSync(target);
     writeFileSync(path.join(target, "SKILL.md"), "same path, user-owned contents");
+    writeFileSync(firstInstallMarkerPath(target, marker), "forged marker contents");
     const skill = serveSkill("/interrupted-first-install.tgz", "registry contents");
     writeFileSync(path.join(stateDir, "provision.lock.json"), JSON.stringify({
       version: 1,
       approved: [],
       revoked: [],
+      upgradeRecoveries: [recoveryId],
       installed: {
-	"skill/interrupted-first-install": {
+	[`skill/${name}`]: {
 	  sha256: skill.sha256,
 	  files: ["SKILL.md"],
 	  fileHashes: { "SKILL.md": sha(Buffer.from("registry contents")) },
 	  installedAt: new Date().toISOString(),
 	  uncommitted: true,
-	  installMarker: "a".repeat(32),
+	  installMarker: marker,
+	  rejectionRecoveryId: recoveryId,
 	},
       },
     }));
     registerManifestUrl(serveManifest([{
       type: "skill",
-      name: "interrupted-first-install",
+      name,
       ...skill,
     }]));
 
     const view = await syncNow();
 
-    assert.equal(statusOf(view, "interrupted-first-install"), "failed");
+    assert.equal(statusOf(view, name), "failed");
     assert.equal(
       readFileSync(path.join(target, "SKILL.md"), "utf8"),
       "same path, user-owned contents",
     );
+    assert.equal(
+      readFileSync(firstInstallMarkerPath(target, marker), "utf8"),
+      "forged marker contents",
+    );
+    assert.equal(existsSync(path.join(skillsDir, `.provision-rejected-${recoveryId}`)), false);
     const state = JSON.parse(readFileSync(path.join(stateDir, "provision.lock.json"), "utf8"));
-    assert.equal(state.installed["skill/interrupted-first-install"], undefined);
+    assert.equal(state.installed[`skill/${name}`], undefined);
   });
 
   test("DELETE discards a pre-exposure claim before inspecting its target", async () => {
