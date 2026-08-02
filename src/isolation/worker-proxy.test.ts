@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
-import { rm } from "node:fs/promises";
+import { readFile, rm, writeFile } from "node:fs/promises";
 import http from "node:http";
 import type { AddressInfo } from "node:net";
 import { afterEach, test } from "node:test";
@@ -176,6 +176,8 @@ test("gateway consumes a worker provisioning notification without exposing its p
 test("gateway persists notification ordering across restart", async () => {
   const socketPath = `/tmp/cap-worker-${randomUUID().slice(0, 8)}.sock`;
   const generationStateFile = `/tmp/cap-generation-${randomUUID().slice(0, 8)}.state`;
+  const persistedGeneration = "0fffffff-ffff-7fff-bfff-ffffffffffff";
+  await writeFile(generationStateFile, `${persistedGeneration}\n`);
   const generations = new Map<string, string>();
   const urls = new Map([
     ["session-a", "https://collavre.test/agents/vrex/a.json"],
@@ -235,9 +237,16 @@ test("gateway persists notification ordering across restart", async () => {
     const first = await create();
     const second = await create();
     assert.notEqual(generations.get(first.sessionId), headers[PROVISIONING_GENERATION_HEADER]);
+    assert.ok(persistedGeneration < generations.get(first.sessionId)!);
     assert.ok(generations.get(first.sessionId)! < generations.get(second.sessionId)!);
+    assert.equal((await readFile(generationStateFile, "utf8")).trim(), generations.get(second.sessionId));
 
-    await fetch(`http://127.0.0.1:${port}/v1/auth/fake/sessions/${second.sessionId}`, { headers });
+    const poll = async (sessionId: string) => {
+      const response = await fetch(`http://127.0.0.1:${port}/v1/auth/fake/sessions/${sessionId}`, { headers });
+      await response.arrayBuffer();
+    };
+    await poll(second.sessionId);
+    assert.deepEqual(notifications, [urls.get(second.sessionId)]);
 
     await new Promise<void>((resolve) => gateway!.close(() => resolve()));
     gateway = undefined;
@@ -248,8 +257,8 @@ test("gateway persists notification ordering across restart", async () => {
     await new Promise<void>((resolve) => gateway!.once("listening", resolve));
     port = (gateway.address() as AddressInfo).port;
 
-    await fetch(`http://127.0.0.1:${port}/v1/auth/fake/sessions/${second.sessionId}`, { headers });
-    await fetch(`http://127.0.0.1:${port}/v1/auth/fake/sessions/${first.sessionId}`, { headers });
+    await poll(second.sessionId);
+    await poll(first.sessionId);
 
     assert.deepEqual(notifications, [urls.get(second.sessionId), urls.get(second.sessionId)]);
   } finally {

@@ -73,6 +73,10 @@ function saveProvisioningGeneration(file: string, generation: string): void {
   }
 }
 
+function provisioningGenerationTimestamp(generation: string): number {
+  return Number.parseInt(`${generation.slice(0, 8)}${generation.slice(9, 13)}`, 16);
+}
+
 function outgoingHeaders(
   headers: IncomingHttpHeaders,
   body: Buffer,
@@ -144,10 +148,16 @@ export class UserWorkerProxy {
     if (clientClosed || res.destroyed) return;
 
     const body = req.body === undefined ? Buffer.alloc(0) : Buffer.from(JSON.stringify(req.body));
-    const provisioningGeneration = req.method === "POST"
-      && /^\/v1\/auth\/[^/]+\/sessions\/?$/.test(req.path)
-      ? uuidv7()
-      : undefined;
+    let provisioningGeneration: string | undefined;
+    if (req.method === "POST" && /^\/v1\/auth\/[^/]+\/sessions\/?$/.test(req.path)) {
+      try {
+	provisioningGeneration = this.issueProvisioningGeneration();
+      } catch (error) {
+	res.off("close", closeUpstream);
+	if (!clientClosed && !res.destroyed) this.sendFailure(res, error);
+	return;
+      }
+    }
     await new Promise<void>((resolve) => {
       let readinessTimer: ReturnType<typeof setTimeout> | undefined;
       const clearReadinessTimer = () => {
@@ -204,6 +214,24 @@ export class UserWorkerProxy {
       request.end(body);
     });
     res.off("close", closeUpstream);
+  }
+
+  private issueProvisioningGeneration(): string {
+    let generation = uuidv7();
+    if (this.latestProvisioningGeneration && generation <= this.latestProvisioningGeneration) {
+      const nextTimestamp = provisioningGenerationTimestamp(this.latestProvisioningGeneration) + 1;
+      if (nextTimestamp > 0xffffffffffff) {
+	throw new Error("Provisioning generation space exhausted");
+      }
+      generation = uuidv7({
+	msecs: nextTimestamp,
+      });
+    }
+    // Issuance is the ordering point: a retained pre-restart session must not
+    // overtake a session created after the restart.
+    saveProvisioningGeneration(this.generationStateFile, generation);
+    this.latestProvisioningGeneration = generation;
+    return generation;
   }
 
   private relayProvisioningNotification(
