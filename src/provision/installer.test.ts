@@ -780,6 +780,26 @@ describe("provision installer", () => {
     assert.deepEqual(readdirSync(skillsDir).filter((entry) => entry.startsWith(".")), []);
   });
 
+  test("candidate cleanup cannot delete the exposed tree moved back onto its old pathname", async () => {
+    const { url, sha256 } = serve("/candidate-reuse.tgz", makeTarGz([
+      { name: "SKILL.md", content: "preserved" },
+    ]));
+    let candidate = "";
+    await installSkill({ name: "demo", url, sha256 }, {
+      skillsDir,
+      beforeCandidateMove: () => {
+	candidate = path.join(
+	  skillsDir,
+	  readdirSync(skillsDir).find((entry) => entry.startsWith(".provision-candidate-"))!,
+	);
+      },
+      afterFirstInstallMove: (target) => renameSync(target, candidate),
+    });
+
+    assert.equal(readFileSync(path.join(candidate, "SKILL.md"), "utf8"), "preserved");
+    assert.equal(existsSync(path.join(skillsDir, "demo")), false);
+  });
+
   test("a body that streams past the size cap is aborted, not buffered to completion", async () => {
     const guard = new Promise<never>((_, reject) =>
       setTimeout(() => reject(new Error("download buffered past the cap")), 15_000).unref(),

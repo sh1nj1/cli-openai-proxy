@@ -194,6 +194,11 @@ export async function fetchWithPolicy(
       throw new ProvisionError(`Fetch failed: ${reason}`, opts.failCode);
     }
     if (![301, 302, 303, 307, 308].includes(response.status)) return response;
+    try {
+      await response.body?.cancel();
+    } catch {
+      // Cancellation is best-effort; redirect policy must still be enforced.
+    }
     const location = response.headers.get("location");
     if (!location) {
       throw new ProvisionError(`Redirect without a Location header from ${url}`, opts.failCode);

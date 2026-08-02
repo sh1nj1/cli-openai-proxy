@@ -154,7 +154,10 @@ describe("provision manifest", () => {
 
   test("a malformed redirect location is reported with the caller's upstream error code", async () => {
     const realFetch = globalThis.fetch;
-    globalThis.fetch = async () => new Response(null, {
+    let cancelled = false;
+    globalThis.fetch = async () => new Response(new ReadableStream({
+      cancel: () => { cancelled = true; },
+    }), {
       status: 302,
       headers: { location: "http://[::1" },
     });
@@ -167,6 +170,38 @@ describe("provision manifest", () => {
 	}),
 	(err: unknown) => err instanceof ProvisionError && err.code === "manifest_fetch_failed",
       );
+      assert.equal(cancelled, true, "the invalid redirect body must be cancelled before throwing");
+    } finally {
+      globalThis.fetch = realFetch;
+    }
+  });
+
+  test("each redirect body is cancelled before the next hop is fetched", async () => {
+    const realFetch = globalThis.fetch;
+    const cancelled: number[] = [];
+    let fetches = 0;
+    globalThis.fetch = async () => {
+      fetches++;
+      if (fetches === 3) {
+	assert.deepEqual(cancelled, [1, 2]);
+	return new Response("ok");
+      }
+      const hop = fetches;
+      return new Response(new ReadableStream({
+	cancel: () => { cancelled.push(hop); },
+      }), {
+	status: 302,
+	headers: { location: `/hop-${hop}` },
+      });
+    };
+    try {
+      const response = await fetchWithPolicy("https://collavre.com/provision.json", {
+	checkUrl: () => {},
+	timeoutMs: 1_000,
+	failCode: "manifest_fetch_failed",
+      });
+      assert.equal(await response.text(), "ok");
+      assert.deepEqual(cancelled, [1, 2]);
     } finally {
       globalThis.fetch = realFetch;
     }

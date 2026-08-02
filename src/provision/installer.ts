@@ -307,6 +307,7 @@ export async function installSkill(
     );
   }
   let preserveCandidate = false;
+  let candidateExposed = false;
   try {
     const archivePath = path.join(archiveDir, "artifact.tgz");
     writeFileSync(archivePath, buf);
@@ -381,6 +382,7 @@ export async function installSkill(
 	    "untracked_content",
 	  );
 	}
+	candidateExposed = true;
       } catch (err) {
 	preserveCandidate = targetExists(candidate);
 	rollbackCommit?.();
@@ -455,6 +457,7 @@ export async function installSkill(
 	  "untracked_content",
 	);
       }
+      candidateExposed = true;
     } catch (err) {
       if (err instanceof ProvisionError && err.code === "untracked_content") throw err;
       preserveCandidate = targetExists(candidate);
@@ -480,7 +483,11 @@ export async function installSkill(
     return result;
   } finally {
     try {
-      if (!preserveCandidate) rmSync(candidate, { recursive: true, force: true });
+      // Once exposed, the candidate pathname is vacant and no longer identifies
+      // our audited tree. A same-UID process can reuse it before this finally.
+      if (!preserveCandidate && !candidateExposed) {
+	rmSync(candidate, { recursive: true, force: true });
+      }
     } finally {
       rmSync(archiveDir, { recursive: true, force: true });
     }
