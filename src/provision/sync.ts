@@ -69,11 +69,24 @@ let inFlight: Promise<ProvisionStatusView> | null = null;
 let manifestGeneration = 0;
 let syncRequested = false;
 let operationTail: Promise<void> = Promise.resolve();
+let pendingOperations = 0;
+let shuttingDown = false;
+let shutdownPromise: Promise<void> | null = null;
 
 function serialize<T>(operation: () => Promise<T> | T): Promise<T> {
+  pendingOperations += 1;
   const result = operationTail.then(operation, operation);
-  operationTail = result.then(() => undefined, () => undefined);
+  operationTail = result.then(
+    () => { pendingOperations -= 1; },
+    () => { pendingOperations -= 1; },
+  );
   return result;
+}
+
+function assertAcceptingOperations(): void {
+  if (shuttingDown) {
+    throw new ProvisionError("Provisioning is shutting down.", "provisioning_disabled");
+  }
 }
 
 function skillsDir(): string {
@@ -134,6 +147,7 @@ function startRefetchTimer(): void {
 }
 
 export function registerManifestUrl(url: string): void {
+  assertAcceptingOperations();
   if (!enabled) return;
   checkUrlAllowed(url, { allowlist: getAllowlist() });
   if (manifestUrl !== url) {
@@ -294,6 +308,7 @@ async function runSync(): Promise<ProvisionStatusView> {
 
 /** Serialized and coalesced; URL changes during a run queue one follow-up run. */
 export async function syncNow(): Promise<ProvisionStatusView> {
+  assertAcceptingOperations();
   if (inFlight) return inFlight;
   const loop = async (): Promise<ProvisionStatusView> => {
     let result!: ProvisionStatusView;
@@ -335,6 +350,7 @@ export function getStatus(): ProvisionStatusView {
 }
 
 export async function approveItem(type: string, name: string): Promise<ProvisionStatusView> {
+  assertAcceptingOperations();
   const key = `${type}/${name}`;
   // Approval is consent to something the operator has SEEN: only names the
   // current manifest carries can be approved, so the list cannot be pre-seeded
@@ -354,6 +370,7 @@ export async function approveItem(type: string, name: string): Promise<Provision
 }
 
 export function deleteItem(type: string, name: string): Promise<{ removed: boolean }> {
+  assertAcceptingOperations();
   if (!isValidItemName(type) || !isValidItemName(name)) {
     throw new ProvisionError(`Invalid item key "${type}/${name}"`, "invalid_item");
   }
@@ -388,8 +405,7 @@ export async function handleAuthorizedSession(url: string | undefined): Promise<
   }
 }
 
-/** Clear module state (not disk). Shutdown and tests; also the first step of init. */
-export function resetProvisioning(): void {
+function clearProvisioningState(): void {
   if (refetchTimer) clearInterval(refetchTimer);
   refetchTimer = null;
   enabled = false;
@@ -403,4 +419,36 @@ export function resetProvisioning(): void {
   manifestGeneration = 0;
   syncRequested = false;
   operationTail = Promise.resolve();
+  pendingOperations = 0;
+  shuttingDown = false;
+}
+
+/**
+ * Stop accepting work, wait for the active generation and queued mutations,
+ * then clear module state. Keeping the promises attached prevents an
+ * in-process restart from racing a stale sync against the new instance.
+ */
+export function shutdownProvisioning(): Promise<void> {
+  if (shutdownPromise) return shutdownPromise;
+  shuttingDown = true;
+  if (refetchTimer) clearInterval(refetchTimer);
+  refetchTimer = null;
+  const active = inFlight;
+  const shutdown = (async () => {
+    if (active) await active.catch(() => undefined);
+    await operationTail;
+    clearProvisioningState();
+  })();
+  shutdownPromise = shutdown.finally(() => {
+    shutdownPromise = null;
+  });
+  return shutdownPromise;
+}
+
+/** Clear idle module state (not disk). Tests and the first step of init only. */
+export function resetProvisioning(): void {
+  if (inFlight || pendingOperations > 0 || shuttingDown) {
+    throw new Error("Cannot reset provisioning while operations are active; await shutdownProvisioning()");
+  }
+  clearProvisioningState();
 }

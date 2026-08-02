@@ -14,7 +14,7 @@ import {
 } from "./provision-routes.js";
 import { handleCreateAuthSession, initAuthAdmin } from "./auth-routes.js";
 import { authMiddleware, initAuth } from "./auth.js";
-import { getStatus, initProvisioning, resetProvisioning } from "../provision/sync.js";
+import { getStatus, initProvisioning, shutdownProvisioning } from "../provision/sync.js";
 import { engineRegistry } from "../auth/registry.js";
 import { resetSessions } from "../auth/session-manager.js";
 import type { EngineAuthDescriptor, EngineAuthSession } from "../auth/types.js";
@@ -55,9 +55,9 @@ describe("provision-routes", () => {
     process.env.PROVISION_SKILLS_DIR = path.join(stateDir, "skills");
   });
 
-  afterEach(() => {
+  afterEach(async () => {
     resetSessions();
-    resetProvisioning();
+    await shutdownProvisioning();
     for (const name of SAVED_VARS) {
       const value = saved.get(name);
       if (value === undefined) delete process.env[name];
@@ -200,7 +200,7 @@ describe("provision-routes", () => {
 
     test("an authorized session registers its provisioning_url with the sync engine", async () => {
       enable();
-      const url = "https://collavre.example/agents/vrex/provision.json";
+      const url = "http://127.0.0.1:1/agents/vrex/provision.json";
       const created = fakeRes();
       await handleCreateAuthSession(
         fakeReq({ params: { engine: "fake" } as any, body: { provisioning_url: url } }),

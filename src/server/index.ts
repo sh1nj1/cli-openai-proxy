@@ -30,7 +30,7 @@ import {
 } from "./provision-routes.js";
 import { getTimeoutMs } from "../config.js";
 import { resetSessions } from "../auth/session-manager.js";
-import { handleAuthorizedSession, initProvisioning, resetProvisioning } from "../provision/sync.js";
+import { handleAuthorizedSession, initProvisioning, shutdownProvisioning } from "../provision/sync.js";
 import { initRequestIdentity, requireRequestIdentity } from "../isolation/request-identity.js";
 import type { UserWorkerProxy } from "../isolation/worker-proxy.js";
 
@@ -93,7 +93,7 @@ export function createApp(config: AppConfig = {}): Express {
     console.log(
       provisionStatus.enabled
         ? `[Server] Agent provisioning enabled (mode: ${provisionStatus.autoApply}`
-          + `${provisionStatus.manifestUrl ? `, manifest: ${provisionStatus.manifestUrl}` : ""})`
+	  + `${provisionStatus.manifestUrl ? ", fixed manifest configured" : ""})`
         : "[Server] Agent provisioning disabled (set PROVISION_SYNC=1 to enable)",
     );
     if (userWorkerProxy) {
@@ -296,7 +296,7 @@ export async function stopServer(): Promise<void> {
 
   // Also module state: the refetch timer and registered manifest URL would
   // otherwise survive into (and act during) the next startServer().
-  resetProvisioning();
+  await shutdownProvisioning();
 
   if (!serverInstance) {
     return;

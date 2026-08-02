@@ -17,6 +17,11 @@ import type { EngineAuthDescriptor, EngineAuthSession } from "../auth/types.js";
 
 const ADMIN_KEY = "admin-shutdown";
 const authHeaders = { Authorization: `Bearer ${ADMIN_KEY}` };
+const SAVED_PROVISION_VARS = [
+  "PROVISION_SYNC",
+  "PROVISION_MANIFEST_URL",
+  "PROVISION_REFETCH_MS",
+] as const;
 
 /** Stands in for the pty child the real paste-code adapter holds open. */
 class FakeSession implements EngineAuthSession {
@@ -62,6 +67,7 @@ afterEach(async () => {
   if (getServer()) await stopServer();
   engineRegistry.resolve = realResolve;
   delete process.env.AUTH_ADMIN_KEYS;
+  for (const name of SAVED_PROVISION_VARS) delete process.env[name];
 });
 
 async function createFakeSession(port: number): Promise<string> {
@@ -105,4 +111,22 @@ test("a pending session is not resolvable after an in-process restart", async ()
   assert.equal(res.status, 404, "a session must not be resolvable after a restart");
   const body = (await res.json()) as { error: { code: string } };
   assert.equal(body.error.code, "unknown_session");
+});
+
+test("startup logs do not expose credentials from a fixed manifest URL", async () => {
+  process.env.PROVISION_SYNC = "1";
+  process.env.PROVISION_REFETCH_MS = "0";
+  process.env.PROVISION_MANIFEST_URL = "http://user:password@127.0.0.1:1/provision.json?token=secret";
+  const lines: string[] = [];
+  const realLog = console.log;
+  console.log = (...args: unknown[]) => { lines.push(args.map(String).join(" ")); };
+  try {
+    await startServer({ port: 0 });
+  } finally {
+    console.log = realLog;
+  }
+
+  const output = lines.join("\n");
+  assert.match(output, /Agent provisioning enabled/);
+  assert.doesNotMatch(output, /password|token=secret|provision\.json/);
 });

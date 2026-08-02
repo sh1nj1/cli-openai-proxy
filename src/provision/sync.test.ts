@@ -15,6 +15,7 @@ import {
   provisionEnabled,
   registerManifestUrl,
   resetProvisioning,
+  shutdownProvisioning,
   syncNow,
 } from "./sync.js";
 import { ProvisionError } from "./types.js";
@@ -114,8 +115,8 @@ describe("provision sync", () => {
     initProvisioning();
   });
 
-  afterEach(() => {
-    resetProvisioning();
+  afterEach(async () => {
+    await shutdownProvisioning();
     for (const name of SAVED_VARS) {
       const value = saved.get(name);
       if (value === undefined) delete process.env[name];
@@ -392,6 +393,27 @@ describe("provision sync", () => {
     assert.equal(getStatus().manifest_url, `${baseUrl}/second.json`);
     assert.equal(existsSync(path.join(skillsDir, "first")), false);
     assert.equal(existsSync(path.join(skillsDir, "second", "SKILL.md")), true);
+  });
+
+  test("shutdown waits for an active sync before clearing module state", async () => {
+    process.env.PROVISION_AUTOAPPLY = "auto";
+    initProvisioning();
+    const skill = serveSkill("/shutdown.tgz", "installed before shutdown completes");
+    registerManifestUrl(serveManifest([{ type: "skill", name: "shutdown", ...skill }]));
+    let release!: () => void;
+    responseGates.set("/shutdown.tgz", new Promise<void>((resolve) => { release = resolve; }));
+
+    const syncing = syncNow();
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    let stopped = false;
+    const shutdown = shutdownProvisioning().then(() => { stopped = true; });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    assert.equal(stopped, false, "reset must stay attached to the active generation");
+
+    release();
+    await Promise.all([syncing, shutdown]);
+    assert.equal(stopped, true);
+    assert.equal(getStatus().enabled, false);
   });
 
   test("approving an item the manifest never named is unknown_item", async () => {

@@ -192,7 +192,11 @@ export async function fetchWithPolicy(
     if (!location) {
       throw new ProvisionError(`Redirect without a Location header from ${url}`, opts.failCode);
     }
-    url = new URL(location, url).toString();
+    try {
+      url = new URL(location, url).toString();
+    } catch {
+      throw new ProvisionError(`Redirect from ${url} has an invalid Location header`, opts.failCode);
+    }
   }
   throw new ProvisionError(`Too many redirects fetching ${rawUrl}`, opts.failCode);
 }

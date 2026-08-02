@@ -1,6 +1,6 @@
 import { test, describe, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
-import { parseManifest, checkUrlAllowed, getAllowlist } from "./manifest.js";
+import { parseManifest, checkUrlAllowed, fetchWithPolicy, getAllowlist } from "./manifest.js";
 import { ProvisionError } from "./types.js";
 
 const valid = () => ({
@@ -139,5 +139,25 @@ describe("provision manifest", () => {
       process.env.PROVISION_ALLOWLIST = " CDN.Example , collavre.com ";
       assert.deepEqual(getAllowlist(), ["cdn.example", "collavre.com"]);
     });
+  });
+
+  test("a malformed redirect location is reported with the caller's upstream error code", async () => {
+    const realFetch = globalThis.fetch;
+    globalThis.fetch = async () => new Response(null, {
+      status: 302,
+      headers: { location: "http://[::1" },
+    });
+    try {
+      await assert.rejects(
+	fetchWithPolicy("https://collavre.com/provision.json", {
+	  checkUrl: () => {},
+	  timeoutMs: 1_000,
+	  failCode: "manifest_fetch_failed",
+	}),
+	(err: unknown) => err instanceof ProvisionError && err.code === "manifest_fetch_failed",
+      );
+    } finally {
+      globalThis.fetch = realFetch;
+    }
   });
 });
