@@ -437,7 +437,32 @@ describe("provision installer", () => {
     assert.equal(existsSync(path.join(userDirectory, "SKILL.md")), false);
   });
 
-  test("an upgrade does not replace an empty directory created at exposure", async () => {
+  test("a first install atomically refuses a directory replacing the old reservation", async () => {
+    const { url, sha256 } = serve("/reservation-replacement-race.tgz", makeTarGz([
+      { name: "SKILL.md", content: "managed" },
+    ]));
+    const target = path.join(skillsDir, "demo");
+
+    await assert.rejects(
+      installSkill(
+	{ name: "demo", url, sha256 },
+	{
+	  skillsDir,
+	  beforeCandidateRename: () => {
+	    rmSync(target, { recursive: true, force: true });
+	    mkdirSync(target);
+	  },
+	},
+      ),
+      (err: unknown) => err instanceof ProvisionError && err.code === "untracked_content",
+    );
+
+    assert.equal(lstatSync(target).isDirectory(), true);
+    assert.deepEqual(readdirSync(target), []);
+    assert.equal(existsSync(path.join(target, "SKILL.md")), false);
+  });
+
+  test("an upgrade atomically refuses a directory replacing the old reservation", async () => {
     const v1 = serve("/empty-upgrade-target-v1.tgz", makeTarGz([
       { name: "SKILL.md", content: "v1" },
     ]));
@@ -457,7 +482,10 @@ describe("provision installer", () => {
 	  skillsDir,
 	  managedFiles: previous.files,
 	  managedDirectories: previous.directories,
-	  beforeCandidateMove: () => mkdirSync(target),
+	  beforeCandidateRename: () => {
+	    rmSync(target, { recursive: true, force: true });
+	    mkdirSync(target);
+	  },
 	},
       ),
       (err: unknown) => err instanceof ProvisionError && err.code === "untracked_content",

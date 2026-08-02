@@ -143,8 +143,11 @@ The tombstone clears after the item leaves the manifest.
 - **Install = file placement only.** Nothing from an archive is executed. Link
   entries, traversal names, binaries, files over 1 MiB, and text matching
   pipe-download-into-shell patterns are refused. Extraction stages next to the
-  target and swaps in atomically; a failed upgrade leaves the previous install
-  untouched.
+  target and publishes with the platform's atomic no-replace rename; a failed
+  upgrade leaves the previous install recoverable. The optional native helper
+  ships for macOS and Linux on arm64/x64 (glibc and musl on Linux); installs that
+  omit optional dependencies or use another POSIX target fail closed instead of
+  falling back to a racy check-then-rename.
 - **Lockfile ownership.** `~/.cli-openai-proxy/provision.lock.json` records
   what the proxy installed, including archive-owned directories and per-file
   hashes used to repair missing or modified content on the next sync. Upgrades
@@ -154,9 +157,9 @@ The tombstone clears after the item leaves the manifest.
   a user installed by hand are never overwritten or deleted — a manifest item
   whose name collides with an untracked directory fails with
   `Refusing to replace untracked directory` instead of replacing it. Hidden
-  removal and upgrade recoveries are retained for explicit operator cleanup.
-  They are never automatically unlinked because an already-open descriptor can
-  modify an inode after any integrity check.
+  removal, upgrade, and failed candidate recoveries are retained for explicit
+  operator cleanup. They are never automatically unlinked because an already-open
+  descriptor can modify an inode after any integrity check.
 - **TOFU approval.** In the default `approve` mode a first-seen `(type, name)`
   stops at `pending_approval` until an admin approves it.
 

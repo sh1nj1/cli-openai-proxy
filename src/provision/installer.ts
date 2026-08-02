@@ -28,6 +28,7 @@ import path from "path";
 import { gunzipSync } from "zlib";
 import { fetchWithPolicy, readResponseBody } from "./manifest.js";
 import { managedPathParts, MAX_MANAGED_PATH_LENGTH } from "./path-policy.js";
+import { renameDirectoryNoReplace } from "./rename-no-replace.js";
 import { ProvisionError } from "./types.js";
 
 export interface InstallResult {
@@ -117,7 +118,7 @@ function assertDecompressionBounded(buf: Buffer): void {
  * entries (a symlinked directory would let a later entry write through it) and
  * any traversal or absolute name.
  */
-function assertArchiveSafe(archivePath: string): void {
+function assertArchiveSafe(archivePath: string): boolean {
   let verbose: string;
   let names: string;
   try {
@@ -127,12 +128,14 @@ function assertArchiveSafe(archivePath: string): void {
   } catch {
     throw new ProvisionError("Artifact is not a readable tar.gz", "archive_rejected");
   }
-  for (const line of verbose.split("\n").filter(Boolean)) {
+  const verboseEntries = verbose.split("\n").filter(Boolean);
+  for (const line of verboseEntries) {
     if (line[0] === "l" || line[0] === "h") {
       throw new ProvisionError("Archive contains a link entry", "archive_rejected");
     }
   }
-  for (const name of names.split("\n").filter(Boolean)) {
+  const archiveNames = names.split("\n").filter(Boolean);
+  for (const name of archiveNames) {
     const relative = name.replace(/\/+$/, "");
     if (relative.length > MAX_MANAGED_PATH_LENGTH) {
       throw new ProvisionError(
@@ -144,6 +147,18 @@ function assertArchiveSafe(archivePath: string): void {
       throw new ProvisionError(`Archive entry escapes its root: ${name}`, "archive_rejected");
     }
   }
+  const members = archiveNames
+    .map((name, index) => ({
+      name,
+      isDirectory: verboseEntries[index]?.[0] === "d",
+      parts: name.replace(/\/+$/, "").split("/").filter((part) => part !== "."),
+    }))
+    .filter((entry) => entry.parts.length > 0);
+  const wrapper = members[0]?.parts[0];
+  return wrapper !== undefined
+    && members.every((entry) => entry.parts[0] === wrapper)
+    && members.some((entry) => entry.parts.length > 1)
+    && !members.some((entry) => entry.parts.length === 1 && !entry.isDirectory);
 }
 
 /** Walk the extracted tree, enforcing the audit, returning relative file paths. */
@@ -245,6 +260,8 @@ export async function installSkill(
     afterFirstInstallMove?: (target: string) => void;
     /** Test seam for a target appearing immediately before candidate exposure. */
     beforeCandidateMove?: (target: string) => void;
+    /** Test seam for replacing the old reservation immediately before the atomic rename. */
+    beforeCandidateRename?: (target: string) => void;
     /** Test seam for an addition made after the moved-aside tree passes its audit. */
     afterPreviousAudit?: (previousRoot: string) => void;
     /** Test seam for a mutation made after cleanup verifies an isolated file. */
@@ -268,6 +285,11 @@ export async function installSkill(
   // Staging lives INSIDE skillsDir so the final rename is same-filesystem (atomic),
   // and dot-prefixed so skill loaders scanning the directory skip it.
   mkdirSync(opts.skillsDir, { recursive: true });
+  const candidate = path.join(
+    opts.skillsDir,
+    `.provision-candidate-${randomBytes(16).toString("hex")}`,
+  );
+  mkdirSync(candidate, { mode: 0o700 });
   let staging: string;
   let stagingRecoveryFileHashes: Record<string, string> | undefined;
   if (opts.upgradeRecoveryId !== undefined) {
@@ -286,33 +308,28 @@ export async function installSkill(
     staging = mkdtempSync(path.join(opts.skillsDir, UPGRADE_RECOVERY_PREFIX));
   }
   let preserveStaging = false;
+  let preserveCandidate = false;
   try {
     const archivePath = path.join(archiveDir, "artifact.tgz");
     writeFileSync(archivePath, buf);
-    assertArchiveSafe(archivePath);
+    const stripWrapper = assertArchiveSafe(archivePath);
 
-    const extractDir = path.join(staging, "extract");
-    mkdirSync(extractDir);
     try {
-      execFileSync("tar", ["-xzf", archivePath, "-C", extractDir]);
+      execFileSync("tar", [
+	"-xzf",
+	archivePath,
+	"-C",
+	candidate,
+	...(stripWrapper ? ["--strip-components=1"] : []),
+      ]);
     } catch {
       throw new ProvisionError("Extraction failed", "archive_rejected");
     }
 
-    // A root `./` entry can overwrite extractDir's mode. Restore access before
-    // reading it; the selected tree is normalized recursively below.
-    normalizeDirectoryMode(extractDir);
-
-    // Accept both layouts: files at the archive root, or everything under one
-    // top-level directory (the common `name-version/` tarball convention).
-    let root = extractDir;
-    const entries = readdirSync(extractDir);
-    if (entries.length === 1 && lstatSync(path.join(extractDir, entries[0]!)).isDirectory()) {
-      root = path.join(extractDir, entries[0]!);
-    }
-
-    normalizeExtractedModes(root);
-    const result = auditTree(root);
+    // A root `./` entry can overwrite the candidate's mode. Restore access
+    // before inspecting the direct sibling that will be atomically exposed.
+    normalizeExtractedModes(candidate);
+    const result = auditTree(candidate);
     if (result.files.length === 0) {
       throw new ProvisionError("Archive contains no files", "archive_rejected");
     }
@@ -339,7 +356,7 @@ export async function installSkill(
     // installs recheck after this write and undo the preclaim if exposure fails;
     // upgrades retain their stable+pending recovery journal on swap failures.
     if (firstInstall && opts.firstInstallMarker) {
-      writeFileSync(firstInstallMarkerPath(root, opts.firstInstallMarker), opts.firstInstallMarker, {
+      writeFileSync(firstInstallMarkerPath(candidate, opts.firstInstallMarker), opts.firstInstallMarker, {
 	flag: "wx",
 	mode: 0o600,
       });
@@ -355,13 +372,19 @@ export async function installSkill(
       }
       try {
 	opts.beforeCandidateMove?.(target);
-	if (!moveDirectoryNoReplace(root, target)) {
+	if (!moveDirectoryNoReplace(
+	  candidate,
+	  target,
+	  () => opts.beforeCandidateRename?.(target),
+	)) {
+	  preserveCandidate = true;
 	  throw new ProvisionError(
-	    `Refusing to replace "${item.name}" because the target appeared during installation`,
+	    `Refusing to replace "${item.name}" because the target appeared during installation; candidate preserved at "${candidate}"`,
 	    "untracked_content",
 	  );
 	}
       } catch (err) {
+	preserveCandidate = targetExists(candidate);
 	rollbackCommit?.();
 	throw err;
       }
@@ -403,30 +426,31 @@ export async function installSkill(
     if (hadPrevious) opts.afterPreviousAudit?.(previous);
     try {
       opts.beforeCandidateMove?.(target);
-      if (!moveDirectoryNoReplace(root, target)) {
+
+      if (!moveDirectoryNoReplace(
+	candidate,
+	target,
+	() => opts.beforeCandidateRename?.(target),
+      )) {
+	preserveCandidate = true;
 	if (hadPrevious) {
 	  preserveStaging = true;
 	  throw new ProvisionError(
-	    `Upgrade failed because the target was recreated; prior contents preserved at "${previous}"`,
+	    `Upgrade failed because the target was recreated; prior contents preserved at "${previous}" and candidate at "${candidate}"`,
 	    "untracked_content",
 	  );
 	}
 	throw new ProvisionError(
-	  `Refusing to replace "${item.name}" because the target appeared during installation`,
+	  `Refusing to replace "${item.name}" because the target appeared during installation; candidate preserved at "${candidate}"`,
 	  "untracked_content",
 	);
       }
     } catch (err) {
       if (err instanceof ProvisionError && err.code === "untracked_content") throw err;
       if (hadPrevious) {
-	if (!moveDirectoryNoReplace(previous, target)) {
-	  preserveStaging = true;
-	  throw new ProvisionError(
-	    `Upgrade failed and the target was recreated; prior contents preserved at "${previous}"`,
-	    "untracked_content",
-	  );
-	}
+	preserveStaging = true;
       }
+      preserveCandidate = targetExists(candidate);
       throw err;
     }
     if (hadPrevious) {
@@ -465,10 +489,14 @@ export async function installSkill(
     return result;
   } finally {
     try {
-      if (!preserveStaging) {
-	rmSync(staging, { recursive: true, force: true });
-      } else if (stagingRecoveryFileHashes) {
-	sealRecovery(staging, UPGRADE_RECOVERY_METADATA, stagingRecoveryFileHashes);
+      try {
+	if (!preserveCandidate) rmSync(candidate, { recursive: true, force: true });
+      } finally {
+	if (!preserveStaging) {
+	  rmSync(staging, { recursive: true, force: true });
+	} else if (stagingRecoveryFileHashes) {
+	  sealRecovery(staging, UPGRADE_RECOVERY_METADATA, stagingRecoveryFileHashes);
+	}
       }
     } finally {
       rmSync(archiveDir, { recursive: true, force: true });
@@ -477,15 +505,18 @@ export async function installSkill(
 }
 
 /**
- * Publish a directory without replacing an entry created by another process.
- * Windows rename already refuses an existing directory. On POSIX, where rename
- * replaces an empty directory or symlink, an unsearchable empty directory first
- * reserves the name atomically and is then replaced by the candidate in one
- * rename. A competing mkdir/symlink therefore either wins before the reservation
- * or cannot claim the name afterward.
+ * Publish a sibling directory without replacing an entry created by another
+ * process. Windows rename already refuses an existing directory; POSIX uses
+ * renameat2(RENAME_NOREPLACE) or renameatx_np(RENAME_EXCL) through a Node-API
+ * helper because no check-then-rename sequence can close this race.
  */
-function moveDirectoryNoReplace(source: string, target: string): boolean {
+function moveDirectoryNoReplace(
+  source: string,
+  target: string,
+  beforeRename?: () => void,
+): boolean {
   if (process.platform === "win32") {
+    beforeRename?.();
     try {
       renameSync(source, target);
       return true;
@@ -494,20 +525,8 @@ function moveDirectoryNoReplace(source: string, target: string): boolean {
       throw err;
     }
   }
-
-  try {
-    // Write-only prevents ordinary same-user readers from retaining a directory
-    // descriptor while still allowing POSIX rename to replace our reservation.
-    mkdirSync(target, { mode: 0o200 });
-  } catch (err) {
-    if (targetExists(target)) return false;
-    throw err;
-  }
-
-  // If this unexpectedly fails, retain the reservation: removing by pathname
-  // could erase a different empty directory swapped in after the failure.
-  renameSync(source, target);
-  return true;
+  beforeRename?.();
+  return renameDirectoryNoReplace(source, target);
 }
 
 function targetExists(target: string): boolean {
