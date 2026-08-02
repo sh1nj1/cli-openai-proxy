@@ -307,10 +307,11 @@ export class UserWorkerProxy {
         },
         (workerResponse) => {
           clearReadinessTimer();
+	  const bindingToFinalize = workerResponse.statusCode === 201 ? issuedBinding : undefined;
 	  const sessionResponseChunks: Buffer[] = [];
 	  let sessionResponseBytes = 0;
 	  let sessionResponseTooLarge = false;
-	  if (issuedBinding) {
+	  if (bindingToFinalize) {
 	    workerResponse.on("data", (chunk: Buffer | string) => {
 	      if (sessionResponseTooLarge) return;
 	      const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
@@ -329,7 +330,7 @@ export class UserWorkerProxy {
 	  const responseGeneration = decodeProvisioningGeneration(
 	    workerResponse.headers[PROVISIONING_GENERATION_HEADER],
 	  );
-	  if (provisioningUrl && responseGeneration && onAuthorizedProvisioningUrl) {
+	  if (!bindingToFinalize && provisioningUrl && responseGeneration && onAuthorizedProvisioningUrl) {
 	    this.relayProvisioningNotification(
 	      provisioningUrl,
 	      responseGeneration,
@@ -338,16 +339,29 @@ export class UserWorkerProxy {
 	      onAuthorizedProvisioningUrl,
 	    );
 	  }
-          res.status(workerResponse.statusCode ?? 502);
-          copyResponseHeaders(workerResponse.headers, res);
-          workerResponse.pipe(res);
+	  if (!bindingToFinalize) {
+	    res.status(workerResponse.statusCode ?? 502);
+	    copyResponseHeaders(workerResponse.headers, res);
+	    workerResponse.pipe(res);
+	  }
 	  workerResponse.on("end", () => {
-	    if (issuedBinding) {
-	      this.bindIssuedGenerationToSession(
-		issuedBinding,
-		workerResponse.statusCode,
-		sessionResponseTooLarge ? undefined : Buffer.concat(sessionResponseChunks),
-	      );
+	    if (bindingToFinalize) {
+	      const responseBody = sessionResponseTooLarge ? undefined : Buffer.concat(sessionResponseChunks);
+	      try {
+		if (!responseBody || !this.bindIssuedGenerationToSession(bindingToFinalize, responseBody)) {
+		  throw new WorkerIsolationError(
+		    "Worker returned an invalid provisioning session response",
+		    "worker_unavailable",
+		  );
+		}
+		if (!clientClosed && !res.destroyed) {
+		  res.status(workerResponse.statusCode ?? 502);
+		  copyResponseHeaders(workerResponse.headers, res);
+		  res.end(responseBody);
+		}
+	      } catch (error) {
+		if (!clientClosed && !res.destroyed) this.sendFailure(res, error);
+	      }
 	    }
 	    resolve();
 	  });
@@ -423,22 +437,17 @@ export class UserWorkerProxy {
 
   private bindIssuedGenerationToSession(
     binding: IssuedProvisioningBinding,
-    statusCode: number | undefined,
-    responseBody: Buffer | undefined,
-  ): void {
-    if (
-      statusCode !== 201
-      || !responseBody
-      || this.issuedProvisioningBindings.get(binding.generation) !== binding
-    ) return;
+    responseBody: Buffer,
+  ): boolean {
+    if (this.issuedProvisioningBindings.get(binding.generation) !== binding) return false;
     let sessionId: unknown;
     try {
       sessionId = (JSON.parse(responseBody.toString("utf8")) as Record<string, unknown>).sessionId;
     } catch {
-      return;
+      return false;
     }
     if (typeof sessionId !== "string" || sessionId.length === 0 || sessionId.length > 256 || sessionId.includes("/")) {
-      return;
+      return false;
     }
     const finalized = { ...binding, sessionId };
     this.issuedProvisioningBindings.set(binding.generation, finalized);
@@ -449,10 +458,9 @@ export class UserWorkerProxy {
       });
     } catch (error) {
       this.issuedProvisioningBindings.set(binding.generation, binding);
-      console.error(
-	`[UserWorkerProxy] provisioning session binding persistence failed: ${error instanceof Error ? error.message : String(error)}`,
-      );
+	throw error;
     }
+    return true;
   }
 
   private relayProvisioningNotification(

@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { createHash, randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
-import { readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import http from "node:http";
 import type { AddressInfo } from "node:net";
 import { afterEach, test } from "node:test";
@@ -214,6 +214,65 @@ test("ordinary auth sessions do not require writable provisioning generation sta
   });
   assert.equal(result.status, 201);
   assert.equal(result.generation, undefined);
+});
+
+test("gateway withholds a successful provisioning session when its binding cannot be persisted", async () => {
+  const socketPath = `/tmp/cap-worker-${randomUUID().slice(0, 8)}.sock`;
+  const generationStateFile = `/tmp/cap-generation-${randomUUID().slice(0, 8)}.state`;
+  let workerSessionCreated = false;
+  const worker = http.createServer(async (_request, response) => {
+    await rm(`${generationStateFile}.issued`, { force: true });
+    await mkdir(`${generationStateFile}.issued`);
+    workerSessionCreated = true;
+    response.writeHead(201, { "content-type": "application/json" });
+    response.end(JSON.stringify({ sessionId: "unbound-session", status: "pending" }));
+  });
+  await new Promise<void>((resolve) => worker.listen(socketPath, resolve));
+
+  const provisioner: WorkerProvisioner = {
+    async ensureWorker() {
+      return {
+	accountName: "cap_0123456789abcdef0123",
+	endpoint: { kind: "unix", address: socketPath },
+      };
+    },
+  };
+  process.env.USER_API_KEYS = JSON.stringify([
+    { key: "user-key-12345678", tenantId: "tenant-a", userId: "user-a" },
+  ]);
+  process.env.AUTH_ADMIN_KEYS = "admin-key-123456";
+  process.env.PROVISION_SYNC = "1";
+  const gateway = createApp({
+    userWorkerProxy: new UserWorkerProxy(provisioner, 30_000, generationStateFile),
+    onAuthorizedProvisioningUrl: () => {},
+  }).listen(0);
+  await new Promise<void>((resolve) => gateway.once("listening", resolve));
+
+  try {
+    const port = (gateway.address() as AddressInfo).port;
+    const response = await fetch(`http://127.0.0.1:${port}/v1/auth/fake/sessions`, {
+      method: "POST",
+      headers: {
+	authorization: "Bearer admin-key-123456",
+	"content-type": "application/json",
+	"x-cli-proxy-user-key": "user-key-12345678",
+      },
+      body: JSON.stringify({
+	provisioning_url: "https://collavre.test/agents/vrex/provision.json",
+      }),
+    });
+    assert.equal(workerSessionCreated, true);
+    assert.equal(response.status, 503);
+    const payload = await response.json() as { error: { code: string } };
+    assert.equal(payload.error.code, "worker_unavailable");
+    assert.equal(JSON.stringify(payload).includes("unbound-session"), false);
+  } finally {
+    await new Promise<void>((resolve) => gateway.close(() => resolve()));
+    await new Promise<void>((resolve) => worker.close(() => resolve()));
+    await rm(socketPath, { force: true });
+    await rm(generationStateFile, { force: true });
+    await rm(`${generationStateFile}.issued`, { force: true, recursive: true });
+  }
 });
 
 test("disabled provisioning ignores auth URLs without writing generation state", async () => {
