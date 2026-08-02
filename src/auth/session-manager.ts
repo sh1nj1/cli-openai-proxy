@@ -128,7 +128,11 @@ function supersededError(engine: string): AuthProvisioningError {
 export async function createSession(
   engine: string,
   flow?: string,
-  opts: { provisioningUrl?: string; provisioningGeneration?: string } = {},
+  opts: {
+    provisioningUrl?: string;
+    provisioningGeneration?: string;
+    sessionTtlMs?: number;
+  } = {},
 ): Promise<SessionView> {
   const descriptor = resolveEngine(engine);
   if (!descriptor) {
@@ -198,7 +202,7 @@ export async function createSession(
   }
 
   const sessionId = randomUUID();
-  const sessionTtlMs = getAuthSessionTtlMs();
+  const sessionTtlMs = opts.sessionTtlMs ?? getAuthSessionTtlMs();
   const expiresAt = Date.now() + sessionTtlMs;
   const timer = setTimeout(() => {
     const record = byId.get(sessionId);

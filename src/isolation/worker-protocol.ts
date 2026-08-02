@@ -5,6 +5,8 @@
 export const AUTHORIZED_PROVISIONING_HEADER = "x-cli-proxy-authorized-provisioning";
 /** Gateway-issued ordering identity, echoed by the worker with an authorized URL. */
 export const PROVISIONING_GENERATION_HEADER = "x-cli-proxy-provisioning-generation";
+/** Gateway-selected auth-session lifetime shared with an isolated worker. */
+export const PROVISIONING_SESSION_TTL_HEADER = "x-cli-proxy-provisioning-session-ttl-ms";
 /** Leaves ample room under Node's default aggregate HTTP header limit. */
 export const MAX_AUTHORIZED_PROVISIONING_HEADER_BYTES = 8 * 1024;
 
@@ -30,4 +32,10 @@ export function decodeProvisioningUrl(value: string | string[] | undefined): str
 
 export function decodeProvisioningGeneration(value: string | string[] | undefined): string | undefined {
   return typeof value === "string" && UUID_V7.test(value) ? value.toLowerCase() : undefined;
+}
+
+export function decodeProvisioningSessionTtl(value: string | string[] | undefined): number | undefined {
+  if (typeof value !== "string" || !/^[1-9][0-9]*$/.test(value)) return undefined;
+  const ttlMs = Number(value);
+  return Number.isSafeInteger(ttlMs) ? ttlMs : undefined;
 }

@@ -24,7 +24,9 @@ import { AuthProvisioningError } from "../auth/types.js";
 import {
   AUTHORIZED_PROVISIONING_HEADER,
   PROVISIONING_GENERATION_HEADER,
+  PROVISIONING_SESSION_TTL_HEADER,
   decodeProvisioningGeneration,
+  decodeProvisioningSessionTtl,
   encodeProvisioningUrl,
   provisioningUrlFitsHeader,
 } from "../isolation/worker-protocol.js";
@@ -176,10 +178,18 @@ export async function handleCreateAuthSession(req: Request, res: Response): Prom
     return;
   }
   try {
-    const provisioningGeneration = req.app?.locals.cliProxyRole === "worker"
+    const workerRequest = req.app?.locals.cliProxyRole === "worker";
+    const provisioningGeneration = workerRequest
       ? decodeProvisioningGeneration(req.headers[PROVISIONING_GENERATION_HEADER])
       : undefined;
-    res.status(201).json(await createSession(engine, flow, { provisioningUrl, provisioningGeneration }));
+    const sessionTtlMs = workerRequest && provisioningGeneration
+      ? decodeProvisioningSessionTtl(req.headers[PROVISIONING_SESSION_TTL_HEADER])
+      : undefined;
+    res.status(201).json(await createSession(engine, flow, {
+      provisioningUrl,
+      provisioningGeneration,
+      sessionTtlMs,
+    }));
   } catch (err) {
     sendError(res, err);
   }

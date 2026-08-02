@@ -19,6 +19,7 @@ import type { EngineAuthDescriptor, EngineAuthSession } from "../auth/types.js";
 import {
   AUTHORIZED_PROVISIONING_HEADER,
   PROVISIONING_GENERATION_HEADER,
+  PROVISIONING_SESSION_TTL_HEADER,
   decodeProvisioningUrl,
 } from "../isolation/worker-protocol.js";
 
@@ -303,6 +304,25 @@ describe("auth-routes", () => {
     }), polled);
     assert.equal((polled.payload as { status: string }).status, "authorized");
     assert.equal(decodeProvisioningUrl(polled.headers[AUTHORIZED_PROVISIONING_HEADER]), manifestUrl);
+  });
+
+  test("worker provisioning sessions use the gateway-supplied TTL", async () => {
+    const generation = "019865f4-50d6-7000-8000-000000000001";
+    const before = Date.now();
+    const created = fakeRes();
+    await handleCreateAuthSession(fakeReq({
+      app: { locals: { cliProxyRole: "worker" } } as any,
+      headers: {
+	[PROVISIONING_GENERATION_HEADER]: generation,
+	[PROVISIONING_SESSION_TTL_HEADER]: "300000",
+      },
+      params: { engine: "fake" } as any,
+      body: { provisioning_url: "https://collavre.test/provision.json" },
+    }), created);
+
+    const expiresAt = Date.parse((created.payload as { expiresAt: string }).expiresAt);
+    assert.ok(expiresAt >= before + 300_000);
+    assert.ok(expiresAt <= Date.now() + 300_000);
   });
 
   test("provisioning_url is rejected before it can exceed the worker response-header budget", async () => {

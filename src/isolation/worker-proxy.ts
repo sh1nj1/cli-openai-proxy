@@ -13,6 +13,7 @@ import { WorkerIsolationError } from "./types.js";
 import {
   AUTHORIZED_PROVISIONING_HEADER,
   PROVISIONING_GENERATION_HEADER,
+  PROVISIONING_SESSION_TTL_HEADER,
   decodeProvisioningGeneration,
   decodeProvisioningUrl,
   provisioningUrlFitsHeader,
@@ -37,6 +38,7 @@ const PRIVATE_HEADERS = new Set([
   "x-cli-proxy-identity-timestamp",
   "x-cli-proxy-identity-signature",
   PROVISIONING_GENERATION_HEADER,
+  PROVISIONING_SESSION_TTL_HEADER,
 ]);
 
 const REGENERATED_BODY_HEADERS = new Set(["content-encoding", "content-length"]);
@@ -200,6 +202,7 @@ function outgoingHeaders(
   headers: IncomingHttpHeaders,
   body: Buffer,
   provisioningGeneration?: string,
+  provisioningSessionTtlMs?: number,
 ): IncomingHttpHeaders {
   const result: IncomingHttpHeaders = {};
   for (const [name, value] of Object.entries(headers)) {
@@ -216,6 +219,9 @@ function outgoingHeaders(
   result["content-length"] = String(body.length);
   result["content-type"] ??= "application/json";
   if (provisioningGeneration) result[PROVISIONING_GENERATION_HEADER] = provisioningGeneration;
+  if (provisioningSessionTtlMs !== undefined) {
+    result[PROVISIONING_SESSION_TTL_HEADER] = String(provisioningSessionTtlMs);
+  }
   return result;
 }
 
@@ -226,6 +232,7 @@ function copyResponseHeaders(source: IncomingHttpHeaders, destination: Response)
       && !HOP_BY_HOP_HEADERS.has(name.toLowerCase())
       && name.toLowerCase() !== AUTHORIZED_PROVISIONING_HEADER
       && name.toLowerCase() !== PROVISIONING_GENERATION_HEADER
+      && name.toLowerCase() !== PROVISIONING_SESSION_TTL_HEADER
     ) {
       destination.setHeader(name, value);
     }
@@ -311,11 +318,26 @@ export class UserWorkerProxy {
           socketPath: target.endpoint.address,
           path: req.originalUrl,
           method: req.method,
-	  headers: outgoingHeaders(req.headers, body, provisioningGeneration),
+	  headers: outgoingHeaders(
+	    req.headers,
+	    body,
+	    provisioningGeneration,
+	    issuedBinding ? getAuthSessionTtlMs() : undefined,
+	  ),
         },
         (workerResponse) => {
           clearReadinessTimer();
 	  const bindingToFinalize = workerResponse.statusCode === 201 ? issuedBinding : undefined;
+	  if (issuedBinding && !bindingToFinalize) {
+	    try {
+	      this.releaseIssuedGeneration(issuedBinding);
+	    } catch (error) {
+	      workerResponse.resume();
+	      if (!clientClosed && !res.destroyed) this.sendFailure(res, error);
+	      resolve();
+	      return;
+	    }
+	  }
 	  const sessionResponseChunks: Buffer[] = [];
 	  let sessionResponseBytes = 0;
 	  let sessionResponseTooLarge = false;
@@ -368,13 +390,27 @@ export class UserWorkerProxy {
 		  res.end(responseBody);
 		}
 	      } catch (error) {
-		if (!clientClosed && !res.destroyed) this.sendFailure(res, error);
+		let failure = error;
+		try {
+		  this.releaseIssuedGeneration(bindingToFinalize);
+		} catch (releaseError) {
+		  failure = releaseError;
+		}
+		if (!clientClosed && !res.destroyed) this.sendFailure(res, failure);
 	      }
 	    }
 	    resolve();
 	  });
-          workerResponse.on("error", (error) => {
-            if (!res.headersSent) this.sendFailure(res, error);
+	  workerResponse.on("error", (error) => {
+	    let failure: unknown = error;
+	    if (issuedBinding) {
+	      try {
+		this.releaseIssuedGeneration(issuedBinding);
+	      } catch (releaseError) {
+		failure = releaseError;
+	      }
+	    }
+	    if (!res.headersSent) this.sendFailure(res, failure);
             else res.destroy(error);
             resolve();
           });
@@ -387,10 +423,18 @@ export class UserWorkerProxy {
       }, this.connectTimeoutMs);
       request.on("error", (error) => {
         clearReadinessTimer();
-        if (!res.headersSent) this.sendFailure(res, new WorkerIsolationError(
-          `Worker ${target.accountName} unavailable: ${error.message}`,
-          "worker_unavailable",
-        ));
+	let failure: unknown = new WorkerIsolationError(
+	  `Worker ${target.accountName} unavailable: ${error.message}`,
+	  "worker_unavailable",
+	);
+	if (issuedBinding) {
+	  try {
+	    this.releaseIssuedGeneration(issuedBinding);
+	  } catch (releaseError) {
+	    failure = releaseError;
+	  }
+	}
+	if (!res.headersSent) this.sendFailure(res, failure);
         else res.destroy(error);
         resolve();
       });
@@ -488,6 +532,20 @@ export class UserWorkerProxy {
 	throw error;
     }
     return true;
+  }
+
+  private releaseIssuedGeneration(binding: IssuedProvisioningBinding): void {
+    if (this.issuedProvisioningBindings.get(binding.generation) !== binding) return;
+    this.issuedProvisioningBindings.delete(binding.generation);
+    try {
+      saveIssuedProvisioningState(issuedGenerationStateFile(this.generationStateFile), {
+	latestGeneration: this.latestIssuedProvisioningGeneration,
+	bindings: this.issuedProvisioningBindings,
+      });
+    } catch (error) {
+      this.issuedProvisioningBindings.set(binding.generation, binding);
+      throw error;
+    }
   }
 
   private relayProvisioningNotification(
