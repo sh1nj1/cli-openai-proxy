@@ -688,9 +688,11 @@ function removeManagedTree(
     return { clean: rootWasCompleteOwnedTree, recoveryPath: root };
   }
 
-  // An ambiguous visible target with no hash-verified owned file may belong to
-  // a process that won an interrupted exposure race. Leave it untouched.
-  if (!rootWasCompleteOwnedTree && !rootHasVerifiedOwnedFile) {
+  // A visible target with no hash-verified owned file may have been recreated
+  // after an earlier process isolated the managed tree but crashed before
+  // clearing its journal. Matching path names and types alone are not proof of
+  // ownership, so leave that target untouched.
+  if (!rootHasVerifiedOwnedFile) {
     return { clean: true };
   }
 

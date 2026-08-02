@@ -832,6 +832,34 @@ describe("provision sync", () => {
     assert.equal(state.installed[key], undefined);
   });
 
+  test("DELETE preserves an exact-path target recreated after interrupted removal", async () => {
+    process.env.PROVISION_AUTOAPPLY = "auto";
+    initProvisioning();
+    const name = "remove-recreated-target";
+    const skill = serveSkill("/remove-recreated-target.tgz", "managed");
+    registerManifestUrl(serveManifest([{ type: "skill", name, ...skill }]));
+    await syncNow();
+
+    const target = path.join(skillsDir, name);
+    const recoveryId = "a".repeat(32);
+    const priorRecovery = path.join(skillsDir, `.provision-removed-${recoveryId}`);
+    renameSync(target, priorRecovery);
+    mkdirSync(target);
+    writeFileSync(path.join(target, "SKILL.md"), "user replacement");
+    const lockfile = path.join(stateDir, "provision.lock.json");
+    const stateBeforeRestart = JSON.parse(readFileSync(lockfile, "utf8"));
+    stateBeforeRestart.removalRecoveries = [recoveryId];
+    writeFileSync(lockfile, JSON.stringify(stateBeforeRestart));
+    initProvisioning();
+
+    assert.deepEqual(await deleteItem("skill", name), { removed: true });
+    assert.equal(readFileSync(path.join(target, "SKILL.md"), "utf8"), "user replacement");
+    assert.equal(readFileSync(path.join(priorRecovery, "SKILL.md"), "utf8"), "managed");
+    const state = JSON.parse(readFileSync(lockfile, "utf8"));
+    assert.equal(state.installed[`skill/${name}`], undefined);
+    assert.deepEqual(state.removalRecoveries, [recoveryId]);
+  });
+
   test("manifest removal preserves an empty target that won an upgrade exposure race", async () => {
     const name = "sync-remove-lost-exposure";
     const { key, target } = writeLostExposureJournal(name);

@@ -906,6 +906,33 @@ describe("provision installer", () => {
     assert.equal(readFileSync(path.join(displaced, "user-notes.md"), "utf8"), "keep me");
   });
 
+  test("removeSkill preserves a recreated exact-path target without hash evidence", async () => {
+    const { url, sha256 } = serve("/remove-recreated-exact-tree.tgz", makeTarGz([
+      { name: "SKILL.md", content: "managed" },
+      { name: "docs/", type: "dir" },
+      { name: "docs/notes.md", content: "managed notes" },
+    ]));
+    const result = await installSkill({ name: "demo", url, sha256 }, { skillsDir });
+    const target = path.join(skillsDir, "demo");
+    const previouslyIsolated = path.join(skillsDir, "previously-isolated-managed-tree");
+    renameSync(target, previouslyIsolated);
+    mkdirSync(path.join(target, "docs"), { recursive: true });
+    writeFileSync(path.join(target, "SKILL.md"), "user replacement");
+    writeFileSync(path.join(target, "docs", "notes.md"), "user notes");
+
+    const { recoveryPath } = removeSkill("demo", {
+      skillsDir,
+      files: result.files,
+      fileHashes: result.fileHashes,
+      directories: result.directories,
+    });
+
+    assert.equal(recoveryPath, undefined);
+    assert.equal(readFileSync(path.join(target, "SKILL.md"), "utf8"), "user replacement");
+    assert.equal(readFileSync(path.join(target, "docs", "notes.md"), "utf8"), "user notes");
+    assert.equal(readFileSync(path.join(previouslyIsolated, "SKILL.md"), "utf8"), "managed");
+  });
+
   test("removeSkill preserves writes through a descriptor opened before removal", async () => {
     const { url, sha256 } = serve("/remove-open-fd.tgz", makeTarGz([
       { name: "SKILL.md", content: "before removal" },
