@@ -339,40 +339,36 @@ function reconcileFirstInstallJournals(state: ProvisionStateFile): Set<string> {
 
 function prepareRemovalRecovery(state: ProvisionStateFile): {
   recoveryId: string;
-  ownedRecoveryIds: string[];
 } {
   const recoveryId = randomBytes(16).toString("hex");
-  const ownedRecoveryIds = [...(state.removalRecoveries ?? []), recoveryId];
-  state.removalRecoveries = ownedRecoveryIds;
+  state.removalRecoveries = [...(state.removalRecoveries ?? []), recoveryId];
   // Persist the exact identity before its recovery directory can appear.
   saveState(state);
-  return { recoveryId, ownedRecoveryIds };
+  return { recoveryId };
 }
 
 function finalizeRemovalRecoveries(state: ProvisionStateFile): void {
   state.removalRecoveries = (state.removalRecoveries ?? []).filter((recoveryId) =>
-    existsSync(path.join(skillsDir(), `.provision-removed-${recoveryId}`))).slice(-3);
+    existsSync(path.join(skillsDir(), `.provision-removed-${recoveryId}`)));
 }
 
 function prepareUpgradeRecovery(state: ProvisionStateFile): {
   upgradeRecoveryId: string;
-  ownedUpgradeRecoveryIds: string[];
 } {
   const upgradeRecoveryId = randomBytes(16).toString("hex");
-  const ownedUpgradeRecoveryIds = [
+  state.upgradeRecoveries = [
     ...(state.upgradeRecoveries ?? []).filter((recoveryId) =>
-      existsSync(path.join(skillsDir(), `.provision-staging-${recoveryId}`))).slice(-3),
+      existsSync(path.join(skillsDir(), `.provision-staging-${recoveryId}`))),
     upgradeRecoveryId,
   ];
-  state.upgradeRecoveries = ownedUpgradeRecoveryIds;
   // Persist the exact identity before its staging directory can appear.
   saveState(state);
-  return { upgradeRecoveryId, ownedUpgradeRecoveryIds };
+  return { upgradeRecoveryId };
 }
 
 function finalizeUpgradeRecoveries(state: ProvisionStateFile): void {
   state.upgradeRecoveries = (state.upgradeRecoveries ?? []).filter((recoveryId) =>
-    existsSync(path.join(skillsDir(), `.provision-staging-${recoveryId}`))).slice(-3);
+    existsSync(path.join(skillsDir(), `.provision-staging-${recoveryId}`)));
 }
 
 function removalSnapshot(record: InstalledRecord): {

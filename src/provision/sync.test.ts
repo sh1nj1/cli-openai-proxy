@@ -727,7 +727,7 @@ describe("provision sync", () => {
     assert.equal(existsSync(target), false);
   });
 
-  test("upgrade staging recoveries are lockfile-owned and bounded", async () => {
+  test("upgrade staging recoveries are lockfile-owned and retained", async () => {
     process.env.PROVISION_AUTOAPPLY = "auto";
     initProvisioning();
     const spoofedId = "f".repeat(32);
@@ -752,7 +752,7 @@ describe("provision sync", () => {
     }
 
     const state = JSON.parse(readFileSync(path.join(stateDir, "provision.lock.json"), "utf8"));
-    assert.equal(state.upgradeRecoveries.length, 3);
+    assert.equal(state.upgradeRecoveries.length, 5);
     assert.deepEqual(
       readdirSync(skillsDir)
 	.filter((entry) => entry.startsWith(".provision-staging-")
