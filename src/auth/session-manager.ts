@@ -6,10 +6,10 @@
  * bounded: at most one *pending* session per engine (a new start cancels the
  * old), every session is reaped after a TTL, and server shutdown drops them all.
  *
- * "device-code" sessions finish without a submit request, so their terminal
- * status arrives asynchronously (see settleWhenDone). A concluded session stays
- * queryable until its TTL — the poll that discovers the outcome needs something
- * to read — but releases its engine slot immediately.
+ * Concluded sessions stay queryable until their TTL. Device-code callers need to
+ * poll for the outcome, while paste-code/API-key callers may need to retry after
+ * an authorized worker response (and its provisioning notification) is lost.
+ * Either way, the engine slot is released immediately.
  *
  * Sessions are not persisted. A proxy restart drops them and the caller simply
  * restarts the flow — the same trade-off as the memory-only token store. That
@@ -267,6 +267,10 @@ export async function submitSession(
   input: string,
 ): Promise<SessionView> {
   const record = requireSession(engine, sessionId);
+  // Successful submit results remain queryable until TTL so a worker response
+  // lost before the gateway observes its private provisioning header can be
+  // retried. Do not re-drive the adapter or provisioning side effect.
+  if (record.status === "authorized" && !record.handle.wait) return view(record);
   if (record.status !== "pending") {
     throw new AuthProvisioningError(
       `Session is already ${record.status}`,
@@ -297,13 +301,13 @@ export async function submitSession(
   try {
     const result = await record.handle.submit(input);
     if (result.credential) setCredential(engine, result.credential);
-    // Snapshot before dispose(), which removes the record from the maps.
-    const authorized: SessionView = { ...view(record), status: "authorized" };
-    dispose(record, "authorized");
+    record.status = "authorized";
+    record.handle.cancel();
+    if (byEngine.get(record.engine) === record.sessionId) byEngine.delete(record.engine);
     // Fire-and-forget: provisioning is a follow-on to a successful login, and
     // its failure must not turn this response into an error (see sync.ts).
     void handleAuthorizedSession(record.provisioningUrl);
-    return authorized;
+    return view(record);
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     const code = err instanceof AuthProvisioningError ? err.code : "submit_failed";
@@ -311,8 +315,8 @@ export async function submitSession(
     dispose(record, "failed");
     return failed;
   } finally {
-    // Both paths dispose, so the record is already unreachable; released anyway so
-    // the flag can never outlive the attempt that set it.
+    // The authorized path remains queryable until TTL; the flag must still be
+    // released so retries return the retained result.
     record.submitting = false;
   }
 }
@@ -321,7 +325,7 @@ export function getSession(engine: string, sessionId: string): SessionView {
   return view(requireSession(engine, sessionId));
 }
 
-/** Read before submit() disposes a paste-code/API-key session. */
+/** Read a paste-code/API-key session's private provisioning URL. */
 export function getSessionProvisioningUrl(engine: string, sessionId: string): string | undefined {
   return requireSession(engine, sessionId).provisioningUrl;
 }

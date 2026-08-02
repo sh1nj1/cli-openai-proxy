@@ -274,6 +274,27 @@ describe("auth-routes", () => {
     assert.equal((res.payload as { status: string }).status, "authorized");
     assert.equal(decodeProvisioningUrl(res.headers[AUTHORIZED_PROVISIONING_HEADER]), manifestUrl);
     assert.equal(JSON.stringify(res.payload).includes(manifestUrl), false, "private URL must stay out of JSON");
+
+    const retried = fakeRes();
+    await handleSubmitAuthSession(fakeReq({
+      app: { locals: { cliProxyRole: "worker" } } as any,
+      params: { engine: "fake", sessionId } as any,
+      body: { value: "code" },
+    }), retried);
+    assert.equal((retried.payload as { status: string }).status, "authorized");
+    assert.equal(
+      decodeProvisioningUrl(retried.headers[AUTHORIZED_PROVISIONING_HEADER]),
+      manifestUrl,
+      "a retried submit must recover a notification lost before the gateway received it",
+    );
+
+    const polled = fakeRes();
+    handleGetAuthSession(fakeReq({
+      app: { locals: { cliProxyRole: "worker" } } as any,
+      params: { engine: "fake", sessionId } as any,
+    }), polled);
+    assert.equal((polled.payload as { status: string }).status, "authorized");
+    assert.equal(decodeProvisioningUrl(polled.headers[AUTHORIZED_PROVISIONING_HEADER]), manifestUrl);
   });
 
   test("provisioning_url is rejected before it can exceed the worker response-header budget", async () => {

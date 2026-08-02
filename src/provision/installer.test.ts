@@ -194,6 +194,26 @@ describe("provision installer", () => {
     assert.equal(existsSync(target), false);
   });
 
+  test("normalizes unreadable archive files before auditing", async () => {
+    const { url, sha256 } = serve("/unreadable-file.tgz", makeTarGz([
+      { name: "SKILL.md", content: "managed", mode: 0o000 },
+    ]));
+
+    const result = await installSkill({ name: "demo", url, sha256 }, { skillsDir });
+    const target = path.join(skillsDir, "demo");
+    assert.deepEqual(result.files, ["SKILL.md"]);
+    assert.equal(lstatSync(path.join(target, "SKILL.md")).mode & 0o400, 0o400);
+    assert.equal(readFileSync(path.join(target, "SKILL.md"), "utf-8"), "managed");
+
+    removeSkill("demo", {
+      skillsDir,
+      files: result.files,
+      fileHashes: result.fileHashes,
+      directories: result.directories,
+    });
+    assert.equal(existsSync(target), false);
+  });
+
   test("normalizes a restrictive archive root before inspecting its entries", async () => {
     const { url, sha256 } = serve("/restrictive-root.tgz", makeTarGz([
       { name: "./", type: "dir", mode: 0o000 },

@@ -202,18 +202,23 @@ function auditTree(root: string): InstallResult {
   return { files, directories, fileHashes };
 }
 
-/** Ensure the gateway can audit, replace, and remove every extracted directory. */
+/** Ensure the gateway can audit, replace, and remove extracted content. */
 function normalizeDirectoryMode(directory: string): void {
   const stat = lstatSync(directory);
   chmodSync(directory, stat.mode | 0o700);
 }
 
-function normalizeDirectoryModes(root: string): void {
+function normalizeExtractedModes(root: string): void {
   const walk = (dir: string): void => {
     normalizeDirectoryMode(dir);
     for (const entry of readdirSync(dir)) {
       const full = path.join(dir, entry);
-      if (lstatSync(full).isDirectory()) walk(full);
+      const stat = lstatSync(full);
+      if (stat.isDirectory()) {
+	walk(full);
+      } else if (stat.isFile()) {
+	chmodSync(full, stat.mode | 0o400);
+      }
     }
   };
   walk(root);
@@ -317,7 +322,7 @@ export async function installSkill(
       root = path.join(extractDir, entries[0]!);
     }
 
-    normalizeDirectoryModes(root);
+    normalizeExtractedModes(root);
     const result = auditTree(root);
     if (result.files.length === 0) {
       throw new ProvisionError("Archive contains no files", "archive_rejected");
