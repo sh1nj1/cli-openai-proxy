@@ -54,6 +54,10 @@ function defaultGenerationStateFile(): string {
   return path.join(provisionStateDir(), "provisioning-notification-generation");
 }
 
+function issuedGenerationStateFile(notificationStateFile: string): string {
+  return `${notificationStateFile}.issued`;
+}
+
 function loadProvisioningGeneration(file: string): string | undefined {
   try {
     return decodeProvisioningGeneration(readFileSync(file, "utf8").trim());
@@ -66,8 +70,6 @@ function saveProvisioningGeneration(file: string, generation: string): void {
   mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
   const temporary = `${file}.tmp-${process.pid}-${randomUUID()}`;
   try {
-    // Persist before relay so a gateway restart cannot make an older retained
-    // worker session authoritative again. Same-generation retries stay valid.
     writeFileSync(temporary, `${generation}\n`, { encoding: "utf8", mode: 0o600, flag: "wx" });
     renameSync(temporary, file);
   } finally {
@@ -136,7 +138,10 @@ export class UserWorkerProxy {
     private readonly generationStateFile = defaultGenerationStateFile(),
   ) {
     this.latestProvisioningGeneration = loadProvisioningGeneration(generationStateFile);
-    this.latestIssuedProvisioningGeneration = this.latestProvisioningGeneration;
+    const latestIssued = loadProvisioningGeneration(issuedGenerationStateFile(generationStateFile));
+    this.latestIssuedProvisioningGeneration = latestIssued && (
+      !this.latestProvisioningGeneration || latestIssued > this.latestProvisioningGeneration
+    ) ? latestIssued : this.latestProvisioningGeneration;
   }
 
   async forward(
@@ -193,21 +198,6 @@ export class UserWorkerProxy {
         },
         (workerResponse) => {
           clearReadinessTimer();
-	  if (
-	    provisioningGeneration
-	    && (workerResponse.statusCode ?? 500) >= 200
-	    && (workerResponse.statusCode ?? 500) < 300
-	  ) {
-	    try {
-	      this.commitProvisioningGeneration(provisioningGeneration);
-	    } catch (error) {
-	      workerResponse.resume();
-	      if (!res.headersSent) this.sendFailure(res, error);
-	      workerResponse.on("end", resolve);
-	      workerResponse.on("error", resolve);
-	      return;
-	    }
-	  }
 	  const provisioningUrl = decodeProvisioningUrl(
 	    workerResponse.headers[AUTHORIZED_PROVISIONING_HEADER],
 	  );
@@ -262,7 +252,10 @@ export class UserWorkerProxy {
 	msecs: nextTimestamp,
       });
     }
-    this.recordIssuedProvisioningGeneration(generation);
+    // Issuance must survive restarts for monotonic IDs, but only an authorized
+    // notification may advance the separate relay watermark.
+    saveProvisioningGeneration(issuedGenerationStateFile(this.generationStateFile), generation);
+    this.latestIssuedProvisioningGeneration = generation;
     return generation;
   }
 
@@ -270,19 +263,6 @@ export class UserWorkerProxy {
     if (!this.latestIssuedProvisioningGeneration || generation > this.latestIssuedProvisioningGeneration) {
       this.latestIssuedProvisioningGeneration = generation;
     }
-  }
-
-  private commitProvisioningGeneration(generation: string): void {
-    if (this.latestProvisioningGeneration && generation <= this.latestProvisioningGeneration) {
-      this.recordIssuedProvisioningGeneration(generation);
-      return;
-    }
-    // A rejected create request must not make an older retained session stale.
-    // Commit only after the worker has accepted the session, before exposing
-    // that successful response to the caller.
-    saveProvisioningGeneration(this.generationStateFile, generation);
-    this.latestProvisioningGeneration = generation;
-    this.recordIssuedProvisioningGeneration(generation);
   }
 
   private relayProvisioningNotification(
@@ -298,6 +278,8 @@ export class UserWorkerProxy {
     if (this.latestProvisioningGeneration && generation < this.latestProvisioningGeneration) return;
     if (!this.latestProvisioningGeneration || generation > this.latestProvisioningGeneration) {
       try {
+	// Persist before relay so a gateway restart cannot make an older retained
+	// authorized worker session authoritative again. Same-generation retries stay valid.
 	saveProvisioningGeneration(this.generationStateFile, generation);
 	this.latestProvisioningGeneration = generation;
 	this.recordIssuedProvisioningGeneration(generation);

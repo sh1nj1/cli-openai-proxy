@@ -192,7 +192,7 @@ test("disabled provisioning ignores auth URLs without writing generation state",
   assert.equal(result.generation, undefined);
 });
 
-test("a rejected provisioning session does not supersede retained notifications", async () => {
+test("unaccepted and pending provisioning sessions do not supersede retained notifications", async () => {
   const socketPath = `/tmp/cap-worker-${randomUUID().slice(0, 8)}.sock`;
   const generationStateFile = `/tmp/cap-generation-${randomUUID().slice(0, 8)}.state`;
   const retainedGeneration = "019865f4-50d6-7000-8000-000000000001";
@@ -271,12 +271,21 @@ test("a rejected provisioning session does not supersede retained notifications"
     });
     assert.equal(accepted.status, 201);
     assert.ok(acceptedGeneration && rejectedGeneration && acceptedGeneration > rejectedGeneration);
-    assert.equal((await readFile(generationStateFile, "utf8")).trim(), acceptedGeneration);
+    assert.equal((await readFile(generationStateFile, "utf8")).trim(), retainedGeneration);
+    assert.equal((await readFile(`${generationStateFile}.issued`, "utf8")).trim(), acceptedGeneration);
+
+    const retainedAfterPending = await fetch(
+      `http://127.0.0.1:${port}/v1/auth/fake/sessions/retained`,
+      { headers },
+    );
+    await retainedAfterPending.arrayBuffer();
+    assert.deepEqual(notifications, [retainedUrl, retainedUrl]);
   } finally {
     await new Promise<void>((resolve) => gateway.close(() => resolve()));
     await new Promise<void>((resolve) => worker.close(() => resolve()));
     await rm(socketPath, { force: true });
     await rm(generationStateFile, { force: true });
+    await rm(`${generationStateFile}.issued`, { force: true });
   }
 });
 
@@ -418,7 +427,7 @@ test("gateway consumes a worker provisioning notification without exposing its p
   }
 });
 
-test("gateway persists notification ordering across restart", async () => {
+test("gateway persists issued and authorized notification ordering separately across restart", async () => {
   const socketPath = `/tmp/cap-worker-${randomUUID().slice(0, 8)}.sock`;
   const generationStateFile = `/tmp/cap-generation-${randomUUID().slice(0, 8)}.state`;
   const persistedGeneration = "0fffffff-ffff-7fff-bfff-ffffffffffff";
@@ -485,14 +494,32 @@ test("gateway persists notification ordering across restart", async () => {
     assert.notEqual(generations.get(first.sessionId), headers[PROVISIONING_GENERATION_HEADER]);
     assert.ok(persistedGeneration < generations.get(first.sessionId)!);
     assert.ok(generations.get(first.sessionId)! < generations.get(second.sessionId)!);
-    assert.equal((await readFile(generationStateFile, "utf8")).trim(), generations.get(second.sessionId));
+    assert.equal((await readFile(generationStateFile, "utf8")).trim(), persistedGeneration);
+    assert.equal(
+      (await readFile(`${generationStateFile}.issued`, "utf8")).trim(),
+      generations.get(second.sessionId),
+    );
 
     const poll = async (sessionId: string) => {
       const response = await fetch(`http://127.0.0.1:${port}/v1/auth/fake/sessions/${sessionId}`, { headers });
       await response.arrayBuffer();
     };
+    await new Promise<void>((resolve) => gateway!.close(() => resolve()));
+    gateway = undefined;
+    gateway = createApp({
+      userWorkerProxy: new UserWorkerProxy(provisioner, 30_000, generationStateFile),
+      onAuthorizedProvisioningUrl: (url) => { notifications.push(url); },
+    }).listen(0);
+    await new Promise<void>((resolve) => gateway!.once("listening", resolve));
+    port = (gateway.address() as AddressInfo).port;
+
+    await poll(first.sessionId);
+    assert.deepEqual(notifications, [urls.get(first.sessionId)]);
+    assert.equal((await readFile(generationStateFile, "utf8")).trim(), generations.get(first.sessionId));
+
     await poll(second.sessionId);
-    assert.deepEqual(notifications, [urls.get(second.sessionId)]);
+    assert.deepEqual(notifications, [urls.get(first.sessionId), urls.get(second.sessionId)]);
+    assert.equal((await readFile(generationStateFile, "utf8")).trim(), generations.get(second.sessionId));
 
     await new Promise<void>((resolve) => gateway!.close(() => resolve()));
     gateway = undefined;
@@ -506,12 +533,17 @@ test("gateway persists notification ordering across restart", async () => {
     await poll(second.sessionId);
     await poll(first.sessionId);
 
-    assert.deepEqual(notifications, [urls.get(second.sessionId), urls.get(second.sessionId)]);
+    assert.deepEqual(notifications, [
+      urls.get(first.sessionId),
+      urls.get(second.sessionId),
+      urls.get(second.sessionId),
+    ]);
   } finally {
     if (gateway) await new Promise<void>((resolve) => gateway!.close(() => resolve()));
     await new Promise<void>((resolve) => worker.close(() => resolve()));
     await rm(socketPath, { force: true });
     await rm(generationStateFile, { force: true });
+    await rm(`${generationStateFile}.issued`, { force: true });
   }
 });
 
