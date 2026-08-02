@@ -140,17 +140,17 @@ describe("provision-routes", () => {
     assert.equal(errorOf(res).code, "unknown_item");
   });
 
-  test("deleting an item that was never installed reports removed: false", () => {
+  test("deleting an item that was never installed reports removed: false", async () => {
     enable();
     const res = fakeRes();
-    handleProvisionDelete(fakeReq({ params: { type: "skill", name: "ghost" } as any }), res);
+    await handleProvisionDelete(fakeReq({ params: { type: "skill", name: "ghost" } as any }), res);
     assert.deepEqual(res.payload, { type: "skill", name: "ghost", removed: false });
   });
 
-  test("a hostile item name in the path is a 400, not a 500", () => {
+  test("a hostile item name in the path is a 400, not a 500", async () => {
     enable();
     const res = fakeRes();
-    handleProvisionDelete(fakeReq({ params: { type: "skill", name: "../../etc" } as any }), res);
+    await handleProvisionDelete(fakeReq({ params: { type: "skill", name: "../../etc" } as any }), res);
     assert.equal(res.statusCode, 400);
   });
 

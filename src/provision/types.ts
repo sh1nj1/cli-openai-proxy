@@ -44,6 +44,8 @@ export interface InstalledRecord {
   sha256: string;
   /** Paths relative to the item's install dir — what removal may delete. */
   files: string[];
+  /** Per-file content hashes used to detect and repair local drift. */
+  fileHashes?: Record<string, string>;
   installedAt: string;
 }
 
@@ -55,6 +57,8 @@ export interface InstalledRecord {
 export interface ProvisionStateFile {
   version: 1;
   approved: string[];
+  /** Explicit DELETE tombstones; override auto-apply while the item stays desired. */
+  revoked: string[];
   installed: Record<string, InstalledRecord>;
 }
 

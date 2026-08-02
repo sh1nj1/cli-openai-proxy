@@ -78,11 +78,11 @@ export async function handleProvisionApprove(req: Request, res: Response): Promi
 }
 
 /** DELETE /v1/provision/items/:type/:name — uninstall and revoke approval. */
-export function handleProvisionDelete(req: Request, res: Response): void {
+export async function handleProvisionDelete(req: Request, res: Response): Promise<void> {
   const type = String(req.params.type ?? "");
   const name = String(req.params.name ?? "");
   try {
-    res.json({ type, name, ...deleteItem(type, name) });
+    res.json({ type, name, ...await deleteItem(type, name) });
   } catch (err) {
     sendError(res, err);
   }

@@ -111,7 +111,8 @@ the current manifest can be approved. Once a name is approved, later upgrades
 
 Uninstall and **revoke approval** — without revocation the next sync would
 silently reinstall and DELETE would be a no-op. The item returns as
-`pending_approval` if the manifest still names it.
+`pending_approval` if the manifest still names it, including in `auto` mode.
+The tombstone clears after the item leaves the manifest.
 
 ## Security model
 
@@ -125,11 +126,11 @@ silently reinstall and DELETE would be a no-op. The item returns as
 - **Integrity.** Artifact sha256 is mandatory and idempotency is judged on
   content hash, not version strings — a registry that re-publishes different
   bytes under the same name re-installs (and a tampered one fails).
-- **Bounded transfer and expansion.** The download is capped at 10 MiB while
-  the body streams (an oversized or never-ending response is cut off at the
-  limit, under an overall timeout), and the archive's decompressed size is
-  bounded *before* extraction — a small gzip bomb never reaches the
-  filesystem.
+- **Bounded transfer and expansion.** The manifest is capped at 1 MiB and each
+  artifact at 10 MiB while their bodies stream (an oversized or never-ending
+  response is cut off at the limit, under an overall timeout). The archive's
+  decompressed size is bounded *before* extraction — a small gzip bomb never
+  reaches the filesystem.
 - **Redirects re-checked.** `fetch` is never allowed to follow a redirect on
   its own: every hop of a manifest or artifact fetch is validated against the
   same host policy, so an allowed host cannot bounce the request to a
@@ -140,7 +141,8 @@ silently reinstall and DELETE would be a no-op. The item returns as
   target and swaps in atomically; a failed upgrade leaves the previous install
   untouched.
 - **Lockfile ownership.** `~/.cli-openai-proxy/provision.lock.json` records
-  what the proxy installed; removal only ever touches what it lists. Skills a
+  what the proxy installed, including per-file hashes used to repair missing
+  or modified files on the next sync; removal only ever touches what it lists. Skills a
   user installed by hand are never overwritten or deleted — a manifest item
   whose name collides with an untracked directory fails with
   `Refusing to replace untracked directory` instead of replacing it.

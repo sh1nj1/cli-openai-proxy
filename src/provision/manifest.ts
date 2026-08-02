@@ -134,6 +134,38 @@ export function checkUrlAllowed(
 
 const MAX_REDIRECTS = 5;
 
+/** Read a remote body without allowing an endpoint to exhaust process memory. */
+export async function readResponseBody(
+  response: Response,
+  opts: { maxBytes: number; tooLargeCode: string; readErrorCode: string; label: string },
+): Promise<Buffer> {
+  const body = response.body;
+  if (!body) return Buffer.alloc(0);
+  const chunks: Buffer[] = [];
+  let total = 0;
+  const reader = body.getReader();
+  try {
+    for (;;) {
+      let step: { done: boolean; value?: Uint8Array };
+      try {
+	step = await reader.read();
+      } catch (err) {
+	const reason = err instanceof Error ? err.message : String(err);
+	throw new ProvisionError(`${opts.label} read failed: ${reason}`, opts.readErrorCode);
+      }
+      if (step.done || !step.value) break;
+      total += step.value.byteLength;
+      if (total > opts.maxBytes) {
+	throw new ProvisionError(`${opts.label} exceeds ${opts.maxBytes} bytes`, opts.tooLargeCode);
+      }
+      chunks.push(Buffer.from(step.value));
+    }
+  } finally {
+    void reader.cancel().catch(() => {});
+  }
+  return Buffer.concat(chunks);
+}
+
 /**
  * fetch() follows redirects on its own, which would let an allowed host bounce
  * the request to one the policy would refuse. This walks redirects manually and

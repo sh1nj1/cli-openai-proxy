@@ -22,13 +22,14 @@ describe("provision state", () => {
   });
 
   test("a missing lockfile loads as the empty state", () => {
-    assert.deepEqual(loadState(), { version: 1, approved: [], installed: {} });
+    assert.deepEqual(loadState(), { version: 1, approved: [], revoked: [], installed: {} });
   });
 
   test("saved state round-trips", () => {
     const state = {
       version: 1 as const,
       approved: ["skill/pr-monitor"],
+      revoked: [],
       installed: {
         "skill/pr-monitor": {
           sha256: "a".repeat(64),
@@ -45,12 +46,46 @@ describe("provision state", () => {
   test("a corrupt lockfile loads as empty rather than throwing", () => {
     mkdirSync(path.dirname(stateFilePath()), { recursive: true });
     writeFileSync(stateFilePath(), "{ not json");
-    assert.deepEqual(loadState(), { version: 1, approved: [], installed: {} });
+    assert.deepEqual(loadState(), { version: 1, approved: [], revoked: [], installed: {} });
+  });
+
+  test("valid JSON with malformed installed records is discarded safely", () => {
+    mkdirSync(path.dirname(stateFilePath()), { recursive: true });
+    writeFileSync(stateFilePath(), JSON.stringify({
+      version: 1,
+      approved: ["skill/good", 42],
+      revoked: ["skill/nope", null],
+      installed: {
+	"skill/null-record": null,
+	"skill/bad-hash": { sha256: "no", files: [], installedAt: "today" },
+	"../escape": { sha256: "a".repeat(64), files: ["../outside"], installedAt: new Date().toISOString() },
+	"skill/good": {
+	  sha256: "b".repeat(64),
+	  files: ["SKILL.md"],
+	  fileHashes: { "SKILL.md": "c".repeat(64) },
+	  installedAt: "2026-08-02T00:00:00.000Z",
+	},
+      },
+    }));
+
+    assert.deepEqual(loadState(), {
+      version: 1,
+      approved: ["skill/good"],
+      revoked: ["skill/nope"],
+      installed: {
+	"skill/good": {
+	  sha256: "b".repeat(64),
+	  files: ["SKILL.md"],
+	  fileHashes: { "SKILL.md": "c".repeat(64) },
+	  installedAt: "2026-08-02T00:00:00.000Z",
+	},
+      },
+    });
   });
 
   test("saveState writes atomically (no partial file left beside the lockfile)", () => {
-    saveState({ version: 1, approved: [], installed: {} });
+    saveState({ version: 1, approved: [], revoked: [], installed: {} });
     const contents = readFileSync(stateFilePath(), "utf-8");
-    assert.deepEqual(JSON.parse(contents), { version: 1, approved: [], installed: {} });
+    assert.deepEqual(JSON.parse(contents), { version: 1, approved: [], revoked: [], installed: {} });
   });
 });

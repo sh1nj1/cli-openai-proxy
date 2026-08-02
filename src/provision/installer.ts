@@ -24,12 +24,14 @@ import {
 import { tmpdir } from "os";
 import path from "path";
 import { gunzipSync } from "zlib";
-import { fetchWithPolicy } from "./manifest.js";
+import { fetchWithPolicy, readResponseBody } from "./manifest.js";
 import { ProvisionError } from "./types.js";
 
 export interface InstallResult {
   /** Installed file paths relative to the skill's directory. */
   files: string[];
+  /** Hashes of installed contents, used by periodic drift repair. */
+  fileHashes: Record<string, string>;
 }
 
 const MAX_ARCHIVE_BYTES = 10 * 1024 * 1024;
@@ -64,31 +66,12 @@ async function download(url: string, checkUrl?: (url: string) => void): Promise<
   }
   // The cap is enforced WHILE the body streams: a host that sends an oversized
   // or never-ending body is cut off at the limit, not buffered to completion.
-  const chunks: Buffer[] = [];
-  let total = 0;
-  const body = response.body;
-  if (!body) return Buffer.alloc(0);
-  const reader = body.getReader();
-  try {
-    for (;;) {
-      let step: { done: boolean; value?: Uint8Array };
-      try {
-        step = await reader.read();
-      } catch (err) {
-        const reason = err instanceof Error ? err.message : String(err);
-        throw new ProvisionError(`Download failed: ${reason}`, "download_failed");
-      }
-      if (step.done || !step.value) break;
-      total += step.value.byteLength;
-      if (total > MAX_ARCHIVE_BYTES) {
-        throw new ProvisionError(`Archive exceeds ${MAX_ARCHIVE_BYTES} bytes`, "archive_rejected");
-      }
-      chunks.push(Buffer.from(step.value));
-    }
-  } finally {
-    void reader.cancel().catch(() => {});
-  }
-  return Buffer.concat(chunks);
+  return readResponseBody(response, {
+    maxBytes: MAX_ARCHIVE_BYTES,
+    tooLargeCode: "archive_rejected",
+    readErrorCode: "download_failed",
+    label: "Archive",
+  });
 }
 
 /**
@@ -139,8 +122,9 @@ function assertArchiveSafe(archivePath: string): void {
 }
 
 /** Walk the extracted tree, enforcing the audit, returning relative file paths. */
-function auditTree(root: string): string[] {
+function auditTree(root: string): InstallResult {
   const files: string[] = [];
+  const fileHashes: Record<string, string> = {};
   let total = 0;
   const walk = (dir: string): void => {
     for (const entry of readdirSync(dir)) {
@@ -175,10 +159,11 @@ function auditTree(root: string): string[] {
         }
       }
       files.push(relative);
+      fileHashes[relative] = createHash("sha256").update(contents).digest("hex");
     }
   };
   walk(root);
-  return files;
+  return { files, fileHashes };
 }
 
 export async function installSkill(
@@ -224,8 +209,8 @@ export async function installSkill(
       root = path.join(extractDir, entries[0]!);
     }
 
-    const files = auditTree(root);
-    if (files.length === 0) {
+    const result = auditTree(root);
+    if (result.files.length === 0) {
       throw new ProvisionError("Archive contains no files", "archive_rejected");
     }
 
@@ -244,7 +229,7 @@ export async function installSkill(
       if (hadPrevious) renameSync(previous, target);
       throw err;
     }
-    return { files };
+    return result;
   } finally {
     rmSync(staging, { recursive: true, force: true });
     rmSync(archiveDir, { recursive: true, force: true });

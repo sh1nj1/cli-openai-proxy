@@ -57,6 +57,7 @@ describe("provision sync", () => {
   let server: Server;
   let baseUrl: string;
   let responses: Map<string, Buffer | object>;
+  let responseGates: Map<string, Promise<void>>;
   let stateDir: string;
   let skillsDir: string;
   const saved = new Map<string, string | undefined>();
@@ -65,8 +66,9 @@ describe("provision sync", () => {
 
   before(async () => {
     responses = new Map();
+    responseGates = new Map();
     redirects = new Map();
-    server = createServer((req, res) => {
+    server = createServer(async (req, res) => {
       const location = redirects.get(req.url ?? "");
       if (location) {
         res.statusCode = 302;
@@ -80,6 +82,8 @@ describe("provision sync", () => {
         res.end("not found");
         return;
       }
+      const gate = responseGates.get(req.url ?? "");
+      if (gate) await gate;
       if (Buffer.isBuffer(body)) res.end(body);
       else {
         res.setHeader("content-type", "application/json");
@@ -105,6 +109,7 @@ describe("provision sync", () => {
     process.env.PROVISION_SKILLS_DIR = skillsDir;
     process.env.PROVISION_SYNC = "1";
     responses.clear();
+    responseGates.clear();
     redirects.clear();
     initProvisioning();
   });
@@ -264,6 +269,13 @@ describe("provision sync", () => {
     assert.equal(await codeOf(() => syncNow()), "manifest_fetch_failed");
   });
 
+  test("a manifest body is capped while streaming", async () => {
+    responses.set("/huge.json", Buffer.alloc(2 * 1024 * 1024, 0x20));
+    registerManifestUrl(`${baseUrl}/huge.json`);
+    assert.equal(await codeOf(() => syncNow()), "manifest_fetch_failed");
+    assert.match(getStatus().last_error ?? "", /exceeds/i);
+  });
+
   test("deleting an item uninstalls it and revokes its approval", async () => {
     process.env.PROVISION_AUTOAPPLY = "auto";
     initProvisioning();
@@ -274,11 +286,86 @@ describe("provision sync", () => {
     process.env.PROVISION_AUTOAPPLY = "approve";
     initProvisioning();
     registerManifestUrl(serveManifest([{ type: "skill", name: "aaa", ...skill }]));
-    assert.deepEqual(deleteItem("skill", "aaa"), { removed: true });
+    assert.deepEqual(await deleteItem("skill", "aaa"), { removed: true });
     assert.equal(existsSync(path.join(skillsDir, "aaa")), false);
 
     const view = await syncNow();
     assert.equal(statusOf(view, "aaa"), "pending_approval");
+  });
+
+  test("DELETE remains revoked in auto mode until the item leaves the manifest", async () => {
+    process.env.PROVISION_AUTOAPPLY = "auto";
+    initProvisioning();
+    const skill = serveSkill("/a.tgz", "a");
+    registerManifestUrl(serveManifest([{ type: "skill", name: "aaa", ...skill }]));
+    await syncNow();
+
+    assert.deepEqual(await deleteItem("skill", "aaa"), { removed: true });
+    assert.equal(existsSync(path.join(skillsDir, "aaa")), false);
+    assert.equal(statusOf(await syncNow(), "aaa"), "pending_approval");
+    assert.equal(existsSync(path.join(skillsDir, "aaa")), false);
+
+    registerManifestUrl(serveManifest([]));
+    await syncNow();
+    registerManifestUrl(serveManifest([{ type: "skill", name: "aaa", ...skill }]));
+    assert.equal(statusOf(await syncNow(), "aaa"), "installed");
+  });
+
+  test("DELETE waits for an active sync and cannot be undone by its stale state", async () => {
+    process.env.PROVISION_AUTOAPPLY = "auto";
+    initProvisioning();
+    const skill = serveSkill("/slow.tgz", "slow");
+    registerManifestUrl(serveManifest([{ type: "skill", name: "slow", ...skill }]));
+    let release!: () => void;
+    responseGates.set("/slow.tgz", new Promise<void>((resolve) => { release = resolve; }));
+
+    const syncing = syncNow();
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    const deleting = deleteItem("skill", "slow");
+    release();
+    await syncing;
+    assert.deepEqual(await deleting, { removed: true });
+    assert.equal(existsSync(path.join(skillsDir, "slow")), false);
+    assert.equal(statusOf(await syncNow(), "slow"), "pending_approval");
+  });
+
+  test("same-hash sync repairs missing and modified installed files", async () => {
+    process.env.PROVISION_AUTOAPPLY = "auto";
+    initProvisioning();
+    const skill = serveSkill("/drift.tgz", "expected");
+    registerManifestUrl(serveManifest([{ type: "skill", name: "drift", ...skill }]));
+    await syncNow();
+    const file = path.join(skillsDir, "drift", "SKILL.md");
+
+    writeFileSync(file, "tampered");
+    await syncNow();
+    assert.equal(readFileSync(file, "utf8"), "expected");
+
+    rmSync(file);
+    await syncNow();
+    assert.equal(readFileSync(file, "utf8"), "expected");
+  });
+
+  test("a manifest URL change during sync queues and awaits a follow-up sync", async () => {
+    process.env.PROVISION_AUTOAPPLY = "auto";
+    initProvisioning();
+    const first = serveSkill("/first.tgz", "first");
+    const second = serveSkill("/second.tgz", "second");
+    responses.set("/first.json", { schema: "agent-provisioning/v1", items: [{ type: "skill", name: "first", ...first }] });
+    responses.set("/second.json", { schema: "agent-provisioning/v1", items: [{ type: "skill", name: "second", ...second }] });
+    let release!: () => void;
+    responseGates.set("/first.tgz", new Promise<void>((resolve) => { release = resolve; }));
+
+    registerManifestUrl(`${baseUrl}/first.json`);
+    const firstSync = syncNow();
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    const switched = handleAuthorizedSession(`${baseUrl}/second.json`);
+    release();
+    await Promise.all([firstSync, switched]);
+
+    assert.equal(getStatus().manifest_url, `${baseUrl}/second.json`);
+    assert.equal(existsSync(path.join(skillsDir, "first")), false);
+    assert.equal(existsSync(path.join(skillsDir, "second", "SKILL.md")), true);
   });
 
   test("approving an item the manifest never named is unknown_item", async () => {

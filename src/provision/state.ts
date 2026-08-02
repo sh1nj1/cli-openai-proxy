@@ -20,7 +20,39 @@ export function stateFilePath(): string {
   return path.join(stateDir(), "provision.lock.json");
 }
 
-const emptyState = (): ProvisionStateFile => ({ version: 1, approved: [], installed: {} });
+const emptyState = (): ProvisionStateFile => ({ version: 1, approved: [], revoked: [], installed: {} });
+const HASH_PATTERN = /^[0-9a-f]{64}$/i;
+const KEY_PATTERN = /^[a-z0-9][a-z0-9_-]{0,63}\/[a-z0-9][a-z0-9_-]{0,63}$/i;
+
+function safeRelativeFile(value: unknown): value is string {
+  if (typeof value !== "string" || !value || value.length > 1024 || path.isAbsolute(value)) return false;
+  return value.split(/[\\/]/).every((part) => part !== "" && part !== "." && part !== "..");
+}
+
+function installedRecord(value: unknown): InstalledRecord | null {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return null;
+  const record = value as Record<string, unknown>;
+  if (typeof record.sha256 !== "string" || !HASH_PATTERN.test(record.sha256)) return null;
+  if (!Array.isArray(record.files) || record.files.length === 0 || !record.files.every(safeRelativeFile)) return null;
+  const files = record.files as string[];
+  if (new Set(files).size !== files.length) return null;
+  if (typeof record.installedAt !== "string" || !Number.isFinite(Date.parse(record.installedAt))) return null;
+  let fileHashes: Record<string, string> | undefined;
+  if (record.fileHashes !== undefined) {
+    if (typeof record.fileHashes !== "object" || record.fileHashes === null || Array.isArray(record.fileHashes)) return null;
+    const entries = Object.entries(record.fileHashes);
+    if (entries.length !== files.length) return null;
+    if (entries.some(([file, hash]) => !safeRelativeFile(file) || !files.includes(file)
+      || typeof hash !== "string" || !HASH_PATTERN.test(hash))) return null;
+    fileHashes = Object.fromEntries(entries) as Record<string, string>;
+  }
+  return {
+    sha256: record.sha256.toLowerCase(),
+    files: [...files],
+    ...(fileHashes ? { fileHashes } : {}),
+    installedAt: record.installedAt,
+  };
+}
 
 export function loadState(): ProvisionStateFile {
   let raw: string;
@@ -32,15 +64,22 @@ export function loadState(): ProvisionStateFile {
   try {
     const parsed = JSON.parse(raw) as Partial<ProvisionStateFile>;
     if (typeof parsed !== "object" || parsed === null) return emptyState();
+    const installed: Record<string, InstalledRecord> = {};
+    if (typeof parsed.installed === "object" && parsed.installed !== null) {
+      for (const [key, value] of Object.entries(parsed.installed)) {
+	const record = KEY_PATTERN.test(key) ? installedRecord(value) : null;
+	if (record) installed[key] = record;
+      }
+    }
     return {
       version: 1,
       approved: Array.isArray(parsed.approved)
-        ? parsed.approved.filter((k): k is string => typeof k === "string")
+	? parsed.approved.filter((k): k is string => typeof k === "string" && KEY_PATTERN.test(k))
+	: [],
+      revoked: Array.isArray(parsed.revoked)
+	? parsed.revoked.filter((k): k is string => typeof k === "string" && KEY_PATTERN.test(k))
         : [],
-      installed:
-        typeof parsed.installed === "object" && parsed.installed !== null
-          ? (parsed.installed as Record<string, InstalledRecord>)
-          : {},
+      installed,
     };
   } catch {
     return emptyState();

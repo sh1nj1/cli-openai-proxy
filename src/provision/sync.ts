@@ -13,7 +13,8 @@
  * removal only ever touches what the lockfile records as ours.
  */
 
-import { existsSync } from "fs";
+import { createHash } from "crypto";
+import { existsSync, lstatSync, readFileSync } from "fs";
 import { homedir } from "os";
 import path from "path";
 import {
@@ -22,6 +23,7 @@ import {
   getAllowlist,
   isValidItemName,
   parseManifest,
+  readResponseBody,
 } from "./manifest.js";
 import { installSkill, removeSkill } from "./installer.js";
 import { loadState, saveState } from "./state.js";
@@ -29,6 +31,7 @@ import {
   ProvisionError,
   SUPPORTED_PROVISION_TYPES,
   type ProvisionItemStatus,
+  type InstalledRecord,
   type ProvisionManifest,
 } from "./types.js";
 
@@ -52,6 +55,7 @@ export interface ProvisionStatusView {
 
 const DEFAULT_REFETCH_MS = 60 * 60_000;
 const MANIFEST_FETCH_TIMEOUT_MS = 30_000;
+const MAX_MANIFEST_BYTES = 1024 * 1024;
 
 let enabled = false;
 let autoApply: "auto" | "approve" = "approve";
@@ -62,6 +66,15 @@ let lastError: string | null = null;
 let itemViews: ProvisionItemView[] = [];
 let refetchTimer: NodeJS.Timeout | null = null;
 let inFlight: Promise<ProvisionStatusView> | null = null;
+let manifestGeneration = 0;
+let syncRequested = false;
+let operationTail: Promise<void> = Promise.resolve();
+
+function serialize<T>(operation: () => Promise<T> | T): Promise<T> {
+  const result = operationTail.then(operation, operation);
+  operationTail = result.then(() => undefined, () => undefined);
+  return result;
+}
 
 function skillsDir(): string {
   return process.env.PROVISION_SKILLS_DIR?.trim() || path.join(homedir(), ".claude", "skills");
@@ -116,7 +129,11 @@ function startRefetchTimer(): void {
 export function registerManifestUrl(url: string): void {
   if (!enabled) return;
   checkUrlAllowed(url, { allowlist: getAllowlist() });
-  manifestUrl = url;
+  if (manifestUrl !== url) {
+    manifestUrl = url;
+    manifestGeneration += 1;
+    if (inFlight) syncRequested = true;
+  }
   startRefetchTimer();
 }
 
@@ -133,11 +150,35 @@ async function fetchManifest(url: string): Promise<ProvisionManifest> {
   }
   let body: unknown;
   try {
-    body = await response.json();
-  } catch {
+    const raw = await readResponseBody(response, {
+      maxBytes: MAX_MANIFEST_BYTES,
+      tooLargeCode: "manifest_fetch_failed",
+      readErrorCode: "manifest_fetch_failed",
+      label: "Manifest",
+    });
+    body = JSON.parse(raw.toString("utf8"));
+  } catch (err) {
+    if (err instanceof ProvisionError) throw err;
     throw new ProvisionError("Manifest is not valid JSON", "manifest_fetch_failed");
   }
   return parseManifest(body);
+}
+
+function installedRecordIntact(name: string, record: InstalledRecord): boolean {
+  if (!record.fileHashes || Object.keys(record.fileHashes).length !== record.files.length) return false;
+  const root = path.join(skillsDir(), name);
+  try {
+    if (!lstatSync(root).isDirectory()) return false;
+    return record.files.every((relative) => {
+      const file = path.join(root, ...relative.split("/"));
+      const stat = lstatSync(file);
+      if (!stat.isFile()) return false;
+      const digest = createHash("sha256").update(readFileSync(file)).digest("hex");
+      return record.fileHashes![relative] === digest;
+    });
+  } catch {
+    return false;
+  }
 }
 
 async function runSync(): Promise<ProvisionStatusView> {
@@ -167,8 +208,8 @@ async function runSync(): Promise<ProvisionStatusView> {
 
     // Already-installed items count as approved: they were gated when first
     // installed, and upgrades to an approved name apply without a new stop.
-    const approved =
-      autoApply === "auto" || state.approved.includes(key) || key in state.installed;
+    const approved = !state.revoked.includes(key)
+      && (autoApply === "auto" || state.approved.includes(key) || key in state.installed);
     if (!approved) {
       views.push({ type: item.type, name: item.name, status: "pending_approval", sha256: item.sha256 });
       continue;
@@ -176,7 +217,8 @@ async function runSync(): Promise<ProvisionStatusView> {
 
     // Idempotency is judged on content hash, not version strings: a registry
     // that re-publishes different bytes under the same name re-installs.
-    if (state.installed[key]?.sha256 === item.sha256) {
+    if (state.installed[key]?.sha256 === item.sha256
+      && installedRecordIntact(item.name, state.installed[key]!)) {
       views.push({ type: item.type, name: item.name, status: "installed", sha256: item.sha256 });
       continue;
     }
@@ -204,6 +246,7 @@ async function runSync(): Promise<ProvisionStatusView> {
       state.installed[key] = {
         sha256: item.sha256!,
         files: result.files,
+	fileHashes: result.fileHashes,
         installedAt: new Date().toISOString(),
       };
       if (!state.approved.includes(key)) state.approved.push(key);
@@ -231,6 +274,10 @@ async function runSync(): Promise<ProvisionStatusView> {
     }
   }
 
+  // A DELETE tombstone lasts while the manifest still asks for that item. Once
+  // it disappears, a later re-add is a fresh desired-state decision.
+  state.revoked = state.revoked.filter((key) => desired.has(key));
+
   saveState(state);
   itemViews = views;
   lastSyncAt = new Date().toISOString();
@@ -238,10 +285,26 @@ async function runSync(): Promise<ProvisionStatusView> {
   return getStatus();
 }
 
-/** Serialized: a sync requested while one runs awaits the running one. */
+/** Serialized and coalesced; URL changes during a run queue one follow-up run. */
 export async function syncNow(): Promise<ProvisionStatusView> {
   if (inFlight) return inFlight;
-  inFlight = runSync()
+  const loop = async (): Promise<ProvisionStatusView> => {
+    let result!: ProvisionStatusView;
+    do {
+      syncRequested = false;
+      const startedGeneration = manifestGeneration;
+      try {
+	result = await serialize(runSync);
+      } catch (err) {
+	// A superseded URL's failure must not prevent the newly registered URL
+	// from running; only surface an error from the still-current generation.
+	if (startedGeneration === manifestGeneration && !syncRequested) throw err;
+      }
+      if (startedGeneration !== manifestGeneration) syncRequested = true;
+    } while (syncRequested);
+    return result;
+  };
+  inFlight = loop()
     .catch((err) => {
       lastError = err instanceof Error ? err.message : String(err);
       throw err;
@@ -273,29 +336,34 @@ export async function approveItem(type: string, name: string): Promise<Provision
   if (!known) {
     throw new ProvisionError(`No item "${key}" in the current manifest`, "unknown_item");
   }
-  const state = loadState();
-  if (!state.approved.includes(key)) {
-    state.approved.push(key);
+  if (inFlight) syncRequested = true;
+  await serialize(() => {
+    const state = loadState();
+    state.revoked = state.revoked.filter((entry) => entry !== key);
+    if (!state.approved.includes(key)) state.approved.push(key);
     saveState(state);
-  }
+  });
   return syncNow();
 }
 
-export function deleteItem(type: string, name: string): { removed: boolean } {
-  if (!isValidItemName(name)) {
-    throw new ProvisionError(`Invalid item name "${name}"`, "invalid_item");
+export function deleteItem(type: string, name: string): Promise<{ removed: boolean }> {
+  if (!isValidItemName(type) || !isValidItemName(name)) {
+    throw new ProvisionError(`Invalid item key "${type}/${name}"`, "invalid_item");
   }
   const key = `${type}/${name}`;
-  const state = loadState();
-  const installed = key in state.installed;
-  if (installed && type === "skill") removeSkill(name, { skillsDir: skillsDir() });
-  delete state.installed[key];
-  // Revoked, not just uninstalled: without this the next sync would silently
-  // reinstall, making DELETE a no-op from the operator's point of view.
-  state.approved = state.approved.filter((entry) => entry !== key);
-  saveState(state);
-  itemViews = itemViews.filter((item) => !(item.type === type && item.name === name));
-  return { removed: installed };
+  if (inFlight) syncRequested = true;
+  return serialize(() => {
+    const state = loadState();
+    const installed = key in state.installed;
+    if (installed && type === "skill") removeSkill(name, { skillsDir: skillsDir() });
+    delete state.installed[key];
+    // Revoked, not just uninstalled: auto mode must not undo an explicit DELETE.
+    state.approved = state.approved.filter((entry) => entry !== key);
+    if (!state.revoked.includes(key)) state.revoked.push(key);
+    saveState(state);
+    itemViews = itemViews.filter((item) => !(item.type === type && item.name === name));
+    return { removed: installed };
+  });
 }
 
 /**
@@ -325,4 +393,7 @@ export function resetProvisioning(): void {
   lastError = null;
   itemViews = [];
   inFlight = null;
+  manifestGeneration = 0;
+  syncRequested = false;
+  operationTail = Promise.resolve();
 }
