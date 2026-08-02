@@ -35,7 +35,7 @@ export function provisionAdminMiddleware(req: Request, res: Response, next: Next
   authAdminMiddleware(req, res, next);
 }
 
-function sendError(res: Response, err: unknown): void {
+function sendError(res: Response, err: unknown, invalidItemIsUpstream = false): void {
   if (err instanceof ProvisionError) {
     // 502 for upstream faults: the request was fine, the registry's answer was
     // not — retrying may succeed once the remote side is fixed.
@@ -44,6 +44,7 @@ function sendError(res: Response, err: unknown): void {
         ? 404
         : err.code === "manifest_fetch_failed" ||
             err.code === "invalid_manifest" ||
+	    (invalidItemIsUpstream && err.code === "invalid_item") ||
             err.code === "download_failed"
           ? 502
           : 400;
@@ -64,7 +65,7 @@ export async function handleProvisionSync(_req: Request, res: Response): Promise
   try {
     res.json(await syncNow());
   } catch (err) {
-    sendError(res, err);
+    sendError(res, err, true);
   }
 }
 

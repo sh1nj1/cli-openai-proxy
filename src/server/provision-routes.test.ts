@@ -1,6 +1,7 @@
 import { test, describe, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
 import { mkdtempSync, rmSync } from "fs";
+import { createServer } from "http";
 import { tmpdir } from "os";
 import path from "path";
 import type { Request, Response } from "express";
@@ -14,7 +15,7 @@ import {
 } from "./provision-routes.js";
 import { handleCreateAuthSession, initAuthAdmin } from "./auth-routes.js";
 import { authMiddleware, initAuth } from "./auth.js";
-import { getStatus, initProvisioning, shutdownProvisioning } from "../provision/sync.js";
+import { getStatus, initProvisioning, registerManifestUrl, shutdownProvisioning } from "../provision/sync.js";
 import { engineRegistry } from "../auth/registry.js";
 import { resetSessions } from "../auth/session-manager.js";
 import type { EngineAuthDescriptor, EngineAuthSession } from "../auth/types.js";
@@ -130,6 +131,28 @@ describe("provision-routes", () => {
     await handleProvisionSync(fakeReq(), res);
     assert.equal(res.statusCode, 400);
     assert.equal(errorOf(res).code, "no_manifest_url");
+  });
+
+  test("a malformed item from the registry is an upstream 502", async () => {
+    enable();
+    const server = createServer((_req, response) => {
+      response.setHeader("content-type", "application/json");
+      response.end(JSON.stringify({
+	schema: "agent-provisioning/v1",
+	items: [{ type: "skill", name: "missing-artifact-fields" }],
+      }));
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    try {
+      const port = (server.address() as { port: number }).port;
+      registerManifestUrl(`http://127.0.0.1:${port}/provision.json`);
+      const res = fakeRes();
+      await handleProvisionSync(fakeReq(), res);
+      assert.equal(res.statusCode, 502);
+      assert.equal(errorOf(res).code, "invalid_item");
+    } finally {
+      await new Promise<void>((resolve, reject) => server.close((err) => err ? reject(err) : resolve()));
+    }
   });
 
   test("approving an item no manifest has named is a 404", async () => {

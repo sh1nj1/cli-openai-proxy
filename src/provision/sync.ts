@@ -260,16 +260,28 @@ async function runSync(): Promise<ProvisionStatusView> {
     const checkUrl = (hop: string) => checkUrlAllowed(hop, { manifestUrl: url, allowlist });
     try {
       checkUrl(item.url!);
+      const previousRecord = state.installed[key];
       const result = await installSkill(
         { name: item.name, url: item.url!, sha256: item.sha256! },
-        { skillsDir: skillsDir(), checkUrl },
+	{
+	  skillsDir: skillsDir(),
+	  checkUrl,
+	  managedFiles: previousRecord?.files,
+	  beforeCommit: (candidate) => {
+	    state.installed[key] = {
+	      sha256: item.sha256!,
+	      files: candidate.files,
+	      fileHashes: candidate.fileHashes,
+	      installedAt: new Date().toISOString(),
+	    };
+	    saveState(state);
+	  },
+	},
       );
-      state.installed[key] = {
-        sha256: item.sha256!,
-        files: result.files,
-	fileHashes: result.fileHashes,
-        installedAt: new Date().toISOString(),
-      };
+      // `beforeCommit` already persisted this exact record before the atomic
+      // rename. Keep the result reference explicit so this coupling is visible.
+      state.installed[key]!.files = result.files;
+      state.installed[key]!.fileHashes = result.fileHashes;
       if (!state.approved.includes(key)) state.approved.push(key);
       views.push({ type: item.type, name: item.name, status: "installed", sha256: item.sha256 });
     } catch (err) {
@@ -286,7 +298,14 @@ async function runSync(): Promise<ProvisionStatusView> {
     const [type, ...rest] = key.split("/");
     const name = rest.join("/");
     try {
-      if (type === "skill") removeSkill(name, { skillsDir: skillsDir() });
+      const record = state.installed[key]!;
+      if (type === "skill") {
+	removeSkill(name, {
+	  skillsDir: skillsDir(),
+	  files: record.files,
+	  fileHashes: record.fileHashes,
+	});
+      }
       delete state.installed[key];
       views.push({ type: type ?? "skill", name, status: "removed" });
     } catch (err) {
@@ -379,7 +398,14 @@ export function deleteItem(type: string, name: string): Promise<{ removed: boole
   return serialize(() => {
     const state = loadState();
     const installed = key in state.installed;
-    if (installed && type === "skill") removeSkill(name, { skillsDir: skillsDir() });
+    const record = state.installed[key];
+    if (record && type === "skill") {
+      removeSkill(name, {
+	skillsDir: skillsDir(),
+	files: record.files,
+	fileHashes: record.fileHashes,
+      });
+    }
     delete state.installed[key];
     // Revoked, not just uninstalled: auto mode must not undo an explicit DELETE.
     state.approved = state.approved.filter((entry) => entry !== key);

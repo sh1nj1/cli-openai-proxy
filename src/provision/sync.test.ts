@@ -234,6 +234,40 @@ describe("provision sync", () => {
     assert.equal(existsSync(path.join(skillsDir, "aaa")), false);
   });
 
+  test("removal preserves files added beneath a managed skill by the user", async () => {
+    process.env.PROVISION_AUTOAPPLY = "auto";
+    initProvisioning();
+    const skill = serveSkill("/owned.tgz", "managed");
+    registerManifestUrl(serveManifest([{ type: "skill", name: "owned", ...skill }]));
+    await syncNow();
+    writeFileSync(path.join(skillsDir, "owned", "user-notes.md"), "keep me");
+
+    registerManifestUrl(serveManifest([]));
+    const view = await syncNow();
+
+    assert.equal(statusOf(view, "owned"), "removed");
+    assert.equal(existsSync(path.join(skillsDir, "owned", "SKILL.md")), false);
+    assert.equal(readFileSync(path.join(skillsDir, "owned", "user-notes.md"), "utf8"), "keep me");
+  });
+
+  test("an upgrade refuses to overwrite files added beneath a managed skill", async () => {
+    process.env.PROVISION_AUTOAPPLY = "auto";
+    initProvisioning();
+    const first = serveSkill("/upgrade-v1.tgz", "v1");
+    registerManifestUrl(serveManifest([{ type: "skill", name: "upgrade", ...first }]));
+    await syncNow();
+    writeFileSync(path.join(skillsDir, "upgrade", "user-notes.md"), "keep me");
+
+    const second = serveSkill("/upgrade-v2.tgz", "v2");
+    registerManifestUrl(serveManifest([{ type: "skill", name: "upgrade", ...second }]));
+    const view = await syncNow();
+
+    assert.equal(statusOf(view, "upgrade"), "failed");
+    assert.match(view.data.find((item) => item.name === "upgrade")?.error ?? "", /untracked/i);
+    assert.equal(readFileSync(path.join(skillsDir, "upgrade", "SKILL.md"), "utf8"), "v1");
+    assert.equal(readFileSync(path.join(skillsDir, "upgrade", "user-notes.md"), "utf8"), "keep me");
+  });
+
   test("an unknown item type reports unsupported and is otherwise ignored", async () => {
     registerManifestUrl(serveManifest([{ type: "mcp", name: "future" }]));
     const view = await syncNow();
@@ -301,6 +335,19 @@ describe("provision sync", () => {
     registerManifestUrl(`${baseUrl}/huge.json`);
     assert.equal(await codeOf(() => syncNow()), "manifest_fetch_failed");
     assert.match(getStatus().last_error ?? "", /exceeds/i);
+  });
+
+  test("a first install is not exposed when its ownership record cannot be persisted", async () => {
+    process.env.PROVISION_AUTOAPPLY = "auto";
+    initProvisioning();
+    const blocker = path.join(stateDir, "not-a-directory");
+    writeFileSync(blocker, "block nested state writes");
+    process.env.PROVISION_STATE_DIR = path.join(blocker, "child");
+    const skill = serveSkill("/ownership.tgz", "owned only after lockfile write");
+    registerManifestUrl(serveManifest([{ type: "skill", name: "ownership", ...skill }]));
+
+    await assert.rejects(syncNow());
+    assert.equal(existsSync(path.join(skillsDir, "ownership")), false);
   });
 
   test("deleting an item uninstalls it and revokes its approval", async () => {

@@ -307,8 +307,8 @@ describe("provision installer", () => {
 
   test("removeSkill deletes the skill directory", async () => {
     const { url, sha256 } = serve("/k.tgz", makeTarGz([{ name: "SKILL.md", content: "ok" }]));
-    await installSkill({ name: "demo", url, sha256 }, { skillsDir });
-    removeSkill("demo", { skillsDir });
+    const result = await installSkill({ name: "demo", url, sha256 }, { skillsDir });
+    removeSkill("demo", { skillsDir, files: result.files, fileHashes: result.fileHashes });
     assert.equal(existsSync(path.join(skillsDir, "demo")), false);
     assert.equal(lstatSync(skillsDir).isDirectory(), true);
   });

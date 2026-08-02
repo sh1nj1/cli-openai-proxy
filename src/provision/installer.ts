@@ -18,6 +18,7 @@ import {
   readdirSync,
   readFileSync,
   renameSync,
+  rmdirSync,
   rmSync,
   writeFileSync,
 } from "fs";
@@ -168,7 +169,14 @@ function auditTree(root: string): InstallResult {
 
 export async function installSkill(
   item: { name: string; url: string; sha256: string },
-  opts: { skillsDir: string; checkUrl?: (url: string) => void },
+  opts: {
+    skillsDir: string;
+    checkUrl?: (url: string) => void;
+    /** Persist ownership before the staged directory becomes externally visible. */
+    beforeCommit?: (result: InstallResult) => void;
+    /** Existing managed paths; an upgrade must not erase additions outside this set. */
+    managedFiles?: string[];
+  },
 ): Promise<InstallResult> {
   if (!NAME_PATTERN.test(item.name)) {
     throw new ProvisionError(`Invalid skill name "${item.name}"`, "invalid_item");
@@ -215,6 +223,16 @@ export async function installSkill(
     }
 
     const target = path.join(opts.skillsDir, item.name);
+    if (opts.managedFiles && hasUntrackedFiles(target, new Set(opts.managedFiles))) {
+      throw new ProvisionError(
+	`Refusing to replace "${item.name}" because it contains untracked files`,
+	"untracked_content",
+      );
+    }
+    // The lockfile pre-claim happens before either the old or new target moves.
+    // A failed write leaves the target untouched; a crash after the write is
+    // recoverable because the next sync recognizes the path as proxy-owned.
+    opts.beforeCommit?.(result);
     const previous = path.join(staging, "previous");
     let hadPrevious = false;
     try {
@@ -236,9 +254,108 @@ export async function installSkill(
   }
 }
 
-export function removeSkill(name: string, opts: { skillsDir: string }): void {
+function hasUntrackedFiles(root: string, managed: Set<string>): boolean {
+  try {
+    if (!lstatSync(root).isDirectory()) return true;
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") return false;
+    throw err;
+  }
+  const walk = (dir: string): boolean => {
+    for (const entry of readdirSync(dir)) {
+      const full = path.join(dir, entry);
+      const stat = lstatSync(full);
+      if (stat.isDirectory()) {
+	if (walk(full)) return true;
+	continue;
+      }
+      const relative = path.relative(root, full).split(path.sep).join("/");
+      if (!stat.isFile() || !managed.has(relative)) return true;
+    }
+    return false;
+  };
+  return walk(root);
+}
+
+function existsAsDirectory(target: string): boolean {
+  try {
+    return lstatSync(target).isDirectory();
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") return false;
+    throw err;
+  }
+}
+
+function managedPath(root: string, relative: string): string | null {
+  if (!relative || path.isAbsolute(relative)) return null;
+  const parts = relative.split(/[\\/]/);
+  if (parts.some((part) => !part || part === "." || part === "..")) return null;
+  return path.join(root, ...parts);
+}
+
+/** Remove only recorded regular files, leaving modified or added user content. */
+export function removeSkill(
+  name: string,
+  opts: { skillsDir: string; files: string[]; fileHashes?: Record<string, string> },
+): void {
   if (!NAME_PATTERN.test(name)) {
     throw new ProvisionError(`Invalid skill name "${name}"`, "invalid_item");
   }
-  rmSync(path.join(opts.skillsDir, name), { recursive: true, force: true });
+  const root = path.join(opts.skillsDir, name);
+  if (!existsAsDirectory(root)) return;
+
+  const removable: Array<{ file: string; relative: string }> = [];
+  for (const relative of opts.files) {
+    const file = managedPath(root, relative);
+    if (!file) continue;
+    let safe = true;
+    let current = root;
+    for (const part of relative.split(/[\\/]/).slice(0, -1)) {
+      current = path.join(current, part);
+      try {
+	if (!lstatSync(current).isDirectory()) safe = false;
+      } catch (err) {
+	if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
+	safe = false;
+      }
+      if (!safe) break;
+    }
+    if (!safe) continue;
+    try {
+      const stat = lstatSync(file);
+      if (!stat.isFile()) continue;
+      const expected = opts.fileHashes?.[relative];
+      if (expected) {
+	const actual = createHash("sha256").update(readFileSync(file)).digest("hex");
+	if (actual !== expected) continue;
+      }
+      removable.push({ file, relative });
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
+    }
+  }
+
+  for (const { file } of removable) rmSync(file, { force: true });
+  const directories = new Set<string>();
+  for (const { relative } of removable) {
+    let current = path.dirname(managedPath(root, relative)!);
+    while (current !== root && current.startsWith(`${root}${path.sep}`)) {
+      directories.add(current);
+      current = path.dirname(current);
+    }
+  }
+  for (const directory of [...directories].sort((a, b) => b.length - a.length)) {
+    try {
+      rmdirSync(directory);
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code;
+      if (code !== "ENOENT" && code !== "ENOTEMPTY") throw err;
+    }
+  }
+  try {
+    rmdirSync(root);
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code !== "ENOENT" && code !== "ENOTEMPTY") throw err;
+  }
 }
