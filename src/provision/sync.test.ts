@@ -490,6 +490,55 @@ describe("provision sync", () => {
     assert.equal(state.installed[`skill/${name}`], undefined);
   });
 
+  test("a modified committed install marker remains owned through upgrade and removal", async () => {
+    process.env.PROVISION_AUTOAPPLY = "auto";
+    const name = "modified-install-marker";
+    const marker = "f".repeat(32);
+    const markerName = `.provision-install-${marker}`;
+    const target = path.join(skillsDir, name);
+    mkdirSync(target);
+    writeFileSync(path.join(target, "SKILL.md"), "v1");
+    writeFileSync(path.join(target, markerName), "modified after ownership commit");
+    const v1 = serveSkill("/modified-install-marker-v1.tgz", "v1");
+    writeFileSync(path.join(stateDir, "provision.lock.json"), JSON.stringify({
+      version: 1,
+      approved: [`skill/${name}`],
+      revoked: [],
+      installed: {
+	[`skill/${name}`]: {
+	  sha256: v1.sha256,
+	  files: ["SKILL.md"],
+	  directories: [],
+	  fileHashes: { "SKILL.md": sha(Buffer.from("v1")) },
+	  installedAt: new Date().toISOString(),
+	  installMarker: marker,
+	},
+      },
+    }));
+    initProvisioning();
+    registerManifestUrl(serveManifest([{ type: "skill", name, ...v1 }]));
+
+    assert.equal(statusOf(await syncNow(), name), "installed");
+    let state = JSON.parse(readFileSync(path.join(stateDir, "provision.lock.json"), "utf8"));
+    assert.equal(state.installed[`skill/${name}`].installMarker, undefined);
+    assert.ok(state.installed[`skill/${name}`].files.includes(markerName));
+    assert.equal(
+      state.installed[`skill/${name}`].fileHashes[markerName],
+      sha(Buffer.from("modified after ownership commit")),
+    );
+
+    const v2 = serveSkill("/modified-install-marker-v2.tgz", "v2");
+    registerManifestUrl(serveManifest([{ type: "skill", name, ...v2 }]));
+    assert.equal(statusOf(await syncNow(), name), "installed");
+    assert.equal(readFileSync(path.join(target, "SKILL.md"), "utf8"), "v2");
+    assert.equal(existsSync(path.join(target, markerName)), false);
+
+    assert.deepEqual(await deleteItem("skill", name), { removed: true });
+    assert.equal(existsSync(target), false);
+    state = JSON.parse(readFileSync(path.join(stateDir, "provision.lock.json"), "utf8"));
+    assert.equal(state.installed[`skill/${name}`], undefined);
+  });
+
   test("a rejected first-install journal is not finalized as stable ownership", async () => {
     process.env.PROVISION_AUTOAPPLY = "auto";
     initProvisioning({

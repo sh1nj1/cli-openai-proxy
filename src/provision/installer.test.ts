@@ -573,6 +573,75 @@ describe("provision installer", () => {
     );
   });
 
+  test("bounded upgrade cleanup never prunes a retained inode modified after quarantine", async () => {
+    const v1 = serve("/bounded-modified-upgrade-v1.tgz", makeTarGz([
+      { name: "SKILL.md", content: "v1" },
+    ]));
+    let previous = await installSkill(
+      { name: "demo", url: v1.url, sha256: v1.sha256 },
+      { skillsDir },
+    );
+    const ownedUpgradeRecoveryIds: string[] = [];
+    const firstRecoveryId = "1".repeat(32);
+    ownedUpgradeRecoveryIds.push(firstRecoveryId);
+    const v2 = serve("/bounded-modified-upgrade-v2.tgz", makeTarGz([
+      { name: "SKILL.md", content: "v2" },
+    ]));
+    let descriptor: number | undefined;
+    try {
+      previous = await installSkill(
+	{ name: "demo", url: v2.url, sha256: v2.sha256 },
+	{
+	  skillsDir,
+	  managedFiles: previous.files,
+	  managedDirectories: previous.directories,
+	  managedFileHashes: previous.fileHashes,
+	  upgradeRecoveryId: firstRecoveryId,
+	  ownedUpgradeRecoveryIds,
+	  afterPreviousAudit: (previousRoot) => {
+	    descriptor = openSync(path.join(previousRoot, "SKILL.md"), "r+");
+	  },
+	  afterCleanupHash: () => {
+	    assert.notEqual(descriptor, undefined);
+	    ftruncateSync(descriptor!, 0);
+	    writeSync(descriptor!, "user change after quarantine");
+	  },
+	},
+      );
+    } finally {
+      if (descriptor !== undefined) closeSync(descriptor);
+    }
+    const firstRecovery = path.join(skillsDir, `.provision-staging-${firstRecoveryId}`);
+
+    for (let version = 3; version <= 6; version += 1) {
+      const recoveryId = version.toString(16).repeat(32);
+      ownedUpgradeRecoveryIds.push(recoveryId);
+      const artifact = serve(`/bounded-modified-upgrade-v${version}.tgz`, makeTarGz([
+	{ name: "SKILL.md", content: `v${version}` },
+      ]));
+      previous = await installSkill(
+	{ name: "demo", url: artifact.url, sha256: artifact.sha256 },
+	{
+	  skillsDir,
+	  managedFiles: previous.files,
+	  managedDirectories: previous.directories,
+	  managedFileHashes: previous.fileHashes,
+	  upgradeRecoveryId: recoveryId,
+	  ownedUpgradeRecoveryIds,
+	},
+      );
+    }
+
+    const previousDirectory = path.join(firstRecovery, "previous");
+    const quarantine = readdirSync(previousDirectory)
+      .find((entry) => entry.startsWith(".provision-cleanup-"));
+    assert.notEqual(quarantine, undefined);
+    assert.equal(
+      readFileSync(path.join(previousDirectory, quarantine!, "0"), "utf8"),
+      "user change after quarantine",
+    );
+  });
+
   test("a download error surfaces as download_failed", async () => {
     assert.equal(
       await codeOf(() =>
@@ -719,6 +788,49 @@ describe("provision installer", () => {
       entry.startsWith(".provision-removed-") && entry !== ".provision-removed-user");
     assert.equal(recoveries.length, 3);
     assert.equal(readFileSync(path.join(similarlyNamedUserDirectory, "keep.txt"), "utf8"), "user-owned");
+  });
+
+  test("bounded removal cleanup never prunes a retained inode modified after quarantine", async () => {
+    const { url, sha256 } = serve("/bounded-modified-removal.tgz", makeTarGz([
+      { name: "SKILL.md", content: "managed" },
+    ]));
+    const ownedRecoveryIds: string[] = [];
+    const firstRecoveryId = "a".repeat(32);
+    ownedRecoveryIds.push(firstRecoveryId);
+    let result = await installSkill({ name: "demo", url, sha256 }, { skillsDir });
+    const descriptor = openSync(path.join(skillsDir, "demo", "SKILL.md"), "r+");
+    let firstRecovery: string | undefined;
+    try {
+      ({ recoveryPath: firstRecovery } = removeSkill("demo", {
+	skillsDir,
+	files: result.files,
+	fileHashes: result.fileHashes,
+	directories: result.directories,
+	recoveryId: firstRecoveryId,
+	ownedRecoveryIds,
+      }));
+      ftruncateSync(descriptor, 0);
+      writeSync(descriptor, "user change after quarantine");
+    } finally {
+      closeSync(descriptor);
+    }
+
+    for (let index = 1; index <= 4; index += 1) {
+      const recoveryId = index.toString(16).padStart(32, "0");
+      ownedRecoveryIds.push(recoveryId);
+      result = await installSkill({ name: "demo", url, sha256 }, { skillsDir });
+      removeSkill("demo", {
+	skillsDir,
+	files: result.files,
+	fileHashes: result.fileHashes,
+	directories: result.directories,
+	recoveryId,
+	ownedRecoveryIds,
+      });
+    }
+
+    assert.notEqual(firstRecovery, undefined);
+    assert.equal(readFileSync(path.join(firstRecovery!, "0"), "utf8"), "user change after quarantine");
   });
 
   test("removeSkill deletes empty directories owned by the archive", async () => {

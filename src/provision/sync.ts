@@ -299,10 +299,36 @@ function reconcileFirstInstallJournals(state: ProvisionStateFile): Set<string> {
   for (const [key, record] of Object.entries(state.installed)) {
     if (record.uncommitted || !record.installMarker) continue;
     const name = key.slice(key.indexOf("/") + 1);
-    if (firstInstallMarkerStatus(name, record.installMarker) === "matching") {
-      unlinkSync(firstInstallMarkerPath(path.join(skillsDir(), name), record.installMarker));
-    }
+    const marker = record.installMarker;
+    const markerFile = firstInstallMarkerPath(path.join(skillsDir(), name), marker);
+    const markerStatus = firstInstallMarkerStatus(name, marker);
     const next = { ...record };
+    let markerFinalized = markerStatus === "missing";
+    if (markerStatus === "matching") {
+      unlinkSync(markerFile);
+      markerFinalized = true;
+    } else if (markerStatus === "modified") {
+      try {
+	if (lstatSync(markerFile).isFile()) {
+	  const relative = path.basename(markerFile);
+	  const ownedHashes = next.fileHashes ?? Object.fromEntries(next.files.map((owned) => {
+	    const ownedFile = path.join(skillsDir(), name, ...owned.split("/"));
+	    if (!lstatSync(ownedFile).isFile()) throw new Error("Owned path is no longer a file");
+	    return [owned, createHash("sha256").update(readFileSync(ownedFile)).digest("hex")];
+	  }));
+	  next.files = [...new Set([...next.files, relative])];
+	  next.fileHashes = {
+	    ...ownedHashes,
+	    [relative]: createHash("sha256").update(readFileSync(markerFile)).digest("hex"),
+	  };
+	  markerFinalized = true;
+	}
+      } catch (err) {
+	if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
+	markerFinalized = true;
+      }
+    }
+    if (!markerFinalized) continue;
     delete next.installMarker;
     state.installed[key] = next;
     changed = true;
@@ -424,6 +450,7 @@ async function runSync(): Promise<ProvisionStatusView> {
     // Idempotency is judged on content hash, not version strings: a registry
     // that re-publishes different bytes under the same name re-installs.
     if (state.installed[key]?.sha256 === item.sha256
+      && !state.installed[key]!.installMarker
       && installedRecordIntact(item.name, state.installed[key]!)) {
       views.push({ type: item.type, name: item.name, status: "installed", sha256: item.sha256 });
       continue;

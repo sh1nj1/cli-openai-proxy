@@ -272,6 +272,7 @@ export async function installSkill(
   mkdirSync(opts.skillsDir, { recursive: true });
   let staging: string;
   let ownedUpgradeRecoveryIds: string[] | undefined;
+  let stagingRecoveryFileHashes: Record<string, string> | undefined;
   if (opts.upgradeRecoveryId !== undefined) {
     if (!RECOVERY_ID_PATTERN.test(opts.upgradeRecoveryId) || opts.managedFiles === undefined) {
       throw new ProvisionError("Invalid upgrade recovery identity", "invalid_item");
@@ -455,11 +456,25 @@ export async function installSkill(
 	);
       }
       preserveStaging = previousCleanup.recoveryPath !== undefined;
+      if (previousCleanup.recoveryPath && previousCleanup.recoveryFileHashes) {
+	const recoveryRoot = path.relative(staging, previousCleanup.recoveryPath)
+	  .split(path.sep).join("/");
+	stagingRecoveryFileHashes = Object.fromEntries(
+	  Object.entries(previousCleanup.recoveryFileHashes).map(([relative, hash]) => [
+	    `${recoveryRoot}/${relative}`,
+	    hash,
+	  ]),
+	);
+      }
     }
     return result;
   } finally {
     try {
-      if (!preserveStaging) rmSync(staging, { recursive: true, force: true });
+      if (!preserveStaging) {
+	rmSync(staging, { recursive: true, force: true });
+      } else if (stagingRecoveryFileHashes) {
+	sealRecovery(staging, UPGRADE_RECOVERY_METADATA, stagingRecoveryFileHashes);
+      }
       if (ownedUpgradeRecoveryIds) {
 	cleanupUpgradeRecoveries(opts.skillsDir, ownedUpgradeRecoveryIds);
       }
@@ -539,11 +554,18 @@ function removeManagedTree(
     /** Exact lockfile-owned identity for this recovery directory. */
     recoveryId?: string;
   },
-): { clean: boolean; recoveryPath?: string } {
+): {
+  clean: boolean;
+  recoveryPath?: string;
+  /** Hashes captured before any post-quarantine descriptor write can occur. */
+  recoveryFileHashes?: Record<string, string>;
+} {
   if (!existsAsDirectory(root)) return { clean: !targetExists(root) };
 
   const removed: string[] = [];
   let quarantine: string | undefined;
+  const recoveryFileHashes: Record<string, string> = {};
+  let unverifiedRecovery = false;
   for (const [index, relative] of opts.files.entries()) {
     const file = managedPath(root, relative);
     if (!file) continue;
@@ -583,22 +605,33 @@ function removeManagedTree(
       const isolated = path.join(quarantine, String(index));
       renameSync(file, isolated);
       const expected = opts.fileHashes?.[relative];
+      let verifiedHash: string | undefined;
       if (expected) {
 	const actual = createHash("sha256").update(readFileSync(isolated)).digest("hex");
 	const accepted = Array.isArray(expected) ? expected : [expected];
 	if (!accepted.includes(actual)) {
+	  let restored = true;
 	  try {
 	    renameSync(isolated, file);
 	  } catch (err) {
 	    if (!["EEXIST", "ENOTEMPTY", "ENOENT"].includes(
 	      (err as NodeJS.ErrnoException).code ?? "",
 	    )) throw err;
+	    restored = false;
 	  }
+	  if (!restored) unverifiedRecovery = true;
 	  continue;
 	}
+	verifiedHash = actual;
       }
       opts.afterFileHash?.(relative);
-      if (!opts.preserveIsolatedFiles) rmSync(isolated, { force: true });
+      if (!opts.preserveIsolatedFiles) {
+	rmSync(isolated, { force: true });
+      } else if (verifiedHash) {
+	recoveryFileHashes[path.relative(quarantine, isolated).split(path.sep).join("/")] = verifiedHash;
+      } else {
+	unverifiedRecovery = true;
+      }
       removed.push(relative);
     } catch (err) {
       if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
@@ -644,7 +677,98 @@ function removeManagedTree(
   const rootRemoved = !targetExists(root);
   const clean = rootRemoved || (recoveryPath !== undefined
     && readdirSync(root).every((entry) => path.join(root, entry) === recoveryPath));
-  return { clean, recoveryPath };
+  return {
+    clean,
+    recoveryPath,
+    ...(recoveryPath && !unverifiedRecovery && Object.keys(recoveryFileHashes).length > 0
+      ? { recoveryFileHashes }
+      : {}),
+  };
+}
+
+function inspectRecoveryTree(
+  root: string,
+  metadataName: string,
+): { files: Record<string, string>; directories: string[] } | null {
+  const files: Record<string, string> = {};
+  const directories: string[] = [];
+  try {
+    const walk = (directory: string): void => {
+      for (const entry of readdirSync(directory)) {
+	const full = path.join(directory, entry);
+	const relative = path.relative(root, full).split(path.sep).join("/");
+	if (relative === metadataName) continue;
+	const stat = lstatSync(full);
+	if (stat.isDirectory()) {
+	  directories.push(relative);
+	  walk(full);
+	} else if (stat.isFile()) {
+	  files[relative] = createHash("sha256").update(readFileSync(full)).digest("hex");
+	} else {
+	  throw new Error("Unexpected recovery entry type");
+	}
+      }
+    };
+    walk(root);
+    directories.sort();
+    return { files, directories };
+  } catch {
+    return null;
+  }
+}
+
+function sealRecovery(
+  directory: string,
+  metadataName: string,
+  trustedFileHashes: Record<string, string>,
+): void {
+  try {
+    const metadataFile = path.join(directory, metadataName);
+    const metadata = JSON.parse(readFileSync(metadataFile, "utf8")) as Record<string, unknown>;
+    const inspected = inspectRecoveryTree(directory, metadataName);
+    if (!inspected) return;
+    const actualFiles = Object.keys(inspected.files).sort();
+    const trustedFiles = Object.keys(trustedFileHashes).sort();
+    if (actualFiles.length !== trustedFiles.length
+	|| actualFiles.some((relative, index) => relative !== trustedFiles[index])) return;
+    writeFileSync(metadataFile, JSON.stringify({
+      ...metadata,
+      version: 2,
+      retainedFiles: trustedFileHashes,
+      retainedDirectories: inspected.directories,
+    }));
+  } catch {
+    // An unsealed recovery is retained for explicit operator cleanup.
+  }
+}
+
+function sealedRecoveryIntact(
+  directory: string,
+  metadataName: string,
+  metadata: Record<string, unknown>,
+): boolean {
+  if (metadata.version !== 2
+    || typeof metadata.retainedFiles !== "object"
+    || metadata.retainedFiles === null
+    || Array.isArray(metadata.retainedFiles)
+    || !Array.isArray(metadata.retainedDirectories)) return false;
+  const retainedFiles = metadata.retainedFiles as Record<string, unknown>;
+  const files = Object.entries(retainedFiles);
+  if (files.some(([relative, hash]) => managedPathParts(relative) === null
+    || typeof hash !== "string" || !/^[0-9a-f]{64}$/.test(hash))) return false;
+  if (metadata.retainedDirectories.some((relative) => managedPathParts(relative) === null)) return false;
+  const inspected = inspectRecoveryTree(directory, metadataName);
+  if (!inspected) return false;
+  const expectedDirectories = [...metadata.retainedDirectories].sort() as string[];
+  if (inspected.directories.length !== expectedDirectories.length
+    || inspected.directories.some((relative, index) => relative !== expectedDirectories[index])) return false;
+  const actualFiles = Object.entries(inspected.files).sort(([left], [right]) => left.localeCompare(right));
+  const expectedFiles = files.sort(([left], [right]) => left.localeCompare(right));
+  return actualFiles.length === expectedFiles.length
+    && actualFiles.every(([relative, hash], index) => {
+      const expected = expectedFiles[index];
+      return expected?.[0] === relative && expected[1] === hash;
+    });
 }
 
 function cleanupRemovalRecoveries(
@@ -652,7 +776,7 @@ function cleanupRemovalRecoveries(
   ownedRecoveryIds: string[],
   retain = MAX_REMOVAL_RECOVERIES,
 ): void {
-  const recoveries: string[] = [];
+  const recoveries: Array<{ directory: string; prunable: boolean }> = [];
   for (const recoveryId of ownedRecoveryIds) {
     if (!RECOVERY_ID_PATTERN.test(recoveryId)) continue;
     const directory = path.join(skillsDir, `${REMOVAL_RECOVERY_PREFIX}${recoveryId}`);
@@ -662,16 +786,19 @@ function cleanupRemovalRecoveries(
 	readFileSync(path.join(directory, REMOVAL_RECOVERY_METADATA), "utf8"),
       ) as Record<string, unknown>;
       const createdAt = typeof metadata.createdAt === "string" ? Date.parse(metadata.createdAt) : NaN;
-      if (metadata.version !== 1 || typeof metadata.skill !== "string"
+      if (![1, 2].includes(metadata.version as number) || typeof metadata.skill !== "string"
 	|| !NAME_PATTERN.test(metadata.skill) || !Number.isFinite(createdAt)
 	|| metadata.recoveryId !== recoveryId) continue;
-      recoveries.push(directory);
+      recoveries.push({
+	directory,
+	prunable: sealedRecoveryIntact(directory, REMOVAL_RECOVERY_METADATA, metadata),
+      });
     } catch {
       // Missing or malformed entries do not establish positive ownership.
     }
   }
   for (const recovery of recoveries.slice(0, Math.max(0, recoveries.length - retain))) {
-    rmSync(recovery, { recursive: true, force: true });
+    if (recovery.prunable) rmSync(recovery.directory, { recursive: true, force: true });
   }
 }
 
@@ -680,7 +807,7 @@ function cleanupUpgradeRecoveries(
   ownedRecoveryIds: string[],
   retain = MAX_UPGRADE_RECOVERIES,
 ): void {
-  const recoveries: string[] = [];
+  const recoveries: Array<{ directory: string; prunable: boolean }> = [];
   for (const recoveryId of ownedRecoveryIds) {
     if (!RECOVERY_ID_PATTERN.test(recoveryId)) continue;
     const directory = path.join(skillsDir, `${UPGRADE_RECOVERY_PREFIX}${recoveryId}`);
@@ -690,10 +817,13 @@ function cleanupUpgradeRecoveries(
 	readFileSync(path.join(directory, UPGRADE_RECOVERY_METADATA), "utf8"),
       ) as Record<string, unknown>;
       const createdAt = typeof metadata.createdAt === "string" ? Date.parse(metadata.createdAt) : NaN;
-      if (metadata.version !== 1 || typeof metadata.skill !== "string"
+      if (![1, 2].includes(metadata.version as number) || typeof metadata.skill !== "string"
 	|| !NAME_PATTERN.test(metadata.skill) || !Number.isFinite(createdAt)
 	|| metadata.recoveryId !== recoveryId) continue;
-      recoveries.push(directory);
+      recoveries.push({
+	directory,
+	prunable: sealedRecoveryIntact(directory, UPGRADE_RECOVERY_METADATA, metadata),
+      });
     } catch {
       // A crash between mkdir and metadata creation can leave only an empty
       // preclaimed directory. Remove that empty shell, never unknown content.
@@ -705,7 +835,7 @@ function cleanupUpgradeRecoveries(
     }
   }
   for (const recovery of recoveries.slice(0, Math.max(0, recoveries.length - retain))) {
-    rmSync(recovery, { recursive: true, force: true });
+    if (recovery.prunable) rmSync(recovery.directory, { recursive: true, force: true });
   }
 }
 
@@ -744,6 +874,9 @@ export function removeSkill(
     quarantineSkill: name,
     recoveryId,
   });
+  if (result.recoveryPath && result.recoveryFileHashes) {
+    sealRecovery(result.recoveryPath, REMOVAL_RECOVERY_METADATA, result.recoveryFileHashes);
+  }
   cleanupRemovalRecoveries(opts.skillsDir, ownedRecoveryIds);
   return { recoveryPath: result.recoveryPath };
 }

@@ -153,7 +153,10 @@ The tombstone clears after the item leaves the manifest.
   touches what the journal lists and removes directories only when empty. Skills
   a user installed by hand are never overwritten or deleted — a manifest item
   whose name collides with an untracked directory fails with
-  `Refusing to replace untracked directory` instead of replacing it.
+  `Refusing to replace untracked directory` instead of replacing it. Hidden
+  removal and upgrade recoveries are automatically limited to the newest three
+  only when their sealed contents are unchanged; a recovery changed through an
+  already-open descriptor is retained for explicit operator cleanup.
 - **TOFU approval.** In the default `approve` mode a first-seen `(type, name)`
   stops at `pending_approval` until an admin approves it.
 
