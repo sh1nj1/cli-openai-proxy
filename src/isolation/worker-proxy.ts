@@ -14,6 +14,7 @@ import {
   PROVISIONING_GENERATION_HEADER,
   decodeProvisioningGeneration,
   decodeProvisioningUrl,
+  provisioningUrlFitsHeader,
 } from "./worker-protocol.js";
 
 const HOP_BY_HOP_HEADERS = new Set([
@@ -75,6 +76,17 @@ function saveProvisioningGeneration(file: string, generation: string): void {
 
 function provisioningGenerationTimestamp(generation: string): number {
   return Number.parseInt(`${generation.slice(0, 8)}${generation.slice(9, 13)}`, 16);
+}
+
+function hasValidProvisioningUrl(body: unknown): boolean {
+  const url = (body as Record<string, unknown> | undefined)?.provisioning_url;
+  if (typeof url !== "string" || !provisioningUrlFitsHeader(url)) return false;
+  try {
+    new URL(url);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 function outgoingHeaders(
@@ -149,7 +161,12 @@ export class UserWorkerProxy {
 
     const body = req.body === undefined ? Buffer.alloc(0) : Buffer.from(JSON.stringify(req.body));
     let provisioningGeneration: string | undefined;
-    if (req.method === "POST" && /^\/v1\/auth\/[^/]+\/sessions\/?$/.test(req.path)) {
+    if (
+      onAuthorizedProvisioningUrl
+      && hasValidProvisioningUrl(req.body)
+      && req.method === "POST"
+      && /^\/v1\/auth\/[^/]+\/sessions\/?$/.test(req.path)
+    ) {
       try {
 	provisioningGeneration = this.issueProvisioningGeneration();
       } catch (error) {

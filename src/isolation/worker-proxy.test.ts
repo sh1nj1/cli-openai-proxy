@@ -32,10 +32,65 @@ afterEach(() => {
     "USER_API_KEYS",
     "USER_IDENTITY_HMAC_SECRET",
     "USER_WORKER_MODE",
+    "PROVISION_SYNC",
   ]) {
     delete process.env[name];
   }
 });
+
+async function forwardAuthCreateWithBlockedGenerationState(options: {
+  provisioningEnabled: boolean;
+  body: Record<string, unknown>;
+}): Promise<{ status: number; generation: string | undefined }> {
+  const socketPath = `/tmp/cap-worker-${randomUUID().slice(0, 8)}.sock`;
+  const stateBlocker = `/tmp/cap-generation-blocker-${randomUUID().slice(0, 8)}`;
+  await writeFile(stateBlocker, "not a directory");
+  let generation: string | undefined;
+  const worker = http.createServer((request, response) => {
+    generation = request.headers[PROVISIONING_GENERATION_HEADER] as string | undefined;
+    response.writeHead(201, { "content-type": "application/json" });
+    response.end(JSON.stringify({ status: "pending" }));
+  });
+  await new Promise<void>((resolve) => worker.listen(socketPath, resolve));
+
+  const provisioner: WorkerProvisioner = {
+    async ensureWorker() {
+      return {
+	accountName: "cap_0123456789abcdef0123",
+	endpoint: { kind: "unix", address: socketPath },
+      };
+    },
+  };
+  process.env.USER_API_KEYS = JSON.stringify([
+    { key: "user-key-12345678", tenantId: "tenant-a", userId: "user-a" },
+  ]);
+  process.env.AUTH_ADMIN_KEYS = "admin-key-123456";
+  if (options.provisioningEnabled) process.env.PROVISION_SYNC = "1";
+  const gateway = createApp({
+    userWorkerProxy: new UserWorkerProxy(provisioner, 30_000, `${stateBlocker}/generation`),
+  }).listen(0);
+  await new Promise<void>((resolve) => gateway.once("listening", resolve));
+
+  try {
+    const port = (gateway.address() as AddressInfo).port;
+    const response = await fetch(`http://127.0.0.1:${port}/v1/auth/fake/sessions`, {
+      method: "POST",
+      headers: {
+	authorization: "Bearer admin-key-123456",
+	"content-type": "application/json",
+	"x-cli-proxy-user-key": "user-key-12345678",
+      },
+      body: JSON.stringify(options.body),
+    });
+    await response.arrayBuffer();
+    return { status: response.status, generation };
+  } finally {
+    await new Promise<void>((resolve) => gateway.close(() => resolve()));
+    await new Promise<void>((resolve) => worker.close(() => resolve()));
+    await rm(socketPath, { force: true });
+    await rm(stateBlocker, { force: true });
+  }
+}
 
 test("identity configuration fails closed without active worker routing", () => {
   process.env.USER_WORKER_MODE = "enabled";
@@ -118,6 +173,24 @@ test("gateway provisions by authenticated identity and strips private headers", 
   }
 });
 
+test("ordinary auth sessions do not require writable provisioning generation state", async () => {
+  const result = await forwardAuthCreateWithBlockedGenerationState({
+    provisioningEnabled: true,
+    body: { flow: "device-code" },
+  });
+  assert.equal(result.status, 201);
+  assert.equal(result.generation, undefined);
+});
+
+test("disabled provisioning ignores auth URLs without writing generation state", async () => {
+  const result = await forwardAuthCreateWithBlockedGenerationState({
+    provisioningEnabled: false,
+    body: { provisioning_url: "https://collavre.test/agents/vrex/provision.json" },
+  });
+  assert.equal(result.status, 201);
+  assert.equal(result.generation, undefined);
+});
+
 test("gateway consumes a worker provisioning notification without exposing its private header", async () => {
   const socketPath = `/tmp/cap-worker-${randomUUID().slice(0, 8)}.sock`;
   const generationStateFile = `/tmp/cap-generation-${randomUUID().slice(0, 8)}.state`;
@@ -145,6 +218,7 @@ test("gateway consumes a worker provisioning notification without exposing its p
     { key: "user-key-12345678", tenantId: "tenant-a", userId: "user-a" },
   ]);
   process.env.AUTH_ADMIN_KEYS = "admin-key-123456";
+  process.env.PROVISION_SYNC = "1";
   const notifications: string[] = [];
   const gateway = createApp({
     userWorkerProxy: new UserWorkerProxy(provisioner, 30_000, generationStateFile),
@@ -214,6 +288,7 @@ test("gateway persists notification ordering across restart", async () => {
     { key: "user-key-12345678", tenantId: "tenant-a", userId: "user-a" },
   ]);
   process.env.AUTH_ADMIN_KEYS = "admin-key-123456";
+  process.env.PROVISION_SYNC = "1";
   const notifications: string[] = [];
   let gateway: http.Server | undefined = createApp({
     userWorkerProxy: new UserWorkerProxy(provisioner, 30_000, generationStateFile),
@@ -232,7 +307,7 @@ test("gateway persists notification ordering across restart", async () => {
     const create = () => fetch(`http://127.0.0.1:${port}/v1/auth/fake/sessions`, {
       method: "POST",
       headers,
-      body: "{}",
+      body: JSON.stringify({ provisioning_url: "https://collavre.test/agents/vrex/provision.json" }),
     }).then((response) => response.json() as Promise<{ sessionId: string }>);
     const first = await create();
     const second = await create();

@@ -73,7 +73,7 @@ export function createApp(config: AppConfig = {}): Express {
   const app = express();
   const role = config.role ?? "gateway";
   const userWorkerProxy = config.userWorkerProxy;
-  const onAuthorizedProvisioningUrl = config.onAuthorizedProvisioningUrl ?? handleAuthorizedSession;
+  let onAuthorizedProvisioningUrl: AppConfig["onAuthorizedProvisioningUrl"];
   app.locals.cliProxyRole = role;
 
   if (role === "gateway") {
@@ -90,6 +90,9 @@ export function createApp(config: AppConfig = {}): Express {
         : "[Server] CLI auth provisioning disabled (set AUTH_ADMIN_KEYS to enable)",
     );
     const provisionStatus = initProvisioning();
+    if (provisionStatus.enabled) {
+      onAuthorizedProvisioningUrl = config.onAuthorizedProvisioningUrl ?? handleAuthorizedSession;
+    }
     console.log(
       provisionStatus.enabled
         ? `[Server] Agent provisioning enabled (mode: ${provisionStatus.autoApply}`
