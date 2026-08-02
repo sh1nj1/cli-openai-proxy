@@ -577,6 +577,28 @@ function existsAsDirectory(target: string): boolean {
   }
 }
 
+interface DirectoryIdentity {
+  dev: bigint;
+  ino: bigint;
+}
+
+function directoryIdentity(target: string): DirectoryIdentity | null {
+  try {
+    const stat = lstatSync(target, { bigint: true });
+    return stat.isDirectory() ? { dev: stat.dev, ino: stat.ino } : null;
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") return null;
+    throw err;
+  }
+}
+
+function sameDirectoryIdentity(
+  left: DirectoryIdentity | null,
+  right: DirectoryIdentity | null,
+): boolean {
+  return left !== null && right !== null && left.dev === right.dev && left.ino === right.ino;
+}
+
 function managedTreeHasExactPaths(
   root: string,
   files: string[],
@@ -639,6 +661,8 @@ function removeManagedTree(
     rootPathSnapshots?: Array<{ files: string[]; directories?: string[] }>;
     fileHashes?: Record<string, string | string[]>;
     afterFileHash?: (relative: string) => void;
+    /** Test seam for a namespace mutation after root ownership validation. */
+    afterRootAudit?: (root: string) => void;
     /** Keep isolated inodes linked so writes through already-open descriptors survive. */
     preserveIsolatedFiles?: boolean;
     /** Place retained inode links outside root so an uninstall can remove its visible target. */
@@ -656,6 +680,11 @@ function removeManagedTree(
 } {
   if (!existsAsDirectory(root)) return { clean: !targetExists(root) };
 
+  // Capture identity before walking the tree. A complete path-set check alone
+  // cannot authorize a later rmdir by pathname because the name may be swapped
+  // to a different directory while cleanup is in progress.
+  const auditedRootIdentity = directoryIdentity(root);
+
   // An unresolved upgrade journal can outlive a lost exposure race. In that
   // case the visible target may belong to the racing process. Never infer
   // ownership of an otherwise-empty root from the journal alone.
@@ -666,16 +695,47 @@ function removeManagedTree(
   const rootWasCompleteOwnedTree = rootPathSnapshots.some((snapshot) =>
     managedTreeHasExactPaths(root, snapshot.files, snapshot.directories));
 
+  let managedRoot = root;
+  let isolatedOwnedRoot: string | undefined;
+  if (
+    rootWasCompleteOwnedTree
+    && auditedRootIdentity
+    && opts.quarantineParent
+    && opts.recoveryId
+  ) {
+    opts.afterRootAudit?.(root);
+    isolatedOwnedRoot = path.join(
+      opts.quarantineParent,
+      `.provision-removing-${opts.recoveryId}`,
+    );
+    if (!moveDirectoryNoReplace(root, isolatedOwnedRoot)) {
+      throw new ProvisionError(
+	`Removal could not isolate "${path.basename(root)}" without replacing another entry`,
+	"untracked_content",
+      );
+    }
+    if (!sameDirectoryIdentity(auditedRootIdentity, directoryIdentity(isolatedOwnedRoot))) {
+      if (!moveDirectoryNoReplace(isolatedOwnedRoot, root)) {
+	throw new ProvisionError(
+	  `Removal stopped after the target changed; replacement preserved at "${isolatedOwnedRoot}"`,
+	  "untracked_content",
+	);
+      }
+      return { clean: false };
+    }
+    managedRoot = isolatedOwnedRoot;
+  }
+
   const removed: string[] = [];
   let quarantine: string | undefined;
   const recoveryFileHashes: Record<string, string> = {};
   let unverifiedRecovery = false;
   for (const [index, relative] of opts.files.entries()) {
-    const file = managedPath(root, relative);
+    const file = managedPath(managedRoot, relative);
     if (!file) continue;
     const parts = managedPathParts(relative)!;
     let safe = true;
-    let current = root;
+    let current = managedRoot;
     for (const part of parts.slice(0, -1)) {
       current = path.join(current, part);
       try {
@@ -695,7 +755,7 @@ function removeManagedTree(
 	  quarantine = path.join(opts.quarantineParent, `${REMOVAL_RECOVERY_PREFIX}${opts.recoveryId}`);
 	  mkdirSync(quarantine, { mode: 0o700 });
 	} else {
-	  quarantine = mkdtempSync(path.join(root, ".provision-cleanup-"));
+	  quarantine = mkdtempSync(path.join(managedRoot, ".provision-cleanup-"));
 	}
 	if (opts.quarantineParent && opts.quarantineSkill) {
 	  writeFileSync(path.join(quarantine, REMOVAL_RECOVERY_METADATA), JSON.stringify({
@@ -754,12 +814,12 @@ function removeManagedTree(
   }
   const directories = new Set<string>();
   for (const relative of opts.directories ?? []) {
-    const directory = managedPath(root, relative);
+    const directory = managedPath(managedRoot, relative);
     if (directory) directories.add(directory);
   }
   for (const relative of removed) {
-    let current = path.dirname(managedPath(root, relative)!);
-    while (current !== root && current.startsWith(`${root}${path.sep}`)) {
+    let current = path.dirname(managedPath(managedRoot, relative)!);
+    while (current !== managedRoot && current.startsWith(`${managedRoot}${path.sep}`)) {
       directories.add(current);
       current = path.dirname(current);
     }
@@ -774,15 +834,25 @@ function removeManagedTree(
   }
   if (rootWasCompleteOwnedTree) {
     try {
-      rmdirSync(root);
+      rmdirSync(managedRoot);
     } catch (err) {
       const code = (err as NodeJS.ErrnoException).code;
       if (code !== "ENOENT" && code !== "ENOTEMPTY") throw err;
     }
   }
-  const rootRemoved = !targetExists(root);
-  const clean = rootRemoved || (recoveryPath !== undefined
-    && readdirSync(root).every((entry) => path.join(root, entry) === recoveryPath));
+  const ownedRootRemoved = !targetExists(managedRoot);
+  if (isolatedOwnedRoot && !ownedRootRemoved) {
+    if (!moveDirectoryNoReplace(isolatedOwnedRoot, root)) {
+      throw new ProvisionError(
+	`Removal preserved changed content at "${isolatedOwnedRoot}" because the target was recreated`,
+	"untracked_content",
+      );
+    }
+  }
+  const clean = isolatedOwnedRoot
+    ? ownedRootRemoved
+    : ownedRootRemoved || (recoveryPath !== undefined
+      && readdirSync(managedRoot).every((entry) => path.join(managedRoot, entry) === recoveryPath));
   return {
     clean,
     recoveryPath,
@@ -857,6 +927,8 @@ export function removeSkill(
     directories?: string[];
     rootPathSnapshots?: Array<{ files: string[]; directories?: string[] }>;
     fileHashes?: Record<string, string | string[]>;
+    /** Test seam for a namespace mutation after root ownership validation. */
+    afterRootAudit?: (root: string) => void;
     /** New identity preclaimed in the lockfile before this removal begins. */
     recoveryId?: string;
   },

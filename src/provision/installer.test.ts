@@ -11,6 +11,7 @@ import {
   openSync,
   readdirSync,
   readFileSync,
+  renameSync,
   rmSync,
   symlinkSync,
   writeSync,
@@ -833,6 +834,30 @@ describe("provision installer", () => {
     });
     assert.equal(existsSync(path.join(skillsDir, "demo")), false);
     assert.equal(lstatSync(skillsDir).isDirectory(), true);
+  });
+
+  test("removeSkill does not delete a directory swapped in after root validation", async () => {
+    const { url, sha256 } = serve("/remove-root-swap.tgz", makeTarGz([
+      { name: "SKILL.md", content: "managed" },
+    ]));
+    const result = await installSkill({ name: "demo", url, sha256 }, { skillsDir });
+    const target = path.join(skillsDir, "demo");
+    const displaced = path.join(skillsDir, "displaced-managed-tree");
+
+    removeSkill("demo", {
+      skillsDir,
+      files: result.files,
+      fileHashes: result.fileHashes,
+      directories: result.directories,
+      afterRootAudit: () => {
+	renameSync(target, displaced);
+	mkdirSync(target);
+      },
+    });
+
+    assert.equal(lstatSync(target).isDirectory(), true);
+    assert.deepEqual(readdirSync(target), []);
+    assert.equal(readFileSync(path.join(displaced, "SKILL.md"), "utf8"), "managed");
   });
 
   test("removeSkill preserves writes through a descriptor opened before removal", async () => {

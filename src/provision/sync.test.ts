@@ -8,6 +8,7 @@ import {
   mkdtempSync,
   readdirSync,
   readFileSync,
+  renameSync,
   rmSync,
   writeFileSync,
 } from "fs";
@@ -796,6 +797,54 @@ describe("provision sync", () => {
     assert.deepEqual(readdirSync(target), []);
     const state = JSON.parse(readFileSync(path.join(stateDir, "provision.lock.json"), "utf8"));
     assert.equal(state.installed[key], undefined);
+  });
+
+  test("DELETE preserves a replacement directory swapped in after removal validation", async () => {
+    process.env.PROVISION_AUTOAPPLY = "auto";
+    initProvisioning();
+    const name = "delete-root-swap";
+    const skill = serveSkill("/delete-root-swap.tgz", "managed");
+    registerManifestUrl(serveManifest([{ type: "skill", name, ...skill }]));
+    await syncNow();
+    const target = path.join(skillsDir, name);
+    const displaced = path.join(skillsDir, `${name}-displaced`);
+    initProvisioning({
+      afterRemovalAudit: () => {
+	renameSync(target, displaced);
+	mkdirSync(target);
+      },
+    });
+
+    assert.deepEqual(await deleteItem("skill", name), { removed: true });
+
+    assert.equal(lstatSync(target).isDirectory(), true);
+    assert.deepEqual(readdirSync(target), []);
+    assert.equal(readFileSync(path.join(displaced, "SKILL.md"), "utf8"), "managed");
+  });
+
+  test("manifest removal preserves a replacement swapped in after validation", async () => {
+    process.env.PROVISION_AUTOAPPLY = "auto";
+    initProvisioning();
+    const name = "manifest-root-swap";
+    const skill = serveSkill("/manifest-root-swap.tgz", "managed");
+    registerManifestUrl(serveManifest([{ type: "skill", name, ...skill }]));
+    await syncNow();
+    const target = path.join(skillsDir, name);
+    const displaced = path.join(skillsDir, `${name}-displaced`);
+    initProvisioning({
+      afterRemovalAudit: () => {
+	renameSync(target, displaced);
+	mkdirSync(target);
+      },
+    });
+    registerManifestUrl(serveManifest([]));
+
+    const view = await syncNow();
+
+    assert.equal(statusOf(view, name), "removed");
+    assert.equal(lstatSync(target).isDirectory(), true);
+    assert.deepEqual(readdirSync(target), []);
+    assert.equal(readFileSync(path.join(displaced, "SKILL.md"), "utf8"), "managed");
   });
 
   test("removal accepts either hash for a path shared by upgrade journal snapshots", async () => {

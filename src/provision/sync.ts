@@ -76,6 +76,7 @@ let pendingOperations = 0;
 let shuttingDown = false;
 let shutdownPromise: Promise<void> | null = null;
 let afterFirstInstallMove: ((target: string) => void) | undefined;
+let afterRemovalAudit: ((target: string) => void) | undefined;
 
 function serialize<T>(operation: () => Promise<T> | T): Promise<T> {
   pendingOperations += 1;
@@ -107,6 +108,8 @@ function refetchMs(): number {
 export function initProvisioning(hooks: {
   /** Test seam for a mutation immediately after a first install is exposed. */
   afterFirstInstallMove?: (target: string) => void;
+  /** Test seam for a namespace mutation after removal validates ownership. */
+  afterRemovalAudit?: (target: string) => void;
 } = {}): {
   enabled: boolean;
   autoApply: "auto" | "approve";
@@ -114,6 +117,7 @@ export function initProvisioning(hooks: {
 } {
   resetProvisioning();
   afterFirstInstallMove = hooks.afterFirstInstallMove;
+  afterRemovalAudit = hooks.afterRemovalAudit;
   const raw = process.env.PROVISION_SYNC?.trim().toLowerCase() ?? "";
   enabled = ["1", "true", "yes", "enabled"].includes(raw);
   autoApply = process.env.PROVISION_AUTOAPPLY?.trim().toLowerCase() === "auto" ? "auto" : "approve";
@@ -353,7 +357,8 @@ function prepareRemovalRecovery(state: ProvisionStateFile): {
 
 function finalizeRemovalRecoveries(state: ProvisionStateFile): void {
   state.removalRecoveries = (state.removalRecoveries ?? []).filter((recoveryId) =>
-    existsSync(path.join(skillsDir(), `.provision-removed-${recoveryId}`)));
+    existsSync(path.join(skillsDir(), `.provision-removed-${recoveryId}`))
+    || existsSync(path.join(skillsDir(), `.provision-removing-${recoveryId}`)));
 }
 
 function prepareUpgradeRecovery(state: ProvisionStateFile): {
@@ -611,6 +616,7 @@ async function runSync(): Promise<ProvisionStatusView> {
 	    skillsDir: skillsDir(),
 	    ...snapshot,
 	    ...recovery,
+	    afterRootAudit: afterRemovalAudit,
 	  });
 	} finally {
 	  finalizeRemovalRecoveries(state);
@@ -718,6 +724,7 @@ export function deleteItem(type: string, name: string): Promise<{ removed: boole
 	  skillsDir: skillsDir(),
 	  ...snapshot,
 	  ...recovery,
+	  afterRootAudit: afterRemovalAudit,
 	});
       } finally {
 	finalizeRemovalRecoveries(state);
@@ -766,6 +773,7 @@ function clearProvisioningState(): void {
   pendingOperations = 0;
   shuttingDown = false;
   afterFirstInstallMove = undefined;
+  afterRemovalAudit = undefined;
 }
 
 /**
