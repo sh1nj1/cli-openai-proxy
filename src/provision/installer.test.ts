@@ -66,9 +66,25 @@ describe("provision installer", () => {
   let archives: Map<string, Buffer>;
   let skillsDir: string;
 
+  let redirects: Map<string, string>;
+
   before(async () => {
     archives = new Map();
+    redirects = new Map();
     server = createServer((req, res) => {
+      const location = redirects.get(req.url ?? "");
+      if (location) {
+        res.statusCode = 302;
+        res.setHeader("location", location);
+        res.end();
+        return;
+      }
+      if (req.url === "/endless.tgz") {
+        const chunk = Buffer.alloc(1024 * 1024);
+        const timer = setInterval(() => res.write(chunk), 1);
+        res.on("close", () => clearInterval(timer));
+        return;
+      }
       const body = archives.get(req.url ?? "");
       if (!body) {
         res.statusCode = 404;
@@ -83,12 +99,14 @@ describe("provision installer", () => {
   });
 
   after(async () => {
+    server.closeAllConnections?.();
     await new Promise((resolve) => server.close(resolve));
   });
 
   beforeEach(() => {
     skillsDir = mkdtempSync(path.join(tmpdir(), "provision-skills-"));
     archives.clear();
+    redirects.clear();
   });
 
   afterEach(() => {
@@ -229,6 +247,62 @@ describe("provision installer", () => {
     await codeOf(() => installSkill({ name: "demo2", url: bad.url, sha256: bad.sha256 }, { skillsDir }));
 
     assert.deepEqual(readdirSync(skillsDir).filter((entry) => entry.startsWith(".")), []);
+  });
+
+  test("a body that streams past the size cap is aborted, not buffered to completion", async () => {
+    const guard = new Promise<never>((_, reject) =>
+      setTimeout(() => reject(new Error("download buffered past the cap")), 15_000).unref(),
+    );
+    const code = await Promise.race([
+      codeOf(() =>
+        installSkill({ name: "demo", url: `${baseUrl}/endless.tgz`, sha256: "0".repeat(64) }, { skillsDir }),
+      ),
+      guard,
+    ]);
+    assert.equal(code, "archive_rejected");
+  });
+
+  test("a redirect to a host the policy rejects is refused before download", async () => {
+    const { sha256 } = serve("/real.tgz", makeTarGz([{ name: "SKILL.md", content: "ok" }]));
+    redirects.set("/hop.tgz", "https://evil.example/x.tgz");
+    const checkUrl = (url: string) => {
+      if (new URL(url).hostname !== "127.0.0.1") {
+        throw new ProvisionError(`Host not allowed: ${url}`, "url_not_allowed");
+      }
+    };
+    assert.equal(
+      await codeOf(() =>
+        installSkill({ name: "demo", url: `${baseUrl}/hop.tgz`, sha256 }, { skillsDir, checkUrl }),
+      ),
+      "url_not_allowed",
+    );
+  });
+
+  test("a redirect the policy allows is followed to a successful install", async () => {
+    const { sha256 } = serve("/real.tgz", makeTarGz([{ name: "SKILL.md", content: "moved" }]));
+    redirects.set("/hop.tgz", `${baseUrl}/real.tgz`);
+    const checkUrl = (url: string) => {
+      if (new URL(url).hostname !== "127.0.0.1") {
+        throw new ProvisionError(`Host not allowed: ${url}`, "url_not_allowed");
+      }
+    };
+    const result = await installSkill(
+      { name: "demo", url: `${baseUrl}/hop.tgz`, sha256 },
+      { skillsDir, checkUrl },
+    );
+    assert.deepEqual(result.files, ["SKILL.md"]);
+    assert.equal(readFileSync(path.join(skillsDir, "demo", "SKILL.md"), "utf-8"), "moved");
+  });
+
+  test("an archive that decompresses past the total cap is refused before extraction", async () => {
+    const { url, sha256 } = serve("/bomb.tgz", makeTarGz([
+      { name: "SKILL.md", content: Buffer.alloc(20 * 1024 * 1024, 0x61) },
+    ]));
+    assert.equal(
+      await codeOf(() => installSkill({ name: "demo", url, sha256 }, { skillsDir })),
+      "archive_rejected",
+    );
+    assert.equal(existsSync(path.join(skillsDir, "demo")), false);
   });
 
   test("removeSkill deletes the skill directory", async () => {

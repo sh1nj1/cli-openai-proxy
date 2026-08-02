@@ -132,6 +132,39 @@ export function checkUrlAllowed(
   }
 }
 
+const MAX_REDIRECTS = 5;
+
+/**
+ * fetch() follows redirects on its own, which would let an allowed host bounce
+ * the request to one the policy would refuse. This walks redirects manually and
+ * re-applies `checkUrl` to every hop, so the policy holds for the URL actually
+ * fetched, not just the one registered.
+ */
+export async function fetchWithPolicy(
+  rawUrl: string,
+  opts: { checkUrl: (url: string) => void; timeoutMs: number; failCode: string },
+): Promise<Response> {
+  let url = rawUrl;
+  const signal = AbortSignal.timeout(opts.timeoutMs);
+  for (let hop = 0; hop <= MAX_REDIRECTS; hop++) {
+    opts.checkUrl(url);
+    let response: Response;
+    try {
+      response = await fetch(url, { redirect: "manual", signal });
+    } catch (err) {
+      const reason = err instanceof Error ? err.message : String(err);
+      throw new ProvisionError(`Fetch failed: ${reason}`, opts.failCode);
+    }
+    if (![301, 302, 303, 307, 308].includes(response.status)) return response;
+    const location = response.headers.get("location");
+    if (!location) {
+      throw new ProvisionError(`Redirect without a Location header from ${url}`, opts.failCode);
+    }
+    url = new URL(location, url).toString();
+  }
+  throw new ProvisionError(`Too many redirects fetching ${rawUrl}`, opts.failCode);
+}
+
 /** PROVISION_ALLOWLIST as lowercased hostnames; unset (null) means same-host-as-manifest. */
 export function getAllowlist(): string[] | null {
   const raw = process.env.PROVISION_ALLOWLIST;

@@ -192,7 +192,8 @@ export function createApp(config: AppConfig = {}): Express {
   app.delete(`${AUTH_PROVISIONING_PREFIX}/:engine/credential`, ...scoped(handleForgetCredential));
 
   // Agent provisioning (gated above). Deliberately NOT scoped(): artifacts
-  // install onto the gateway host's filesystem, which per-user workers share.
+  // install into the GATEWAY process's skills dir. Per-user Linux workers run
+  // with their own HOME and do not see it — see docs/provisioning.md.
   app.get(PROVISION_PREFIX, handleProvisionStatus);
   app.post(`${PROVISION_PREFIX}/sync`, handleProvisionSync);
   app.post(`${PROVISION_PREFIX}/items/:type/:name/approve`, handleProvisionApprove);

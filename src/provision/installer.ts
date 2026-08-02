@@ -23,6 +23,8 @@ import {
 } from "fs";
 import { tmpdir } from "os";
 import path from "path";
+import { gunzipSync } from "zlib";
+import { fetchWithPolicy } from "./manifest.js";
 import { ProvisionError } from "./types.js";
 
 export interface InstallResult {
@@ -33,6 +35,9 @@ export interface InstallResult {
 const MAX_ARCHIVE_BYTES = 10 * 1024 * 1024;
 const MAX_FILE_BYTES = 1024 * 1024;
 const MAX_TOTAL_BYTES = 10 * 1024 * 1024;
+/** Content cap plus slack for tar headers and padding (~512B per entry). */
+const MAX_DECOMPRESSED_BYTES = MAX_TOTAL_BYTES + 1024 * 1024;
+const DOWNLOAD_TIMEOUT_MS = 120_000;
 
 /** Same charset the manifest enforces; re-checked here so no other caller can widen it. */
 const NAME_PATTERN = /^[a-z0-9][a-z0-9_-]{0,63}$/i;
@@ -48,25 +53,62 @@ const REMOTE_EXEC_PATTERNS: Array<[RegExp, string]> = [
   [/\beval\s*"?\$\(/, "evals command substitution"],
 ];
 
-async function download(url: string): Promise<Buffer> {
-  let response: Response;
-  try {
-    response = await fetch(url);
-  } catch (err) {
-    const reason = err instanceof Error ? err.message : String(err);
-    throw new ProvisionError(`Download failed: ${reason}`, "download_failed");
-  }
+async function download(url: string, checkUrl?: (url: string) => void): Promise<Buffer> {
+  const response = await fetchWithPolicy(url, {
+    checkUrl: checkUrl ?? (() => {}),
+    timeoutMs: DOWNLOAD_TIMEOUT_MS,
+    failCode: "download_failed",
+  });
   if (!response.ok) {
     throw new ProvisionError(`Download failed: HTTP ${response.status}`, "download_failed");
   }
-  const buf = Buffer.from(await response.arrayBuffer());
-  if (buf.length > MAX_ARCHIVE_BYTES) {
-    throw new ProvisionError(
-      `Archive exceeds ${MAX_ARCHIVE_BYTES} bytes`,
-      "archive_rejected",
-    );
+  // The cap is enforced WHILE the body streams: a host that sends an oversized
+  // or never-ending body is cut off at the limit, not buffered to completion.
+  const chunks: Buffer[] = [];
+  let total = 0;
+  const body = response.body;
+  if (!body) return Buffer.alloc(0);
+  const reader = body.getReader();
+  try {
+    for (;;) {
+      let step: { done: boolean; value?: Uint8Array };
+      try {
+        step = await reader.read();
+      } catch (err) {
+        const reason = err instanceof Error ? err.message : String(err);
+        throw new ProvisionError(`Download failed: ${reason}`, "download_failed");
+      }
+      if (step.done || !step.value) break;
+      total += step.value.byteLength;
+      if (total > MAX_ARCHIVE_BYTES) {
+        throw new ProvisionError(`Archive exceeds ${MAX_ARCHIVE_BYTES} bytes`, "archive_rejected");
+      }
+      chunks.push(Buffer.from(step.value));
+    }
+  } finally {
+    void reader.cancel().catch(() => {});
   }
-  return buf;
+  return Buffer.concat(chunks);
+}
+
+/**
+ * Extraction writes whatever the gzip stream expands to, so the expansion is
+ * bounded BEFORE tar runs: a small archive that decompresses to gigabytes (a
+ * gzip bomb) must never reach the filesystem. The audit's per-file/total caps
+ * remain as the backstop for what fits under this bound.
+ */
+function assertDecompressionBounded(buf: Buffer): void {
+  try {
+    gunzipSync(buf, { maxOutputLength: MAX_DECOMPRESSED_BYTES });
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ERR_BUFFER_TOO_LARGE") {
+      throw new ProvisionError(
+        `Archive decompresses beyond ${MAX_DECOMPRESSED_BYTES} bytes`,
+        "archive_rejected",
+      );
+    }
+    throw new ProvisionError("Artifact is not a readable tar.gz", "archive_rejected");
+  }
 }
 
 /**
@@ -141,12 +183,12 @@ function auditTree(root: string): string[] {
 
 export async function installSkill(
   item: { name: string; url: string; sha256: string },
-  opts: { skillsDir: string },
+  opts: { skillsDir: string; checkUrl?: (url: string) => void },
 ): Promise<InstallResult> {
   if (!NAME_PATTERN.test(item.name)) {
     throw new ProvisionError(`Invalid skill name "${item.name}"`, "invalid_item");
   }
-  const buf = await download(item.url);
+  const buf = await download(item.url, opts.checkUrl);
   const digest = createHash("sha256").update(buf).digest("hex");
   if (digest !== item.sha256.toLowerCase()) {
     throw new ProvisionError(
@@ -154,6 +196,7 @@ export async function installSkill(
       "sha256_mismatch",
     );
   }
+  assertDecompressionBounded(buf);
 
   const archiveDir = mkdtempSync(path.join(tmpdir(), "provision-archive-"));
   // Staging lives INSIDE skillsDir so the final rename is same-filesystem (atomic),

@@ -1,7 +1,7 @@
 import { test, describe, before, after, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
 import { createHash } from "crypto";
-import { existsSync, mkdtempSync, rmSync } from "fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "fs";
 import { createServer, type Server } from "http";
 import { tmpdir } from "os";
 import path from "path";
@@ -61,9 +61,19 @@ describe("provision sync", () => {
   let skillsDir: string;
   const saved = new Map<string, string | undefined>();
 
+  let redirects: Map<string, string>;
+
   before(async () => {
     responses = new Map();
+    redirects = new Map();
     server = createServer((req, res) => {
+      const location = redirects.get(req.url ?? "");
+      if (location) {
+        res.statusCode = 302;
+        res.setHeader("location", location);
+        res.end();
+        return;
+      }
       const body = responses.get(req.url ?? "");
       if (body === undefined) {
         res.statusCode = 404;
@@ -95,6 +105,7 @@ describe("provision sync", () => {
     process.env.PROVISION_SKILLS_DIR = skillsDir;
     process.env.PROVISION_SYNC = "1";
     responses.clear();
+    redirects.clear();
     initProvisioning();
   });
 
@@ -209,6 +220,43 @@ describe("provision sync", () => {
     assert.equal(statusOf(view, "good"), "installed");
     assert.equal(statusOf(view, "foreign"), "failed");
     assert.match(view.data.find((item) => item.name === "foreign")?.error ?? "", /PROVISION_ALLOWLIST/);
+  });
+
+  test("a manifest that redirects to a foreign host is refused", async () => {
+    redirects.set("/moved.json", "https://evil.example/provision.json");
+    registerManifestUrl(`${baseUrl}/moved.json`);
+    assert.equal(await codeOf(() => syncNow()), "url_not_allowed");
+  });
+
+  test("an artifact that redirects to a foreign host fails that item", async () => {
+    process.env.PROVISION_AUTOAPPLY = "auto";
+    initProvisioning();
+    const real = serveSkill("/real.tgz", "content");
+    redirects.set("/hop.tgz", "https://evil.example/x.tgz");
+    registerManifestUrl(serveManifest([
+      { type: "skill", name: "hopper", url: `${baseUrl}/hop.tgz`, sha256: real.sha256 },
+    ]));
+    const view = await syncNow();
+    assert.equal(statusOf(view, "hopper"), "failed");
+    assert.match(view.data.find((item) => item.name === "hopper")?.error ?? "", /host/i);
+  });
+
+  test("a name collision with an untracked directory fails the item and preserves it", async () => {
+    process.env.PROVISION_AUTOAPPLY = "auto";
+    initProvisioning();
+    mkdirSync(path.join(skillsDir, "handmade"));
+    writeFileSync(path.join(skillsDir, "handmade", "SKILL.md"), "mine, not yours");
+
+    const skill = serveSkill("/handmade.tgz", "from the registry");
+    registerManifestUrl(serveManifest([{ type: "skill", name: "handmade", ...skill }]));
+    const view = await syncNow();
+
+    assert.equal(statusOf(view, "handmade"), "failed");
+    assert.match(view.data.find((item) => item.name === "handmade")?.error ?? "", /untracked/i);
+    assert.equal(
+      readFileSync(path.join(skillsDir, "handmade", "SKILL.md"), "utf-8"),
+      "mine, not yours",
+    );
   });
 
   test("an unreachable manifest is manifest_fetch_failed", async () => {

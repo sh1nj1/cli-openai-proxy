@@ -125,6 +125,15 @@ silently reinstall and DELETE would be a no-op. The item returns as
 - **Integrity.** Artifact sha256 is mandatory and idempotency is judged on
   content hash, not version strings — a registry that re-publishes different
   bytes under the same name re-installs (and a tampered one fails).
+- **Bounded transfer and expansion.** The download is capped at 10 MiB while
+  the body streams (an oversized or never-ending response is cut off at the
+  limit, under an overall timeout), and the archive's decompressed size is
+  bounded *before* extraction — a small gzip bomb never reaches the
+  filesystem.
+- **Redirects re-checked.** `fetch` is never allowed to follow a redirect on
+  its own: every hop of a manifest or artifact fetch is validated against the
+  same host policy, so an allowed host cannot bounce the request to a
+  forbidden one.
 - **Install = file placement only.** Nothing from an archive is executed. Link
   entries, traversal names, binaries, files over 1 MiB, and text matching
   pipe-download-into-shell patterns are refused. Extraction stages next to the
@@ -132,7 +141,9 @@ silently reinstall and DELETE would be a no-op. The item returns as
   untouched.
 - **Lockfile ownership.** `~/.cli-openai-proxy/provision.lock.json` records
   what the proxy installed; removal only ever touches what it lists. Skills a
-  user installed by hand are never overwritten or deleted.
+  user installed by hand are never overwritten or deleted — a manifest item
+  whose name collides with an untracked directory fails with
+  `Refusing to replace untracked directory` instead of replacing it.
 - **TOFU approval.** In the default `approve` mode a first-seen `(type, name)`
   stops at `pending_approval` until an admin approves it.
 
@@ -146,5 +157,13 @@ enabling `PROVISION_SYNC` — and especially `PROVISION_AUTOAPPLY=auto` — as t
 same class of decision as `AUTH_TRUST_COMPLETION_CALLERS`: an explicit
 declaration that the manifest's publisher is inside your trust boundary.
 
-With per-user workers, provisioning stays a gateway concern: artifacts install
-onto the host filesystem the workers share.
+### Per-user Linux workers: a known limitation
+
+Provisioning installs into the **gateway process's** skills directory
+(`PROVISION_SKILLS_DIR`, default the gateway's `~/.claude/skills`). The
+per-user Linux workers (`deploy/linux/cli-openai-proxy-worker@.service`) run
+with their own `HOME=/var/lib/cli-openai-proxy/users/%i` and their own write
+scope, so they do not see what the gateway installed even when the status view
+reports it as `installed`. In that deployment, provisioning currently covers
+only engines running as the gateway user; distributing skills into worker
+homes (or a shared, per-engine load path) is future work.

@@ -13,9 +13,16 @@
  * removal only ever touches what the lockfile records as ours.
  */
 
+import { existsSync } from "fs";
 import { homedir } from "os";
 import path from "path";
-import { checkUrlAllowed, getAllowlist, isValidItemName, parseManifest } from "./manifest.js";
+import {
+  checkUrlAllowed,
+  fetchWithPolicy,
+  getAllowlist,
+  isValidItemName,
+  parseManifest,
+} from "./manifest.js";
 import { installSkill, removeSkill } from "./installer.js";
 import { loadState, saveState } from "./state.js";
 import {
@@ -114,13 +121,13 @@ export function registerManifestUrl(url: string): void {
 }
 
 async function fetchManifest(url: string): Promise<ProvisionManifest> {
-  let response: Response;
-  try {
-    response = await fetch(url, { signal: AbortSignal.timeout(MANIFEST_FETCH_TIMEOUT_MS) });
-  } catch (err) {
-    const reason = err instanceof Error ? err.message : String(err);
-    throw new ProvisionError(`Manifest fetch failed: ${reason}`, "manifest_fetch_failed");
-  }
+  // Redirect hops obey the same policy as artifacts: same host as the
+  // registered URL unless PROVISION_ALLOWLIST says otherwise.
+  const response = await fetchWithPolicy(url, {
+    checkUrl: (hop) => checkUrlAllowed(hop, { manifestUrl: url, allowlist: getAllowlist() }),
+    timeoutMs: MANIFEST_FETCH_TIMEOUT_MS,
+    failCode: "manifest_fetch_failed",
+  });
   if (!response.ok) {
     throw new ProvisionError(`Manifest fetch failed: HTTP ${response.status}`, "manifest_fetch_failed");
   }
@@ -174,11 +181,25 @@ async function runSync(): Promise<ProvisionStatusView> {
       continue;
     }
 
+    // The install target belongs to the lockfile boundary: a directory we did
+    // not record is someone else's, and a name collision must not overwrite it.
+    if (!(key in state.installed) && existsSync(path.join(skillsDir(), item.name))) {
+      views.push({
+        type: item.type,
+        name: item.name,
+        status: "failed",
+        sha256: item.sha256,
+        error: `Refusing to replace untracked directory "${item.name}" in ${skillsDir()}`,
+      });
+      continue;
+    }
+
+    const checkUrl = (hop: string) => checkUrlAllowed(hop, { manifestUrl: url, allowlist });
     try {
-      checkUrlAllowed(item.url!, { manifestUrl: url, allowlist });
+      checkUrl(item.url!);
       const result = await installSkill(
         { name: item.name, url: item.url!, sha256: item.sha256! },
-        { skillsDir: skillsDir() },
+        { skillsDir: skillsDir(), checkUrl },
       );
       state.installed[key] = {
         sha256: item.sha256!,
