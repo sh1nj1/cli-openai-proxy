@@ -211,7 +211,7 @@ function installedRecordIntact(name: string, record: InstalledSnapshot): boolean
 }
 
 function stableSnapshot(record: InstalledRecord): InstalledSnapshot {
-  const { pending: _pending, ...stable } = record;
+  const { pending: _pending, uncommitted: _uncommitted, ...stable } = record;
   return stable;
 }
 
@@ -238,6 +238,17 @@ async function runSync(): Promise<ProvisionStatusView> {
   lastManifest = manifest;
 
   const state = loadState();
+  // A crash can occur after a first-install ownership preclaim is persisted but
+  // before its candidate is exposed. The visible target is therefore
+  // ambiguous and must be treated as user-owned after restart. Persist the
+  // discarded claim before inspecting or mutating any target.
+  let discardedUncommittedClaim = false;
+  for (const [key, record] of Object.entries(state.installed)) {
+    if (!record.uncommitted) continue;
+    delete state.installed[key];
+    discardedUncommittedClaim = true;
+  }
+  if (discardedUncommittedClaim) saveState(state);
   const views: ProvisionItemView[] = [];
   const desired = new Set<string>();
 
@@ -328,7 +339,7 @@ async function runSync(): Promise<ProvisionStatusView> {
 	    };
 	    const nextRecord: InstalledRecord = previousRecord
 	      ? { ...stableSnapshot(previousRecord), pending: candidateRecord }
-	      : candidateRecord;
+	      : { ...candidateRecord, uncommitted: true };
 	    state.installed[key] = nextRecord;
 	    try {
 	      saveState(state);

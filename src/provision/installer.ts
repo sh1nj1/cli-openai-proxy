@@ -466,6 +466,8 @@ function removeManagedTree(
     afterFileHash?: (relative: string) => void;
     /** Keep isolated inodes linked so writes through already-open descriptors survive. */
     preserveIsolatedFiles?: boolean;
+    /** Place retained inode links outside root so an uninstall can remove its visible target. */
+    quarantineParent?: string;
   },
 ): { clean: boolean; recoveryPath?: string } {
   if (!existsAsDirectory(root)) return { clean: !targetExists(root) };
@@ -492,7 +494,10 @@ function removeManagedTree(
     try {
       const stat = lstatSync(file);
       if (!stat.isFile()) continue;
-      quarantine ??= mkdtempSync(path.join(root, ".provision-cleanup-"));
+      quarantine ??= mkdtempSync(path.join(
+	opts.quarantineParent ?? root,
+	opts.quarantineParent ? ".provision-removed-" : ".provision-cleanup-",
+      ));
       const isolated = path.join(quarantine, String(index));
       renameSync(file, isolated);
       const expected = opts.fileHashes?.[relative];
@@ -569,9 +574,17 @@ export function removeSkill(
     directories?: string[];
     fileHashes?: Record<string, string>;
   },
-): void {
+): { recoveryPath?: string } {
   if (!NAME_PATTERN.test(name)) {
     throw new ProvisionError(`Invalid skill name "${name}"`, "invalid_item");
   }
-  removeManagedTree(path.join(opts.skillsDir, name), opts);
+  const result = removeManagedTree(path.join(opts.skillsDir, name), {
+    ...opts,
+    // An already-open descriptor can mutate the isolated inode after its hash
+    // check. Keep the link in a hidden sibling recovery directory while still
+    // removing the visible skill target.
+    preserveIsolatedFiles: true,
+    quarantineParent: opts.skillsDir,
+  });
+  return { recoveryPath: result.recoveryPath };
 }

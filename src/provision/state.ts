@@ -68,6 +68,7 @@ function installedRecord(value: unknown): InstalledRecord | null {
   const pending = raw.pending === undefined ? null : installedSnapshot(raw.pending);
   return {
     ...stable,
+    ...(raw.uncommitted === true ? { uncommitted: true as const } : {}),
     ...(pending ? { pending } : {}),
   };
 }

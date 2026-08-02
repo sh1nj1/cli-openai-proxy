@@ -393,6 +393,44 @@ describe("provision sync", () => {
     assert.equal(existsSync(path.join(skillsDir, "ownership")), false);
   });
 
+  test("a restarted first-install preclaim never owns an ambiguous target", async () => {
+    process.env.PROVISION_AUTOAPPLY = "auto";
+    initProvisioning();
+    const target = path.join(skillsDir, "interrupted-first-install");
+    mkdirSync(target);
+    writeFileSync(path.join(target, "SKILL.md"), "same path, user-owned contents");
+    const skill = serveSkill("/interrupted-first-install.tgz", "registry contents");
+    writeFileSync(path.join(stateDir, "provision.lock.json"), JSON.stringify({
+      version: 1,
+      approved: [],
+      revoked: [],
+      installed: {
+	"skill/interrupted-first-install": {
+	  sha256: skill.sha256,
+	  files: ["SKILL.md"],
+	  fileHashes: { "SKILL.md": sha(Buffer.from("registry contents")) },
+	  installedAt: new Date().toISOString(),
+	  uncommitted: true,
+	},
+      },
+    }));
+    registerManifestUrl(serveManifest([{
+      type: "skill",
+      name: "interrupted-first-install",
+      ...skill,
+    }]));
+
+    const view = await syncNow();
+
+    assert.equal(statusOf(view, "interrupted-first-install"), "failed");
+    assert.equal(
+      readFileSync(path.join(target, "SKILL.md"), "utf8"),
+      "same path, user-owned contents",
+    );
+    const state = JSON.parse(readFileSync(path.join(stateDir, "provision.lock.json"), "utf8"));
+    assert.equal(state.installed["skill/interrupted-first-install"], undefined);
+  });
+
   test("a committed upgrade is recovered from a pending ownership transaction", async () => {
     process.env.PROVISION_AUTOAPPLY = "auto";
     initProvisioning();

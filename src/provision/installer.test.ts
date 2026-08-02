@@ -640,6 +640,32 @@ describe("provision installer", () => {
     assert.equal(lstatSync(skillsDir).isDirectory(), true);
   });
 
+  test("removeSkill preserves writes through a descriptor opened before removal", async () => {
+    const { url, sha256 } = serve("/remove-open-fd.tgz", makeTarGz([
+      { name: "SKILL.md", content: "before removal" },
+    ]));
+    const result = await installSkill({ name: "demo", url, sha256 }, { skillsDir });
+    const descriptor = openSync(path.join(skillsDir, "demo", "SKILL.md"), "r+");
+
+    let recoveryPath: string | undefined;
+    try {
+      ({ recoveryPath } = removeSkill("demo", {
+	skillsDir,
+	files: result.files,
+	fileHashes: result.fileHashes,
+	directories: result.directories,
+      }));
+      ftruncateSync(descriptor, 0);
+      writeSync(descriptor, "written after removal");
+    } finally {
+      closeSync(descriptor);
+    }
+
+    assert.equal(existsSync(path.join(skillsDir, "demo")), false);
+    assert.notEqual(recoveryPath, undefined);
+    assert.equal(readFileSync(path.join(recoveryPath!, "0"), "utf8"), "written after removal");
+  });
+
   test("removeSkill deletes empty directories owned by the archive", async () => {
     const { url, sha256 } = serve("/empty-dir.tgz", makeTarGz([
       { name: "SKILL.md", content: "ok" },

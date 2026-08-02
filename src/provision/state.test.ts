@@ -44,6 +44,26 @@ describe("provision state", () => {
     assert.deepEqual(loadState(), state);
   });
 
+  test("an uncommitted first-install journal round-trips", () => {
+    const state = {
+      version: 1 as const,
+      approved: [],
+      revoked: [],
+      installed: {
+	"skill/demo": {
+	  sha256: "a".repeat(64),
+	  files: ["SKILL.md"],
+	  fileHashes: { "SKILL.md": "b".repeat(64) },
+	  installedAt: "2026-08-02T00:00:00.000Z",
+	  uncommitted: true as const,
+	},
+      },
+    };
+
+    saveState(state);
+    assert.deepEqual(loadState(), state);
+  });
+
   test("a managed path at the archive limit round-trips", () => {
     const prefix = "a/";
     const file = `${prefix}${"b".repeat(MAX_MANAGED_PATH_LENGTH - prefix.length)}`;
