@@ -17,6 +17,7 @@ import { createHash } from "crypto";
 import { existsSync, lstatSync, readFileSync } from "fs";
 import { homedir } from "os";
 import path from "path";
+import { takeProxySecret } from "../config.js";
 import {
   checkUrlAllowed,
   fetchWithPolicy,
@@ -110,6 +111,9 @@ export function initProvisioning(): {
   const raw = process.env.PROVISION_SYNC?.trim().toLowerCase() ?? "";
   enabled = ["1", "true", "yes", "enabled"].includes(raw);
   autoApply = process.env.PROVISION_AUTOAPPLY?.trim().toLowerCase() === "auto" ? "auto" : "approve";
+  // Consume even while provisioning is disabled: a signed URL left in the
+  // gateway environment is readable through /proc by same-uid CLI children.
+  const fixed = takeProxySecret("PROVISION_MANIFEST_URL")?.trim();
   if (enabled) {
     // What the lockfile already records survives a restart in the status view,
     // so an operator sees their installs before (and without) the next sync.
@@ -117,7 +121,6 @@ export function initProvisioning(): {
       const [type, ...rest] = key.split("/");
       return { type: type ?? "skill", name: rest.join("/"), status: "installed" as const, sha256: record.sha256 };
     });
-    const fixed = process.env.PROVISION_MANIFEST_URL?.trim();
     if (fixed) {
       registerManifestUrl(fixed);
       // A fixed startup URL is itself a request to provision now. The interval

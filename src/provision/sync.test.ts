@@ -6,6 +6,7 @@ import { createServer, type Server } from "http";
 import { tmpdir } from "os";
 import path from "path";
 import { gzipSync } from "zlib";
+import { resetCapturedProxySecrets } from "../config.js";
 import {
   approveItem,
   deleteItem,
@@ -100,6 +101,7 @@ describe("provision sync", () => {
   });
 
   beforeEach(() => {
+    resetCapturedProxySecrets();
     for (const name of SAVED_VARS) {
       saved.set(name, process.env[name]);
       delete process.env[name];
@@ -117,6 +119,7 @@ describe("provision sync", () => {
 
   afterEach(async () => {
     await shutdownProvisioning();
+    resetCapturedProxySecrets();
     for (const name of SAVED_VARS) {
       const value = saved.get(name);
       if (value === undefined) delete process.env[name];
@@ -611,6 +614,22 @@ describe("provision sync", () => {
     assert.equal(getStatus().manifest_url, `${baseUrl}/provision.json`);
     await syncNow();
     assert.equal(existsSync(path.join(skillsDir, "startup", "SKILL.md")), true);
+  });
+
+  test("PROVISION_MANIFEST_URL is removed from the gateway environment after capture", () => {
+    process.env.PROVISION_REFETCH_MS = "0";
+    responses.set("/provision.json?token=secret", { schema: "agent-provisioning/v1", items: [] });
+    const fixedManifestUrl = `${baseUrl}/provision.json?token=secret`;
+    process.env.PROVISION_MANIFEST_URL = fixedManifestUrl;
+
+    initProvisioning();
+
+    assert.equal(getStatus().manifest_url, fixedManifestUrl);
+    assert.equal(
+      "PROVISION_MANIFEST_URL" in process.env,
+      false,
+      "a same-uid completion must not recover manifest credentials from the gateway environment",
+    );
   });
 
   test("with no sync yet, status lists what the lockfile says is installed", async () => {
