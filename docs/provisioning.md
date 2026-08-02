@@ -88,6 +88,9 @@ Three ways, all equivalent once registered:
    `PROVISION_REFETCH_MS` (default 1h). Updating the JSON is all an external
    app does to roll out changes; a failed sync retries on the next tick.
 
+Manifest and artifact URLs may use signed query parameters, but embedded
+`https://user:password@host/` credentials are rejected before any request.
+
 ## Endpoints
 
 All under the admin key (`Authorization: Bearer <admin-key>`).

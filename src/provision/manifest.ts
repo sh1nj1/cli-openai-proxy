@@ -108,6 +108,11 @@ export function checkUrlAllowed(
   } catch {
     throw new ProvisionError(`Not a valid URL: ${rawUrl}`, "invalid_url");
   }
+  // Node fetch rejects userinfo, and translating it to Authorization could
+  // leak credentials across redirect origins. Signed query URLs remain valid.
+  if (url.username || url.password) {
+    throw new ProvisionError("URL credentials are not supported", "url_not_allowed");
+  }
   const host = url.hostname.toLowerCase();
   if (url.protocol !== "https:" && !(url.protocol === "http:" && LOOPBACK_HOSTS.has(host))) {
     throw new ProvisionError(`Refusing non-https URL: ${rawUrl}`, "url_not_allowed");

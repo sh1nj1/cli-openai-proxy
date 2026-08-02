@@ -13,12 +13,12 @@ import path from "path";
 import { managedPathParts } from "./path-policy.js";
 import type { InstalledRecord, InstalledSnapshot, ProvisionStateFile } from "./types.js";
 
-function stateDir(): string {
+export function provisionStateDir(): string {
   return process.env.PROVISION_STATE_DIR?.trim() || path.join(homedir(), ".cli-openai-proxy");
 }
 
 export function stateFilePath(): string {
-  return path.join(stateDir(), "provision.lock.json");
+  return path.join(provisionStateDir(), "provision.lock.json");
 }
 
 const emptyState = (): ProvisionStateFile => ({ version: 1, approved: [], revoked: [], installed: {} });

@@ -120,6 +120,7 @@ test("gateway provisions by authenticated identity and strips private headers", 
 
 test("gateway consumes a worker provisioning notification without exposing its private header", async () => {
   const socketPath = `/tmp/cap-worker-${randomUUID().slice(0, 8)}.sock`;
+  const generationStateFile = `/tmp/cap-generation-${randomUUID().slice(0, 8)}.state`;
   const manifestUrl = "https://collavre.test/agents/vrex/provision.json?token=secret";
   const generation = "019865f4-50d6-7000-8000-000000000001";
   const worker = http.createServer((_request, response) => {
@@ -146,7 +147,7 @@ test("gateway consumes a worker provisioning notification without exposing its p
   process.env.AUTH_ADMIN_KEYS = "admin-key-123456";
   const notifications: string[] = [];
   const gateway = createApp({
-    userWorkerProxy: new UserWorkerProxy(provisioner),
+    userWorkerProxy: new UserWorkerProxy(provisioner, 30_000, generationStateFile),
     onAuthorizedProvisioningUrl: (url) => { notifications.push(url); },
   }).listen(0);
   await new Promise<void>((resolve) => gateway.once("listening", resolve));
@@ -168,11 +169,13 @@ test("gateway consumes a worker provisioning notification without exposing its p
     await new Promise<void>((resolve) => gateway.close(() => resolve()));
     await new Promise<void>((resolve) => worker.close(() => resolve()));
     await rm(socketPath, { force: true });
+    await rm(generationStateFile, { force: true });
   }
 });
 
-test("gateway ignores a retained session notification after a newer session registers", async () => {
+test("gateway persists notification ordering across restart", async () => {
   const socketPath = `/tmp/cap-worker-${randomUUID().slice(0, 8)}.sock`;
+  const generationStateFile = `/tmp/cap-generation-${randomUUID().slice(0, 8)}.state`;
   const generations = new Map<string, string>();
   const urls = new Map([
     ["session-a", "https://collavre.test/agents/vrex/a.json"],
@@ -210,14 +213,14 @@ test("gateway ignores a retained session notification after a newer session regi
   ]);
   process.env.AUTH_ADMIN_KEYS = "admin-key-123456";
   const notifications: string[] = [];
-  const gateway = createApp({
-    userWorkerProxy: new UserWorkerProxy(provisioner),
+  let gateway: http.Server | undefined = createApp({
+    userWorkerProxy: new UserWorkerProxy(provisioner, 30_000, generationStateFile),
     onAuthorizedProvisioningUrl: (url) => { notifications.push(url); },
   }).listen(0);
-  await new Promise<void>((resolve) => gateway.once("listening", resolve));
+  await new Promise<void>((resolve) => gateway!.once("listening", resolve));
 
   try {
-    const port = (gateway.address() as AddressInfo).port;
+    let port = (gateway.address() as AddressInfo).port;
     const headers = {
       authorization: "Bearer admin-key-123456",
       "content-type": "application/json",
@@ -235,13 +238,25 @@ test("gateway ignores a retained session notification after a newer session regi
     assert.ok(generations.get(first.sessionId)! < generations.get(second.sessionId)!);
 
     await fetch(`http://127.0.0.1:${port}/v1/auth/fake/sessions/${second.sessionId}`, { headers });
+
+    await new Promise<void>((resolve) => gateway!.close(() => resolve()));
+    gateway = undefined;
+    gateway = createApp({
+      userWorkerProxy: new UserWorkerProxy(provisioner, 30_000, generationStateFile),
+      onAuthorizedProvisioningUrl: (url) => { notifications.push(url); },
+    }).listen(0);
+    await new Promise<void>((resolve) => gateway!.once("listening", resolve));
+    port = (gateway.address() as AddressInfo).port;
+
+    await fetch(`http://127.0.0.1:${port}/v1/auth/fake/sessions/${second.sessionId}`, { headers });
     await fetch(`http://127.0.0.1:${port}/v1/auth/fake/sessions/${first.sessionId}`, { headers });
 
-    assert.deepEqual(notifications, [urls.get(second.sessionId)]);
+    assert.deepEqual(notifications, [urls.get(second.sessionId), urls.get(second.sessionId)]);
   } finally {
-    await new Promise<void>((resolve) => gateway.close(() => resolve()));
+    if (gateway) await new Promise<void>((resolve) => gateway!.close(() => resolve()));
     await new Promise<void>((resolve) => worker.close(() => resolve()));
     await rm(socketPath, { force: true });
+    await rm(generationStateFile, { force: true });
   }
 });
 

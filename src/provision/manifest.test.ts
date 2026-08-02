@@ -131,6 +131,17 @@ describe("provision manifest", () => {
     test("an unparseable url is refused", () => {
       assert.equal(codeOf(() => checkUrlAllowed("not a url", { manifestUrl, allowlist: null })), "invalid_url");
     });
+
+    test("userinfo credentials are refused without echoing them", () => {
+      const credentialUrl = "https://user:password@collavre.com/provision.json";
+      assert.throws(
+	() => checkUrlAllowed(credentialUrl, { allowlist: null }),
+	(err: unknown) => err instanceof ProvisionError
+	  && err.code === "url_not_allowed"
+	  && !err.message.includes("user")
+	  && !err.message.includes("password"),
+      );
+    });
   });
 
   describe("getAllowlist", () => {
@@ -156,6 +167,33 @@ describe("provision manifest", () => {
 	}),
 	(err: unknown) => err instanceof ProvisionError && err.code === "manifest_fetch_failed",
       );
+    } finally {
+      globalThis.fetch = realFetch;
+    }
+  });
+
+  test("a redirect cannot introduce URL credentials", async () => {
+    const realFetch = globalThis.fetch;
+    let fetches = 0;
+    globalThis.fetch = async () => {
+      fetches++;
+      return new Response(null, {
+	status: 302,
+	headers: { location: "https://user:password@collavre.com/private.json" },
+      });
+    };
+    try {
+      await assert.rejects(
+	fetchWithPolicy("https://collavre.com/provision.json", {
+	  checkUrl: (url) => checkUrlAllowed(url, { allowlist: null }),
+	  timeoutMs: 1_000,
+	  failCode: "manifest_fetch_failed",
+	}),
+	(err: unknown) => err instanceof ProvisionError
+	  && err.code === "url_not_allowed"
+	  && !err.message.includes("password"),
+      );
+      assert.equal(fetches, 1, "the credential-bearing redirect target must not be fetched");
     } finally {
       globalThis.fetch = realFetch;
     }

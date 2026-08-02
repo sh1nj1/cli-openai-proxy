@@ -116,7 +116,7 @@ test("a pending session is not resolvable after an in-process restart", async ()
 test("startup logs do not expose credentials from a fixed manifest URL", async () => {
   process.env.PROVISION_SYNC = "1";
   process.env.PROVISION_REFETCH_MS = "0";
-  process.env.PROVISION_MANIFEST_URL = "http://user:password@127.0.0.1:1/provision.json?token=secret";
+  process.env.PROVISION_MANIFEST_URL = "http://127.0.0.1:1/provision.json?password=secret&token=secret";
   const lines: string[] = [];
   const realLog = console.log;
   console.log = (...args: unknown[]) => { lines.push(args.map(String).join(" ")); };

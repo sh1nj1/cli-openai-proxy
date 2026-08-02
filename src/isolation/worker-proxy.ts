@@ -1,7 +1,11 @@
 import http, { type IncomingHttpHeaders } from "node:http";
+import { randomUUID } from "node:crypto";
+import { mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import path from "node:path";
 import type { Request, Response } from "express";
 import { v7 as uuidv7 } from "uuid";
 import { getWorkerConnectTimeoutMs } from "../config.js";
+import { provisionStateDir } from "../provision/state.js";
 import { requestIdentity } from "./request-identity.js";
 import type { WorkerProvisioner, WorkerTarget } from "./types.js";
 import { WorkerIsolationError } from "./types.js";
@@ -43,6 +47,31 @@ const PUBLIC_FAILURE_MESSAGES: Record<WorkerIsolationError["code"], string> = {
   provisioner_unavailable: "User worker provisioner unavailable",
   worker_unavailable: "User worker unavailable",
 };
+
+function defaultGenerationStateFile(): string {
+  return path.join(provisionStateDir(), "provisioning-notification-generation");
+}
+
+function loadProvisioningGeneration(file: string): string | undefined {
+  try {
+    return decodeProvisioningGeneration(readFileSync(file, "utf8").trim());
+  } catch {
+    return undefined;
+  }
+}
+
+function saveProvisioningGeneration(file: string, generation: string): void {
+  mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
+  const temporary = `${file}.tmp-${process.pid}-${randomUUID()}`;
+  try {
+    // Persist before relay so a gateway restart cannot make an older retained
+    // worker session authoritative again. Same-generation retries stay valid.
+    writeFileSync(temporary, `${generation}\n`, { encoding: "utf8", mode: 0o600, flag: "wx" });
+    renameSync(temporary, file);
+  } finally {
+    rmSync(temporary, { force: true });
+  }
+}
 
 function outgoingHeaders(
   headers: IncomingHttpHeaders,
@@ -86,7 +115,10 @@ export class UserWorkerProxy {
   constructor(
     private readonly provisioner: WorkerProvisioner,
     private readonly connectTimeoutMs = getWorkerConnectTimeoutMs(),
-  ) {}
+    private readonly generationStateFile = defaultGenerationStateFile(),
+  ) {
+    this.latestProvisioningGeneration = loadProvisioningGeneration(generationStateFile);
+  }
 
   async forward(
     req: Request,
@@ -181,7 +213,15 @@ export class UserWorkerProxy {
   ): void {
     if (this.latestProvisioningGeneration && generation < this.latestProvisioningGeneration) return;
     if (!this.latestProvisioningGeneration || generation > this.latestProvisioningGeneration) {
-      this.latestProvisioningGeneration = generation;
+      try {
+	saveProvisioningGeneration(this.generationStateFile, generation);
+	this.latestProvisioningGeneration = generation;
+      } catch (error) {
+	console.error(
+	  `[UserWorkerProxy] provisioning generation persistence failed: ${error instanceof Error ? error.message : String(error)}`,
+	);
+	return;
+      }
     }
     void Promise.resolve(callback(url)).catch((error) => {
       console.error(
