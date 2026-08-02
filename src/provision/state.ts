@@ -10,6 +10,7 @@
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from "fs";
 import { homedir } from "os";
 import path from "path";
+import { managedPathParts } from "./path-policy.js";
 import type { InstalledRecord, InstalledSnapshot, ProvisionStateFile } from "./types.js";
 
 function stateDir(): string {
@@ -25,8 +26,7 @@ const HASH_PATTERN = /^[0-9a-f]{64}$/i;
 const KEY_PATTERN = /^[a-z0-9][a-z0-9_-]{0,63}\/[a-z0-9][a-z0-9_-]{0,63}$/i;
 
 function safeRelativeFile(value: unknown): value is string {
-  if (typeof value !== "string" || !value || value.length > 1024 || path.isAbsolute(value)) return false;
-  return value.split(/[\\/]/).every((part) => part !== "" && part !== "." && part !== "..");
+  return managedPathParts(value) !== null;
 }
 
 function installedSnapshot(value: unknown): InstalledSnapshot | null {

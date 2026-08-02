@@ -20,16 +20,16 @@ interface TarEntry {
   linkTarget?: string;
 }
 
-function tarHeader(entry: TarEntry, size: number): Buffer {
+function tarHeader(entry: TarEntry, size: number, name = entry.name, type?: string): Buffer {
   const header = Buffer.alloc(512);
-  header.write(entry.name, 0, 100, "utf-8");
+  header.write(name, 0, 100, "utf-8");
   header.write("0000755", 100, 8, "ascii");
   header.write("0000000", 108, 8, "ascii");
   header.write("0000000", 116, 8, "ascii");
   header.write(size.toString(8).padStart(11, "0"), 124, 12, "ascii");
   header.write("00000000000", 136, 12, "ascii");
   header.write("        ", 148, 8, "ascii"); // checksum placeholder: spaces
-  const typeflag = entry.type === "dir" ? "5" : entry.type === "symlink" ? "2" : "0";
+  const typeflag = type ?? (entry.type === "dir" ? "5" : entry.type === "symlink" ? "2" : "0");
   header.write(typeflag, 156, 1, "ascii");
   if (entry.linkTarget) header.write(entry.linkTarget, 157, 100, "utf-8");
   header.write("ustar", 257, 6, "ascii");
@@ -42,17 +42,28 @@ function tarHeader(entry: TarEntry, size: number): Buffer {
 
 function makeTarGz(entries: TarEntry[]): Buffer {
   const blocks: Buffer[] = [];
+  const appendContent = (content: Buffer): void => {
+    if (content.length === 0) return;
+    const padded = Buffer.alloc(Math.ceil(content.length / 512) * 512);
+    content.copy(padded);
+    blocks.push(padded);
+  };
   for (const entry of entries) {
     const content =
       entry.type === "dir" || entry.type === "symlink"
         ? Buffer.alloc(0)
         : Buffer.from(entry.content ?? "");
-    blocks.push(tarHeader(entry, content.length));
-    if (content.length > 0) {
-      const padded = Buffer.alloc(Math.ceil(content.length / 512) * 512);
-      content.copy(padded);
-      blocks.push(padded);
+    if (Buffer.byteLength(entry.name) > 100) {
+      const longName = Buffer.from(`${entry.name}\0`);
+      blocks.push(tarHeader(entry, longName.length, "././@LongLink", "L"));
+      appendContent(longName);
     }
+    blocks.push(tarHeader(
+      entry,
+      content.length,
+      Buffer.byteLength(entry.name) > 100 ? "long-path" : entry.name,
+    ));
+    appendContent(content);
   }
   blocks.push(Buffer.alloc(1024));
   return gzipSync(Buffer.concat(blocks));
@@ -164,6 +175,22 @@ describe("provision installer", () => {
     const code = await codeOf(() => installSkill({ name: "demo", url, sha256 }, { skillsDir }));
     assert.equal(code, "archive_rejected");
     assert.equal(existsSync(path.join(path.dirname(skillsDir), "escape.md")), false);
+  });
+
+  test("an archive path longer than the lockfile limit is refused", async () => {
+    const component = "a".repeat(80);
+    const longPath = `${Array.from({ length: 13 }, () => component).join("/")}/SKILL.md`;
+    const { url, sha256 } = serve("/long-path.tgz", makeTarGz([
+      { name: longPath, content: "too deep" },
+    ]));
+
+    await assert.rejects(
+      installSkill({ name: "demo", url, sha256 }, { skillsDir }),
+      (err: unknown) => err instanceof ProvisionError
+	&& err.code === "archive_rejected"
+	&& err.message.includes("exceeds 1024 characters"),
+    );
+    assert.equal(existsSync(path.join(skillsDir, "demo")), false);
   });
 
   test("a symlink entry is refused", async () => {
@@ -336,4 +363,29 @@ describe("provision installer", () => {
 
     assert.equal(existsSync(path.join(skillsDir, "demo")), false);
   });
+
+  test(
+    "removeSkill preserves literal backslashes in Unix managed filenames",
+    { skip: path.sep === "\\" },
+    async () => {
+      const { url, sha256 } = serve("/backslash.tgz", makeTarGz([
+	{ name: "SKILL.md", content: "ok" },
+	{ name: "docs\\notes.md", content: "literal" },
+      ]));
+      const result = await installSkill({ name: "demo", url, sha256 }, { skillsDir });
+
+      assert.equal(
+	readFileSync(path.join(skillsDir, "demo", "docs\\notes.md"), "utf-8"),
+	"literal",
+      );
+      removeSkill("demo", {
+	skillsDir,
+	files: result.files,
+	fileHashes: result.fileHashes,
+	directories: result.directories,
+      });
+
+      assert.equal(existsSync(path.join(skillsDir, "demo")), false);
+    },
+  );
 });

@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { mkdtempSync, rmSync, readFileSync, writeFileSync, mkdirSync } from "fs";
 import { tmpdir } from "os";
 import path from "path";
+import { MAX_MANAGED_PATH_LENGTH } from "./path-policy.js";
 import { loadState, saveState, stateFilePath } from "./state.js";
 
 describe("provision state", () => {
@@ -39,6 +40,26 @@ describe("provision state", () => {
         },
       },
     };
+    saveState(state);
+    assert.deepEqual(loadState(), state);
+  });
+
+  test("a managed path at the archive limit round-trips", () => {
+    const prefix = "a/";
+    const file = `${prefix}${"b".repeat(MAX_MANAGED_PATH_LENGTH - prefix.length)}`;
+    const state = {
+      version: 1 as const,
+      approved: [],
+      revoked: [],
+      installed: {
+	"skill/demo": {
+	  sha256: "a".repeat(64),
+	  files: [file],
+	  installedAt: "2026-08-02T00:00:00.000Z",
+	},
+      },
+    };
+
     saveState(state);
     assert.deepEqual(loadState(), state);
   });

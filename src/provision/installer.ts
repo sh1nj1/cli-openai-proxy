@@ -26,6 +26,7 @@ import { tmpdir } from "os";
 import path from "path";
 import { gunzipSync } from "zlib";
 import { fetchWithPolicy, readResponseBody } from "./manifest.js";
+import { managedPathParts, MAX_MANAGED_PATH_LENGTH } from "./path-policy.js";
 import { ProvisionError } from "./types.js";
 
 export interface InstallResult {
@@ -118,6 +119,13 @@ function assertArchiveSafe(archivePath: string): void {
     }
   }
   for (const name of names.split("\n").filter(Boolean)) {
+    const relative = name.replace(/\/+$/, "");
+    if (relative.length > MAX_MANAGED_PATH_LENGTH) {
+      throw new ProvisionError(
+	`Archive entry path exceeds ${MAX_MANAGED_PATH_LENGTH} characters`,
+	"archive_rejected",
+      );
+    }
     if (path.isAbsolute(name) || name.split("/").includes("..")) {
       throw new ProvisionError(`Archive entry escapes its root: ${name}`, "archive_rejected");
     }
@@ -138,7 +146,11 @@ function auditTree(root: string): InstallResult {
         throw new ProvisionError("Extracted tree contains a symlink", "archive_rejected");
       }
       if (stat.isDirectory()) {
-	directories.push(path.relative(root, full).split(path.sep).join("/"));
+	const relative = path.relative(root, full).split(path.sep).join("/");
+	if (!managedPathParts(relative)) {
+	  throw new ProvisionError(`Archive path cannot be recorded: ${relative}`, "archive_rejected");
+	}
+	directories.push(relative);
         walk(full);
         continue;
       }
@@ -146,6 +158,9 @@ function auditTree(root: string): InstallResult {
         throw new ProvisionError(`Not a regular file: ${entry}`, "archive_rejected");
       }
       const relative = path.relative(root, full).split(path.sep).join("/");
+      if (!managedPathParts(relative)) {
+	throw new ProvisionError(`Archive path cannot be recorded: ${relative}`, "archive_rejected");
+      }
       if (stat.size > MAX_FILE_BYTES) {
         throw new ProvisionError(`File exceeds ${MAX_FILE_BYTES} bytes: ${relative}`, "audit_failed");
       }
@@ -303,9 +318,8 @@ function existsAsDirectory(target: string): boolean {
 }
 
 function managedPath(root: string, relative: string): string | null {
-  if (!relative || path.isAbsolute(relative)) return null;
-  const parts = relative.split(/[\\/]/);
-  if (parts.some((part) => !part || part === "." || part === "..")) return null;
+  const parts = managedPathParts(relative);
+  if (!parts) return null;
   return path.join(root, ...parts);
 }
 
@@ -329,9 +343,10 @@ export function removeSkill(
   for (const relative of opts.files) {
     const file = managedPath(root, relative);
     if (!file) continue;
+    const parts = managedPathParts(relative)!;
     let safe = true;
     let current = root;
-    for (const part of relative.split(/[\\/]/).slice(0, -1)) {
+    for (const part of parts.slice(0, -1)) {
       current = path.join(current, part);
       try {
 	if (!lstatSync(current).isDirectory()) safe = false;
