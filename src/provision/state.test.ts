@@ -46,6 +46,35 @@ describe("provision state", () => {
     assert.deepEqual(loadState(), state);
   });
 
+  test("legacy consent keys are canonicalized while installed path spelling is retained", () => {
+    mkdirSync(path.dirname(stateFilePath()), { recursive: true });
+    writeFileSync(stateFilePath(), JSON.stringify({
+      version: 1,
+      approved: ["skill/Demo", "skill/demo"],
+      revoked: ["skill/Old"],
+      installed: {
+	"skill/Demo": {
+	  sha256: "a".repeat(64),
+	  files: ["SKILL.md"],
+	  installedAt: "2026-08-02T00:00:00.000Z",
+	},
+      },
+    }));
+
+    assert.deepEqual(loadState(), {
+      version: 1,
+      approved: ["skill/demo"],
+      revoked: ["skill/old"],
+      installed: {
+	"skill/Demo": {
+	  sha256: "a".repeat(64),
+	  files: ["SKILL.md"],
+	  installedAt: "2026-08-02T00:00:00.000Z",
+	},
+      },
+    });
+  });
+
   test("an uncommitted first-install journal round-trips", () => {
     const state = {
       version: 1 as const,

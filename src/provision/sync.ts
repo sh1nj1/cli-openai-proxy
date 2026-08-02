@@ -136,7 +136,7 @@ export function initProvisioning(hooks: {
       // Leave it out until a target-touching operation reconciles the state.
       .filter(([, record]) => !record.uncommitted && !record.pending)
       .map(([key, record]) => {
-	const [type, ...rest] = key.split("/");
+	const [type, ...rest] = canonicalStateKey(key).split("/");
 	return { type: type ?? "skill", name: rest.join("/"), status: "installed" as const, sha256: record.sha256 };
       });
     if (fixed) {
@@ -428,6 +428,79 @@ function reconcileUpgradeJournal(name: string, record: InstalledRecord): Install
   return record;
 }
 
+function canonicalStateKey(key: string): string {
+  return key.toLowerCase();
+}
+
+/**
+ * Re-home lockfile entries written before lowercase names were enforced.
+ *
+ * A legacy tree is removed through the normal ownership boundary and retained
+ * in recovery, then the canonical manifest item is installed during this same
+ * sync. This works on both case-sensitive and case-insensitive filesystems and
+ * avoids treating the old directory as an untracked collision.
+ */
+function migrateLegacyDesiredItems(
+  state: ProvisionStateFile,
+  desired: Set<string>,
+): Map<string, string> {
+  const failures = new Map<string, string>();
+  for (const [legacyKey, record] of Object.entries(state.installed)) {
+    const canonicalKey = canonicalStateKey(legacyKey);
+    if (legacyKey === canonicalKey || !desired.has(canonicalKey)) continue;
+
+    // Two records that case-fold together may represent distinct trees on a
+    // case-sensitive filesystem. Preserve both rather than guessing ownership.
+    if (state.installed[canonicalKey]) {
+      failures.set(canonicalKey, `Cannot migrate legacy item "${legacyKey}": canonical record already exists`);
+      desired.add(legacyKey);
+      continue;
+    }
+
+    const [legacyType, ...nameParts] = legacyKey.split("/");
+    const legacyName = nameParts.join("/");
+    if (legacyType?.toLowerCase() !== "skill") {
+      failures.set(canonicalKey, `Cannot migrate legacy item "${legacyKey}": unsupported installed type`);
+      desired.add(legacyKey);
+      continue;
+    }
+    try {
+      const recovery = prepareRemovalRecovery(state);
+      try {
+	const snapshot = removalSnapshot(record);
+	removeSkill(legacyName, {
+	  skillsDir: skillsDir(),
+	  ...snapshot,
+	  ...recovery,
+	  afterRootAudit: afterRemovalAudit,
+	  afterRootIsolation: afterRemovalIsolation,
+	});
+      } finally {
+	finalizeRemovalRecoveries(state);
+      }
+      if (existsSync(path.join(skillsDir(), legacyName))) {
+	throw new ProvisionError(
+	  `Cannot migrate legacy item "${legacyKey}" without verified ownership of its target`,
+	  "untracked_content",
+	);
+      }
+      // Installed records were already treated as approved even when an older
+      // lockfile omitted the redundant grant entry. Preserve that trust state.
+      if (!state.revoked.includes(canonicalKey) && !state.approved.includes(canonicalKey)) {
+	state.approved.push(canonicalKey);
+      }
+      delete state.installed[legacyKey];
+      saveState(state);
+    } catch (err) {
+      failures.set(canonicalKey, err instanceof Error ? err.message : String(err));
+      // The manifest's canonical key must not make the still-owned legacy key
+      // look undesired and trigger a second removal attempt below.
+      desired.add(legacyKey);
+    }
+  }
+  return failures;
+}
+
 async function runSync(): Promise<ProvisionStatusView> {
   if (!enabled) {
     throw new ProvisionError("Provisioning is disabled. Set PROVISION_SYNC=1 to enable it.", "provisioning_disabled");
@@ -443,14 +516,26 @@ async function runSync(): Promise<ProvisionStatusView> {
   const state = loadState();
   reconcileFirstInstallJournals(state);
   const views: ProvisionItemView[] = [];
-  const desired = new Set<string>();
+  const desired = new Set(manifest.items.map((item) => `${item.type}/${item.name}`));
+  const legacyMigrationFailures = migrateLegacyDesiredItems(state, desired);
 
   for (const item of manifest.items) {
     const key = `${item.type}/${item.name}`;
-    desired.add(key);
 
     if (!SUPPORTED_PROVISION_TYPES.has(item.type)) {
       views.push({ type: item.type, name: item.name, status: "unsupported" });
+      continue;
+    }
+
+    const migrationFailure = legacyMigrationFailures.get(key);
+    if (migrationFailure) {
+      views.push({
+	type: item.type,
+	name: item.name,
+	status: "failed",
+	sha256: item.sha256,
+	error: migrationFailure,
+      });
       continue;
     }
 
@@ -610,9 +695,11 @@ async function runSync(): Promise<ProvisionStatusView> {
     if (desired.has(key)) continue;
     const [type, ...rest] = key.split("/");
     const name = rest.join("/");
+    const canonicalType = type?.toLowerCase() ?? "skill";
+    const canonicalName = name.toLowerCase();
     try {
       const record = state.installed[key]!;
-      if (type === "skill") {
+      if (canonicalType === "skill") {
 	const recovery = prepareRemovalRecovery(state);
 	try {
 	  const snapshot = removalSnapshot(record);
@@ -628,10 +715,10 @@ async function runSync(): Promise<ProvisionStatusView> {
 	}
       }
       delete state.installed[key];
-      views.push({ type: type ?? "skill", name, status: "removed" });
+      views.push({ type: canonicalType, name: canonicalName, status: "removed" });
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
-      views.push({ type: type ?? "skill", name, status: "failed", error: message });
+      views.push({ type: canonicalType, name: canonicalName, status: "failed", error: message });
     }
   }
 
@@ -719,13 +806,19 @@ export function deleteItem(type: string, name: string): Promise<{ removed: boole
   return serialize(() => {
     const state = loadState();
     reconcileFirstInstallJournals(state);
-    const installed = key in state.installed;
-    const record = state.installed[key];
+    const legacyMatches = Object.keys(state.installed)
+      .filter((entry) => canonicalStateKey(entry) === key);
+    const installedKey = key in state.installed
+      ? key
+      : legacyMatches.length === 1 ? legacyMatches[0] : undefined;
+    const installed = installedKey !== undefined;
+    const record = installedKey ? state.installed[installedKey] : undefined;
     if (record && type === "skill") {
+	const installedName = installedKey!.slice(installedKey!.indexOf("/") + 1);
       const recovery = prepareRemovalRecovery(state);
       try {
 	const snapshot = removalSnapshot(record);
-	removeSkill(name, {
+	removeSkill(installedName, {
 	  skillsDir: skillsDir(),
 	  ...snapshot,
 	  ...recovery,
@@ -737,7 +830,7 @@ export function deleteItem(type: string, name: string): Promise<{ removed: boole
 	saveState(state);
       }
     }
-    delete state.installed[key];
+    if (installedKey) delete state.installed[installedKey];
     // Revoked, not just uninstalled: auto mode must not undo an explicit DELETE.
     state.approved = state.approved.filter((entry) => entry !== key);
     if (!state.revoked.includes(key)) state.revoked.push(key);

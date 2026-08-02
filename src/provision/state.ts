@@ -25,7 +25,18 @@ const emptyState = (): ProvisionStateFile => ({ version: 1, approved: [], revoke
 const HASH_PATTERN = /^[0-9a-f]{64}$/i;
 const INSTALL_MARKER_PATTERN = /^[0-9a-f]{32}$/;
 const RECOVERY_ID_PATTERN = /^[0-9a-f]{32}$/;
+// Loading remains case-insensitive for lockfiles written before names became
+// lowercase-only. Installed keys retain their spelling because it identifies
+// the legacy on-disk directory; consent/tombstone keys have no path identity
+// and can be canonicalized immediately.
 const KEY_PATTERN = /^[a-z0-9][a-z0-9_-]{0,63}\/[a-z0-9][a-z0-9_-]{0,63}$/i;
+
+function canonicalKeys(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  return [...new Set(value
+    .filter((key): key is string => typeof key === "string" && KEY_PATTERN.test(key))
+    .map((key) => key.toLowerCase()))];
+}
 
 function safeRelativeFile(value: unknown): value is string {
   return managedPathParts(value) !== null;
@@ -97,12 +108,8 @@ export function loadState(): ProvisionStateFile {
     }
     return {
       version: 1,
-      approved: Array.isArray(parsed.approved)
-	? parsed.approved.filter((k): k is string => typeof k === "string" && KEY_PATTERN.test(k))
-	: [],
-      revoked: Array.isArray(parsed.revoked)
-	? parsed.revoked.filter((k): k is string => typeof k === "string" && KEY_PATTERN.test(k))
-        : [],
+      approved: canonicalKeys(parsed.approved),
+      revoked: canonicalKeys(parsed.revoked),
       ...(Array.isArray(parsed.removalRecoveries)
 	? {
 	  removalRecoveries: [...new Set(parsed.removalRecoveries.filter(

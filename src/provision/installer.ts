@@ -52,6 +52,8 @@ const UPGRADE_RECOVERY_PREFIX = ".provision-staging-";
 
 /** Same lowercase charset the manifest enforces; re-checked for non-manifest callers. */
 const NAME_PATTERN = /^[a-z0-9][a-z0-9_-]{0,63}$/;
+/** Removal also accepts pre-canonicalization lockfile names so they can migrate safely. */
+const LEGACY_NAME_PATTERN = /^[a-z0-9][a-z0-9_-]{0,63}$/i;
 
 export function firstInstallMarkerPath(root: string, marker: string): string {
   if (!INSTALL_MARKER_PATTERN.test(marker)) {
@@ -737,7 +739,7 @@ export function removeSkill(
     recoveryId?: string;
   },
 ): { recoveryPath?: string } {
-  if (!NAME_PATTERN.test(name)) {
+  if (!LEGACY_NAME_PATTERN.test(name)) {
     throw new ProvisionError(`Invalid skill name "${name}"`, "invalid_item");
   }
   const recoveryId = opts.recoveryId ?? randomBytes(16).toString("hex");

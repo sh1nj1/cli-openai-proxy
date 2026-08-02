@@ -263,6 +263,49 @@ describe("provision sync", () => {
     assert.equal(existsSync(path.join(skillsDir, "pr-monitor", "SKILL.md")), true);
   });
 
+  test("a legacy uppercase lockfile item migrates to lowercase in one sync", async () => {
+    const legacyName = "Demo";
+    const canonicalName = "demo";
+    const legacyContents = "legacy contents";
+    const legacyTarget = path.join(skillsDir, legacyName);
+    mkdirSync(legacyTarget);
+    writeFileSync(path.join(legacyTarget, "SKILL.md"), legacyContents);
+    writeFileSync(path.join(stateDir, "provision.lock.json"), JSON.stringify({
+      version: 1,
+      approved: [],
+      revoked: [],
+      installed: {
+	"skill/Demo": {
+	  sha256: "a".repeat(64),
+	  files: ["SKILL.md"],
+	  directories: [],
+	  fileHashes: { "SKILL.md": sha(Buffer.from(legacyContents)) },
+	  installedAt: new Date().toISOString(),
+	},
+      },
+    }));
+    initProvisioning();
+    const replacement = serveSkill("/lowercase-migration.tgz", "canonical contents");
+    registerManifestUrl(serveManifest([{
+      type: "skill",
+      name: canonicalName,
+      ...replacement,
+    }]));
+
+    const view = await syncNow();
+
+    assert.equal(statusOf(view, canonicalName), "installed");
+    assert.equal(readFileSync(path.join(skillsDir, canonicalName, "SKILL.md"), "utf8"), "canonical contents");
+    const state = JSON.parse(readFileSync(path.join(stateDir, "provision.lock.json"), "utf8"));
+    assert.equal(state.installed["skill/Demo"], undefined);
+    assert.equal(state.installed["skill/demo"].sha256, replacement.sha256);
+    assert.deepEqual(state.approved, ["skill/demo"]);
+    const recovery = readdirSync(skillsDir)
+      .find((entry) => entry.startsWith(".provision-removed-"));
+    assert.notEqual(recovery, undefined);
+    assert.equal(readFileSync(path.join(skillsDir, recovery!, "SKILL.md"), "utf8"), legacyContents);
+  });
+
   test("an item that leaves the manifest is removed — but only lockfile-managed ones", async () => {
     process.env.PROVISION_AUTOAPPLY = "auto";
     initProvisioning();
@@ -969,6 +1012,39 @@ describe("provision sync", () => {
       state.upgradeRecoveries.map((id: string) => `.provision-staging-${id}`).sort(),
     );
     assert.equal(readFileSync(path.join(spoofed, "keep.txt"), "utf8"), "user-owned");
+  });
+
+  test("a lowercase DELETE removes a legacy uppercase lockfile item", async () => {
+    const contents = "legacy delete contents";
+    const target = path.join(skillsDir, "Demo");
+    mkdirSync(target);
+    writeFileSync(path.join(target, "SKILL.md"), contents);
+    writeFileSync(path.join(stateDir, "provision.lock.json"), JSON.stringify({
+      version: 1,
+      approved: ["skill/Demo"],
+      revoked: [],
+      installed: {
+	"skill/Demo": {
+	  sha256: "a".repeat(64),
+	  files: ["SKILL.md"],
+	  directories: [],
+	  fileHashes: { "SKILL.md": sha(Buffer.from(contents)) },
+	  installedAt: new Date().toISOString(),
+	},
+      },
+    }));
+    initProvisioning();
+
+    assert.deepEqual(await deleteItem("skill", "demo"), { removed: true });
+
+    const state = JSON.parse(readFileSync(path.join(stateDir, "provision.lock.json"), "utf8"));
+    assert.deepEqual(state.approved, []);
+    assert.deepEqual(state.revoked, ["skill/demo"]);
+    assert.deepEqual(state.installed, {});
+    const recovery = readdirSync(skillsDir)
+      .find((entry) => entry.startsWith(".provision-removed-"));
+    assert.notEqual(recovery, undefined);
+    assert.equal(readFileSync(path.join(skillsDir, recovery!, "SKILL.md"), "utf8"), contents);
   });
 
   test("deleting an item uninstalls it and revokes its approval", async () => {
