@@ -27,12 +27,13 @@ interface TarEntry {
   content?: string | Buffer;
   type?: "file" | "dir" | "symlink";
   linkTarget?: string;
+  mode?: number;
 }
 
 function tarHeader(entry: TarEntry, size: number, name = entry.name, type?: string): Buffer {
   const header = Buffer.alloc(512);
   header.write(name, 0, 100, "utf-8");
-  header.write("0000755", 100, 8, "ascii");
+  header.write((entry.mode ?? 0o755).toString(8).padStart(7, "0"), 100, 8, "ascii");
   header.write("0000000", 108, 8, "ascii");
   header.write("0000000", 116, 8, "ascii");
   header.write(size.toString(8).padStart(11, "0"), 124, 12, "ascii");
@@ -166,6 +167,27 @@ describe("provision installer", () => {
     const result = await installSkill({ name: "demo", url, sha256 }, { skillsDir });
     assert.deepEqual(result.files.sort(), ["SKILL.md", "notes/extra.md"]);
     assert.equal(readFileSync(path.join(skillsDir, "demo", "SKILL.md"), "utf-8"), "top");
+  });
+
+  test("normalizes restrictive archive directory modes before installation", async () => {
+    const { url, sha256 } = serve("/restrictive-dirs.tgz", makeTarGz([
+      { name: "demo-1.0.0/", type: "dir", mode: 0o000 },
+      { name: "demo-1.0.0/docs/", type: "dir", mode: 0o555 },
+      { name: "demo-1.0.0/docs/notes.md", content: "managed" },
+    ]));
+
+    const result = await installSkill({ name: "demo", url, sha256 }, { skillsDir });
+    const target = path.join(skillsDir, "demo");
+    assert.equal(lstatSync(target).mode & 0o700, 0o700);
+    assert.equal(lstatSync(path.join(target, "docs")).mode & 0o700, 0o700);
+
+    removeSkill("demo", {
+      skillsDir,
+      files: result.files,
+      fileHashes: result.fileHashes,
+      directories: result.directories,
+    });
+    assert.equal(existsSync(target), false);
   });
 
   test("a sha256 mismatch refuses the archive and installs nothing", async () => {

@@ -12,6 +12,7 @@
 import { execFileSync } from "child_process";
 import { createHash } from "crypto";
 import {
+  chmodSync,
   lstatSync,
   mkdirSync,
   mkdtempSync,
@@ -186,6 +187,19 @@ function auditTree(root: string): InstallResult {
   return { files, directories, fileHashes };
 }
 
+/** Ensure the gateway can audit, replace, and remove every extracted directory. */
+function normalizeDirectoryModes(root: string): void {
+  const walk = (dir: string): void => {
+    const stat = lstatSync(dir);
+    chmodSync(dir, stat.mode | 0o700);
+    for (const entry of readdirSync(dir)) {
+      const full = path.join(dir, entry);
+      if (lstatSync(full).isDirectory()) walk(full);
+    }
+  };
+  walk(root);
+}
+
 export async function installSkill(
   item: { name: string; url: string; sha256: string },
   opts: {
@@ -247,6 +261,7 @@ export async function installSkill(
       root = path.join(extractDir, entries[0]!);
     }
 
+    normalizeDirectoryModes(root);
     const result = auditTree(root);
     if (result.files.length === 0) {
       throw new ProvisionError("Archive contains no files", "archive_rejected");
