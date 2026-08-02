@@ -123,10 +123,14 @@ export function initProvisioning(hooks: {
   if (enabled) {
     // What the lockfile already records survives a restart in the status view,
     // so an operator sees their installs before (and without) the next sync.
-    itemViews = Object.entries(loadState().installed).map(([key, record]) => {
-      const [type, ...rest] = key.split("/");
-      return { type: type ?? "skill", name: rest.join("/"), status: "installed" as const, sha256: record.sha256 };
-    });
+    itemViews = Object.entries(loadState().installed)
+      // A pre-exposure first-install claim is not an install. Leave it out
+      // until a target-touching operation reconciles the journal.
+      .filter(([, record]) => !record.uncommitted)
+      .map(([key, record]) => {
+	const [type, ...rest] = key.split("/");
+	return { type: type ?? "skill", name: rest.join("/"), status: "installed" as const, sha256: record.sha256 };
+      });
     if (fixed) {
       registerManifestUrl(fixed);
       // A fixed startup URL is itself a request to provision now. The interval
@@ -431,7 +435,18 @@ async function runSync(): Promise<ProvisionStatusView> {
     }
 
     if (state.installed[key]?.pending) {
-      state.installed[key] = reconcileUpgradeJournal(item.name, state.installed[key]!);
+      const reconciled = reconcileUpgradeJournal(item.name, state.installed[key]!);
+      state.installed[key] = reconciled;
+      if (reconciled.pending) {
+	views.push({
+	  type: item.type,
+	  name: item.name,
+	  status: "failed",
+	  sha256: item.sha256,
+	  error: `Cannot upgrade "${item.name}" until its interrupted upgrade journal is resolved`,
+	});
+	continue;
+      }
     }
 
     // Already-installed items count as approved: they were gated when first
@@ -559,6 +574,10 @@ async function runSync(): Promise<ProvisionStatusView> {
       if (!state.approved.includes(key)) state.approved.push(key);
       views.push({ type: item.type, name: item.name, status: "installed", sha256: item.sha256 });
     } catch (err) {
+      const journal = state.installed[key];
+      if (journal?.pending) {
+	state.installed[key] = reconcileUpgradeJournal(item.name, journal);
+      }
       const message = err instanceof Error ? err.message : String(err);
       views.push({ type: item.type, name: item.name, status: "failed", sha256: item.sha256, error: message });
     }

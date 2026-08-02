@@ -659,6 +659,48 @@ describe("provision sync", () => {
     assert.equal(state.installed["skill/recover-subset-upgrade"].pending, undefined);
   });
 
+  test("an unresolved upgrade journal blocks re-upgrade without dropping pending ownership", async () => {
+    process.env.PROVISION_AUTOAPPLY = "auto";
+    const name = "ambiguous-upgrade";
+    const key = `skill/${name}`;
+    const target = path.join(skillsDir, name);
+    mkdirSync(target);
+    writeFileSync(path.join(target, "OLD.md"), "old contents");
+    writeFileSync(path.join(target, "NEW.md"), "new contents");
+    const replacement = serveSkill("/ambiguous-upgrade.tgz", "replacement contents");
+    const journal = {
+      sha256: "a".repeat(64),
+      files: ["OLD.md"],
+      directories: [],
+      fileHashes: { "OLD.md": sha(Buffer.from("old contents")) },
+      installedAt: new Date().toISOString(),
+      pending: {
+	sha256: "b".repeat(64),
+	files: ["NEW.md"],
+	directories: [],
+	fileHashes: { "NEW.md": sha(Buffer.from("new contents")) },
+	installedAt: new Date().toISOString(),
+      },
+    };
+    writeFileSync(path.join(stateDir, "provision.lock.json"), JSON.stringify({
+      version: 1,
+      approved: [key],
+      revoked: [],
+      installed: { [key]: journal },
+    }));
+    initProvisioning();
+    registerManifestUrl(serveManifest([{ type: "skill", name, ...replacement }]));
+
+    const view = await syncNow();
+
+    assert.equal(statusOf(view, name), "failed");
+    assert.match(view.data.find((item) => item.name === name)?.error ?? "", /journal is resolved/i);
+    const state = JSON.parse(readFileSync(path.join(stateDir, "provision.lock.json"), "utf8"));
+    assert.deepEqual(state.installed[key], journal);
+    assert.deepEqual(await deleteItem("skill", name), { removed: true });
+    assert.equal(existsSync(target), false);
+  });
+
   test("removal after an interrupted upgrade recognizes candidate-owned files", async () => {
     process.env.PROVISION_AUTOAPPLY = "auto";
     initProvisioning();
@@ -935,5 +977,31 @@ describe("provision sync", () => {
     resetProvisioning();
     initProvisioning();
     assert.equal(statusOf(getStatus(), "aaa"), "installed");
+  });
+
+  test("startup status omits an uncommitted first-install preclaim", () => {
+    const key = "skill/startup-preclaim";
+    writeFileSync(path.join(stateDir, "provision.lock.json"), JSON.stringify({
+      version: 1,
+      approved: [],
+      revoked: [],
+      installed: {
+	[key]: {
+	  sha256: "a".repeat(64),
+	  files: ["SKILL.md"],
+	  directories: [],
+	  fileHashes: { "SKILL.md": sha(Buffer.from("never exposed")) },
+	  installedAt: new Date().toISOString(),
+	  uncommitted: true,
+	  installMarker: "b".repeat(32),
+	},
+      },
+    }));
+
+    initProvisioning();
+
+    assert.equal(statusOf(getStatus(), "startup-preclaim"), undefined);
+    const state = JSON.parse(readFileSync(path.join(stateDir, "provision.lock.json"), "utf8"));
+    assert.equal(state.installed[key].uncommitted, true);
   });
 });
