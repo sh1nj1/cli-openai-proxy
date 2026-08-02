@@ -291,7 +291,7 @@ test("gateway preserves live provisioning bindings and reuses only expired capac
     generation: `019865f4-50d6-7000-8000-${index.toString(16).padStart(12, "0")}`,
     urlHash: provisioningUrlHash(manifestUrl),
     accountName: "cap_0123456789abcdef0123",
-    engine: "fake",
+    engine: index === 0 ? "fake" : `other-${index}`,
     sessionId: `session-${index}`,
     expiresAt: liveExpiresAt,
   }));
@@ -478,6 +478,87 @@ test("gateway releases provisional bindings when worker session creation fails",
   }
 });
 
+test("gateway reclaims bindings for superseded and cancelled worker sessions", async () => {
+  const socketPath = `/tmp/cap-worker-${randomUUID().slice(0, 8)}.sock`;
+  const generationStateFile = `/tmp/cap-generation-${randomUUID().slice(0, 8)}.state`;
+  let created = 0;
+  const worker = http.createServer((request, response) => {
+    if (request.method === "POST") {
+      created += 1;
+      response.writeHead(201, { "content-type": "application/json" });
+      response.end(JSON.stringify({
+	sessionId: `session-${created}`,
+	status: "pending",
+	expiresAt: new Date(Date.now() + 600_000).toISOString(),
+      }));
+      return;
+    }
+    response.writeHead(200, { "content-type": "application/json" });
+    response.end(JSON.stringify({ status: "cancelled" }));
+  });
+  await new Promise<void>((resolve) => worker.listen(socketPath, resolve));
+
+  const provisioner: WorkerProvisioner = {
+    async ensureWorker() {
+      return {
+	accountName: "cap_0123456789abcdef0123",
+	endpoint: { kind: "unix", address: socketPath },
+      };
+    },
+  };
+  process.env.USER_API_KEYS = JSON.stringify([
+    { key: "user-key-12345678", tenantId: "tenant-a", userId: "user-a" },
+  ]);
+  process.env.AUTH_ADMIN_KEYS = "admin-key-123456";
+  process.env.PROVISION_SYNC = "1";
+  const gateway = createApp({
+    userWorkerProxy: new UserWorkerProxy(provisioner, 30_000, generationStateFile),
+    onAuthorizedProvisioningUrl: () => {},
+  }).listen(0);
+  await new Promise<void>((resolve) => gateway.once("listening", resolve));
+
+  try {
+    const port = (gateway.address() as AddressInfo).port;
+    const headers = {
+      authorization: "Bearer admin-key-123456",
+      "content-type": "application/json",
+      "x-cli-proxy-user-key": "user-key-12345678",
+    };
+    for (let index = 0; index < 513; index += 1) {
+      const response = await fetch(`http://127.0.0.1:${port}/v1/auth/fake/sessions`, {
+	method: "POST",
+	headers,
+	body: JSON.stringify({
+	  provisioning_url: "https://collavre.test/agents/vrex/provision.json",
+	}),
+      });
+      assert.equal(response.status, 201);
+      await response.arrayBuffer();
+    }
+    const afterSupersession = JSON.parse(await readFile(`${generationStateFile}.issued`, "utf8")) as {
+      bindings: Array<{ sessionId?: string }>;
+    };
+    assert.deepEqual(afterSupersession.bindings.map(({ sessionId }) => sessionId), ["session-513"]);
+
+    const cancelled = await fetch(
+      `http://127.0.0.1:${port}/v1/auth/fake/sessions/session-513`,
+      { method: "DELETE", headers },
+    );
+    assert.equal(cancelled.status, 200);
+    await cancelled.arrayBuffer();
+    const afterCancellation = JSON.parse(await readFile(`${generationStateFile}.issued`, "utf8")) as {
+      bindings: unknown[];
+    };
+    assert.deepEqual(afterCancellation.bindings, []);
+  } finally {
+    await new Promise<void>((resolve) => gateway.close(() => resolve()));
+    await new Promise<void>((resolve) => worker.close(() => resolve()));
+    await rm(socketPath, { force: true });
+    await rm(generationStateFile, { force: true });
+    await rm(`${generationStateFile}.issued`, { force: true });
+  }
+});
+
 test("gateway shares its auth session TTL with provisioning workers", async () => {
   const socketPath = `/tmp/cap-worker-${randomUUID().slice(0, 8)}.sock`;
   const generationStateFile = `/tmp/cap-generation-${randomUUID().slice(0, 8)}.state`;
@@ -546,7 +627,7 @@ test("disabled provisioning ignores auth URLs without writing generation state",
   assert.equal(result.generation, undefined);
 });
 
-test("unaccepted and pending provisioning sessions do not supersede retained notifications", async () => {
+test("rejected creates preserve retained notifications while successful creates supersede them", async () => {
   const socketPath = `/tmp/cap-worker-${randomUUID().slice(0, 8)}.sock`;
   const generationStateFile = `/tmp/cap-generation-${randomUUID().slice(0, 8)}.state`;
   const retainedGeneration = "019865f4-50d6-7000-8000-000000000001";
@@ -642,7 +723,7 @@ test("unaccepted and pending provisioning sessions do not supersede retained not
       { headers },
     );
     await retainedAfterPending.arrayBuffer();
-    assert.deepEqual(notifications, [retainedUrl, retainedUrl]);
+    assert.deepEqual(notifications, [retainedUrl]);
   } finally {
     await new Promise<void>((resolve) => gateway.close(() => resolve()));
     await new Promise<void>((resolve) => worker.close(() => resolve()));
@@ -652,7 +733,7 @@ test("unaccepted and pending provisioning sessions do not supersede retained not
   }
 });
 
-test("a policy-rejected provisioning URL does not supersede retained notifications", async () => {
+test("a successful plain session supersedes retained provisioning bindings", async () => {
   const socketPath = `/tmp/cap-worker-${randomUUID().slice(0, 8)}.sock`;
   const generationStateFile = `/tmp/cap-generation-${randomUUID().slice(0, 8)}.state`;
   const retainedGeneration = "019865f4-50d6-7000-8000-000000000001";
@@ -734,7 +815,7 @@ test("a policy-rejected provisioning URL does not supersede retained notificatio
 
     const retained = await fetch(`http://127.0.0.1:${port}/v1/auth/fake/sessions/retained`, { headers });
     await retained.arrayBuffer();
-    assert.deepEqual(notifications, [retainedUrl]);
+    assert.deepEqual(notifications, []);
   } finally {
     await new Promise<void>((resolve) => gateway.close(() => resolve()));
     await new Promise<void>((resolve) => worker.close(() => resolve()));
@@ -924,7 +1005,7 @@ test("gateway persists issued and authorized notification ordering separately ac
   ]);
   let created = 0;
   const worker = http.createServer((request, response) => {
-    if (request.method === "POST" && request.url === "/v1/auth/fake/sessions") {
+    if (request.method === "POST" && /^\/v1\/auth\/fake-[ab]\/sessions$/.test(request.url ?? "")) {
       const sessionId = created++ === 0 ? "session-a" : "session-b";
       generations.set(sessionId, String(request.headers[PROVISIONING_GENERATION_HEADER]));
       response.writeHead(201, { "content-type": "application/json" });
@@ -973,21 +1054,21 @@ test("gateway persists issued and authorized notification ordering separately ac
       [PROVISIONING_GENERATION_HEADER]: "ffffffff-ffff-7fff-bfff-ffffffffffff",
       "x-cli-proxy-user-key": "user-key-12345678",
     };
-    const create = (provisioningUrl: string) => fetch(`http://127.0.0.1:${port}/v1/auth/fake/sessions`, {
+    const create = (engine: string, provisioningUrl: string) => fetch(`http://127.0.0.1:${port}/v1/auth/${engine}/sessions`, {
       method: "POST",
       headers,
       body: JSON.stringify({ provisioning_url: provisioningUrl }),
     }).then((response) => response.json() as Promise<{ sessionId: string }>);
-    const first = await create(urls.get("session-a")!);
-    const second = await create(urls.get("session-b")!);
+    const first = await create("fake-a", urls.get("session-a")!);
+    const second = await create("fake-b", urls.get("session-b")!);
     assert.notEqual(generations.get(first.sessionId), headers[PROVISIONING_GENERATION_HEADER]);
     assert.ok(persistedGeneration < generations.get(first.sessionId)!);
     assert.ok(generations.get(first.sessionId)! < generations.get(second.sessionId)!);
     assert.equal((await readFile(generationStateFile, "utf8")).trim(), persistedGeneration);
     assert.equal(await latestIssuedGeneration(generationStateFile), generations.get(second.sessionId));
 
-    const poll = async (sessionId: string) => {
-      const response = await fetch(`http://127.0.0.1:${port}/v1/auth/fake/sessions/${sessionId}`, { headers });
+    const poll = async (engine: string, sessionId: string) => {
+      const response = await fetch(`http://127.0.0.1:${port}/v1/auth/${engine}/sessions/${sessionId}`, { headers });
       await response.arrayBuffer();
     };
     await new Promise<void>((resolve) => gateway!.close(() => resolve()));
@@ -999,11 +1080,11 @@ test("gateway persists issued and authorized notification ordering separately ac
     await new Promise<void>((resolve) => gateway!.once("listening", resolve));
     port = (gateway.address() as AddressInfo).port;
 
-    await poll(first.sessionId);
+    await poll("fake-a", first.sessionId);
     assert.deepEqual(notifications, [urls.get(first.sessionId)]);
     assert.equal((await readFile(generationStateFile, "utf8")).trim(), generations.get(first.sessionId));
 
-    await poll(second.sessionId);
+    await poll("fake-b", second.sessionId);
     assert.deepEqual(notifications, [urls.get(first.sessionId), urls.get(second.sessionId)]);
     assert.equal((await readFile(generationStateFile, "utf8")).trim(), generations.get(second.sessionId));
 
@@ -1016,8 +1097,8 @@ test("gateway persists issued and authorized notification ordering separately ac
     await new Promise<void>((resolve) => gateway!.once("listening", resolve));
     port = (gateway.address() as AddressInfo).port;
 
-    await poll(second.sessionId);
-    await poll(first.sessionId);
+    await poll("fake-b", second.sessionId);
+    await poll("fake-a", first.sessionId);
 
     assert.deepEqual(notifications, [
       urls.get(first.sessionId),

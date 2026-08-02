@@ -288,6 +288,7 @@ export class UserWorkerProxy {
       ? allowedProvisioningUrl(req.body)
       : undefined;
     const sessionCollection = authSessionCollection(req.path);
+    const cancelledSession = req.method === "DELETE" ? authSessionResource(req.path) : undefined;
     if (
       onAuthorizedProvisioningUrl
       && requestedProvisioningUrl
@@ -328,6 +329,31 @@ export class UserWorkerProxy {
         (workerResponse) => {
           clearReadinessTimer();
 	  const bindingToFinalize = workerResponse.statusCode === 201 ? issuedBinding : undefined;
+	  if (sessionCollection && workerResponse.statusCode === 201 && !bindingToFinalize) {
+	    try {
+	      this.releaseIssuedEngineSessions(target.accountName, sessionCollection.engine);
+	    } catch (error) {
+	      workerResponse.resume();
+	      if (!clientClosed && !res.destroyed) this.sendFailure(res, error);
+	      resolve();
+	      return;
+	    }
+	  }
+	  if (
+	    cancelledSession
+	    && workerResponse.statusCode !== undefined
+	    && workerResponse.statusCode >= 200
+	    && workerResponse.statusCode < 300
+	  ) {
+	    try {
+	      this.releaseIssuedSession(target.accountName, cancelledSession.engine, cancelledSession.sessionId);
+	    } catch (error) {
+	      workerResponse.resume();
+	      if (!clientClosed && !res.destroyed) this.sendFailure(res, error);
+	      resolve();
+	      return;
+	    }
+	  }
 	  if (issuedBinding && !bindingToFinalize) {
 	    try {
 	      this.releaseIssuedGeneration(issuedBinding);
@@ -521,31 +547,75 @@ export class UserWorkerProxy {
       return false;
     }
     const finalized = { ...binding, sessionId, expiresAt };
+    const previousBindings = new Map(this.issuedProvisioningBindings);
     this.issuedProvisioningBindings.set(binding.generation, finalized);
+    for (const [generation, existing] of this.issuedProvisioningBindings) {
+      if (
+	generation < binding.generation
+	&& existing.accountName === binding.accountName
+	&& existing.engine === binding.engine
+      ) {
+	// A successful worker create supersedes every older session for this engine,
+	// including a create whose response was interrupted before finalization.
+	this.issuedProvisioningBindings.delete(generation);
+      }
+    }
     try {
       saveIssuedProvisioningState(issuedGenerationStateFile(this.generationStateFile), {
 	latestGeneration: this.latestIssuedProvisioningGeneration,
 	bindings: this.issuedProvisioningBindings,
       });
     } catch (error) {
-      this.issuedProvisioningBindings.set(binding.generation, binding);
+	this.issuedProvisioningBindings.clear();
+	for (const [generation, previous] of previousBindings) {
+	  this.issuedProvisioningBindings.set(generation, previous);
+	}
 	throw error;
     }
     return true;
   }
 
-  private releaseIssuedGeneration(binding: IssuedProvisioningBinding): void {
-    if (this.issuedProvisioningBindings.get(binding.generation) !== binding) return;
-    this.issuedProvisioningBindings.delete(binding.generation);
+  private releaseIssuedSession(accountName: string, engine: string, sessionId: string): void {
+    this.releaseIssuedBindings((binding) => (
+      binding.accountName === accountName
+      && binding.engine === engine
+      && binding.sessionId === sessionId
+    ));
+  }
+
+  private releaseIssuedEngineSessions(accountName: string, engine: string): void {
+    this.releaseIssuedBindings((binding) => (
+      binding.accountName === accountName && binding.engine === engine
+    ));
+  }
+
+  private releaseIssuedBindings(predicate: (binding: IssuedProvisioningBinding) => boolean): void {
+    const previousBindings = new Map(this.issuedProvisioningBindings);
+    let removed = false;
+    for (const [generation, binding] of this.issuedProvisioningBindings) {
+      if (predicate(binding)) {
+	this.issuedProvisioningBindings.delete(generation);
+	removed = true;
+      }
+    }
+    if (!removed) return;
     try {
       saveIssuedProvisioningState(issuedGenerationStateFile(this.generationStateFile), {
 	latestGeneration: this.latestIssuedProvisioningGeneration,
 	bindings: this.issuedProvisioningBindings,
       });
     } catch (error) {
-      this.issuedProvisioningBindings.set(binding.generation, binding);
+      this.issuedProvisioningBindings.clear();
+      for (const [generation, previous] of previousBindings) {
+	this.issuedProvisioningBindings.set(generation, previous);
+      }
       throw error;
     }
+  }
+
+  private releaseIssuedGeneration(binding: IssuedProvisioningBinding): void {
+    if (this.issuedProvisioningBindings.get(binding.generation) !== binding) return;
+    this.releaseIssuedBindings((existing) => existing === binding);
   }
 
   private relayProvisioningNotification(
