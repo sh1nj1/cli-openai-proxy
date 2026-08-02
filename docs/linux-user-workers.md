@@ -60,14 +60,24 @@ workers and the provisioner on the new release, then starts the gateway again.
 Active CLI requests can be interrupted during this upgrade, so schedule it
 during a maintenance window.
 
+Containerized deployments — including macOS/Windows, where Docker Desktop runs
+containers in a Linux VM — should use [docs/docker.md](docker.md) instead of
+running the installer directly. The container's first-boot systemd unit runs
+this same installer (`scripts/install-linux-user-workers.sh`) on first boot,
+so the install behavior described above is identical; only the entry point
+differs.
+
 ## Integration test
 
-`npm run test:integration:linux-workers` builds a systemd-enabled Ubuntu image,
-runs the real installer inside it, and asserts the isolation boundaries end to
-end: dynamic `cap_*` account creation, worker UID/HOME, socket and state-file
-permissions, fail-closed auth, and that a chat completion's CLI process runs as
-the caller's dedicated account (via a stub `claude` that reports its own OS
-identity). It needs Docker and takes a few minutes; CI runs it on every PR.
+`npm run test:integration:linux-workers` builds the production image from the
+root `Dockerfile`, runs the real installer inside it, and asserts the
+isolation boundaries end to end: dynamic `cap_*` account creation, worker
+UID/HOME, socket and state-file permissions, fail-closed auth, and that a chat
+completion's CLI process runs as the caller's dedicated account (via a stub
+`claude` that reports its own OS identity). The stub `claude` is injected into
+the running container at test time, not baked into the image — the
+production image ships no CLI at all. It needs Docker and takes a few minutes;
+CI runs it on every PR.
 
 ## Trusted user identity
 

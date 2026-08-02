@@ -1,0 +1,18 @@
+[Unit]
+Description=cli-openai-proxy container first-boot install
+After=network.target
+# On boots after the first the gateway is enabled and would otherwise start in
+# parallel with this unit, serving the previously persisted gateway.env before
+# the host seed lands — rotated/revoked keys would stay valid for that window.
+# Ordering it after this oneshot means the gateway only ever boots with the
+# freshly seeded env. Ignored on first boot (unit not yet enabled) and on any
+# system without the gateway unit.
+Before=cli-openai-proxy-gateway.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/lib/cli-openai-proxy/first-boot-install.sh
+
+[Install]
+WantedBy=multi-user.target

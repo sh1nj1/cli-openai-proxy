@@ -1,0 +1,38 @@
+# Production deployment for macOS/Windows/Linux hosts via Docker (Desktop).
+# Create gateway.env next to this file first (see gateway.env.example).
+# NOTE: restart containers with `stop`/`start`. Recreating the container while
+# keeping volumes breaks provisioned cap_* accounts (see docs/docker.md).
+services:
+  proxy:
+    build:
+      context: ../..
+      args:
+        INSTALL_CLIS: "${INSTALL_CLIS-@anthropic-ai/claude-code @openai/codex}"
+    image: cli-openai-proxy:local
+    # systemd as PID 1 needs a writable cgroup tree and its own /run tmpfs.
+    privileged: true
+    cgroup: host
+    volumes:
+      - /sys/fs/cgroup:/sys/fs/cgroup:rw
+      - state:/var/lib/cli-openai-proxy
+      - config:/etc/cli-openai-proxy
+      - ${GATEWAY_ENV_FILE:-./gateway.env}:/run/host-config/gateway.env:ro
+    tmpfs:
+      - /run
+      - /run/lock
+    ports:
+      # Loopback by default to match the bare-metal gateway (plain HTTP —
+      # bearer keys are interceptable on shared networks). Set
+      # HOST_BIND=0.0.0.0 to opt into remote exposure.
+      - "${HOST_BIND:-127.0.0.1}:${HOST_PORT:-3456}:3456"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:3456/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 12
+      start_period: 90s
+
+volumes:
+  state:
+  config:
