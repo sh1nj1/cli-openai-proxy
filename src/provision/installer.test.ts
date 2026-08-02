@@ -853,11 +853,14 @@ describe("provision installer", () => {
     const target = path.join(skillsDir, "demo");
     let candidate = "";
     let rolledBack = false;
+    const rejectionRecoveryId = "a".repeat(32);
+    const recovery = path.join(skillsDir, `.provision-rejected-${rejectionRecoveryId}`);
 
     await assert.rejects(
       installSkill({ name: "demo", url, sha256 }, {
 	skillsDir,
 	beforeCommit: () => () => { rolledBack = true; },
+	rejectionRecoveryId,
 	beforeCandidateMove: () => {
 	  candidate = path.join(
 	    skillsDir,
@@ -872,12 +875,13 @@ describe("provision installer", () => {
       }),
       (err: unknown) => err instanceof ProvisionError
 	&& err.code === "untracked_content"
-	&& err.message.includes("unaudited candidate"),
+	&& err.message.includes("was isolated"),
     );
 
     assert.equal(rolledBack, true);
     assert.equal(readFileSync(path.join(preservedOriginal, "SKILL.md"), "utf8"), "audited original");
-    assert.equal(readFileSync(path.join(target, "SKILL.md"), "utf8"), "unaudited replacement");
+    assert.equal(existsSync(target), false);
+    assert.equal(readFileSync(path.join(recovery, "SKILL.md"), "utf8"), "unaudited replacement");
   });
 
   test("publication rejects in-place candidate mutations after audit", async () => {
@@ -887,11 +891,14 @@ describe("provision installer", () => {
     const target = path.join(skillsDir, "demo");
     let candidate = "";
     let rolledBack = false;
+    const rejectionRecoveryId = "b".repeat(32);
+    const recovery = path.join(skillsDir, `.provision-rejected-${rejectionRecoveryId}`);
 
     await assert.rejects(
       installSkill({ name: "demo", url, sha256 }, {
 	skillsDir,
 	beforeCommit: () => () => { rolledBack = true; },
+	rejectionRecoveryId,
 	beforeCandidateMove: () => {
 	  candidate = path.join(
 	    skillsDir,
@@ -905,12 +912,13 @@ describe("provision installer", () => {
       }),
       (err: unknown) => err instanceof ProvisionError
 	&& err.code === "untracked_content"
-	&& err.message.includes("candidate contents changed"),
+	&& err.message.includes("was isolated"),
     );
 
     assert.equal(rolledBack, true);
-    assert.equal(readFileSync(path.join(target, "SKILL.md"), "utf8"), "mutated after audit");
-    assert.equal(readFileSync(path.join(target, "injected.md"), "utf8"), "new after audit");
+    assert.equal(existsSync(target), false);
+    assert.equal(readFileSync(path.join(recovery, "SKILL.md"), "utf8"), "mutated after audit");
+    assert.equal(readFileSync(path.join(recovery, "injected.md"), "utf8"), "new after audit");
   });
 
   test("a body that streams past the size cap is aborted, not buffered to completion", async () => {

@@ -85,7 +85,7 @@ export interface ProvisionStateFile {
   revoked: string[];
   /** Exact random identities of retained removal recoveries. */
   removalRecoveries?: string[];
-  /** Exact random identities of retained upgrade staging trees. */
+  /** Exact random identities of retained upgrade or rejected-candidate recovery trees. */
   upgradeRecoveries?: string[];
   installed: Record<string, InstalledRecord>;
 }

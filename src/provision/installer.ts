@@ -49,6 +49,7 @@ const INSTALL_MARKER_PATTERN = /^[0-9a-f]{32}$/;
 const RECOVERY_ID_PATTERN = /^[0-9a-f]{32}$/;
 const REMOVAL_RECOVERY_PREFIX = ".provision-removed-";
 const UPGRADE_RECOVERY_PREFIX = ".provision-staging-";
+const REJECTED_RECOVERY_PREFIX = ".provision-rejected-";
 
 /** Same lowercase charset the manifest enforces; re-checked for non-manifest callers. */
 const NAME_PATTERN = /^[a-z0-9][a-z0-9_-]{0,63}$/;
@@ -262,6 +263,8 @@ export async function installSkill(
     requireVerifiedOwnership?: boolean;
     /** New upgrade recovery identity preclaimed in the lockfile before staging begins. */
     upgradeRecoveryId?: string;
+    /** Recovery identity preclaimed before a rejected published candidate can be isolated. */
+    rejectionRecoveryId?: string;
     /** Test seam for deterministically exercising restoration races. */
     afterPreviousMove?: () => void;
     /** Test seam for mutation between first exposure and journal reconciliation. */
@@ -317,8 +320,13 @@ export async function installSkill(
       `${UPGRADE_RECOVERY_PREFIX}${randomBytes(16).toString("hex")}`,
     );
   }
+  if (opts.rejectionRecoveryId !== undefined
+    && !RECOVERY_ID_PATTERN.test(opts.rejectionRecoveryId)) {
+    throw new ProvisionError("Invalid rejected-candidate recovery identity", "invalid_item");
+  }
   let preserveCandidate = false;
   let candidateExposed = false;
+  let rejectedCandidateIsolated = false;
   try {
     const archivePath = path.join(archiveDir, "artifact.tgz");
     writeFileSync(archivePath, buf);
@@ -401,16 +409,29 @@ export async function installSkill(
 	  );
 	}
 	candidateExposed = true;
-	assertPublishedCandidate(
-	  target,
-	  candidateIdentity,
-	  item.name,
-	  result,
-	  opts.firstInstallMarker,
-	);
+	try {
+	  assertPublishedCandidate(
+	    target,
+	    candidateIdentity,
+	    item.name,
+	    result,
+	    opts.firstInstallMarker,
+	  );
+	} catch (err) {
+	  const isolationError = isolateRejectedCandidate(
+	    target,
+	    item.name,
+	    opts.skillsDir,
+	    opts.rejectionRecoveryId,
+	  );
+	  rejectedCandidateIsolated = true;
+	  throw isolationError;
+	}
       } catch (err) {
 	preserveCandidate = targetExists(candidate);
-	rollbackCommit?.();
+	// If isolation itself failed, retain the durable ownership journal rather
+	// than turning rejected live content into an untracked target.
+	if (!candidateExposed || rejectedCandidateIsolated) rollbackCommit?.();
 	throw err;
       }
       opts.afterFirstInstallMove?.(target);
@@ -483,7 +504,12 @@ export async function installSkill(
 	);
       }
       candidateExposed = true;
-      assertPublishedCandidate(target, candidateIdentity, item.name, result);
+      try {
+	assertPublishedCandidate(target, candidateIdentity, item.name, result);
+      } catch (err) {
+	isolateRejectedCandidate(target, item.name, opts.skillsDir, opts.rejectionRecoveryId);
+	throw err;
+      }
     } catch (err) {
       if (err instanceof ProvisionError && err.code === "untracked_content") throw err;
       preserveCandidate = targetExists(candidate);
@@ -663,6 +689,31 @@ function assertPublishedCandidate(
   if (!sameInstallResult(publishedContents, expectedContents)) {
     rejectChangedContents();
   }
+}
+
+function isolateRejectedCandidate(
+  target: string,
+  itemName: string,
+  skillsDir: string,
+  recoveryId?: string,
+): ProvisionError {
+  if (!recoveryId) {
+    throw new ProvisionError(
+      `Rejected candidate for "${itemName}" could not be isolated without a preclaimed recovery`,
+      "untracked_content",
+    );
+  }
+  const recovery = path.join(skillsDir, `${REJECTED_RECOVERY_PREFIX}${recoveryId}`);
+  if (!moveDirectoryNoReplace(target, recovery)) {
+    throw new ProvisionError(
+      `Rejected candidate for "${itemName}" could not be isolated; ownership remains recorded`,
+      "untracked_content",
+    );
+  }
+  return new ProvisionError(
+    `Rejected candidate for "${itemName}" was isolated at "${recovery}"`,
+    "untracked_content",
+  );
 }
 
 function sameInstallResult(left: InstallResult, right: InstallResult): boolean {

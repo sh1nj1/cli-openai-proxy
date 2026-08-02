@@ -228,6 +228,11 @@ async function fetchManifest(url: string): Promise<ProvisionManifest> {
     failCode: "manifest_fetch_failed",
   });
   if (!response.ok) {
+    try {
+      await response.body?.cancel();
+    } catch {
+      // Cancellation is best-effort; the HTTP failure must still be reported.
+    }
     throw new ProvisionError(`Manifest fetch failed: HTTP ${response.status}`, "manifest_fetch_failed");
   }
   let body: unknown;
@@ -431,7 +436,8 @@ function prepareUpgradeRecovery(state: ProvisionStateFile): {
   const upgradeRecoveryId = randomBytes(16).toString("hex");
   state.upgradeRecoveries = [
     ...(state.upgradeRecoveries ?? []).filter((recoveryId) =>
-      existsSync(path.join(skillsDir(), `.provision-staging-${recoveryId}`))),
+      existsSync(path.join(skillsDir(), `.provision-staging-${recoveryId}`))
+      || existsSync(path.join(skillsDir(), `.provision-rejected-${recoveryId}`))),
     upgradeRecoveryId,
   ];
   // Persist the exact identity before its staging directory can appear.
@@ -439,9 +445,23 @@ function prepareUpgradeRecovery(state: ProvisionStateFile): {
   return { upgradeRecoveryId };
 }
 
+function prepareRejectedCandidateRecovery(state: ProvisionStateFile): {
+  rejectionRecoveryId: string;
+} {
+  const rejectionRecoveryId = randomBytes(16).toString("hex");
+  state.upgradeRecoveries = [
+    ...(state.upgradeRecoveries ?? []),
+    rejectionRecoveryId,
+  ];
+  // Persist the exact identity before rejected content can enter this recovery.
+  saveState(state);
+  return { rejectionRecoveryId };
+}
+
 function finalizeUpgradeRecoveries(state: ProvisionStateFile): void {
   state.upgradeRecoveries = (state.upgradeRecoveries ?? []).filter((recoveryId) =>
-    existsSync(path.join(skillsDir(), `.provision-staging-${recoveryId}`)));
+    existsSync(path.join(skillsDir(), `.provision-staging-${recoveryId}`))
+    || existsSync(path.join(skillsDir(), `.provision-rejected-${recoveryId}`)));
 }
 
 function removalSnapshot(record: InstalledRecord): {
@@ -685,6 +705,7 @@ async function runSync(generation: number): Promise<ProvisionStatusView> {
 	? hasInterruptedRemovalForRecord(state, previousRecord)
 	: false;
       const upgradeRecovery = previousRecord ? prepareUpgradeRecovery(state) : undefined;
+      const rejectedCandidateRecovery = prepareRejectedCandidateRecovery(state);
       let result: Awaited<ReturnType<typeof installSkill>>;
       try {
 	result = await installSkill(
@@ -698,6 +719,7 @@ async function runSync(generation: number): Promise<ProvisionStatusView> {
 	    managedFileHashes,
 	    requireVerifiedOwnership,
 	    ...upgradeRecovery,
+	    ...rejectedCandidateRecovery,
 	    firstInstallMarker,
 	    afterFirstInstallMove,
 	    beforeCommit: (candidate) => {
@@ -733,7 +755,7 @@ async function runSync(generation: number): Promise<ProvisionStatusView> {
 	  },
 	);
       } finally {
-	if (upgradeRecovery) finalizeUpgradeRecoveries(state);
+	finalizeUpgradeRecoveries(state);
       }
       if (!previousRecord && reconcileFirstInstallJournals(state).has(key)) {
 	throw new ProvisionError(

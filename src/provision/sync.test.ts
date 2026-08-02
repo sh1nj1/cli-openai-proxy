@@ -1292,6 +1292,21 @@ describe("provision sync", () => {
     assert.equal(existsSync(path.join(skillsDir, "second", "SKILL.md")), true);
   });
 
+  test("a failed manifest response is cancelled before the fetch error is reported", async () => {
+    const realFetch = globalThis.fetch;
+    let cancelled = false;
+    globalThis.fetch = async () => new Response(new ReadableStream({
+      cancel: () => { cancelled = true; },
+    }), { status: 503 });
+    try {
+      registerManifestUrl("https://example.invalid/provision.json");
+      assert.equal(await codeOf(syncNow), "manifest_fetch_failed");
+      assert.equal(cancelled, true);
+    } finally {
+      globalThis.fetch = realFetch;
+    }
+  });
+
   test("persists and removes a root-level __proto__ artifact after reload", async () => {
     process.env.PROVISION_AUTOAPPLY = "auto";
     initProvisioning();
