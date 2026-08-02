@@ -378,6 +378,7 @@ function finalizeUpgradeRecoveries(state: ProvisionStateFile): void {
 function removalSnapshot(record: InstalledRecord): {
   files: string[];
   directories?: string[];
+  rootPathSnapshots: Array<{ files: string[]; directories?: string[] }>;
   fileHashes?: Record<string, string | string[]>;
 } {
   const snapshots: InstalledSnapshot[] = [record, ...(record.pending ? [record.pending] : [])];
@@ -393,6 +394,16 @@ function removalSnapshot(record: InstalledRecord): {
   }
   return {
     files,
+    rootPathSnapshots: [
+      ...snapshots.map((snapshot) => ({
+	files: snapshot.files,
+	...(snapshot.directories !== undefined ? { directories: snapshot.directories } : {}),
+      })),
+      {
+	files,
+	...(directories.length > 0 ? { directories } : {}),
+      },
+    ],
     ...(directories.length > 0 ? { directories } : {}),
     ...(Object.keys(fileHashes).length > 0 ? { fileHashes } : {}),
   };

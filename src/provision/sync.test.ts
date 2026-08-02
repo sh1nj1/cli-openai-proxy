@@ -1,7 +1,16 @@
 import { test, describe, before, after, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
 import { createHash } from "crypto";
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "fs";
+import {
+  existsSync,
+  lstatSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "fs";
 import { createServer, type Server } from "http";
 import { tmpdir } from "os";
 import path from "path";
@@ -153,6 +162,35 @@ describe("provision sync", () => {
 
   const statusOf = (view: { data: Array<{ type: string; name: string; status: string }> }, name: string) =>
     view.data.find((item) => item.name === name)?.status;
+
+  function writeLostExposureJournal(name: string): { key: string; target: string } {
+    const key = `skill/${name}`;
+    const target = path.join(skillsDir, name);
+    mkdirSync(target);
+    writeFileSync(path.join(stateDir, "provision.lock.json"), JSON.stringify({
+      version: 1,
+      approved: [key],
+      revoked: [],
+      installed: {
+	[key]: {
+	  sha256: "a".repeat(64),
+	  files: ["OLD.md"],
+	  directories: [],
+	  fileHashes: { "OLD.md": sha(Buffer.from("old contents")) },
+	  installedAt: new Date().toISOString(),
+	  pending: {
+	    sha256: "b".repeat(64),
+	    files: ["NEW.md"],
+	    directories: [],
+	    fileHashes: { "NEW.md": sha(Buffer.from("new contents")) },
+	    installedAt: new Date().toISOString(),
+	  },
+	},
+      },
+    }));
+    initProvisioning();
+    return { key, target };
+  }
 
   test("PROVISION_SYNC unset means the feature is off end to end", async () => {
     delete process.env.PROVISION_SYNC;
@@ -733,6 +771,31 @@ describe("provision sync", () => {
 
     assert.equal(statusOf(view, "remove-pending"), "removed");
     assert.equal(existsSync(target), false);
+  });
+
+  test("DELETE preserves an empty target that won an interrupted upgrade exposure race", async () => {
+    const name = "remove-lost-exposure";
+    const { key, target } = writeLostExposureJournal(name);
+
+    assert.deepEqual(await deleteItem("skill", name), { removed: true });
+    assert.equal(lstatSync(target).isDirectory(), true);
+    assert.deepEqual(readdirSync(target), []);
+    const state = JSON.parse(readFileSync(path.join(stateDir, "provision.lock.json"), "utf8"));
+    assert.equal(state.installed[key], undefined);
+  });
+
+  test("manifest removal preserves an empty target that won an upgrade exposure race", async () => {
+    const name = "sync-remove-lost-exposure";
+    const { key, target } = writeLostExposureJournal(name);
+    registerManifestUrl(serveManifest([]));
+
+    const view = await syncNow();
+
+    assert.equal(statusOf(view, name), "removed");
+    assert.equal(lstatSync(target).isDirectory(), true);
+    assert.deepEqual(readdirSync(target), []);
+    const state = JSON.parse(readFileSync(path.join(stateDir, "provision.lock.json"), "utf8"));
+    assert.equal(state.installed[key], undefined);
   });
 
   test("removal accepts either hash for a path shared by upgrade journal snapshots", async () => {

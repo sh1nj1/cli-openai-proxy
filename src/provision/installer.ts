@@ -577,6 +577,53 @@ function existsAsDirectory(target: string): boolean {
   }
 }
 
+function managedTreeHasExactPaths(
+  root: string,
+  files: string[],
+  directories?: string[],
+): boolean {
+  const expected = new Set<string>();
+  for (const relative of files) {
+    const parts = managedPathParts(relative);
+    if (!parts) return false;
+    expected.add(`f:${parts.join("/")}`);
+    for (let depth = 1; depth < parts.length; depth += 1) {
+      expected.add(`d:${parts.slice(0, depth).join("/")}`);
+    }
+  }
+  for (const relative of directories ?? []) {
+    const parts = managedPathParts(relative);
+    if (!parts) return false;
+    expected.add(`d:${parts.join("/")}`);
+    for (let depth = 1; depth < parts.length; depth += 1) {
+      expected.add(`d:${parts.slice(0, depth).join("/")}`);
+    }
+  }
+
+  const actual = new Set<string>();
+  try {
+    const walk = (directory: string): void => {
+      for (const entry of readdirSync(directory)) {
+	const full = path.join(directory, entry);
+	const relative = path.relative(root, full).split(path.sep).join("/");
+	const stat = lstatSync(full);
+	if (stat.isDirectory()) {
+	  actual.add(`d:${relative}`);
+	  walk(full);
+	} else if (stat.isFile()) {
+	  actual.add(`f:${relative}`);
+	} else {
+	  throw new Error("Unexpected managed entry type");
+	}
+      }
+    };
+    walk(root);
+  } catch {
+    return false;
+  }
+  return actual.size === expected.size && [...actual].every((entry) => expected.has(entry));
+}
+
 function managedPath(root: string, relative: string): string | null {
   const parts = managedPathParts(relative);
   if (!parts) return null;
@@ -588,6 +635,8 @@ function removeManagedTree(
   opts: {
     files: string[];
     directories?: string[];
+    /** Complete path sets that may legitimately own the visible root. */
+    rootPathSnapshots?: Array<{ files: string[]; directories?: string[] }>;
     fileHashes?: Record<string, string | string[]>;
     afterFileHash?: (relative: string) => void;
     /** Keep isolated inodes linked so writes through already-open descriptors survive. */
@@ -606,6 +655,16 @@ function removeManagedTree(
   recoveryFileHashes?: Record<string, string>;
 } {
   if (!existsAsDirectory(root)) return { clean: !targetExists(root) };
+
+  // An unresolved upgrade journal can outlive a lost exposure race. In that
+  // case the visible target may belong to the racing process. Never infer
+  // ownership of an otherwise-empty root from the journal alone.
+  const rootPathSnapshots = opts.rootPathSnapshots ?? [{
+    files: opts.files,
+    directories: opts.directories,
+  }];
+  const rootWasCompleteOwnedTree = rootPathSnapshots.some((snapshot) =>
+    managedTreeHasExactPaths(root, snapshot.files, snapshot.directories));
 
   const removed: string[] = [];
   let quarantine: string | undefined;
@@ -713,11 +772,13 @@ function removeManagedTree(
       if (code !== "ENOENT" && code !== "ENOTEMPTY") throw err;
     }
   }
-  try {
-    rmdirSync(root);
-  } catch (err) {
-    const code = (err as NodeJS.ErrnoException).code;
-    if (code !== "ENOENT" && code !== "ENOTEMPTY") throw err;
+  if (rootWasCompleteOwnedTree) {
+    try {
+      rmdirSync(root);
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code;
+      if (code !== "ENOENT" && code !== "ENOTEMPTY") throw err;
+    }
   }
   const rootRemoved = !targetExists(root);
   const clean = rootRemoved || (recoveryPath !== undefined
@@ -794,6 +855,7 @@ export function removeSkill(
     skillsDir: string;
     files: string[];
     directories?: string[];
+    rootPathSnapshots?: Array<{ files: string[]; directories?: string[] }>;
     fileHashes?: Record<string, string | string[]>;
     /** New identity preclaimed in the lockfile before this removal begins. */
     recoveryId?: string;
