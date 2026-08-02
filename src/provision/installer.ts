@@ -378,19 +378,23 @@ export async function installSkill(
       // content after the audit above. Delete only recorded old content, never
       // the whole tree, so anything racing cleanup remains recoverable.
       preserveStaging = true;
-      const removedPrevious = removeManagedTree(previous, {
+      const previousCleanup = removeManagedTree(previous, {
 	files: opts.managedFiles!,
 	directories: opts.managedDirectories,
 	fileHashes: opts.managedFileHashes,
 	afterFileHash: (relative) => opts.afterCleanupHash?.(previous, relative),
+	// An inode can still be writable through a descriptor opened before its
+	// rename. Retaining the isolated link is the only portable way to ensure a
+	// later write is recoverable; the hidden staging tree is therefore kept.
+	preserveIsolatedFiles: true,
       });
-      if (!removedPrevious) {
+      if (!previousCleanup.clean) {
 	throw new ProvisionError(
 	  `Upgrade completed, but content added during installation was preserved at "${previous}"`,
 	  "untracked_content",
 	);
       }
-      preserveStaging = false;
+      preserveStaging = previousCleanup.recoveryPath !== undefined;
     }
     return result;
   } finally {
@@ -460,9 +464,11 @@ function removeManagedTree(
     directories?: string[];
     fileHashes?: Record<string, string | string[]>;
     afterFileHash?: (relative: string) => void;
+    /** Keep isolated inodes linked so writes through already-open descriptors survive. */
+    preserveIsolatedFiles?: boolean;
   },
-): boolean {
-  if (!existsAsDirectory(root)) return !targetExists(root);
+): { clean: boolean; recoveryPath?: string } {
+  if (!existsAsDirectory(root)) return { clean: !targetExists(root) };
 
   const removed: string[] = [];
   let quarantine: string | undefined;
@@ -505,19 +511,21 @@ function removeManagedTree(
 	}
       }
       opts.afterFileHash?.(relative);
-      rmSync(isolated, { force: true });
+      if (!opts.preserveIsolatedFiles) rmSync(isolated, { force: true });
       removed.push(relative);
     } catch (err) {
       if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
     }
   }
 
+  let recoveryPath: string | undefined;
   if (quarantine) {
     try {
       rmdirSync(quarantine);
     } catch (err) {
       const code = (err as NodeJS.ErrnoException).code;
       if (code !== "ENOENT" && code !== "ENOTEMPTY") throw err;
+      if (code === "ENOTEMPTY") recoveryPath = quarantine;
     }
   }
   const directories = new Set<string>();
@@ -546,7 +554,10 @@ function removeManagedTree(
     const code = (err as NodeJS.ErrnoException).code;
     if (code !== "ENOENT" && code !== "ENOTEMPTY") throw err;
   }
-  return !targetExists(root);
+  const rootRemoved = !targetExists(root);
+  const clean = rootRemoved || (recoveryPath !== undefined
+    && readdirSync(root).every((entry) => path.join(root, entry) === recoveryPath));
+  return { clean, recoveryPath };
 }
 
 /** Remove only recorded regular files, leaving modified or added user content. */

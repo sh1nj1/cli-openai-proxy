@@ -2,13 +2,17 @@ import { test, describe, before, after, beforeEach, afterEach } from "node:test"
 import assert from "node:assert/strict";
 import { createHash } from "crypto";
 import {
+  closeSync,
   existsSync,
+  ftruncateSync,
   lstatSync,
   mkdirSync,
   mkdtempSync,
+  openSync,
   readdirSync,
   readFileSync,
   rmSync,
+  writeSync,
   writeFileSync,
 } from "fs";
 import { createServer, type Server } from "http";
@@ -501,6 +505,51 @@ describe("provision installer", () => {
     assert.equal(
       readFileSync(path.join(previousRoot, "SKILL.md"), "utf-8"),
       "modified after cleanup hash",
+    );
+  });
+
+  test("an upgrade preserves writes through a descriptor opened before cleanup", async () => {
+    const v1 = serve("/cleanup-open-fd-v1.tgz", makeTarGz([{ name: "SKILL.md", content: "v1" }]));
+    const previous = await installSkill(
+      { name: "demo", url: v1.url, sha256: v1.sha256 },
+      { skillsDir },
+    );
+    const v2 = serve("/cleanup-open-fd-v2.tgz", makeTarGz([{ name: "SKILL.md", content: "v2" }]));
+    let descriptor: number | undefined;
+
+    try {
+      await installSkill(
+	{ name: "demo", url: v2.url, sha256: v2.sha256 },
+	{
+	  skillsDir,
+	  managedFiles: previous.files,
+	  managedDirectories: previous.directories,
+	  managedFileHashes: previous.fileHashes,
+	  afterPreviousAudit: (previousRoot) => {
+	    descriptor = openSync(path.join(previousRoot, "SKILL.md"), "r+");
+	  },
+	  afterCleanupHash: () => {
+	    assert.notEqual(descriptor, undefined);
+	    ftruncateSync(descriptor!, 0);
+	    writeSync(descriptor!, "modified through open descriptor");
+	  },
+	},
+      );
+    } finally {
+      if (descriptor !== undefined) closeSync(descriptor);
+    }
+
+    assert.equal(readFileSync(path.join(skillsDir, "demo", "SKILL.md"), "utf-8"), "v2");
+    const preserved = readdirSync(skillsDir)
+      .filter((entry) => entry.startsWith(".provision-staging-"));
+    assert.equal(preserved.length, 1);
+    const previousRoot = path.join(skillsDir, preserved[0]!, "previous");
+    const quarantine = readdirSync(previousRoot)
+      .find((entry) => entry.startsWith(".provision-cleanup-"));
+    assert.notEqual(quarantine, undefined);
+    assert.equal(
+      readFileSync(path.join(previousRoot, quarantine!, "0"), "utf-8"),
+      "modified through open descriptor",
     );
   });
 
