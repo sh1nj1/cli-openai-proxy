@@ -104,7 +104,14 @@ export function initProvisioning(): {
       return { type: type ?? "skill", name: rest.join("/"), status: "installed" as const, sha256: record.sha256 };
     });
     const fixed = process.env.PROVISION_MANIFEST_URL?.trim();
-    if (fixed) registerManifestUrl(fixed);
+    if (fixed) {
+      registerManifestUrl(fixed);
+      // A fixed startup URL is itself a request to provision now. The interval
+      // is drift repair, not the first-run trigger (and may be disabled).
+      void syncNow().catch(() => {
+	// syncNow records lastError; startup remains available for status/retry
+      });
+    }
   }
   return { enabled, autoApply, manifestUrl };
 }

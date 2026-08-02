@@ -182,6 +182,32 @@ describe("provision sync", () => {
     assert.equal(statusOf(view, "pr-monitor"), "installed");
   });
 
+  test("approval queued during an active sync survives its stale snapshot and installs", async () => {
+    const first = serveSkill("/slow-v1.tgz", "v1");
+    registerManifestUrl(serveManifest([{ type: "skill", name: "slow", ...first }]));
+    await syncNow();
+    await approveItem("skill", "slow");
+
+    const upgrade = serveSkill("/slow-v2.tgz", "v2");
+    const target = serveSkill("/target.tgz", "target");
+    registerManifestUrl(serveManifest([
+      { type: "skill", name: "slow", ...upgrade },
+      { type: "skill", name: "target", ...target },
+    ]));
+    let release!: () => void;
+    responseGates.set("/slow-v2.tgz", new Promise<void>((resolve) => { release = resolve; }));
+
+    const active = syncNow();
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    const approval = approveItem("skill", "target");
+    release();
+    await active;
+    const view = await approval;
+
+    assert.equal(statusOf(view, "target"), "installed");
+    assert.equal(existsSync(path.join(skillsDir, "target", "SKILL.md")), true);
+  });
+
   test("PROVISION_AUTOAPPLY=auto installs without the approval stop", async () => {
     process.env.PROVISION_AUTOAPPLY = "auto";
     initProvisioning();
@@ -390,10 +416,15 @@ describe("provision sync", () => {
     assert.match(getStatus().last_error ?? "", /HTTP 404|fetch/i);
   });
 
-  test("PROVISION_MANIFEST_URL registers at init", () => {
-    process.env.PROVISION_MANIFEST_URL = `${baseUrl}/provision.json`;
+  test("PROVISION_MANIFEST_URL performs an initial sync even when refetch is disabled", async () => {
+    process.env.PROVISION_AUTOAPPLY = "auto";
+    process.env.PROVISION_REFETCH_MS = "0";
+    const skill = serveSkill("/startup.tgz", "startup");
+    process.env.PROVISION_MANIFEST_URL = serveManifest([{ type: "skill", name: "startup", ...skill }]);
     initProvisioning();
     assert.equal(getStatus().manifest_url, `${baseUrl}/provision.json`);
+    await syncNow();
+    assert.equal(existsSync(path.join(skillsDir, "startup", "SKILL.md")), true);
   });
 
   test("with no sync yet, status lists what the lockfile says is installed", async () => {
