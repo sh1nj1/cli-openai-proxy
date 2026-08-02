@@ -28,7 +28,7 @@ import { gunzipSync } from "zlib";
 import { fetchWithPolicy, readResponseBody } from "./manifest.js";
 import { managedPathParts, MAX_MANAGED_PATH_LENGTH } from "./path-policy.js";
 import { renameDirectoryNoReplace } from "./rename-no-replace.js";
-import { ProvisionError } from "./types.js";
+import { ProvisionError, type InstalledDirectoryIdentity } from "./types.js";
 
 export interface InstallResult {
   /** Installed file paths relative to the skill's directory. */
@@ -248,7 +248,10 @@ export async function installSkill(
     skillsDir: string;
     checkUrl?: (url: string) => void;
     /** Persist ownership before exposure; return an undo for a failed first-install rename. */
-    beforeCommit?: (result: InstallResult) => void | (() => void);
+    beforeCommit?: (
+      result: InstallResult,
+      candidateIdentity: InstalledDirectoryIdentity,
+    ) => void | (() => void);
     /** Random journal marker that moves atomically with a first-install candidate. */
     firstInstallMarker?: string;
     /** Existing managed paths; an upgrade must not erase additions outside this set. */
@@ -386,7 +389,10 @@ export async function installSkill(
 	mode: 0o600,
       });
     }
-    const rollbackCommit = opts.beforeCommit?.(result);
+    const rollbackCommit = opts.beforeCommit?.(result, {
+      dev: candidateIdentity.dev.toString(),
+      ino: candidateIdentity.ino.toString(),
+    });
     if (firstInstall) {
       if (targetExists(target)) {
 	rollbackCommit?.();

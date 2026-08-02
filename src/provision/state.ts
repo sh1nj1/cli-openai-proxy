@@ -106,6 +106,7 @@ const emptyState = (): ProvisionStateFile => ({ version: 1, approved: [], revoke
 const HASH_PATTERN = /^[0-9a-f]{64}$/i;
 const INSTALL_MARKER_PATTERN = /^[0-9a-f]{32}$/;
 const RECOVERY_ID_PATTERN = /^[0-9a-f]{32}$/;
+const FILESYSTEM_ID_PATTERN = /^(?:0|[1-9][0-9]*)$/;
 // Loading remains case-insensitive for lockfiles written before names became
 // lowercase-only. Installed keys retain their spelling because it identifies
 // the legacy on-disk directory; consent/tombstone keys have no path identity
@@ -160,9 +161,23 @@ function installedRecord(value: unknown): InstalledRecord | null {
   if (!stable) return null;
   const raw = value as Record<string, unknown>;
   const pending = raw.pending === undefined ? null : installedSnapshot(raw.pending);
+  const rawCandidateIdentity = raw.candidateIdentity;
+  const candidateIdentity = typeof rawCandidateIdentity === "object"
+    && rawCandidateIdentity !== null
+    && !Array.isArray(rawCandidateIdentity)
+    && typeof (rawCandidateIdentity as Record<string, unknown>).dev === "string"
+    && FILESYSTEM_ID_PATTERN.test((rawCandidateIdentity as Record<string, string>).dev)
+    && typeof (rawCandidateIdentity as Record<string, unknown>).ino === "string"
+    && FILESYSTEM_ID_PATTERN.test((rawCandidateIdentity as Record<string, string>).ino)
+    ? {
+	dev: (rawCandidateIdentity as Record<string, string>).dev,
+	ino: (rawCandidateIdentity as Record<string, string>).ino,
+      }
+    : undefined;
   return {
     ...stable,
     ...(raw.uncommitted === true ? { uncommitted: true as const } : {}),
+    ...(candidateIdentity ? { candidateIdentity } : {}),
     ...(typeof raw.installMarker === "string" && INSTALL_MARKER_PATTERN.test(raw.installMarker)
       ? { installMarker: raw.installMarker }
       : {}),

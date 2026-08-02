@@ -537,16 +537,19 @@ describe("provision sync", () => {
     assert.equal(existsSync(path.join(skillsDir, "ownership")), false);
   });
 
-  test("a restarted first-install preclaim preserves a target with a forged marker", async () => {
+  test("a restarted first-install preclaim preserves a distinct target with a replayed marker", async () => {
     process.env.PROVISION_AUTOAPPLY = "auto";
     initProvisioning();
     const name = "interrupted-first-install";
     const marker = "a".repeat(32);
     const recoveryId = "b".repeat(32);
+    const candidate = path.join(skillsDir, ".provision-candidate-interrupted");
+    mkdirSync(candidate);
+    const candidateStat = lstatSync(candidate, { bigint: true });
     const target = path.join(skillsDir, name);
     mkdirSync(target);
     writeFileSync(path.join(target, "SKILL.md"), "same path, user-owned contents");
-    writeFileSync(firstInstallMarkerPath(target, marker), "forged marker contents");
+    writeFileSync(firstInstallMarkerPath(target, marker), marker);
     const skill = serveSkill("/interrupted-first-install.tgz", "registry contents");
     writeFileSync(path.join(stateDir, "provision.lock.json"), JSON.stringify({
       version: 1,
@@ -560,6 +563,7 @@ describe("provision sync", () => {
 	  fileHashes: { "SKILL.md": sha(Buffer.from("registry contents")) },
 	  installedAt: new Date().toISOString(),
 	  uncommitted: true,
+	  candidateIdentity: { dev: candidateStat.dev.toString(), ino: candidateStat.ino.toString() },
 	  installMarker: marker,
 	  rejectionRecoveryId: recoveryId,
 	},
@@ -580,7 +584,7 @@ describe("provision sync", () => {
     );
     assert.equal(
       readFileSync(firstInstallMarkerPath(target, marker), "utf8"),
-      "forged marker contents",
+      marker,
     );
     assert.equal(existsSync(path.join(skillsDir, `.provision-rejected-${recoveryId}`)), false);
     const state = JSON.parse(readFileSync(path.join(stateDir, "provision.lock.json"), "utf8"));
@@ -622,6 +626,7 @@ describe("provision sync", () => {
     mkdirSync(target);
     writeFileSync(path.join(target, "SKILL.md"), "installed contents");
     writeFileSync(firstInstallMarkerPath(target, marker), marker);
+    const targetStat = lstatSync(target, { bigint: true });
     writeFileSync(path.join(stateDir, "provision.lock.json"), JSON.stringify({
       version: 1,
       approved: [],
@@ -630,9 +635,11 @@ describe("provision sync", () => {
 	[`skill/${name}`]: {
 	  sha256: "e".repeat(64),
 	  files: ["SKILL.md"],
+	  directories: [],
 	  fileHashes: { "SKILL.md": sha(Buffer.from("installed contents")) },
 	  installedAt: new Date().toISOString(),
 	  uncommitted: true,
+	  candidateIdentity: { dev: targetStat.dev.toString(), ino: targetStat.ino.toString() },
 	  installMarker: marker,
 	},
       },
@@ -727,7 +734,7 @@ describe("provision sync", () => {
     );
   });
 
-  test("restart isolates a changed exposed first-install journal before repair", async () => {
+  test("restart isolates added content in an exposed first-install journal before repair", async () => {
     process.env.PROVISION_AUTOAPPLY = "auto";
     const name = "restart-changed-exposure";
     const key = `skill/${name}`;
@@ -735,8 +742,10 @@ describe("provision sync", () => {
     const recoveryId = "b".repeat(32);
     const target = path.join(skillsDir, name);
     mkdirSync(target);
-    writeFileSync(path.join(target, "SKILL.md"), "changed after exposure");
+    writeFileSync(path.join(target, "SKILL.md"), "registry contents");
+    writeFileSync(path.join(target, "UNTRACKED.md"), "added after exposure");
     writeFileSync(firstInstallMarkerPath(target, marker), marker);
+    const targetStat = lstatSync(target, { bigint: true });
     const skill = serveSkill("/restart-changed-exposure.tgz", "registry contents");
     writeFileSync(path.join(stateDir, "provision.lock.json"), JSON.stringify({
       version: 1,
@@ -751,6 +760,7 @@ describe("provision sync", () => {
 	  fileHashes: { "SKILL.md": sha(Buffer.from("registry contents")) },
 	  installedAt: new Date().toISOString(),
 	  uncommitted: true,
+	  candidateIdentity: { dev: targetStat.dev.toString(), ino: targetStat.ino.toString() },
 	  installMarker: marker,
 	  rejectionRecoveryId: recoveryId,
 	},
@@ -761,7 +771,8 @@ describe("provision sync", () => {
     assert.equal(statusOf(await syncNow(), name), "installed");
     assert.equal(readFileSync(path.join(target, "SKILL.md"), "utf8"), "registry contents");
     const recovery = path.join(skillsDir, `.provision-rejected-${recoveryId}`);
-    assert.equal(readFileSync(path.join(recovery, "SKILL.md"), "utf8"), "changed after exposure");
+    assert.equal(readFileSync(path.join(recovery, "SKILL.md"), "utf8"), "registry contents");
+    assert.equal(readFileSync(path.join(recovery, "UNTRACKED.md"), "utf8"), "added after exposure");
     const state = JSON.parse(readFileSync(path.join(stateDir, "provision.lock.json"), "utf8"));
     assert.deepEqual(state.upgradeRecoveries, [recoveryId]);
     assert.equal(state.installed[key].uncommitted, undefined);

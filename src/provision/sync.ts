@@ -43,6 +43,7 @@ import {
   SUPPORTED_PROVISION_TYPES,
   type ProvisionItemStatus,
   type InstalledRecord,
+  type InstalledDirectoryIdentity,
   type InstalledSnapshot,
   type ProvisionManifest,
   type ProvisionStateFile,
@@ -330,12 +331,42 @@ function stableSnapshot(record: InstalledRecord): InstalledSnapshot {
   const {
     pending: _pending,
     uncommitted: _uncommitted,
+    candidateIdentity: _candidateIdentity,
     installMarker: _installMarker,
     rejectionRecoveryId: _rejectionRecoveryId,
     removalRecoveryId: _removalRecoveryId,
     ...stable
   } = record;
   return stable;
+}
+
+function targetMatchesCandidateIdentity(
+  name: string,
+  expected: InstalledDirectoryIdentity | undefined,
+): boolean {
+  if (expected === undefined) return false;
+  try {
+    const stat = lstatSync(path.join(skillsDir(), name), { bigint: true });
+    return stat.isDirectory()
+      && stat.dev.toString() === expected.dev
+      && stat.ino.toString() === expected.ino;
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") return false;
+    throw err;
+  }
+}
+
+function firstInstallRecordMatchesEntireTree(name: string, record: InstalledRecord): boolean {
+  if (record.installMarker === undefined) return installedRecordMatchesEntireTree(name, record);
+  const marker = `.provision-install-${record.installMarker}`;
+  return installedRecordMatchesEntireTree(name, {
+    ...record,
+    files: [...record.files, marker],
+    fileHashes: {
+      ...record.fileHashes,
+      [marker]: createHash("sha256").update(record.installMarker).digest("hex"),
+    },
+  });
 }
 
 function firstInstallMarkerStatus(
@@ -359,15 +390,12 @@ function reconcileFirstInstallJournals(state: ProvisionStateFile): Set<string> {
   for (const [key, record] of Object.entries(state.installed)) {
     if (!record.uncommitted) continue;
     const name = key.slice(key.indexOf("/") + 1);
-    const markerStatus = record.installMarker === undefined
-      ? "missing"
-      : firstInstallMarkerStatus(name, record.installMarker);
-    const exposed = markerStatus === "matching"
-      && installedRecordIntact(name, record);
+    const originalCandidateIsTarget = targetMatchesCandidateIdentity(name, record.candidateIdentity);
+    const exposed = originalCandidateIsTarget && firstInstallRecordMatchesEntireTree(name, record);
     if (!exposed) {
-      // Only the journal's exact marker proves the preclaimed candidate reached
-      // the canonical target; a missing or changed marker may be user-owned.
-      if (markerStatus === "matching" && record.rejectionRecoveryId !== undefined) {
+      // A readable marker can be replayed by another same-UID process. Only the
+      // original staged directory identity authorizes moving a rejected target.
+      if (originalCandidateIsTarget && record.rejectionRecoveryId !== undefined) {
 	isolateRejectedCandidate(
 	  path.join(skillsDir(), name),
 	  name,
@@ -380,6 +408,7 @@ function reconcileFirstInstallJournals(state: ProvisionStateFile): Set<string> {
     } else {
       const next = { ...record };
       delete next.uncommitted;
+      delete next.candidateIdentity;
       delete next.rejectionRecoveryId;
       state.installed[key] = next;
     }
@@ -741,7 +770,7 @@ async function runSync(generation: number): Promise<ProvisionStatusView> {
 	    ...rejectedCandidateRecovery,
 	    firstInstallMarker,
 	    afterFirstInstallMove,
-	    beforeCommit: (candidate) => {
+	    beforeCommit: (candidate, candidateIdentity) => {
 	      const candidateRecord: InstalledSnapshot = {
 		sha256: item.sha256!,
 		files: candidate.files,
@@ -754,6 +783,7 @@ async function runSync(generation: number): Promise<ProvisionStatusView> {
 		: {
 		  ...candidateRecord,
 		  uncommitted: true,
+		  candidateIdentity,
 		  installMarker: firstInstallMarker,
 		  rejectionRecoveryId: rejectedCandidateRecovery.rejectionRecoveryId,
 		};

@@ -51,17 +51,26 @@ export interface InstalledSnapshot {
   installedAt: string;
 }
 
+/** Durable identity of the staged directory that a first install may expose. */
+export interface InstalledDirectoryIdentity {
+  /** Decimal filesystem device identifier from lstat(2). */
+  dev: string;
+  /** Decimal filesystem inode identifier from lstat(2). */
+  ino: string;
+}
+
 /** One installed artifact as the lockfile records it. */
 export interface InstalledRecord extends InstalledSnapshot {
   /**
-   * First-install ownership written before exposure. Recovery uses the random
-   * installMarker to decide whether the candidate rename completed.
+   * First-install ownership written before exposure. Recovery accepts only the
+   * original staged directory identity at the canonical target.
    */
   uncommitted?: true;
+  /** Physical identity of the original staged directory, captured before exposure. */
+  candidateIdentity?: InstalledDirectoryIdentity;
   /**
-   * Random marker placed in the candidate before its first atomic exposure.
-   * Its presence after restart distinguishes an exposed install from a
-   * preclaim whose rename never ran.
+   * Random marker placed in the candidate and removed after ownership commits.
+   * It is lifecycle metadata, not ownership evidence: its value is readable.
    */
   installMarker?: string;
   /** Rejected-candidate recovery preclaimed before the first install is exposed. */
