@@ -19,7 +19,11 @@
  */
 
 import { randomUUID } from "crypto";
-import { TRUST_COMPLETION_CALLERS_VAR, trustsCompletionCallers } from "../config.js";
+import {
+  getAuthSessionTtlMs,
+  TRUST_COMPLETION_CALLERS_VAR,
+  trustsCompletionCallers,
+} from "../config.js";
 import { handleAuthorizedSession } from "../provision/sync.js";
 import { resolveEngine } from "./registry.js";
 import { setCredential } from "./token-store.js";
@@ -71,8 +75,6 @@ interface SessionRecord extends Omit<SessionView, "expiresAt"> {
   submitting: boolean;
 }
 
-const DEFAULT_TTL_MS = 10 * 60_000;
-
 const byId = new Map<string, SessionRecord>();
 const byEngine = new Map<string, string>();
 
@@ -87,11 +89,6 @@ const byEngine = new Map<string, string>();
  * makes the one-session-per-engine invariant hold DURING start, not just after.
  */
 const starting = new Map<string, { handle: EngineAuthSession }>();
-
-function ttlMs(): number {
-  const raw = Number(process.env.AUTH_SESSION_TTL_MS);
-  return Number.isFinite(raw) && raw > 0 ? raw : DEFAULT_TTL_MS;
-}
 
 function view(record: SessionRecord): SessionView {
   const {
@@ -201,11 +198,12 @@ export async function createSession(
   }
 
   const sessionId = randomUUID();
-  const expiresAt = Date.now() + ttlMs();
+  const sessionTtlMs = getAuthSessionTtlMs();
+  const expiresAt = Date.now() + sessionTtlMs;
   const timer = setTimeout(() => {
     const record = byId.get(sessionId);
     if (record) dispose(record, "failed");
-  }, ttlMs());
+  }, sessionTtlMs);
   // Do not hold the event loop open for a pending login.
   timer.unref?.();
 

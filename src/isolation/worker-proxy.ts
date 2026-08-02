@@ -4,7 +4,7 @@ import { mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } 
 import path from "node:path";
 import type { Request, Response } from "express";
 import { v7 as uuidv7 } from "uuid";
-import { getWorkerConnectTimeoutMs } from "../config.js";
+import { getAuthSessionTtlMs, getWorkerConnectTimeoutMs } from "../config.js";
 import { checkUrlAllowed, getAllowlist } from "../provision/manifest.js";
 import { provisionStateDir } from "../provision/state.js";
 import { requestIdentity } from "./request-identity.js";
@@ -49,6 +49,7 @@ interface IssuedProvisioningBinding {
   urlHash: string;
   accountName: string;
   engine: string;
+  expiresAt: number;
   sessionId?: string;
 }
 
@@ -100,8 +101,14 @@ function loadIssuedProvisioningState(file: string): IssuedProvisioningState {
       const generation = decodeProvisioningGeneration(
 	typeof binding.generation === "string" ? binding.generation : undefined,
       );
+      const expiresAt = typeof binding.expiresAt === "number" && Number.isFinite(binding.expiresAt)
+	? binding.expiresAt
+	: generation
+	  ? provisioningGenerationTimestamp(generation) + getAuthSessionTtlMs() + getWorkerConnectTimeoutMs()
+	  : 0;
       if (
 	!generation
+	|| expiresAt <= Date.now()
 	|| typeof binding.urlHash !== "string"
 	|| !/^[0-9a-f]{64}$/.test(binding.urlHash)
 	|| typeof binding.accountName !== "string"
@@ -122,6 +129,7 @@ function loadIssuedProvisioningState(file: string): IssuedProvisioningState {
 	urlHash: binding.urlHash,
 	accountName: binding.accountName,
 	engine: binding.engine,
+	expiresAt,
 	...(typeof binding.sessionId === "string" ? { sessionId: binding.sessionId } : {}),
       });
       if (!latestGeneration || generation > latestGeneration) latestGeneration = generation;
@@ -411,12 +419,20 @@ export class UserWorkerProxy {
       urlHash: provisioningUrlHash(options.url),
       accountName: options.accountName,
       engine: options.engine,
+      expiresAt: Date.now() + getAuthSessionTtlMs() + this.connectTimeoutMs,
     };
     const previousBindings = new Map(this.issuedProvisioningBindings);
-    this.issuedProvisioningBindings.set(generation, binding);
-    while (this.issuedProvisioningBindings.size > MAX_ISSUED_BINDINGS) {
-      this.issuedProvisioningBindings.delete(this.issuedProvisioningBindings.keys().next().value!);
+    const now = Date.now();
+    for (const [issued, existing] of this.issuedProvisioningBindings) {
+      if (existing.expiresAt <= now) this.issuedProvisioningBindings.delete(issued);
     }
+    if (this.issuedProvisioningBindings.size >= MAX_ISSUED_BINDINGS) {
+      throw new WorkerIsolationError(
+	"Provisioning session binding capacity exhausted",
+	"worker_unavailable",
+      );
+    }
+    this.issuedProvisioningBindings.set(generation, binding);
     // Issuance and its authority boundary must survive restarts before the
     // generation is disclosed to the worker.
     try {
@@ -441,15 +457,26 @@ export class UserWorkerProxy {
   ): boolean {
     if (this.issuedProvisioningBindings.get(binding.generation) !== binding) return false;
     let sessionId: unknown;
+    let expiresAt: number;
     try {
-      sessionId = (JSON.parse(responseBody.toString("utf8")) as Record<string, unknown>).sessionId;
+      const response = JSON.parse(responseBody.toString("utf8")) as Record<string, unknown>;
+      sessionId = response.sessionId;
+      expiresAt = Date.parse(typeof response.expiresAt === "string" ? response.expiresAt : "");
     } catch {
       return false;
     }
-    if (typeof sessionId !== "string" || sessionId.length === 0 || sessionId.length > 256 || sessionId.includes("/")) {
+    if (
+      typeof sessionId !== "string"
+      || sessionId.length === 0
+      || sessionId.length > 256
+      || sessionId.includes("/")
+      || !Number.isFinite(expiresAt)
+      || expiresAt <= Date.now()
+      || expiresAt > binding.expiresAt
+    ) {
       return false;
     }
-    const finalized = { ...binding, sessionId };
+    const finalized = { ...binding, sessionId, expiresAt };
     this.issuedProvisioningBindings.set(binding.generation, finalized);
     try {
       saveIssuedProvisioningState(issuedGenerationStateFile(this.generationStateFile), {
@@ -474,6 +501,7 @@ export class UserWorkerProxy {
     const session = authSessionResource(requestPath);
     if (
       !binding?.sessionId
+	|| binding.expiresAt <= Date.now()
       || !session
       || binding.accountName !== accountName
       || binding.engine !== session.engine

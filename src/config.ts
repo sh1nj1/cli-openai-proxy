@@ -12,6 +12,7 @@ export const DEFAULT_TIMEOUT_MS = 0;
 // to finish at 10 minutes by default, then exits — cutting off longer runs.
 // 0 = wait until subagents finish (no ceiling).
 export const DEFAULT_BG_WAIT_CEILING_MS = 0;
+export const DEFAULT_AUTH_SESSION_TTL_MS = 10 * 60_000;
 
 const KEEPALIVE_INTERVAL_MS = 15000;
 export { KEEPALIVE_INTERVAL_MS };
@@ -150,4 +151,9 @@ export function getWorkerConnectTimeoutMs(): number {
   if (!raw) return 15_000;
   const parsed = Number.parseInt(raw, 10);
   return Number.isFinite(parsed) && parsed > 0 ? parsed : 15_000;
+}
+
+export function getAuthSessionTtlMs(): number {
+  const raw = Number(process.env.AUTH_SESSION_TTL_MS);
+  return Number.isFinite(raw) && raw > 0 ? raw : DEFAULT_AUTH_SESSION_TTL_MS;
 }

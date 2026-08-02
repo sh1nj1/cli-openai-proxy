@@ -34,6 +34,7 @@ afterEach(() => {
     "USER_WORKER_MODE",
     "PROVISION_ALLOWLIST",
     "PROVISION_SYNC",
+    "AUTH_SESSION_TTL_MS",
   ]) {
     delete process.env[name];
   }
@@ -61,6 +62,7 @@ async function seedIssuedBinding(
       accountName: binding.accountName ?? "cap_0123456789abcdef0123",
       engine: binding.engine ?? "fake",
       sessionId: binding.sessionId,
+      expiresAt: Date.now() + 600_000,
     }],
   }));
 }
@@ -225,7 +227,11 @@ test("gateway withholds a successful provisioning session when its binding canno
     await mkdir(`${generationStateFile}.issued`);
     workerSessionCreated = true;
     response.writeHead(201, { "content-type": "application/json" });
-    response.end(JSON.stringify({ sessionId: "unbound-session", status: "pending" }));
+    response.end(JSON.stringify({
+      sessionId: "unbound-session",
+      status: "pending",
+      expiresAt: new Date(Date.now() + 600_000).toISOString(),
+    }));
   });
   await new Promise<void>((resolve) => worker.listen(socketPath, resolve));
 
@@ -275,6 +281,116 @@ test("gateway withholds a successful provisioning session when its binding canno
   }
 });
 
+test("gateway preserves live provisioning bindings and reuses only expired capacity", async () => {
+  const socketPath = `/tmp/cap-worker-${randomUUID().slice(0, 8)}.sock`;
+  const generationStateFile = `/tmp/cap-generation-${randomUUID().slice(0, 8)}.state`;
+  const manifestUrl = "https://collavre.test/agents/vrex/provision.json";
+  const liveExpiresAt = Date.now() + 600_000;
+  const bindings = Array.from({ length: 512 }, (_, index) => ({
+    generation: `019865f4-50d6-7000-8000-${index.toString(16).padStart(12, "0")}`,
+    urlHash: provisioningUrlHash(manifestUrl),
+    accountName: "cap_0123456789abcdef0123",
+    engine: "fake",
+    sessionId: `session-${index}`,
+    expiresAt: liveExpiresAt,
+  }));
+  await writeFile(`${generationStateFile}.issued`, JSON.stringify({
+    version: 1,
+    latestGeneration: bindings.at(-1)!.generation,
+    bindings,
+  }));
+
+  let workerRequests = 0;
+  const worker = http.createServer((_request, response) => {
+    workerRequests += 1;
+    response.writeHead(201, { "content-type": "application/json" });
+    response.end(JSON.stringify({
+      sessionId: "new-session",
+      status: "pending",
+      expiresAt: new Date(Date.now() + 600_000).toISOString(),
+    }));
+  });
+  await new Promise<void>((resolve) => worker.listen(socketPath, resolve));
+
+  const provisioner: WorkerProvisioner = {
+    async ensureWorker() {
+      return {
+	accountName: "cap_0123456789abcdef0123",
+	endpoint: { kind: "unix", address: socketPath },
+      };
+    },
+  };
+  process.env.USER_API_KEYS = JSON.stringify([
+    { key: "user-key-12345678", tenantId: "tenant-a", userId: "user-a" },
+  ]);
+  process.env.AUTH_ADMIN_KEYS = "admin-key-123456";
+  process.env.PROVISION_SYNC = "1";
+  const headers = {
+    authorization: "Bearer admin-key-123456",
+    "content-type": "application/json",
+    "x-cli-proxy-user-key": "user-key-12345678",
+  };
+  let gateway: http.Server | undefined;
+  const startGateway = async () => {
+    gateway = createApp({
+      userWorkerProxy: new UserWorkerProxy(provisioner, 30_000, generationStateFile),
+      onAuthorizedProvisioningUrl: () => {},
+    }).listen(0);
+    await new Promise<void>((resolve) => gateway!.once("listening", resolve));
+    return (gateway.address() as AddressInfo).port;
+  };
+  const stopGateway = async () => {
+    if (gateway) await new Promise<void>((resolve) => gateway!.close(() => resolve()));
+    gateway = undefined;
+  };
+
+  try {
+    let port = await startGateway();
+    const atCapacity = await fetch(`http://127.0.0.1:${port}/v1/auth/fake/sessions`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ provisioning_url: manifestUrl }),
+    });
+    assert.equal(atCapacity.status, 503);
+    assert.equal(workerRequests, 0, "capacity must be reserved before forwarding a create");
+    await stopGateway();
+
+    const stored = JSON.parse(await readFile(`${generationStateFile}.issued`, "utf8")) as {
+      bindings: Array<{ generation: string; expiresAt: number }>;
+    };
+    assert.equal(stored.bindings.length, 512);
+    assert.equal(stored.bindings[0]!.generation, bindings[0]!.generation);
+    stored.bindings[0]!.expiresAt = Date.now() - 1;
+    await writeFile(`${generationStateFile}.issued`, JSON.stringify({
+      version: 1,
+      latestGeneration: bindings.at(-1)!.generation,
+      bindings: stored.bindings,
+    }));
+
+    port = await startGateway();
+    const afterExpiry = await fetch(`http://127.0.0.1:${port}/v1/auth/fake/sessions`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ provisioning_url: manifestUrl }),
+    });
+    assert.equal(afterExpiry.status, 201);
+    assert.equal(workerRequests, 1);
+    await afterExpiry.arrayBuffer();
+    const after = JSON.parse(await readFile(`${generationStateFile}.issued`, "utf8")) as {
+      bindings: Array<{ generation: string }>;
+    };
+    assert.equal(after.bindings.length, 512);
+    assert.equal(after.bindings.some(({ generation }) => generation === bindings[0]!.generation), false);
+    assert.equal(after.bindings.some(({ generation }) => generation === bindings[1]!.generation), true);
+  } finally {
+    await stopGateway();
+    await new Promise<void>((resolve) => worker.close(() => resolve()));
+    await rm(socketPath, { force: true });
+    await rm(generationStateFile, { force: true });
+    await rm(`${generationStateFile}.issued`, { force: true });
+  }
+});
+
 test("disabled provisioning ignores auth URLs without writing generation state", async () => {
   const result = await forwardAuthCreateWithBlockedGenerationState({
     provisioningEnabled: false,
@@ -309,7 +425,11 @@ test("unaccepted and pending provisioning sessions do not supersede retained not
       }
       acceptedGeneration = generation;
       response.writeHead(201, { "content-type": "application/json" });
-      response.end(JSON.stringify({ sessionId: "accepted", status: "pending" }));
+      response.end(JSON.stringify({
+	sessionId: "accepted",
+	status: "pending",
+	expiresAt: new Date(Date.now() + 600_000).toISOString(),
+      }));
       return;
     }
     response.writeHead(200, {
@@ -403,7 +523,11 @@ test("a policy-rejected provisioning URL does not supersede retained notificatio
     if (request.method === "POST") {
       rejectedGeneration = request.headers[PROVISIONING_GENERATION_HEADER] as string | undefined;
       response.writeHead(201, { "content-type": "application/json" });
-      response.end(JSON.stringify({ sessionId: "rejected", status: "pending" }));
+      response.end(JSON.stringify({
+	sessionId: "rejected",
+	status: "pending",
+	expiresAt: new Date(Date.now() + 600_000).toISOString(),
+      }));
       return;
     }
     const invalidNotification = request.url?.endsWith("/rejected") ?? false;
@@ -483,7 +607,11 @@ test("gateway consumes a worker provisioning notification without exposing its p
     if (request.method === "POST") {
       generation = request.headers[PROVISIONING_GENERATION_HEADER] as string | undefined;
       response.writeHead(201, { "content-type": "application/json" });
-      response.end(JSON.stringify({ sessionId: "session-1", status: "pending" }));
+      response.end(JSON.stringify({
+	sessionId: "session-1",
+	status: "pending",
+	expiresAt: new Date(Date.now() + 600_000).toISOString(),
+      }));
       return;
     }
     response.writeHead(200, {
@@ -561,7 +689,11 @@ test("gateway rejects worker notifications outside their issued URL, worker, and
       issuedGeneration = request.headers[PROVISIONING_GENERATION_HEADER] as string | undefined;
       responseGeneration = issuedGeneration;
       response.writeHead(201, { "content-type": "application/json" });
-      response.end(JSON.stringify({ sessionId: "session-1", status: "pending" }));
+      response.end(JSON.stringify({
+	sessionId: "session-1",
+	status: "pending",
+	expiresAt: new Date(Date.now() + 600_000).toISOString(),
+      }));
       return;
     }
     response.writeHead(200, {
@@ -650,7 +782,11 @@ test("gateway persists issued and authorized notification ordering separately ac
       const sessionId = created++ === 0 ? "session-a" : "session-b";
       generations.set(sessionId, String(request.headers[PROVISIONING_GENERATION_HEADER]));
       response.writeHead(201, { "content-type": "application/json" });
-      response.end(JSON.stringify({ sessionId, status: "pending" }));
+      response.end(JSON.stringify({
+	sessionId,
+	status: "pending",
+	expiresAt: new Date(Date.now() + 600_000).toISOString(),
+      }));
       return;
     }
     const sessionId = request.url?.split("/").at(-1) ?? "";
