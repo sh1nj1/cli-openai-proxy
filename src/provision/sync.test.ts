@@ -530,11 +530,13 @@ describe("provision sync", () => {
 	"skill/recover-upgrade": {
 	  sha256: "a".repeat(64),
 	  files: ["OLD.md"],
+	  directories: [],
 	  fileHashes: { "OLD.md": sha(Buffer.from("old contents")) },
 	  installedAt: new Date().toISOString(),
 	  pending: {
 	    sha256: candidateSha,
 	    files: ["NEW.md"],
+	    directories: [],
 	    fileHashes: { "NEW.md": sha(Buffer.from("new contents")) },
 	    installedAt: new Date().toISOString(),
 	  },
@@ -556,6 +558,56 @@ describe("provision sync", () => {
     const state = JSON.parse(readFileSync(path.join(stateDir, "provision.lock.json"), "utf8"));
     assert.equal(state.installed["skill/recover-upgrade"].sha256, candidateSha);
     assert.equal(state.installed["skill/recover-upgrade"].pending, undefined);
+  });
+
+  test("an upgrade candidate subset does not impersonate the stable tree during recovery", async () => {
+    process.env.PROVISION_AUTOAPPLY = "auto";
+    initProvisioning();
+    const target = path.join(skillsDir, "recover-subset-upgrade");
+    mkdirSync(target);
+    writeFileSync(path.join(target, "SKILL.md"), "shared contents");
+    writeFileSync(path.join(target, "OLD.md"), "old contents");
+    const candidate = serveSkill("/recover-subset-upgrade.tgz", "shared contents");
+    writeFileSync(path.join(stateDir, "provision.lock.json"), JSON.stringify({
+      version: 1,
+      approved: ["skill/recover-subset-upgrade"],
+      revoked: [],
+      installed: {
+	"skill/recover-subset-upgrade": {
+	  sha256: "a".repeat(64),
+	  files: ["SKILL.md", "OLD.md"],
+	  directories: [],
+	  fileHashes: {
+	    "SKILL.md": sha(Buffer.from("shared contents")),
+	    "OLD.md": sha(Buffer.from("old contents")),
+	  },
+	  installedAt: new Date().toISOString(),
+	  pending: {
+	    sha256: candidate.sha256,
+	    files: ["SKILL.md"],
+	    directories: [],
+	    fileHashes: { "SKILL.md": sha(Buffer.from("shared contents")) },
+	    installedAt: new Date().toISOString(),
+	  },
+	},
+      },
+    }));
+    initProvisioning();
+    registerManifestUrl(serveManifest([{
+      type: "skill",
+      name: "recover-subset-upgrade",
+      ...candidate,
+    }]));
+
+    const view = await syncNow();
+
+    assert.equal(statusOf(view, "recover-subset-upgrade"), "installed");
+    assert.equal(readFileSync(path.join(target, "SKILL.md"), "utf8"), "shared contents");
+    assert.equal(existsSync(path.join(target, "OLD.md")), false);
+    const state = JSON.parse(readFileSync(path.join(stateDir, "provision.lock.json"), "utf8"));
+    assert.equal(state.installed["skill/recover-subset-upgrade"].sha256, candidate.sha256);
+    assert.deepEqual(state.installed["skill/recover-subset-upgrade"].files, ["SKILL.md"]);
+    assert.equal(state.installed["skill/recover-subset-upgrade"].pending, undefined);
   });
 
   test("removal after an interrupted upgrade recognizes candidate-owned files", async () => {

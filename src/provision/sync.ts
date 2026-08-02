@@ -14,7 +14,7 @@
  */
 
 import { createHash, randomBytes } from "crypto";
-import { existsSync, lstatSync, readFileSync, unlinkSync } from "fs";
+import { existsSync, lstatSync, readdirSync, readFileSync, unlinkSync } from "fs";
 import { homedir } from "os";
 import path from "path";
 import { takeProxySecret } from "../config.js";
@@ -216,6 +216,37 @@ function installedRecordIntact(name: string, record: InstalledSnapshot): boolean
   }
 }
 
+function installedRecordMatchesEntireTree(name: string, record: InstalledSnapshot): boolean {
+  if (!installedRecordIntact(name, record) || record.directories === undefined) return false;
+  const root = path.join(skillsDir(), name);
+  const expected = new Set([
+    ...record.files.map((relative) => `f:${relative}`),
+    ...record.directories.map((relative) => `d:${relative}`),
+  ]);
+  const actual = new Set<string>();
+  try {
+    const walk = (directory: string): void => {
+      for (const entry of readdirSync(directory)) {
+	const full = path.join(directory, entry);
+	const relative = path.relative(root, full).split(path.sep).join("/");
+	const stat = lstatSync(full);
+	if (stat.isDirectory()) {
+	  actual.add(`d:${relative}`);
+	  walk(full);
+	} else if (stat.isFile()) {
+	  actual.add(`f:${relative}`);
+	} else {
+	  throw new Error("Unexpected managed entry type");
+	}
+      }
+    };
+    walk(root);
+  } catch {
+    return false;
+  }
+  return actual.size === expected.size && [...actual].every((entry) => expected.has(entry));
+}
+
 function stableSnapshot(record: InstalledRecord): InstalledSnapshot {
   const {
     pending: _pending,
@@ -346,8 +377,8 @@ function reconcileUpgradeJournal(name: string, record: InstalledRecord): Install
   // A crash can leave either side of the swap visible. Whichever complete
   // snapshot is on disk becomes stable; if neither is intact, retain both
   // ownership sets so the next install/removal can recover safely.
-  if (installedRecordIntact(name, record.pending)) return { ...record.pending };
-  if (installedRecordIntact(name, record)) return { ...stableSnapshot(record) };
+  if (installedRecordMatchesEntireTree(name, record.pending)) return { ...record.pending };
+  if (installedRecordMatchesEntireTree(name, record)) return { ...stableSnapshot(record) };
   return record;
 }
 
