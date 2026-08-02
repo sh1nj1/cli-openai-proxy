@@ -197,8 +197,12 @@ export async function installSkill(
     managedFiles?: string[];
     /** Existing managed directories; omitted for legacy lockfiles that did not track them. */
     managedDirectories?: string[];
+    /** Accepted hashes for existing managed files, including either journal snapshot. */
+    managedFileHashes?: Record<string, string | string[]>;
     /** Test seam for deterministically exercising restoration races. */
     afterPreviousMove?: () => void;
+    /** Test seam for an addition made after the moved-aside tree passes its audit. */
+    afterPreviousAudit?: (previousRoot: string) => void;
   },
 ): Promise<InstallResult> {
   if (!NAME_PATTERN.test(item.name)) {
@@ -322,6 +326,7 @@ export async function installSkill(
 	"untracked_content",
       );
     }
+    if (hadPrevious) opts.afterPreviousAudit?.(previous);
     try {
       renameSync(root, target);
     } catch (err) {
@@ -342,6 +347,24 @@ export async function installSkill(
 	}
       }
       throw err;
+    }
+    if (hadPrevious) {
+      // A process with an open descriptor to the moved directory can still add
+      // content after the audit above. Delete only recorded old content, never
+      // the whole tree, so anything racing cleanup remains recoverable.
+      preserveStaging = true;
+      const removedPrevious = removeManagedTree(previous, {
+	files: opts.managedFiles!,
+	directories: opts.managedDirectories,
+	fileHashes: opts.managedFileHashes,
+      });
+      if (!removedPrevious) {
+	throw new ProvisionError(
+	  `Upgrade completed, but content added during installation was preserved at "${previous}"`,
+	  "untracked_content",
+	);
+      }
+      preserveStaging = false;
     }
     return result;
   } finally {
@@ -404,21 +427,15 @@ function managedPath(root: string, relative: string): string | null {
   return path.join(root, ...parts);
 }
 
-/** Remove only recorded regular files, leaving modified or added user content. */
-export function removeSkill(
-  name: string,
+function removeManagedTree(
+  root: string,
   opts: {
-    skillsDir: string;
     files: string[];
     directories?: string[];
-    fileHashes?: Record<string, string>;
+    fileHashes?: Record<string, string | string[]>;
   },
-): void {
-  if (!NAME_PATTERN.test(name)) {
-    throw new ProvisionError(`Invalid skill name "${name}"`, "invalid_item");
-  }
-  const root = path.join(opts.skillsDir, name);
-  if (!existsAsDirectory(root)) return;
+): boolean {
+  if (!existsAsDirectory(root)) return !targetExists(root);
 
   const removable: Array<{ file: string; relative: string }> = [];
   for (const relative of opts.files) {
@@ -444,7 +461,8 @@ export function removeSkill(
       const expected = opts.fileHashes?.[relative];
       if (expected) {
 	const actual = createHash("sha256").update(readFileSync(file)).digest("hex");
-	if (actual !== expected) continue;
+	const accepted = Array.isArray(expected) ? expected : [expected];
+	if (!accepted.includes(actual)) continue;
       }
       removable.push({ file, relative });
     } catch (err) {
@@ -479,4 +497,21 @@ export function removeSkill(
     const code = (err as NodeJS.ErrnoException).code;
     if (code !== "ENOENT" && code !== "ENOTEMPTY") throw err;
   }
+  return !targetExists(root);
+}
+
+/** Remove only recorded regular files, leaving modified or added user content. */
+export function removeSkill(
+  name: string,
+  opts: {
+    skillsDir: string;
+    files: string[];
+    directories?: string[];
+    fileHashes?: Record<string, string>;
+  },
+): void {
+  if (!NAME_PATTERN.test(name)) {
+    throw new ProvisionError(`Invalid skill name "${name}"`, "invalid_item");
+  }
+  removeManagedTree(path.join(opts.skillsDir, name), opts);
 }

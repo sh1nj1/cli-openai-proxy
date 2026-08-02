@@ -298,6 +298,18 @@ async function runSync(): Promise<ProvisionStatusView> {
 	  ...(previousRecord.pending?.directories ?? []),
 	])]
 	: undefined;
+      const managedFileHashes: Record<string, string[]> | undefined = previousRecord
+	? {}
+	: undefined;
+      if (managedFileHashes && previousRecord) {
+	for (const snapshot of [previousRecord, previousRecord.pending]) {
+	  for (const [file, hash] of Object.entries(snapshot?.fileHashes ?? {})) {
+	    const accepted = managedFileHashes[file] ?? [];
+	    if (!accepted.includes(hash)) accepted.push(hash);
+	    managedFileHashes[file] = accepted;
+	  }
+	}
+      }
       const result = await installSkill(
         { name: item.name, url: item.url!, sha256: item.sha256! },
 	{
@@ -305,6 +317,7 @@ async function runSync(): Promise<ProvisionStatusView> {
 	  checkUrl,
 	  managedFiles,
 	  managedDirectories,
+	  managedFileHashes,
 	  beforeCommit: (candidate) => {
 	    const candidateRecord: InstalledSnapshot = {
 	      sha256: item.sha256!,
