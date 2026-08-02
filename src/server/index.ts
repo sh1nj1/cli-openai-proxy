@@ -30,7 +30,7 @@ import {
 } from "./provision-routes.js";
 import { getTimeoutMs } from "../config.js";
 import { resetSessions } from "../auth/session-manager.js";
-import { initProvisioning, resetProvisioning } from "../provision/sync.js";
+import { handleAuthorizedSession, initProvisioning, resetProvisioning } from "../provision/sync.js";
 import { initRequestIdentity, requireRequestIdentity } from "../isolation/request-identity.js";
 import type { UserWorkerProxy } from "../isolation/worker-proxy.js";
 
@@ -45,6 +45,8 @@ export interface ServerConfig {
 export interface AppConfig {
   role?: "gateway" | "worker";
   userWorkerProxy?: UserWorkerProxy;
+  /** Test seam; production defaults to the gateway-owned provisioning engine. */
+  onAuthorizedProvisioningUrl?: (url: string) => void | Promise<void>;
 }
 
 let serverInstance: Server | null = null;
@@ -71,6 +73,8 @@ export function createApp(config: AppConfig = {}): Express {
   const app = express();
   const role = config.role ?? "gateway";
   const userWorkerProxy = config.userWorkerProxy;
+  const onAuthorizedProvisioningUrl = config.onAuthorizedProvisioningUrl ?? handleAuthorizedSession;
+  app.locals.cliProxyRole = role;
 
   if (role === "gateway") {
     // Identity mappings must initialize first: mapped user keys are also valid
@@ -170,7 +174,7 @@ export function createApp(config: AppConfig = {}): Express {
     if (!userWorkerProxy) return [handler];
     return [
       (req, res) => {
-        void userWorkerProxy.forward(req, res);
+	void userWorkerProxy.forward(req, res, onAuthorizedProvisioningUrl);
       },
     ];
   };

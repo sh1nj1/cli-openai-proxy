@@ -56,6 +56,8 @@ interface SessionRecord extends Omit<SessionView, "expiresAt"> {
    * request to carry it.
    */
   provisioningUrl?: string;
+  /** Prevent repeated device-code polls from notifying the gateway repeatedly. */
+  provisioningNotificationTaken: boolean;
   /**
    * Set for the duration of submit(). Not part of SessionView: the session is
    * still "pending" to an observer — nothing has been decided yet — and this only
@@ -214,6 +216,7 @@ export async function createSession(
     timer,
     submitting: false,
     provisioningUrl: opts.provisioningUrl,
+    provisioningNotificationTaken: false,
   };
   byId.set(sessionId, record);
   byEngine.set(engine, sessionId);
@@ -319,6 +322,19 @@ export async function submitSession(
 
 export function getSession(engine: string, sessionId: string): SessionView {
   return view(requireSession(engine, sessionId));
+}
+
+/** Read before submit() disposes a paste-code/API-key session. */
+export function getSessionProvisioningUrl(engine: string, sessionId: string): string | undefined {
+  return requireSession(engine, sessionId).provisioningUrl;
+}
+
+/** Return a completed device-code session's URL once, for worker-to-gateway notification. */
+export function takeAuthorizedProvisioningUrl(engine: string, sessionId: string): string | undefined {
+  const record = requireSession(engine, sessionId);
+  if (record.status !== "authorized" || record.provisioningNotificationTaken) return undefined;
+  record.provisioningNotificationTaken = true;
+  return record.provisioningUrl;
 }
 
 export function cancelSession(engine: string, sessionId: string): SessionView {

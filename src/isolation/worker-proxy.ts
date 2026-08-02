@@ -4,6 +4,7 @@ import { getWorkerConnectTimeoutMs } from "../config.js";
 import { requestIdentity } from "./request-identity.js";
 import type { WorkerProvisioner, WorkerTarget } from "./types.js";
 import { WorkerIsolationError } from "./types.js";
+import { AUTHORIZED_PROVISIONING_HEADER, decodeProvisioningUrl } from "./worker-protocol.js";
 
 const HOP_BY_HOP_HEADERS = new Set([
   "connection",
@@ -56,7 +57,11 @@ function outgoingHeaders(headers: IncomingHttpHeaders, body: Buffer): IncomingHt
 
 function copyResponseHeaders(source: IncomingHttpHeaders, destination: Response): void {
   for (const [name, value] of Object.entries(source)) {
-    if (value !== undefined && !HOP_BY_HOP_HEADERS.has(name.toLowerCase())) {
+    if (
+      value !== undefined
+      && !HOP_BY_HOP_HEADERS.has(name.toLowerCase())
+      && name.toLowerCase() !== AUTHORIZED_PROVISIONING_HEADER
+    ) {
       destination.setHeader(name, value);
     }
   }
@@ -68,7 +73,11 @@ export class UserWorkerProxy {
     private readonly connectTimeoutMs = getWorkerConnectTimeoutMs(),
   ) {}
 
-  async forward(req: Request, res: Response): Promise<void> {
+  async forward(
+    req: Request,
+    res: Response,
+    onAuthorizedProvisioningUrl?: (url: string) => void | Promise<void>,
+  ): Promise<void> {
     let upstream: http.ClientRequest | undefined;
     let clientClosed = false;
     const closeUpstream = () => {
@@ -103,6 +112,16 @@ export class UserWorkerProxy {
         },
         (workerResponse) => {
           clearReadinessTimer();
+	  const provisioningUrl = decodeProvisioningUrl(
+	    workerResponse.headers[AUTHORIZED_PROVISIONING_HEADER],
+	  );
+	  if (provisioningUrl && onAuthorizedProvisioningUrl) {
+	    void Promise.resolve(onAuthorizedProvisioningUrl(provisioningUrl)).catch((error) => {
+	      console.error(
+		`[UserWorkerProxy] provisioning notification failed: ${error instanceof Error ? error.message : String(error)}`,
+	      );
+	    });
+	  }
           res.status(workerResponse.statusCode ?? 502);
           copyResponseHeaders(workerResponse.headers, res);
           workerResponse.pipe(res);

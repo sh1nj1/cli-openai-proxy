@@ -13,11 +13,14 @@ import { engineRegistry, resolveEngine } from "../auth/registry.js";
 import {
   cancelSession,
   createSession,
+  getSessionProvisioningUrl,
   getSession,
   submitSession,
+  takeAuthorizedProvisioningUrl,
 } from "../auth/session-manager.js";
 import { clearCredential } from "../auth/token-store.js";
 import { AuthProvisioningError } from "../auth/types.js";
+import { AUTHORIZED_PROVISIONING_HEADER, encodeProvisioningUrl } from "../isolation/worker-protocol.js";
 
 /** Path prefix these handlers own. authMiddleware defers to this module's gate for it. */
 export const AUTH_PROVISIONING_PREFIX = "/v1/auth";
@@ -104,6 +107,12 @@ function parseable(url: string): boolean {
   }
 }
 
+function notifyGatewayWhenWorker(req: Request, res: Response, url: string | undefined): void {
+  if (url && req.app?.locals.cliProxyRole === "worker") {
+    res.setHeader(AUTHORIZED_PROVISIONING_HEADER, encodeProvisioningUrl(url));
+  }
+}
+
 function flowFields(engine: string): { flow: string; flows: string[] } {
   const flows = resolveEngine(engine)!.flows.map((f) => f.flow);
   return { flow: flows[0]!, flows };
@@ -174,7 +183,13 @@ export async function handleSubmitAuthSession(req: Request, res: Response): Prom
     return;
   }
   try {
-    res.json(await submitSession(engine, String(req.params.sessionId ?? ""), raw));
+    const sessionId = String(req.params.sessionId ?? "");
+    const provisioningUrl = req.app?.locals.cliProxyRole === "worker"
+      ? getSessionProvisioningUrl(engine, sessionId)
+      : undefined;
+    const result = await submitSession(engine, sessionId, raw);
+    if (result.status === "authorized") notifyGatewayWhenWorker(req, res, provisioningUrl);
+    res.json(result);
   } catch (err) {
     sendError(res, err);
   }
@@ -185,7 +200,12 @@ export function handleGetAuthSession(req: Request, res: Response): void {
   const engine = engineOf(req, res);
   if (!engine) return;
   try {
-    res.json(getSession(engine, String(req.params.sessionId ?? "")));
+    const sessionId = String(req.params.sessionId ?? "");
+    const result = getSession(engine, sessionId);
+    if (req.app?.locals.cliProxyRole === "worker" && result.status === "authorized") {
+      notifyGatewayWhenWorker(req, res, takeAuthorizedProvisioningUrl(engine, sessionId));
+    }
+    res.json(result);
   } catch (err) {
     sendError(res, err);
   }
