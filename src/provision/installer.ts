@@ -19,7 +19,6 @@ import {
   readdirSync,
   readFileSync,
   renameSync,
-  rmdirSync,
   rmSync,
   writeFileSync,
 } from "fs";
@@ -49,7 +48,6 @@ const DOWNLOAD_TIMEOUT_MS = 120_000;
 const INSTALL_MARKER_PATTERN = /^[0-9a-f]{32}$/;
 const RECOVERY_ID_PATTERN = /^[0-9a-f]{32}$/;
 const REMOVAL_RECOVERY_PREFIX = ".provision-removed-";
-const REMOVAL_RECOVERY_METADATA = ".recovery.json";
 const UPGRADE_RECOVERY_PREFIX = ".provision-staging-";
 const UPGRADE_RECOVERY_METADATA = ".upgrade-recovery.json";
 
@@ -264,8 +262,8 @@ export async function installSkill(
     beforeCandidateRename?: (target: string) => void;
     /** Test seam for an addition made after the moved-aside tree passes its audit. */
     afterPreviousAudit?: (previousRoot: string) => void;
-    /** Test seam for a mutation made after cleanup verifies an isolated file. */
-    afterCleanupHash?: (previousRoot: string, relative: string) => void;
+    /** Test seam for a mutation after the retained previous tree is audited. */
+    afterPreviousRetention?: (previousRoot: string) => void;
   },
 ): Promise<InstallResult> {
   if (!NAME_PATTERN.test(item.name)) {
@@ -291,7 +289,6 @@ export async function installSkill(
   );
   mkdirSync(candidate, { mode: 0o700 });
   let staging: string;
-  let stagingRecoveryFileHashes: Record<string, string> | undefined;
   if (opts.upgradeRecoveryId !== undefined) {
     if (!RECOVERY_ID_PATTERN.test(opts.upgradeRecoveryId) || opts.managedFiles === undefined) {
       throw new ProvisionError("Invalid upgrade recovery identity", "invalid_item");
@@ -454,19 +451,15 @@ export async function installSkill(
       throw err;
     }
     if (hadPrevious) {
-      // A process with an open descriptor to the moved directory can still add
-      // content after the audit above. Delete only recorded old content, never
-      // the whole tree, so anything racing cleanup remains recoverable.
+      // The staging name is writable by the same UID and cannot stay bound to
+      // the audited inode during pathname cleanup. Retain the whole previous
+      // tree instead; explicit operator cleanup is the only safe lifecycle.
       preserveStaging = true;
       const previousCleanup = removeManagedTree(previous, {
 	files: opts.managedFiles!,
 	directories: opts.managedDirectories,
 	fileHashes: opts.managedFileHashes,
-	afterFileHash: (relative) => opts.afterCleanupHash?.(previous, relative),
-	// An inode can still be writable through a descriptor opened before its
-	// rename. Retaining the isolated link is the only portable way to ensure a
-	// later write is recoverable; the hidden staging tree is therefore kept.
-	preserveIsolatedFiles: true,
+	afterRootAudit: opts.afterPreviousRetention,
       });
       if (!previousCleanup.clean) {
 	throw new ProvisionError(
@@ -475,16 +468,6 @@ export async function installSkill(
 	);
       }
       preserveStaging = previousCleanup.recoveryPath !== undefined;
-      if (previousCleanup.recoveryPath && previousCleanup.recoveryFileHashes) {
-	const recoveryRoot = path.relative(staging, previousCleanup.recoveryPath)
-	  .split(path.sep).join("/");
-	stagingRecoveryFileHashes = Object.fromEntries(
-	  Object.entries(previousCleanup.recoveryFileHashes).map(([relative, hash]) => [
-	    `${recoveryRoot}/${relative}`,
-	    hash,
-	  ]),
-	);
-      }
     }
     return result;
   } finally {
@@ -494,8 +477,6 @@ export async function installSkill(
       } finally {
 	if (!preserveStaging) {
 	  rmSync(staging, { recursive: true, force: true });
-	} else if (stagingRecoveryFileHashes) {
-	  sealRecovery(staging, UPGRADE_RECOVERY_METADATA, stagingRecoveryFileHashes);
 	}
       }
     } finally {
@@ -646,6 +627,28 @@ function managedTreeHasExactPaths(
   return actual.size === expected.size && [...actual].every((entry) => expected.has(entry));
 }
 
+function managedTreeHasVerifiedOwnedFile(
+  root: string,
+  files: string[],
+  fileHashes?: Record<string, string | string[]>,
+): boolean {
+  for (const relative of files) {
+    const expected = fileHashes?.[relative];
+    if (!expected) continue;
+    const file = managedPath(root, relative);
+    if (!file) continue;
+    try {
+      if (!lstatSync(file).isFile()) continue;
+      const actual = createHash("sha256").update(readFileSync(file)).digest("hex");
+      const accepted = Array.isArray(expected) ? expected : [expected];
+      if (accepted.includes(actual)) return true;
+    } catch {
+      // A concurrent namespace change makes this path unusable as ownership evidence.
+    }
+  }
+  return false;
+}
+
 function managedPath(root: string, relative: string): string | null {
   const parts = managedPathParts(relative);
   if (!parts) return null;
@@ -660,26 +663,16 @@ function removeManagedTree(
     /** Complete path sets that may legitimately own the visible root. */
     rootPathSnapshots?: Array<{ files: string[]; directories?: string[] }>;
     fileHashes?: Record<string, string | string[]>;
-    afterFileHash?: (relative: string) => void;
     /** Test seam for a namespace mutation after root ownership validation. */
     afterRootAudit?: (root: string) => void;
     /** Test seam for a namespace mutation after the owned root is isolated. */
     afterRootIsolation?: (root: string) => void;
-    /** Keep isolated inodes linked so writes through already-open descriptors survive. */
-    preserveIsolatedFiles?: boolean;
-    /** Place retained inode links outside root so an uninstall can remove its visible target. */
+    /** Parent for an explicit-removal recovery; omitted for existing upgrade staging. */
     quarantineParent?: string;
-    /** Metadata for bounded removal recovery directories. */
-    quarantineSkill?: string;
     /** Exact lockfile-owned identity for this recovery directory. */
     recoveryId?: string;
   },
-): {
-  clean: boolean;
-  recoveryPath?: string;
-  /** Hashes captured before any post-quarantine descriptor write can occur. */
-  recoveryFileHashes?: Record<string, string>;
-} {
+): { clean: boolean; recoveryPath?: string } {
   if (!existsAsDirectory(root)) return { clean: !targetExists(root) };
 
   // Capture identity before walking the tree. A complete path-set check alone
@@ -696,235 +689,54 @@ function removeManagedTree(
   }];
   const rootWasCompleteOwnedTree = rootPathSnapshots.some((snapshot) =>
     managedTreeHasExactPaths(root, snapshot.files, snapshot.directories));
+  const rootHasVerifiedOwnedFile = managedTreeHasVerifiedOwnedFile(
+    root,
+    opts.files,
+    opts.fileHashes,
+  );
 
-  let managedRoot = root;
-  let isolatedOwnedRoot: string | undefined;
-  if (
-    rootWasCompleteOwnedTree
-    && auditedRootIdentity
-    && opts.quarantineParent
-    && opts.recoveryId
-  ) {
+  // Upgrade staging is already hidden and lockfile-owned. Retain it whole:
+  // any pathname cleanup would let a same-UID sibling swap redirect deletion.
+  if (!opts.quarantineParent || !opts.recoveryId) {
     opts.afterRootAudit?.(root);
-    isolatedOwnedRoot = path.join(opts.quarantineParent, `${REMOVAL_RECOVERY_PREFIX}${opts.recoveryId}`);
-    if (!moveDirectoryNoReplace(root, isolatedOwnedRoot)) {
+    return { clean: rootWasCompleteOwnedTree, recoveryPath: root };
+  }
+
+  // An ambiguous visible target with no hash-verified owned file may belong to
+  // a process that won an interrupted exposure race. Leave it untouched.
+  if (!rootWasCompleteOwnedTree && !rootHasVerifiedOwnedFile) {
+    return { clean: true };
+  }
+
+  if (!auditedRootIdentity) return { clean: false };
+  opts.afterRootAudit?.(root);
+  const recoveryPath = path.join(
+    opts.quarantineParent,
+    `${REMOVAL_RECOVERY_PREFIX}${opts.recoveryId}`,
+  );
+  if (!moveDirectoryNoReplace(root, recoveryPath)) {
+    throw new ProvisionError(
+      `Removal could not isolate "${path.basename(root)}" without replacing another entry`,
+      "untracked_content",
+    );
+  }
+  if (!sameDirectoryIdentity(auditedRootIdentity, directoryIdentity(recoveryPath))) {
+    if (!moveDirectoryNoReplace(recoveryPath, root)) {
       throw new ProvisionError(
-	`Removal could not isolate "${path.basename(root)}" without replacing another entry`,
+	`Removal stopped after the target changed; replacement preserved at "${recoveryPath}"`,
 	"untracked_content",
       );
     }
-    if (!sameDirectoryIdentity(auditedRootIdentity, directoryIdentity(isolatedOwnedRoot))) {
-      if (!moveDirectoryNoReplace(isolatedOwnedRoot, root)) {
-	throw new ProvisionError(
-	  `Removal stopped after the target changed; replacement preserved at "${isolatedOwnedRoot}"`,
-	  "untracked_content",
-	);
-      }
-      return { clean: false };
-    }
-    managedRoot = isolatedOwnedRoot;
-    opts.afterRootIsolation?.(isolatedOwnedRoot);
-    if (opts.preserveIsolatedFiles) {
-      // The writable sibling name cannot stay bound to the inode verified
-      // above. Retain the complete isolated tree for explicit cleanup instead
-      // of traversing a pathname that another same-UID process can replace.
-      return { clean: true, recoveryPath: isolatedOwnedRoot };
-    }
+    return { clean: false };
   }
-
-  const removed: string[] = [];
-  let quarantine: string | undefined;
-  const recoveryFileHashes: Record<string, string> = {};
-  let unverifiedRecovery = false;
-  for (const [index, relative] of opts.files.entries()) {
-    const file = managedPath(managedRoot, relative);
-    if (!file) continue;
-    const parts = managedPathParts(relative)!;
-    let safe = true;
-    let current = managedRoot;
-    for (const part of parts.slice(0, -1)) {
-      current = path.join(current, part);
-      try {
-	if (!lstatSync(current).isDirectory()) safe = false;
-      } catch (err) {
-	if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
-	safe = false;
-      }
-      if (!safe) break;
-    }
-    if (!safe) continue;
-    try {
-      const stat = lstatSync(file);
-      if (!stat.isFile()) continue;
-      if (!quarantine) {
-	if (opts.quarantineParent && opts.recoveryId) {
-	  quarantine = path.join(opts.quarantineParent, `${REMOVAL_RECOVERY_PREFIX}${opts.recoveryId}`);
-	  mkdirSync(quarantine, { mode: 0o700 });
-	} else {
-	  quarantine = mkdtempSync(path.join(managedRoot, ".provision-cleanup-"));
-	}
-	if (opts.quarantineParent && opts.quarantineSkill) {
-	  writeFileSync(path.join(quarantine, REMOVAL_RECOVERY_METADATA), JSON.stringify({
-	    version: 1,
-	    skill: opts.quarantineSkill,
-	    createdAt: new Date().toISOString(),
-	    recoveryId: opts.recoveryId,
-	  }));
-	}
-      }
-      const isolated = path.join(quarantine, String(index));
-      renameSync(file, isolated);
-      const expected = opts.fileHashes?.[relative];
-      let verifiedHash: string | undefined;
-      if (expected) {
-	const actual = createHash("sha256").update(readFileSync(isolated)).digest("hex");
-	const accepted = Array.isArray(expected) ? expected : [expected];
-	if (!accepted.includes(actual)) {
-	  let restored = true;
-	  try {
-	    renameSync(isolated, file);
-	  } catch (err) {
-	    if (!["EEXIST", "ENOTEMPTY", "ENOENT"].includes(
-	      (err as NodeJS.ErrnoException).code ?? "",
-	    )) throw err;
-	    restored = false;
-	  }
-	  if (!restored) unverifiedRecovery = true;
-	  continue;
-	}
-	verifiedHash = actual;
-      }
-      opts.afterFileHash?.(relative);
-      if (!opts.preserveIsolatedFiles) {
-	rmSync(isolated, { force: true });
-      } else if (verifiedHash) {
-	recoveryFileHashes[path.relative(quarantine, isolated).split(path.sep).join("/")] = verifiedHash;
-      } else {
-	unverifiedRecovery = true;
-      }
-      removed.push(relative);
-    } catch (err) {
-      if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
-    }
-  }
-
-  let recoveryPath: string | undefined;
-  if (quarantine) {
-    try {
-      rmdirSync(quarantine);
-    } catch (err) {
-      const code = (err as NodeJS.ErrnoException).code;
-      if (code !== "ENOENT" && code !== "ENOTEMPTY") throw err;
-      if (code === "ENOTEMPTY") recoveryPath = quarantine;
-    }
-  }
-  const directories = new Set<string>();
-  for (const relative of opts.directories ?? []) {
-    const directory = managedPath(managedRoot, relative);
-    if (directory) directories.add(directory);
-  }
-  for (const relative of removed) {
-    let current = path.dirname(managedPath(managedRoot, relative)!);
-    while (current !== managedRoot && current.startsWith(`${managedRoot}${path.sep}`)) {
-      directories.add(current);
-      current = path.dirname(current);
-    }
-  }
-  for (const directory of [...directories].sort((a, b) => b.split(path.sep).length - a.split(path.sep).length)) {
-    try {
-      rmdirSync(directory);
-    } catch (err) {
-      const code = (err as NodeJS.ErrnoException).code;
-      if (code !== "ENOENT" && code !== "ENOTEMPTY") throw err;
-    }
-  }
-  if (rootWasCompleteOwnedTree) {
-    try {
-      rmdirSync(managedRoot);
-    } catch (err) {
-      const code = (err as NodeJS.ErrnoException).code;
-      if (code !== "ENOENT" && code !== "ENOTEMPTY") throw err;
-    }
-  }
-  const ownedRootRemoved = !targetExists(managedRoot);
-  if (isolatedOwnedRoot && !ownedRootRemoved) {
-    if (!moveDirectoryNoReplace(isolatedOwnedRoot, root)) {
-      throw new ProvisionError(
-	`Removal preserved changed content at "${isolatedOwnedRoot}" because the target was recreated`,
-	"untracked_content",
-      );
-    }
-  }
-  const clean = isolatedOwnedRoot
-    ? ownedRootRemoved
-    : ownedRootRemoved || (recoveryPath !== undefined
-      && readdirSync(managedRoot).every((entry) => path.join(managedRoot, entry) === recoveryPath));
-  return {
-    clean,
-    recoveryPath,
-    ...(recoveryPath && !unverifiedRecovery && Object.keys(recoveryFileHashes).length > 0
-      ? { recoveryFileHashes }
-      : {}),
-  };
+  opts.afterRootIsolation?.(recoveryPath);
+  // Never traverse the writable recovery pathname after isolation. Retaining
+  // the complete inode tree is what keeps both late writes and sibling swaps
+  // recoverable until an operator explicitly removes it.
+  return { clean: true, recoveryPath };
 }
 
-function inspectRecoveryTree(
-  root: string,
-  metadataName: string,
-): { files: Record<string, string>; directories: string[] } | null {
-  const files: Record<string, string> = {};
-  const directories: string[] = [];
-  try {
-    const walk = (directory: string): void => {
-      for (const entry of readdirSync(directory)) {
-	const full = path.join(directory, entry);
-	const relative = path.relative(root, full).split(path.sep).join("/");
-	if (relative === metadataName) continue;
-	const stat = lstatSync(full);
-	if (stat.isDirectory()) {
-	  directories.push(relative);
-	  walk(full);
-	} else if (stat.isFile()) {
-	  files[relative] = createHash("sha256").update(readFileSync(full)).digest("hex");
-	} else {
-	  throw new Error("Unexpected recovery entry type");
-	}
-      }
-    };
-    walk(root);
-    directories.sort();
-    return { files, directories };
-  } catch {
-    return null;
-  }
-}
-
-function sealRecovery(
-  directory: string,
-  metadataName: string,
-  trustedFileHashes: Record<string, string>,
-): void {
-  try {
-    const metadataFile = path.join(directory, metadataName);
-    const metadata = JSON.parse(readFileSync(metadataFile, "utf8")) as Record<string, unknown>;
-    const inspected = inspectRecoveryTree(directory, metadataName);
-    if (!inspected) return;
-    const actualFiles = Object.keys(inspected.files).sort();
-    const trustedFiles = Object.keys(trustedFileHashes).sort();
-    if (actualFiles.length !== trustedFiles.length
-	|| actualFiles.some((relative, index) => relative !== trustedFiles[index])) return;
-    writeFileSync(metadataFile, JSON.stringify({
-      ...metadata,
-      version: 2,
-      retainedFiles: trustedFileHashes,
-      retainedDirectories: inspected.directories,
-    }));
-  } catch {
-    // An unsealed recovery is retained for explicit operator cleanup.
-  }
-}
-
-/** Remove only recorded regular files, leaving modified or added user content. */
+/** Isolate a journal-owned skill tree for explicit operator cleanup. */
 export function removeSkill(
   name: string,
   opts: {
@@ -950,16 +762,8 @@ export function removeSkill(
   }
   const result = removeManagedTree(path.join(opts.skillsDir, name), {
     ...opts,
-    // An already-open descriptor can mutate the isolated inode after its hash
-    // check. Keep the link in a hidden sibling recovery directory while still
-    // removing the visible skill target.
-    preserveIsolatedFiles: true,
     quarantineParent: opts.skillsDir,
-    quarantineSkill: name,
     recoveryId,
   });
-  if (result.recoveryPath && result.recoveryFileHashes) {
-    sealRecovery(result.recoveryPath, REMOVAL_RECOVERY_METADATA, result.recoveryFileHashes);
-  }
   return { recoveryPath: result.recoveryPath };
 }

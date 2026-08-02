@@ -152,10 +152,11 @@ The tombstone clears after the item leaves the manifest.
   what the proxy installed, including archive-owned directories and per-file
   hashes used to repair missing or modified content on the next sync. Upgrades
   journal both the stable and candidate ownership snapshots before swapping
-  directories, so an interrupted swap is recoverable; removal only ever
-  touches what the journal lists and removes directories only when empty. Skills
-  a user installed by hand are never overwritten or deleted — a manifest item
-  whose name collides with an untracked directory fails with
+  directories, so an interrupted swap is recoverable. Removal atomically moves
+  a journal-owned target to a hidden recovery and retains the complete tree;
+  ambiguous targets without an exact snapshot or hash-verified owned file stay
+  untouched. Skills a user installed by hand are never overwritten or deleted —
+  a manifest item whose name collides with an untracked directory fails with
   `Refusing to replace untracked directory` instead of replacing it. Hidden
   removal, upgrade, and failed candidate recoveries are retained for explicit
   operator cleanup. They are never automatically unlinked because an already-open

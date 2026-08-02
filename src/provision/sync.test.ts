@@ -299,7 +299,7 @@ describe("provision sync", () => {
     assert.equal(statusOf(await syncNow(), "empty-dir"), "installed");
   });
 
-  test("removal preserves files added beneath a managed skill by the user", async () => {
+  test("removal preserves an incomplete managed tree in recovery", async () => {
     process.env.PROVISION_AUTOAPPLY = "auto";
     initProvisioning();
     const skill = serveSkill("/owned.tgz", "managed");
@@ -311,8 +311,12 @@ describe("provision sync", () => {
     const view = await syncNow();
 
     assert.equal(statusOf(view, "owned"), "removed");
-    assert.equal(existsSync(path.join(skillsDir, "owned", "SKILL.md")), false);
-    assert.equal(readFileSync(path.join(skillsDir, "owned", "user-notes.md"), "utf8"), "keep me");
+    assert.equal(existsSync(path.join(skillsDir, "owned")), false);
+    const recovery = readdirSync(skillsDir)
+      .find((entry) => entry.startsWith(".provision-removed-"));
+    assert.notEqual(recovery, undefined);
+    assert.equal(readFileSync(path.join(skillsDir, recovery!, "SKILL.md"), "utf8"), "managed");
+    assert.equal(readFileSync(path.join(skillsDir, recovery!, "user-notes.md"), "utf8"), "keep me");
   });
 
   test("an upgrade refuses to overwrite files added beneath a managed skill", async () => {

@@ -604,7 +604,7 @@ describe("provision installer", () => {
     assert.equal(readFileSync(path.join(previousRoot, "late-addition.md"), "utf-8"), "must survive");
   });
 
-  test("an upgrade preserves a file modified after cleanup hashes it", async () => {
+  test("an upgrade retains the previous tree when it changes after the retention audit", async () => {
     const v1 = serve("/cleanup-hash-race-v1.tgz", makeTarGz([{ name: "SKILL.md", content: "v1" }]));
     const previous = await installSkill(
       { name: "demo", url: v1.url, sha256: v1.sha256 },
@@ -612,23 +612,17 @@ describe("provision installer", () => {
     );
     const v2 = serve("/cleanup-hash-race-v2.tgz", makeTarGz([{ name: "SKILL.md", content: "v2" }]));
 
-    await assert.rejects(
-      installSkill(
-	{ name: "demo", url: v2.url, sha256: v2.sha256 },
-	{
-	  skillsDir,
-	  managedFiles: previous.files,
-	  managedDirectories: previous.directories,
-	  managedFileHashes: previous.fileHashes,
-	  afterCleanupHash: (previousRoot, relative) => {
-	    assert.equal(relative, "SKILL.md");
-	    writeFileSync(path.join(previousRoot, relative), "modified after cleanup hash");
-	  },
+    await installSkill(
+      { name: "demo", url: v2.url, sha256: v2.sha256 },
+      {
+	skillsDir,
+	managedFiles: previous.files,
+	managedDirectories: previous.directories,
+	managedFileHashes: previous.fileHashes,
+	afterPreviousRetention: (previousRoot) => {
+	  writeFileSync(path.join(previousRoot, "SKILL.md"), "modified after retention audit");
 	},
-      ),
-      (err: unknown) => err instanceof ProvisionError
-	&& err.code === "untracked_content"
-	&& /preserved at/.test(err.message),
+      },
     );
 
     assert.equal(readFileSync(path.join(skillsDir, "demo", "SKILL.md"), "utf-8"), "v2");
@@ -638,11 +632,11 @@ describe("provision installer", () => {
     const previousRoot = path.join(skillsDir, preserved[0]!, "previous");
     assert.equal(
       readFileSync(path.join(previousRoot, "SKILL.md"), "utf-8"),
-      "modified after cleanup hash",
+      "modified after retention audit",
     );
   });
 
-  test("an upgrade preserves writes through a descriptor opened before cleanup", async () => {
+  test("an upgrade preserves writes through a descriptor opened before retention", async () => {
     const v1 = serve("/cleanup-open-fd-v1.tgz", makeTarGz([{ name: "SKILL.md", content: "v1" }]));
     const previous = await installSkill(
       { name: "demo", url: v1.url, sha256: v1.sha256 },
@@ -662,7 +656,7 @@ describe("provision installer", () => {
 	  afterPreviousAudit: (previousRoot) => {
 	    descriptor = openSync(path.join(previousRoot, "SKILL.md"), "r+");
 	  },
-	  afterCleanupHash: () => {
+	  afterPreviousRetention: () => {
 	    assert.notEqual(descriptor, undefined);
 	    ftruncateSync(descriptor!, 0);
 	    writeSync(descriptor!, "modified through open descriptor");
@@ -678,11 +672,8 @@ describe("provision installer", () => {
       .filter((entry) => entry.startsWith(".provision-staging-"));
     assert.equal(preserved.length, 1);
     const previousRoot = path.join(skillsDir, preserved[0]!, "previous");
-    const quarantine = readdirSync(previousRoot)
-      .find((entry) => entry.startsWith(".provision-cleanup-"));
-    assert.notEqual(quarantine, undefined);
     assert.equal(
-      readFileSync(path.join(previousRoot, quarantine!, "0"), "utf-8"),
+      readFileSync(path.join(previousRoot, "SKILL.md"), "utf-8"),
       "modified through open descriptor",
     );
   });
@@ -740,11 +731,8 @@ describe("provision installer", () => {
 
     const firstRecovery = path.join(skillsDir, `.provision-staging-${firstRecoveryId}`);
     const previousDirectory = path.join(firstRecovery, "previous");
-    const quarantine = readdirSync(previousDirectory)
-      .find((entry) => entry.startsWith(".provision-cleanup-"));
-    assert.notEqual(quarantine, undefined);
     assert.equal(
-      readFileSync(path.join(previousDirectory, quarantine!, "0"), "utf8"),
+      readFileSync(path.join(previousDirectory, "SKILL.md"), "utf8"),
       "user change after later upgrades",
     );
   });
@@ -882,6 +870,32 @@ describe("provision installer", () => {
     assert.equal(recoveryPath, displaced.replace(/-displaced$/, ""));
     assert.deepEqual(readdirSync(recoveryPath!), []);
     assert.equal(readFileSync(path.join(displaced, "SKILL.md"), "utf8"), "managed");
+  });
+
+  test("removeSkill does not clean an incomplete target swapped after audit", async () => {
+    const { url, sha256 } = serve("/remove-incomplete-swap.tgz", makeTarGz([
+      { name: "SKILL.md", content: "managed" },
+    ]));
+    const result = await installSkill({ name: "demo", url, sha256 }, { skillsDir });
+    const target = path.join(skillsDir, "demo");
+    const displaced = path.join(skillsDir, "displaced-incomplete-tree");
+    writeFileSync(path.join(target, "user-notes.md"), "keep me");
+
+    removeSkill("demo", {
+      skillsDir,
+      files: result.files,
+      fileHashes: result.fileHashes,
+      directories: result.directories,
+      afterRootAudit: () => {
+	renameSync(target, displaced);
+	mkdirSync(target);
+	writeFileSync(path.join(target, "replacement.md"), "replacement");
+      },
+    });
+
+    assert.equal(readFileSync(path.join(target, "replacement.md"), "utf8"), "replacement");
+    assert.equal(readFileSync(path.join(displaced, "SKILL.md"), "utf8"), "managed");
+    assert.equal(readFileSync(path.join(displaced, "user-notes.md"), "utf8"), "keep me");
   });
 
   test("removeSkill preserves writes through a descriptor opened before removal", async () => {

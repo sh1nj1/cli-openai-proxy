@@ -10,7 +10,7 @@
  * Fail-closed at three layers: PROVISION_SYNC unset disables everything
  * (routes 404, `provisioning_url` on auth sessions is ignored); a first-seen
  * (type, name) stops at pending_approval unless PROVISION_AUTOAPPLY=auto; and
- * removal only ever touches what the lockfile records as ours.
+ * removal only acts on lockfile-owned targets and retains isolated trees.
  */
 
 import { createHash, randomBytes } from "crypto";
