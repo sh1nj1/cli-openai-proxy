@@ -429,6 +429,7 @@ export async function installSkill(
 	    item.name,
 	    opts.skillsDir,
 	    opts.rejectionRecoveryId,
+	    { dev: candidateIdentity.dev.toString(), ino: candidateIdentity.ino.toString() },
 	  );
 	  rejectedCandidateIsolated = true;
 	  throw isolationError;
@@ -513,7 +514,13 @@ export async function installSkill(
       try {
 	assertPublishedCandidate(target, candidateIdentity, item.name, result);
       } catch (err) {
-	isolateRejectedCandidate(target, item.name, opts.skillsDir, opts.rejectionRecoveryId);
+	isolateRejectedCandidate(
+	  target,
+	  item.name,
+	  opts.skillsDir,
+	  opts.rejectionRecoveryId,
+	  { dev: candidateIdentity.dev.toString(), ino: candidateIdentity.ino.toString() },
+	);
 	throw err;
       }
     } catch (err) {
@@ -702,6 +709,7 @@ export function isolateRejectedCandidate(
   itemName: string,
   skillsDir: string,
   recoveryId?: string,
+  expectedIdentity?: InstalledDirectoryIdentity,
 ): ProvisionError {
   if (!recoveryId) {
     throw new ProvisionError(
@@ -710,9 +718,27 @@ export function isolateRejectedCandidate(
     );
   }
   const recovery = path.join(skillsDir, `${REJECTED_RECOVERY_PREFIX}${recoveryId}`);
+  const expected = expectedIdentity
+    ? { dev: BigInt(expectedIdentity.dev), ino: BigInt(expectedIdentity.ino) }
+    : undefined;
+  if (expected && !sameDirectoryIdentity(directoryIdentity(target), expected)) {
+    throw new ProvisionError(
+      `Rejected candidate for "${itemName}" changed identity before isolation; ownership remains recorded`,
+      "untracked_content",
+    );
+  }
   if (!moveDirectoryNoReplace(target, recovery)) {
     throw new ProvisionError(
       `Rejected candidate for "${itemName}" could not be isolated; ownership remains recorded`,
+      "untracked_content",
+    );
+  }
+  if (expected && !sameDirectoryIdentity(directoryIdentity(recovery), expected)) {
+    // The source pathname was rebound between the check and atomic rename. Put
+    // that unrelated tree back when possible and retain the ownership journal.
+    moveDirectoryNoReplace(recovery, target);
+    throw new ProvisionError(
+      `Rejected candidate for "${itemName}" changed identity during isolation; ownership remains recorded`,
       "untracked_content",
     );
   }

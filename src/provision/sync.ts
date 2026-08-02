@@ -14,7 +14,17 @@
  */
 
 import { createHash, randomBytes } from "crypto";
-import { existsSync, lstatSync, readdirSync, readFileSync, unlinkSync } from "fs";
+import {
+  closeSync,
+  constants as fsConstants,
+  existsSync,
+  fstatSync,
+  lstatSync,
+  openSync,
+  readdirSync,
+  readFileSync,
+  unlinkSync,
+} from "fs";
 import { homedir } from "os";
 import path from "path";
 import { takeProxySecret } from "../config.js";
@@ -89,6 +99,7 @@ let pendingOperations = 0;
 let shuttingDown = false;
 let shutdownPromise: Promise<void> | null = null;
 let afterFirstInstallMove: ((target: string) => void) | undefined;
+let afterFirstInstallReconciliationIdentityCheck: ((target: string) => void) | undefined;
 let afterRemovalAudit: ((target: string) => void) | undefined;
 let afterRemovalIsolation: ((target: string) => void) | undefined;
 
@@ -133,6 +144,8 @@ function refetchMs(): number {
 export function initProvisioning(hooks: {
   /** Test seam for a mutation immediately after a first install is exposed. */
   afterFirstInstallMove?: (target: string) => void;
+  /** Test seam for a namespace swap after restart reconciliation checks identity. */
+  afterFirstInstallReconciliationIdentityCheck?: (target: string) => void;
   /** Test seam for a namespace mutation after removal validates ownership. */
   afterRemovalAudit?: (target: string) => void;
   /** Test seam for a namespace mutation after removal isolates the owned root. */
@@ -144,6 +157,7 @@ export function initProvisioning(hooks: {
 } {
   resetProvisioning();
   afterFirstInstallMove = hooks.afterFirstInstallMove;
+  afterFirstInstallReconciliationIdentityCheck = hooks.afterFirstInstallReconciliationIdentityCheck;
   afterRemovalAudit = hooks.afterRemovalAudit;
   afterRemovalIsolation = hooks.afterRemovalIsolation;
   const raw = process.env.PROVISION_SYNC?.trim().toLowerCase() ?? "";
@@ -296,9 +310,8 @@ function hasInterruptedRemovalForRecord(
   });
 }
 
-function installedRecordMatchesEntireTree(name: string, record: InstalledSnapshot): boolean {
-  if (!installedRecordIntact(name, record) || record.directories === undefined) return false;
-  const root = path.join(skillsDir(), name);
+function installedSnapshotMatchesEntireTreeAt(root: string, record: InstalledSnapshot): boolean {
+  if (!installedSnapshotIntactAt(root, record) || record.directories === undefined) return false;
   const expected = new Set([
     ...record.files.map((relative) => `f:${relative}`),
     ...record.directories.map((relative) => `d:${relative}`),
@@ -325,6 +338,10 @@ function installedRecordMatchesEntireTree(name: string, record: InstalledSnapsho
     return false;
   }
   return actual.size === expected.size && [...actual].every((entry) => expected.has(entry));
+}
+
+function installedRecordMatchesEntireTree(name: string, record: InstalledSnapshot): boolean {
+  return installedSnapshotMatchesEntireTreeAt(path.join(skillsDir(), name), record);
 }
 
 function stableSnapshot(record: InstalledRecord): InstalledSnapshot {
@@ -356,10 +373,10 @@ function targetMatchesCandidateIdentity(
   }
 }
 
-function firstInstallRecordMatchesEntireTree(name: string, record: InstalledRecord): boolean {
-  if (record.installMarker === undefined) return installedRecordMatchesEntireTree(name, record);
+function firstInstallRecordMatchesEntireTreeAt(root: string, record: InstalledRecord): boolean {
+  if (record.installMarker === undefined) return installedSnapshotMatchesEntireTreeAt(root, record);
   const marker = `.provision-install-${record.installMarker}`;
-  return installedRecordMatchesEntireTree(name, {
+  return installedSnapshotMatchesEntireTreeAt(root, {
     ...record,
     files: [...record.files, marker],
     fileHashes: {
@@ -367,6 +384,65 @@ function firstInstallRecordMatchesEntireTree(name: string, record: InstalledReco
       [marker]: createHash("sha256").update(record.installMarker).digest("hex"),
     },
   });
+}
+
+function directoryDescriptorPath(fd: number): string | undefined {
+  if (process.platform === "linux") {
+    const descriptor = `/proc/self/fd/${fd}/.`;
+    if (existsSync(descriptor)) return descriptor;
+  }
+  return undefined;
+}
+
+function auditFirstInstallCandidate(
+  name: string,
+  record: InstalledRecord,
+): { contentsMatch: boolean; originalCandidateIsTarget: boolean } {
+  if (!record.candidateIdentity) {
+    return { contentsMatch: false, originalCandidateIsTarget: false };
+  }
+  const target = path.join(skillsDir(), name);
+  if (process.platform === "win32") {
+    const originalCandidateWasTarget = targetMatchesCandidateIdentity(name, record.candidateIdentity);
+    if (originalCandidateWasTarget) afterFirstInstallReconciliationIdentityCheck?.(target);
+    return {
+      contentsMatch: originalCandidateWasTarget && firstInstallRecordMatchesEntireTreeAt(target, record),
+      originalCandidateIsTarget: originalCandidateWasTarget
+	&& targetMatchesCandidateIdentity(name, record.candidateIdentity),
+    };
+  }
+  let fd: number;
+  try {
+    fd = openSync(
+      target,
+      fsConstants.O_RDONLY | (fsConstants.O_DIRECTORY ?? 0) | (fsConstants.O_NOFOLLOW ?? 0),
+    );
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") {
+      return { contentsMatch: false, originalCandidateIsTarget: false };
+    }
+    throw err;
+  }
+  try {
+    const stat = fstatSync(fd, { bigint: true });
+    const originalCandidateWasTarget = stat.isDirectory()
+      && stat.dev.toString() === record.candidateIdentity.dev
+      && stat.ino.toString() === record.candidateIdentity.ino;
+    if (!originalCandidateWasTarget) {
+      return { contentsMatch: false, originalCandidateIsTarget: false };
+    }
+    afterFirstInstallReconciliationIdentityCheck?.(target);
+    // On Linux, the descriptor path keeps the tree walk attached to the opened
+    // inode even when the canonical pathname is renamed or rebound mid-scan.
+    const auditRoot = directoryDescriptorPath(fd) ?? target;
+    const contentsMatch = firstInstallRecordMatchesEntireTreeAt(auditRoot, record);
+    return {
+      contentsMatch,
+      originalCandidateIsTarget: targetMatchesCandidateIdentity(name, record.candidateIdentity),
+    };
+  } finally {
+    closeSync(fd);
+  }
 }
 
 function firstInstallMarkerStatus(
@@ -390,22 +466,32 @@ function reconcileFirstInstallJournals(state: ProvisionStateFile): Set<string> {
   for (const [key, record] of Object.entries(state.installed)) {
     if (!record.uncommitted) continue;
     const name = key.slice(key.indexOf("/") + 1);
-    const originalCandidateIsTarget = targetMatchesCandidateIdentity(name, record.candidateIdentity);
-    const exposed = originalCandidateIsTarget && firstInstallRecordMatchesEntireTree(name, record);
+    const target = path.join(skillsDir(), name);
+    const { originalCandidateIsTarget, contentsMatch } = auditFirstInstallCandidate(name, record);
+    const exposed = originalCandidateIsTarget && contentsMatch;
     if (!exposed) {
       // A readable marker can be replayed by another same-UID process. Only the
       // original staged directory identity authorizes moving a rejected target.
       if (originalCandidateIsTarget && record.rejectionRecoveryId !== undefined) {
 	isolateRejectedCandidate(
-	  path.join(skillsDir(), name),
+	  target,
 	  name,
 	  skillsDir(),
 	  record.rejectionRecoveryId,
+	  record.candidateIdentity,
 	);
       }
       delete state.installed[key];
       rejected.add(key);
     } else {
+      // Keep the ownership decision adjacent to one final identity read. If the
+      // namespace changed since the scan, preserve the replacement as unowned.
+      if (!targetMatchesCandidateIdentity(name, record.candidateIdentity)) {
+	delete state.installed[key];
+	rejected.add(key);
+	changed = true;
+	continue;
+      }
       const next = { ...record };
       delete next.uncommitted;
       delete next.candidateIdentity;
@@ -1029,6 +1115,7 @@ function clearProvisioningState(): void {
   pendingOperations = 0;
   shuttingDown = false;
   afterFirstInstallMove = undefined;
+  afterFirstInstallReconciliationIdentityCheck = undefined;
   afterRemovalAudit = undefined;
   afterRemovalIsolation = undefined;
 }

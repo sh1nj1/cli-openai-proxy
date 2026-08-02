@@ -845,7 +845,7 @@ describe("provision installer", () => {
     assert.deepEqual(readFileSync(path.join(candidate, "bad.bin")), Buffer.from([0]));
   });
 
-  test("exposure rejects a candidate pathname rebound after audit", async () => {
+  test("exposure preserves a candidate pathname rebound after audit", async () => {
     const { url, sha256 } = serve("/candidate-exposure-rebind.tgz", makeTarGz([
       { name: "SKILL.md", content: "audited original" },
     ]));
@@ -875,13 +875,13 @@ describe("provision installer", () => {
       }),
       (err: unknown) => err instanceof ProvisionError
 	&& err.code === "untracked_content"
-	&& err.message.includes("was isolated"),
+	&& err.message.includes("changed identity before isolation"),
     );
 
-    assert.equal(rolledBack, true);
+    assert.equal(rolledBack, false, "failed isolation must retain the ownership journal");
     assert.equal(readFileSync(path.join(preservedOriginal, "SKILL.md"), "utf8"), "audited original");
-    assert.equal(existsSync(target), false);
-    assert.equal(readFileSync(path.join(recovery, "SKILL.md"), "utf8"), "unaudited replacement");
+    assert.equal(readFileSync(path.join(target, "SKILL.md"), "utf8"), "unaudited replacement");
+    assert.equal(existsSync(recovery), false);
   });
 
   test("publication rejects in-place candidate mutations after audit", async () => {

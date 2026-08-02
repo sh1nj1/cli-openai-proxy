@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
 import { readFile, rm, writeFile } from "node:fs/promises";
 import http from "node:http";
@@ -38,6 +38,39 @@ afterEach(() => {
     delete process.env[name];
   }
 });
+
+const provisioningUrlHash = (url: string) =>
+  createHash("sha256").update(new URL(url).toString()).digest("hex");
+
+async function seedIssuedBinding(
+  generationStateFile: string,
+  binding: {
+    generation: string;
+    url: string;
+    accountName?: string;
+    engine?: string;
+    sessionId: string;
+  },
+): Promise<void> {
+  await writeFile(`${generationStateFile}.issued`, JSON.stringify({
+    version: 1,
+    latestGeneration: binding.generation,
+    bindings: [{
+      generation: binding.generation,
+      urlHash: provisioningUrlHash(binding.url),
+      accountName: binding.accountName ?? "cap_0123456789abcdef0123",
+      engine: binding.engine ?? "fake",
+      sessionId: binding.sessionId,
+    }],
+  }));
+}
+
+async function latestIssuedGeneration(generationStateFile: string): Promise<string> {
+  const state = JSON.parse(await readFile(`${generationStateFile}.issued`, "utf8")) as {
+    latestGeneration: string;
+  };
+  return state.latestGeneration;
+}
 
 async function forwardAuthCreateWithBlockedGenerationState(options: {
   provisioningEnabled: boolean;
@@ -198,6 +231,11 @@ test("unaccepted and pending provisioning sessions do not supersede retained not
   const retainedGeneration = "019865f4-50d6-7000-8000-000000000001";
   const retainedUrl = "https://collavre.test/agents/vrex/retained.json";
   await writeFile(generationStateFile, `${retainedGeneration}\n`);
+  await seedIssuedBinding(generationStateFile, {
+    generation: retainedGeneration,
+    url: retainedUrl,
+    sessionId: "retained",
+  });
   let rejectedGeneration: string | undefined;
   let acceptedGeneration: string | undefined;
   let createAttempts = 0;
@@ -272,7 +310,7 @@ test("unaccepted and pending provisioning sessions do not supersede retained not
     assert.equal(accepted.status, 201);
     assert.ok(acceptedGeneration && rejectedGeneration && acceptedGeneration > rejectedGeneration);
     assert.equal((await readFile(generationStateFile, "utf8")).trim(), retainedGeneration);
-    assert.equal((await readFile(`${generationStateFile}.issued`, "utf8")).trim(), acceptedGeneration);
+    assert.equal(await latestIssuedGeneration(generationStateFile), acceptedGeneration);
 
     const retainedAfterPending = await fetch(
       `http://127.0.0.1:${port}/v1/auth/fake/sessions/retained`,
@@ -296,6 +334,11 @@ test("a policy-rejected provisioning URL does not supersede retained notificatio
   const rejectedNotificationGeneration = "019865f4-50d6-7000-8000-000000000002";
   const retainedUrl = "https://collavre.test/agents/vrex/retained.json";
   await writeFile(generationStateFile, `${retainedGeneration}\n`);
+  await seedIssuedBinding(generationStateFile, {
+    generation: retainedGeneration,
+    url: retainedUrl,
+    sessionId: "retained",
+  });
   let rejectedGeneration: string | undefined;
   const worker = http.createServer((request, response) => {
     if (request.method === "POST") {
@@ -368,6 +411,7 @@ test("a policy-rejected provisioning URL does not supersede retained notificatio
     await new Promise<void>((resolve) => worker.close(() => resolve()));
     await rm(socketPath, { force: true });
     await rm(generationStateFile, { force: true });
+    await rm(`${generationStateFile}.issued`, { force: true });
   }
 });
 
@@ -375,12 +419,18 @@ test("gateway consumes a worker provisioning notification without exposing its p
   const socketPath = `/tmp/cap-worker-${randomUUID().slice(0, 8)}.sock`;
   const generationStateFile = `/tmp/cap-generation-${randomUUID().slice(0, 8)}.state`;
   const manifestUrl = "https://collavre.test/agents/vrex/provision.json?token=secret";
-  const generation = "019865f4-50d6-7000-8000-000000000001";
-  const worker = http.createServer((_request, response) => {
+  let generation: string | undefined;
+  const worker = http.createServer((request, response) => {
+    if (request.method === "POST") {
+      generation = request.headers[PROVISIONING_GENERATION_HEADER] as string | undefined;
+      response.writeHead(201, { "content-type": "application/json" });
+      response.end(JSON.stringify({ sessionId: "session-1", status: "pending" }));
+      return;
+    }
     response.writeHead(200, {
       "content-type": "application/json",
       [AUTHORIZED_PROVISIONING_HEADER]: encodeProvisioningUrl(manifestUrl),
-      [PROVISIONING_GENERATION_HEADER]: generation,
+      [PROVISIONING_GENERATION_HEADER]: generation!,
     });
     response.end(JSON.stringify({ status: "authorized" }));
   });
@@ -408,11 +458,21 @@ test("gateway consumes a worker provisioning notification without exposing its p
 
   try {
     const port = (gateway.address() as AddressInfo).port;
+    const headers = {
+	  authorization: "Bearer admin-key-123456",
+	  "content-type": "application/json",
+	  "x-cli-proxy-user-key": "user-key-12345678",
+	};
+    const created = await fetch(`http://127.0.0.1:${port}/v1/auth/fake/sessions`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ provisioning_url: manifestUrl }),
+    });
+    assert.equal(created.status, 201);
+    await created.arrayBuffer();
+    assert.ok(generation);
     const response = await fetch(`http://127.0.0.1:${port}/v1/auth/fake/sessions/session-1`, {
-      headers: {
-	authorization: "Bearer admin-key-123456",
-	"x-cli-proxy-user-key": "user-key-12345678",
-      },
+      headers,
     });
     assert.equal(response.status, 200);
     assert.equal(response.headers.get(AUTHORIZED_PROVISIONING_HEADER), null);
@@ -424,6 +484,94 @@ test("gateway consumes a worker provisioning notification without exposing its p
     await new Promise<void>((resolve) => worker.close(() => resolve()));
     await rm(socketPath, { force: true });
     await rm(generationStateFile, { force: true });
+    await rm(`${generationStateFile}.issued`, { force: true });
+  }
+});
+
+test("gateway rejects worker notifications outside their issued URL, worker, and session binding", async () => {
+  const socketPath = `/tmp/cap-worker-${randomUUID().slice(0, 8)}.sock`;
+  const generationStateFile = `/tmp/cap-generation-${randomUUID().slice(0, 8)}.state`;
+  const manifestUrl = "https://collavre.test/agents/vrex/provision.json?token=secret";
+  const forgedUrl = "https://attacker.test/arbitrary.json";
+  let issuedGeneration: string | undefined;
+  let responseGeneration: string | undefined;
+  let responseUrl = manifestUrl;
+  let accountName = "cap_worker_a";
+  const worker = http.createServer((request, response) => {
+    if (request.method === "POST" && request.url === "/v1/auth/fake/sessions") {
+      issuedGeneration = request.headers[PROVISIONING_GENERATION_HEADER] as string | undefined;
+      responseGeneration = issuedGeneration;
+      response.writeHead(201, { "content-type": "application/json" });
+      response.end(JSON.stringify({ sessionId: "session-1", status: "pending" }));
+      return;
+    }
+    response.writeHead(200, {
+      "content-type": "application/json",
+      [AUTHORIZED_PROVISIONING_HEADER]: encodeProvisioningUrl(responseUrl),
+      [PROVISIONING_GENERATION_HEADER]: responseGeneration!,
+    });
+    response.end(JSON.stringify({ status: "authorized" }));
+  });
+  await new Promise<void>((resolve) => worker.listen(socketPath, resolve));
+
+  const provisioner: WorkerProvisioner = {
+    async ensureWorker() {
+      return { accountName, endpoint: { kind: "unix", address: socketPath } };
+    },
+  };
+  process.env.USER_API_KEYS = JSON.stringify([
+    { key: "user-key-12345678", tenantId: "tenant-a", userId: "user-a" },
+  ]);
+  process.env.AUTH_ADMIN_KEYS = "admin-key-123456";
+  process.env.PROVISION_SYNC = "1";
+  const notifications: string[] = [];
+  const gateway = createApp({
+    userWorkerProxy: new UserWorkerProxy(provisioner, 30_000, generationStateFile),
+    onAuthorizedProvisioningUrl: (url) => { notifications.push(url); },
+  }).listen(0);
+  await new Promise<void>((resolve) => gateway.once("listening", resolve));
+
+  try {
+    const port = (gateway.address() as AddressInfo).port;
+    const headers = {
+      authorization: "Bearer admin-key-123456",
+      "content-type": "application/json",
+      "x-cli-proxy-user-key": "user-key-12345678",
+    };
+    const request = async (pathname: string, options: RequestInit = {}) => {
+      const response = await fetch(`http://127.0.0.1:${port}${pathname}`, { headers, ...options });
+      await response.arrayBuffer();
+    };
+    await request("/v1/auth/fake/sessions", {
+      method: "POST",
+      body: JSON.stringify({ provisioning_url: manifestUrl }),
+    });
+    assert.ok(issuedGeneration);
+
+    responseUrl = forgedUrl;
+    await request("/v1/chat/completions", { method: "POST", body: "{}" });
+    await request("/v1/auth/fake/sessions/session-1");
+    assert.deepEqual(notifications, [], "route and URL mismatches must not authorize relay");
+
+    responseUrl = manifestUrl;
+    responseGeneration = "ffffffff-ffff-7fff-bfff-ffffffffffff";
+    await request("/v1/auth/fake/sessions/session-1");
+    assert.deepEqual(notifications, [], "unissued future generations must not advance the watermark");
+
+    responseGeneration = issuedGeneration;
+    accountName = "cap_worker_b";
+    await request("/v1/auth/fake/sessions/session-1");
+    assert.deepEqual(notifications, [], "another worker must not consume the binding");
+
+    accountName = "cap_worker_a";
+    await request("/v1/auth/fake/sessions/session-1");
+    assert.deepEqual(notifications, [manifestUrl]);
+  } finally {
+    await new Promise<void>((resolve) => gateway.close(() => resolve()));
+    await new Promise<void>((resolve) => worker.close(() => resolve()));
+    await rm(socketPath, { force: true });
+    await rm(generationStateFile, { force: true });
+    await rm(`${generationStateFile}.issued`, { force: true });
   }
 });
 
@@ -484,21 +632,18 @@ test("gateway persists issued and authorized notification ordering separately ac
       [PROVISIONING_GENERATION_HEADER]: "ffffffff-ffff-7fff-bfff-ffffffffffff",
       "x-cli-proxy-user-key": "user-key-12345678",
     };
-    const create = () => fetch(`http://127.0.0.1:${port}/v1/auth/fake/sessions`, {
+    const create = (provisioningUrl: string) => fetch(`http://127.0.0.1:${port}/v1/auth/fake/sessions`, {
       method: "POST",
       headers,
-      body: JSON.stringify({ provisioning_url: "https://collavre.test/agents/vrex/provision.json" }),
+      body: JSON.stringify({ provisioning_url: provisioningUrl }),
     }).then((response) => response.json() as Promise<{ sessionId: string }>);
-    const first = await create();
-    const second = await create();
+    const first = await create(urls.get("session-a")!);
+    const second = await create(urls.get("session-b")!);
     assert.notEqual(generations.get(first.sessionId), headers[PROVISIONING_GENERATION_HEADER]);
     assert.ok(persistedGeneration < generations.get(first.sessionId)!);
     assert.ok(generations.get(first.sessionId)! < generations.get(second.sessionId)!);
     assert.equal((await readFile(generationStateFile, "utf8")).trim(), persistedGeneration);
-    assert.equal(
-      (await readFile(`${generationStateFile}.issued`, "utf8")).trim(),
-      generations.get(second.sessionId),
-    );
+    assert.equal(await latestIssuedGeneration(generationStateFile), generations.get(second.sessionId));
 
     const poll = async (sessionId: string) => {
       const response = await fetch(`http://127.0.0.1:${port}/v1/auth/fake/sessions/${sessionId}`, { headers });

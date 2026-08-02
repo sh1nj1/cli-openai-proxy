@@ -591,6 +591,78 @@ describe("provision sync", () => {
     assert.equal(state.installed[`skill/${name}`], undefined);
   });
 
+  test("restart reconciliation never commits or quarantines a target swapped after identity lookup", async () => {
+    process.env.PROVISION_AUTOAPPLY = "auto";
+    const marker = "c".repeat(32);
+    const names = ["reconcile-swap-exact", "reconcile-swap-modified"];
+    const originals = new Map<string, string>();
+    initProvisioning({
+      afterFirstInstallReconciliationIdentityCheck: (target) => {
+	const name = path.basename(target);
+	if (!names.includes(name)) return;
+	const original = path.join(skillsDir, `.original-${name}`);
+	renameSync(target, original);
+	originals.set(name, original);
+	mkdirSync(target);
+	writeFileSync(
+	  path.join(target, "SKILL.md"),
+	  name.endsWith("exact") ? "registry contents" : "replacement contents",
+	);
+	writeFileSync(firstInstallMarkerPath(target, marker), marker);
+      },
+    });
+    const installed: Record<string, unknown> = {};
+    const items = names.map((name, index) => {
+      const target = path.join(skillsDir, name);
+      mkdirSync(target);
+      writeFileSync(path.join(target, "SKILL.md"), "registry contents");
+      writeFileSync(firstInstallMarkerPath(target, marker), marker);
+      const targetStat = lstatSync(target, { bigint: true });
+      const skill = serveSkill(`/${name}.tgz`, "registry contents");
+      installed[`skill/${name}`] = {
+	sha256: skill.sha256,
+	files: ["SKILL.md"],
+	directories: [],
+	fileHashes: { "SKILL.md": sha(Buffer.from("registry contents")) },
+	installedAt: new Date().toISOString(),
+	uncommitted: true,
+	candidateIdentity: { dev: targetStat.dev.toString(), ino: targetStat.ino.toString() },
+	installMarker: marker,
+	rejectionRecoveryId: String(index + 1).repeat(32),
+      };
+      return { type: "skill", name, ...skill };
+    });
+    writeFileSync(path.join(stateDir, "provision.lock.json"), JSON.stringify({
+      version: 1,
+      approved: [],
+      revoked: [],
+      upgradeRecoveries: ["1".repeat(32), "2".repeat(32)],
+      installed,
+    }));
+    registerManifestUrl(serveManifest(items));
+
+    const view = await syncNow();
+
+    for (const name of names) {
+      assert.equal(statusOf(view, name), "failed");
+      assert.equal(existsSync(path.join(skillsDir, name)), true, "replacement stays canonical");
+      assert.equal(existsSync(originals.get(name)!), true, "original candidate remains preserved");
+    }
+    assert.equal(
+      readFileSync(path.join(skillsDir, "reconcile-swap-exact", "SKILL.md"), "utf8"),
+      "registry contents",
+    );
+    assert.equal(
+      readFileSync(path.join(skillsDir, "reconcile-swap-modified", "SKILL.md"), "utf8"),
+      "replacement contents",
+    );
+    assert.equal(existsSync(path.join(skillsDir, `.provision-rejected-${"1".repeat(32)}`)), false);
+    assert.equal(existsSync(path.join(skillsDir, `.provision-rejected-${"2".repeat(32)}`)), false);
+    const state = JSON.parse(readFileSync(path.join(stateDir, "provision.lock.json"), "utf8"));
+    assert.equal(state.installed["skill/reconcile-swap-exact"], undefined);
+    assert.equal(state.installed["skill/reconcile-swap-modified"], undefined);
+  });
+
   test("DELETE discards a pre-exposure claim before inspecting its target", async () => {
     const name = "delete-preclaim";
     const marker = "b".repeat(32);

@@ -1,6 +1,6 @@
 import http, { type IncomingHttpHeaders } from "node:http";
-import { randomUUID } from "node:crypto";
-import { mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { createHash, randomUUID } from "node:crypto";
+import { mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import type { Request, Response } from "express";
 import { v7 as uuidv7 } from "uuid";
@@ -40,6 +40,22 @@ const PRIVATE_HEADERS = new Set([
 ]);
 
 const REGENERATED_BODY_HEADERS = new Set(["content-encoding", "content-length"]);
+const MAX_ISSUED_BINDINGS = 512;
+const MAX_ISSUED_STATE_BYTES = 1024 * 1024;
+const MAX_SESSION_RESPONSE_BYTES = 64 * 1024;
+
+interface IssuedProvisioningBinding {
+  generation: string;
+  urlHash: string;
+  accountName: string;
+  engine: string;
+  sessionId?: string;
+}
+
+interface IssuedProvisioningState {
+  latestGeneration?: string;
+  bindings: Map<string, IssuedProvisioningBinding>;
+}
 
 const PUBLIC_FAILURE_MESSAGES: Record<WorkerIsolationError["code"], string> = {
   identity_required: "A trusted user identity is required",
@@ -66,6 +82,56 @@ function loadProvisioningGeneration(file: string): string | undefined {
   }
 }
 
+function loadIssuedProvisioningState(file: string): IssuedProvisioningState {
+  try {
+    if (statSync(file).size > MAX_ISSUED_STATE_BYTES) return { bindings: new Map() };
+    const raw = readFileSync(file, "utf8").trim();
+    const legacyGeneration = decodeProvisioningGeneration(raw);
+    if (legacyGeneration) return { latestGeneration: legacyGeneration, bindings: new Map() };
+    const parsed = JSON.parse(raw) as Record<string, unknown>;
+    if (parsed.version !== 1 || !Array.isArray(parsed.bindings)) return { bindings: new Map() };
+    let latestGeneration = decodeProvisioningGeneration(
+      typeof parsed.latestGeneration === "string" ? parsed.latestGeneration : undefined,
+    );
+    const bindings = new Map<string, IssuedProvisioningBinding>();
+    for (const value of parsed.bindings.slice(-MAX_ISSUED_BINDINGS)) {
+      if (typeof value !== "object" || value === null || Array.isArray(value)) continue;
+      const binding = value as Record<string, unknown>;
+      const generation = decodeProvisioningGeneration(
+	typeof binding.generation === "string" ? binding.generation : undefined,
+      );
+      if (
+	!generation
+	|| typeof binding.urlHash !== "string"
+	|| !/^[0-9a-f]{64}$/.test(binding.urlHash)
+	|| typeof binding.accountName !== "string"
+	|| binding.accountName.length === 0
+	|| binding.accountName.length > 256
+	|| typeof binding.engine !== "string"
+	|| binding.engine.length === 0
+	|| binding.engine.length > 256
+	|| (binding.sessionId !== undefined && (
+	  typeof binding.sessionId !== "string"
+	  || binding.sessionId.length === 0
+	  || binding.sessionId.length > 256
+	  || binding.sessionId.includes("/")
+	))
+      ) continue;
+      bindings.set(generation, {
+	generation,
+	urlHash: binding.urlHash,
+	accountName: binding.accountName,
+	engine: binding.engine,
+	...(typeof binding.sessionId === "string" ? { sessionId: binding.sessionId } : {}),
+      });
+      if (!latestGeneration || generation > latestGeneration) latestGeneration = generation;
+    }
+    return { latestGeneration, bindings };
+  } catch {
+    return { bindings: new Map() };
+  }
+}
+
 function saveProvisioningGeneration(file: string, generation: string): void {
   mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
   const temporary = `${file}.tmp-${process.pid}-${randomUUID()}`;
@@ -77,19 +143,49 @@ function saveProvisioningGeneration(file: string, generation: string): void {
   }
 }
 
+function saveIssuedProvisioningState(file: string, state: IssuedProvisioningState): void {
+  mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
+  const temporary = `${file}.tmp-${process.pid}-${randomUUID()}`;
+  const bindings = [...state.bindings.values()].slice(-MAX_ISSUED_BINDINGS);
+  try {
+    writeFileSync(temporary, `${JSON.stringify({
+      version: 1,
+      latestGeneration: state.latestGeneration,
+      bindings,
+    })}\n`, { encoding: "utf8", mode: 0o600, flag: "wx" });
+    renameSync(temporary, file);
+  } finally {
+    rmSync(temporary, { force: true });
+  }
+}
+
 function provisioningGenerationTimestamp(generation: string): number {
   return Number.parseInt(`${generation.slice(0, 8)}${generation.slice(9, 13)}`, 16);
 }
 
-function hasAllowedProvisioningUrl(body: unknown): boolean {
+function allowedProvisioningUrl(body: unknown): string | undefined {
   const url = (body as Record<string, unknown> | undefined)?.provisioning_url;
-  if (typeof url !== "string" || !provisioningUrlFitsHeader(url)) return false;
+  if (typeof url !== "string" || !provisioningUrlFitsHeader(url)) return undefined;
   try {
     checkUrlAllowed(url, { allowlist: getAllowlist() });
-    return true;
+    return new URL(url).toString();
   } catch {
-    return false;
+    return undefined;
   }
+}
+
+function provisioningUrlHash(url: string): string {
+  return createHash("sha256").update(new URL(url).toString()).digest("hex");
+}
+
+function authSessionCollection(pathname: string): { engine: string } | undefined {
+  const match = /^\/v1\/auth\/([^/]+)\/sessions\/?$/.exec(pathname);
+  return match ? { engine: match[1]! } : undefined;
+}
+
+function authSessionResource(pathname: string): { engine: string; sessionId: string } | undefined {
+  const match = /^\/v1\/auth\/([^/]+)\/sessions\/([^/]+)\/?$/.exec(pathname);
+  return match ? { engine: match[1]!, sessionId: match[2]! } : undefined;
 }
 
 function outgoingHeaders(
@@ -131,6 +227,7 @@ function copyResponseHeaders(source: IncomingHttpHeaders, destination: Response)
 export class UserWorkerProxy {
   private latestProvisioningGeneration: string | undefined;
   private latestIssuedProvisioningGeneration: string | undefined;
+  private readonly issuedProvisioningBindings: Map<string, IssuedProvisioningBinding>;
 
   constructor(
     private readonly provisioner: WorkerProvisioner,
@@ -138,7 +235,9 @@ export class UserWorkerProxy {
     private readonly generationStateFile = defaultGenerationStateFile(),
   ) {
     this.latestProvisioningGeneration = loadProvisioningGeneration(generationStateFile);
-    const latestIssued = loadProvisioningGeneration(issuedGenerationStateFile(generationStateFile));
+    const issuedState = loadIssuedProvisioningState(issuedGenerationStateFile(generationStateFile));
+    this.issuedProvisioningBindings = issuedState.bindings;
+    const latestIssued = issuedState.latestGeneration;
     this.latestIssuedProvisioningGeneration = latestIssued && (
       !this.latestProvisioningGeneration || latestIssued > this.latestProvisioningGeneration
     ) ? latestIssued : this.latestProvisioningGeneration;
@@ -169,14 +268,24 @@ export class UserWorkerProxy {
 
     const body = req.body === undefined ? Buffer.alloc(0) : Buffer.from(JSON.stringify(req.body));
     let provisioningGeneration: string | undefined;
+    let issuedBinding: IssuedProvisioningBinding | undefined;
+    const requestedProvisioningUrl = onAuthorizedProvisioningUrl
+      ? allowedProvisioningUrl(req.body)
+      : undefined;
+    const sessionCollection = authSessionCollection(req.path);
     if (
       onAuthorizedProvisioningUrl
-      && hasAllowedProvisioningUrl(req.body)
+      && requestedProvisioningUrl
       && req.method === "POST"
-      && /^\/v1\/auth\/[^/]+\/sessions\/?$/.test(req.path)
+      && sessionCollection
     ) {
       try {
-	provisioningGeneration = this.issueProvisioningGeneration();
+	issuedBinding = this.issueProvisioningGeneration({
+	  url: requestedProvisioningUrl,
+	  accountName: target.accountName,
+	  engine: sessionCollection.engine,
+	});
+	provisioningGeneration = issuedBinding.generation;
       } catch (error) {
 	res.off("close", closeUpstream);
 	if (!clientClosed && !res.destroyed) this.sendFailure(res, error);
@@ -198,6 +307,22 @@ export class UserWorkerProxy {
         },
         (workerResponse) => {
           clearReadinessTimer();
+	  const sessionResponseChunks: Buffer[] = [];
+	  let sessionResponseBytes = 0;
+	  let sessionResponseTooLarge = false;
+	  if (issuedBinding) {
+	    workerResponse.on("data", (chunk: Buffer | string) => {
+	      if (sessionResponseTooLarge) return;
+	      const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+	      sessionResponseBytes += buffer.length;
+	      if (sessionResponseBytes > MAX_SESSION_RESPONSE_BYTES) {
+		sessionResponseTooLarge = true;
+		sessionResponseChunks.length = 0;
+		return;
+	      }
+	      sessionResponseChunks.push(buffer);
+	    });
+	  }
 	  const provisioningUrl = decodeProvisioningUrl(
 	    workerResponse.headers[AUTHORIZED_PROVISIONING_HEADER],
 	  );
@@ -208,13 +333,24 @@ export class UserWorkerProxy {
 	    this.relayProvisioningNotification(
 	      provisioningUrl,
 	      responseGeneration,
+	      target.accountName,
+	      req.path,
 	      onAuthorizedProvisioningUrl,
 	    );
 	  }
           res.status(workerResponse.statusCode ?? 502);
           copyResponseHeaders(workerResponse.headers, res);
           workerResponse.pipe(res);
-          workerResponse.on("end", resolve);
+	  workerResponse.on("end", () => {
+	    if (issuedBinding) {
+	      this.bindIssuedGenerationToSession(
+		issuedBinding,
+		workerResponse.statusCode,
+		sessionResponseTooLarge ? undefined : Buffer.concat(sessionResponseChunks),
+	      );
+	    }
+	    resolve();
+	  });
           workerResponse.on("error", (error) => {
             if (!res.headersSent) this.sendFailure(res, error);
             else res.destroy(error);
@@ -241,7 +377,11 @@ export class UserWorkerProxy {
     res.off("close", closeUpstream);
   }
 
-  private issueProvisioningGeneration(): string {
+  private issueProvisioningGeneration(options: {
+    url: string;
+    accountName: string;
+    engine: string;
+  }): IssuedProvisioningBinding {
     let generation = uuidv7();
     if (this.latestIssuedProvisioningGeneration && generation <= this.latestIssuedProvisioningGeneration) {
       const nextTimestamp = provisioningGenerationTimestamp(this.latestIssuedProvisioningGeneration) + 1;
@@ -252,24 +392,86 @@ export class UserWorkerProxy {
 	msecs: nextTimestamp,
       });
     }
-    // Issuance must survive restarts for monotonic IDs, but only an authorized
-    // notification may advance the separate relay watermark.
-    saveProvisioningGeneration(issuedGenerationStateFile(this.generationStateFile), generation);
+    const binding: IssuedProvisioningBinding = {
+      generation,
+      urlHash: provisioningUrlHash(options.url),
+      accountName: options.accountName,
+      engine: options.engine,
+    };
+    const previousBindings = new Map(this.issuedProvisioningBindings);
+    this.issuedProvisioningBindings.set(generation, binding);
+    while (this.issuedProvisioningBindings.size > MAX_ISSUED_BINDINGS) {
+      this.issuedProvisioningBindings.delete(this.issuedProvisioningBindings.keys().next().value!);
+    }
+    // Issuance and its authority boundary must survive restarts before the
+    // generation is disclosed to the worker.
+    try {
+      saveIssuedProvisioningState(issuedGenerationStateFile(this.generationStateFile), {
+	latestGeneration: generation,
+	bindings: this.issuedProvisioningBindings,
+      });
+    } catch (error) {
+      this.issuedProvisioningBindings.clear();
+      for (const [issued, previous] of previousBindings) {
+	this.issuedProvisioningBindings.set(issued, previous);
+      }
+      throw error;
+    }
     this.latestIssuedProvisioningGeneration = generation;
-    return generation;
+    return binding;
   }
 
-  private recordIssuedProvisioningGeneration(generation: string): void {
-    if (!this.latestIssuedProvisioningGeneration || generation > this.latestIssuedProvisioningGeneration) {
-      this.latestIssuedProvisioningGeneration = generation;
+  private bindIssuedGenerationToSession(
+    binding: IssuedProvisioningBinding,
+    statusCode: number | undefined,
+    responseBody: Buffer | undefined,
+  ): void {
+    if (
+      statusCode !== 201
+      || !responseBody
+      || this.issuedProvisioningBindings.get(binding.generation) !== binding
+    ) return;
+    let sessionId: unknown;
+    try {
+      sessionId = (JSON.parse(responseBody.toString("utf8")) as Record<string, unknown>).sessionId;
+    } catch {
+      return;
+    }
+    if (typeof sessionId !== "string" || sessionId.length === 0 || sessionId.length > 256 || sessionId.includes("/")) {
+      return;
+    }
+    const finalized = { ...binding, sessionId };
+    this.issuedProvisioningBindings.set(binding.generation, finalized);
+    try {
+      saveIssuedProvisioningState(issuedGenerationStateFile(this.generationStateFile), {
+	latestGeneration: this.latestIssuedProvisioningGeneration,
+	bindings: this.issuedProvisioningBindings,
+      });
+    } catch (error) {
+      this.issuedProvisioningBindings.set(binding.generation, binding);
+      console.error(
+	`[UserWorkerProxy] provisioning session binding persistence failed: ${error instanceof Error ? error.message : String(error)}`,
+      );
     }
   }
 
   private relayProvisioningNotification(
     url: string,
     generation: string,
+    accountName: string,
+    requestPath: string,
     callback: (url: string) => void | Promise<void>,
   ): void {
+    const binding = this.issuedProvisioningBindings.get(generation);
+    const session = authSessionResource(requestPath);
+    if (
+      !binding?.sessionId
+      || !session
+      || binding.accountName !== accountName
+      || binding.engine !== session.engine
+      || binding.sessionId !== session.sessionId
+      || binding.urlHash !== provisioningUrlHash(url)
+    ) return;
     try {
       checkUrlAllowed(url, { allowlist: getAllowlist() });
     } catch {
@@ -282,7 +484,6 @@ export class UserWorkerProxy {
 	// authorized worker session authoritative again. Same-generation retries stay valid.
 	saveProvisioningGeneration(this.generationStateFile, generation);
 	this.latestProvisioningGeneration = generation;
-	this.recordIssuedProvisioningGeneration(generation);
       } catch (error) {
 	console.error(
 	  `[UserWorkerProxy] provisioning generation persistence failed: ${error instanceof Error ? error.message : String(error)}`,
