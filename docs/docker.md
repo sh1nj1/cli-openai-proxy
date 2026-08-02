@@ -43,6 +43,26 @@ publishing port 3456 on the host loopback by default (override the port with
 set `HOST_BIND=0.0.0.0` (or a specific host address) to publish on other
 interfaces, matching the bare-metal default of binding `127.0.0.1`.
 
+## Key rotation and revocation
+
+The seed is authoritative on every boot. To rotate keys, edit
+`deploy/docker/gateway.env` and `docker compose restart` — the gateway is
+ordered after the seed install, so a removed key is never accepted again,
+even transiently.
+
+Truncating `gateway.env` to an empty file revokes everything: on the next
+restart the persisted copy inside the container is deleted and the gateway is
+held down for the entire boot. This is deliberate fail-closed behavior — with
+an empty env the gateway would disable bearer auth altogether, so refusing to
+serve is the only safe response. `/health` stays down and the container
+reports unhealthy until the seed is repopulated and the stack restarted.
+
+Removing the seed mount altogether means "config is not seed-managed": the
+container keeps whatever `/etc/cli-openai-proxy/gateway.env` is already
+persisted and nothing is installed or deleted. Compose deployments always
+mount the seed, so this only applies to running the image directly (as the
+integration test does).
+
 ## CLI authentication
 
 The real `claude` and `codex` CLIs are installed system-wide at image build
@@ -175,8 +195,12 @@ bash deploy/docker/smoke-test.sh
 This boots the real compose stack (`deploy/docker/docker-compose.yml`) on a
 throwaway port (3457) and throwaway volumes, without real CLIs
 (`INSTALL_CLIS=""`), and asserts the `/health` endpoint comes up and the
-auth boundary works (`401` unauthenticated, `200` with a bearer key). It
-tears the stack down (`down -v`) on exit, so it never leaves state behind.
+auth boundary works (`401` unauthenticated, `200` with a bearer key). It then
+exercises the full seed lifecycle across restarts: key rotation (old key
+`401`, rotated key `200`), revoke-everything via an emptied seed (gateway
+held down, persisted env cleared, port refusing connections), and recovery
+after the seed is repopulated. It tears the stack down (`down -v`) on exit,
+so it never leaves state behind.
 
 The smoke test and the production compose file both build the same image tag,
 `cli-openai-proxy:local` — running the smoke test rebuilds and overwrites that
