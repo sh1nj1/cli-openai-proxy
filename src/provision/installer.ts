@@ -401,7 +401,13 @@ export async function installSkill(
 	  );
 	}
 	candidateExposed = true;
-	assertPublishedCandidate(target, candidateIdentity, item.name);
+	assertPublishedCandidate(
+	  target,
+	  candidateIdentity,
+	  item.name,
+	  result,
+	  opts.firstInstallMarker,
+	);
       } catch (err) {
 	preserveCandidate = targetExists(candidate);
 	rollbackCommit?.();
@@ -477,7 +483,7 @@ export async function installSkill(
 	);
       }
       candidateExposed = true;
-      assertPublishedCandidate(target, candidateIdentity, item.name);
+      assertPublishedCandidate(target, candidateIdentity, item.name, result);
     } catch (err) {
       if (err instanceof ProvisionError && err.code === "untracked_content") throw err;
       preserveCandidate = targetExists(candidate);
@@ -617,13 +623,57 @@ function assertPublishedCandidate(
   target: string,
   expected: DirectoryIdentity,
   itemName: string,
+  expectedContents: InstallResult,
+  installMarker?: string,
 ): void {
+  const rejectChangedContents = (): never => {
+    throw new ProvisionError(
+	`Refusing to install "${itemName}" because its candidate contents changed before publication`,
+	"untracked_content",
+    );
+  };
   if (!sameDirectoryIdentity(directoryIdentity(target), expected)) {
     throw new ProvisionError(
       `Refusing to install "${itemName}" because an unaudited candidate reached the target`,
       "untracked_content",
     );
   }
+  let publishedContents: InstallResult;
+  try {
+    // The directory inode can stay stable while a same-UID process mutates its
+    // children, so verify the exposed tree before returning its ownership data.
+    publishedContents = auditTree(target);
+  } catch {
+    return rejectChangedContents();
+  }
+  if (installMarker !== undefined) {
+    const marker = `.provision-install-${installMarker}`;
+    const markerHash = createHash("sha256").update(installMarker).digest("hex");
+    if (publishedContents.fileHashes[marker] !== markerHash) {
+      rejectChangedContents();
+    }
+    publishedContents = {
+      files: publishedContents.files.filter((file) => file !== marker),
+      directories: publishedContents.directories,
+      fileHashes: Object.fromEntries(
+	Object.entries(publishedContents.fileHashes).filter(([file]) => file !== marker),
+      ),
+    };
+  }
+  if (!sameInstallResult(publishedContents, expectedContents)) {
+    rejectChangedContents();
+  }
+}
+
+function sameInstallResult(left: InstallResult, right: InstallResult): boolean {
+  if (left.files.length !== right.files.length || left.directories.length !== right.directories.length) {
+    return false;
+  }
+  const rightDirectories = new Set(right.directories);
+  return left.directories.every((directory) => rightDirectories.has(directory))
+    && left.files.every((file) =>
+      Object.hasOwn(right.fileHashes, file)
+      && left.fileHashes[file] === right.fileHashes[file]);
 }
 
 function managedTreeHasExactPaths(

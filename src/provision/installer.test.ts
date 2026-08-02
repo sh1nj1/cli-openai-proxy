@@ -880,6 +880,39 @@ describe("provision installer", () => {
     assert.equal(readFileSync(path.join(target, "SKILL.md"), "utf8"), "unaudited replacement");
   });
 
+  test("publication rejects in-place candidate mutations after audit", async () => {
+    const { url, sha256 } = serve("/candidate-content-mutation.tgz", makeTarGz([
+      { name: "SKILL.md", content: "audited contents" },
+    ]));
+    const target = path.join(skillsDir, "demo");
+    let candidate = "";
+    let rolledBack = false;
+
+    await assert.rejects(
+      installSkill({ name: "demo", url, sha256 }, {
+	skillsDir,
+	beforeCommit: () => () => { rolledBack = true; },
+	beforeCandidateMove: () => {
+	  candidate = path.join(
+	    skillsDir,
+	    readdirSync(skillsDir).find((entry) => entry.startsWith(".provision-candidate-"))!,
+	  );
+	},
+	beforeCandidateRename: () => {
+	  writeFileSync(path.join(candidate, "SKILL.md"), "mutated after audit");
+	  writeFileSync(path.join(candidate, "injected.md"), "new after audit");
+	},
+      }),
+      (err: unknown) => err instanceof ProvisionError
+	&& err.code === "untracked_content"
+	&& err.message.includes("candidate contents changed"),
+    );
+
+    assert.equal(rolledBack, true);
+    assert.equal(readFileSync(path.join(target, "SKILL.md"), "utf8"), "mutated after audit");
+    assert.equal(readFileSync(path.join(target, "injected.md"), "utf8"), "new after audit");
+  });
+
   test("a body that streams past the size cap is aborted, not buffered to completion", async () => {
     const guard = new Promise<never>((_, reject) =>
       setTimeout(() => reject(new Error("download buffered past the cap")), 15_000).unref(),
