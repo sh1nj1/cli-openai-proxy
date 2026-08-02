@@ -13,10 +13,10 @@ import { engineRegistry, resolveEngine } from "../auth/registry.js";
 import {
   cancelSession,
   createSession,
+  getAuthorizedProvisioningUrl,
   getSessionProvisioningUrl,
   getSession,
   submitSession,
-  takeAuthorizedProvisioningUrl,
 } from "../auth/session-manager.js";
 import { clearCredential } from "../auth/token-store.js";
 import { AuthProvisioningError } from "../auth/types.js";
@@ -211,7 +211,7 @@ export function handleGetAuthSession(req: Request, res: Response): void {
     const sessionId = String(req.params.sessionId ?? "");
     const result = getSession(engine, sessionId);
     if (req.app?.locals.cliProxyRole === "worker" && result.status === "authorized") {
-      notifyGatewayWhenWorker(req, res, takeAuthorizedProvisioningUrl(engine, sessionId));
+      notifyGatewayWhenWorker(req, res, getAuthorizedProvisioningUrl(engine, sessionId));
     }
     res.json(result);
   } catch (err) {

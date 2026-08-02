@@ -605,10 +605,12 @@ test("signals a child spawned after a pre-spawn kill() (disconnect before onSpaw
  * Without it, a caller can ask the model to print AUTH_ADMIN_KEYS — the key that
  * gates the credential-mutating /v1/auth routes.
  */
-test("proxy-only keys are shadowed in the adapter's child environment", async () => {
+test("proxy-only keys and fixed manifest credentials are shadowed in the adapter's child environment", async () => {
   const { PROXY_ONLY_SECRET_VARS } = await import("../config.js");
   const saved = process.env.AUTH_ADMIN_KEYS;
+  const savedManifestUrl = process.env.PROVISION_MANIFEST_URL;
   process.env.AUTH_ADMIN_KEYS = "admin-key-should-not-leak";
+  process.env.PROVISION_MANIFEST_URL = "https://user:password@registry.test/provision.json?token=secret";
   try {
     let captured: Record<string, string> = {};
     const fakeExecute: AdapterExecute = async (ctx) => {
@@ -621,9 +623,13 @@ test("proxy-only keys are shadowed in the adapter's child environment", async ()
     for (const key of PROXY_ONLY_SECRET_VARS) {
       assert.equal(captured[key], "", `${key} must be shadowed, not inherited`);
     }
+    const childEnv = { ...process.env, ...captured };
+    assert.equal(childEnv.PROVISION_MANIFEST_URL, "", "fixed manifest credentials must not reach the CLI child");
   } finally {
     if (saved === undefined) delete process.env.AUTH_ADMIN_KEYS;
     else process.env.AUTH_ADMIN_KEYS = saved;
+    if (savedManifestUrl === undefined) delete process.env.PROVISION_MANIFEST_URL;
+    else process.env.PROVISION_MANIFEST_URL = savedManifestUrl;
   }
 });
 

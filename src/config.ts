@@ -31,8 +31,8 @@ export function getTimeoutMs(): number {
 }
 
 /**
- * Env vars that authenticate callers TO the proxy. They gate the proxy's own
- * surface and mean nothing to the CLIs it spawns.
+ * Env vars that authenticate callers TO the proxy or carry proxy-only registry
+ * credentials. They mean nothing to the CLIs it spawns.
  *
  * Completion runs launch an agentic CLI with permissions skipped, so an ordinary
  * caller can just ask the model to print its environment. Inherited, AUTH_ADMIN_KEYS
@@ -45,6 +45,7 @@ export const PROXY_ONLY_SECRET_VARS = [
   "AUTH_ADMIN_KEYS",
   "USER_API_KEYS",
   "USER_IDENTITY_HMAC_SECRET",
+  "PROVISION_MANIFEST_URL",
 ] as const;
 
 /** What each secret was at boot, so a re-init survives its own removal from the env. */

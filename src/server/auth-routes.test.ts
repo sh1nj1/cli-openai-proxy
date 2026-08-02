@@ -288,7 +288,7 @@ describe("auth-routes", () => {
     assert.match((res.payload as { error: { message: string } }).error.message, /too long/i);
   });
 
-  test("worker polling emits a device-code provisioning notification only once", async () => {
+  test("worker polling repeats a device-code provisioning notification until the session expires", async () => {
     let authorize!: () => void;
     const authorized = new Promise<void>((resolve) => { authorize = resolve; });
     const deviceDescriptor: EngineAuthDescriptor = {
@@ -325,7 +325,11 @@ describe("auth-routes", () => {
 
     const second = fakeRes();
     handleGetAuthSession(request, second);
-    assert.equal(second.headers[AUTHORIZED_PROVISIONING_HEADER], undefined);
+    assert.equal(
+      decodeProvisioningUrl(second.headers[AUTHORIZED_PROVISIONING_HEADER]),
+      manifestUrl,
+      "a retry must recover when the first worker response was lost before the gateway received it",
+    );
   });
 
   test("a submit with no credential in the body is a 400, not a 500", async () => {
