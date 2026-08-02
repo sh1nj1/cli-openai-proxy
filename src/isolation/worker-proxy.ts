@@ -127,6 +127,7 @@ function copyResponseHeaders(source: IncomingHttpHeaders, destination: Response)
 
 export class UserWorkerProxy {
   private latestProvisioningGeneration: string | undefined;
+  private latestIssuedProvisioningGeneration: string | undefined;
 
   constructor(
     private readonly provisioner: WorkerProvisioner,
@@ -134,6 +135,7 @@ export class UserWorkerProxy {
     private readonly generationStateFile = defaultGenerationStateFile(),
   ) {
     this.latestProvisioningGeneration = loadProvisioningGeneration(generationStateFile);
+    this.latestIssuedProvisioningGeneration = this.latestProvisioningGeneration;
   }
 
   async forward(
@@ -190,6 +192,21 @@ export class UserWorkerProxy {
         },
         (workerResponse) => {
           clearReadinessTimer();
+	  if (
+	    provisioningGeneration
+	    && (workerResponse.statusCode ?? 500) >= 200
+	    && (workerResponse.statusCode ?? 500) < 300
+	  ) {
+	    try {
+	      this.commitProvisioningGeneration(provisioningGeneration);
+	    } catch (error) {
+	      workerResponse.resume();
+	      if (!res.headersSent) this.sendFailure(res, error);
+	      workerResponse.on("end", resolve);
+	      workerResponse.on("error", resolve);
+	      return;
+	    }
+	  }
 	  const provisioningUrl = decodeProvisioningUrl(
 	    workerResponse.headers[AUTHORIZED_PROVISIONING_HEADER],
 	  );
@@ -235,8 +252,8 @@ export class UserWorkerProxy {
 
   private issueProvisioningGeneration(): string {
     let generation = uuidv7();
-    if (this.latestProvisioningGeneration && generation <= this.latestProvisioningGeneration) {
-      const nextTimestamp = provisioningGenerationTimestamp(this.latestProvisioningGeneration) + 1;
+    if (this.latestIssuedProvisioningGeneration && generation <= this.latestIssuedProvisioningGeneration) {
+      const nextTimestamp = provisioningGenerationTimestamp(this.latestIssuedProvisioningGeneration) + 1;
       if (nextTimestamp > 0xffffffffffff) {
 	throw new Error("Provisioning generation space exhausted");
       }
@@ -244,11 +261,27 @@ export class UserWorkerProxy {
 	msecs: nextTimestamp,
       });
     }
-    // Issuance is the ordering point: a retained pre-restart session must not
-    // overtake a session created after the restart.
+    this.recordIssuedProvisioningGeneration(generation);
+    return generation;
+  }
+
+  private recordIssuedProvisioningGeneration(generation: string): void {
+    if (!this.latestIssuedProvisioningGeneration || generation > this.latestIssuedProvisioningGeneration) {
+      this.latestIssuedProvisioningGeneration = generation;
+    }
+  }
+
+  private commitProvisioningGeneration(generation: string): void {
+    if (this.latestProvisioningGeneration && generation <= this.latestProvisioningGeneration) {
+      this.recordIssuedProvisioningGeneration(generation);
+      return;
+    }
+    // A rejected create request must not make an older retained session stale.
+    // Commit only after the worker has accepted the session, before exposing
+    // that successful response to the caller.
     saveProvisioningGeneration(this.generationStateFile, generation);
     this.latestProvisioningGeneration = generation;
-    return generation;
+    this.recordIssuedProvisioningGeneration(generation);
   }
 
   private relayProvisioningNotification(
@@ -261,6 +294,7 @@ export class UserWorkerProxy {
       try {
 	saveProvisioningGeneration(this.generationStateFile, generation);
 	this.latestProvisioningGeneration = generation;
+	this.recordIssuedProvisioningGeneration(generation);
       } catch (error) {
 	console.error(
 	  `[UserWorkerProxy] provisioning generation persistence failed: ${error instanceof Error ? error.message : String(error)}`,

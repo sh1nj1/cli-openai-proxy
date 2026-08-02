@@ -191,6 +191,94 @@ test("disabled provisioning ignores auth URLs without writing generation state",
   assert.equal(result.generation, undefined);
 });
 
+test("a rejected provisioning session does not supersede retained notifications", async () => {
+  const socketPath = `/tmp/cap-worker-${randomUUID().slice(0, 8)}.sock`;
+  const generationStateFile = `/tmp/cap-generation-${randomUUID().slice(0, 8)}.state`;
+  const retainedGeneration = "019865f4-50d6-7000-8000-000000000001";
+  const retainedUrl = "https://collavre.test/agents/vrex/retained.json";
+  await writeFile(generationStateFile, `${retainedGeneration}\n`);
+  let rejectedGeneration: string | undefined;
+  let acceptedGeneration: string | undefined;
+  let createAttempts = 0;
+  const worker = http.createServer((request, response) => {
+    if (request.method === "POST") {
+      const generation = request.headers[PROVISIONING_GENERATION_HEADER] as string | undefined;
+      if (createAttempts++ === 0) {
+	rejectedGeneration = generation;
+	response.writeHead(400, { "content-type": "application/json" });
+	response.end(JSON.stringify({ error: { code: "unsupported_flow" } }));
+	return;
+      }
+      acceptedGeneration = generation;
+      response.writeHead(201, { "content-type": "application/json" });
+      response.end(JSON.stringify({ sessionId: "accepted", status: "pending" }));
+      return;
+    }
+    response.writeHead(200, {
+      "content-type": "application/json",
+      [AUTHORIZED_PROVISIONING_HEADER]: encodeProvisioningUrl(retainedUrl),
+      [PROVISIONING_GENERATION_HEADER]: retainedGeneration,
+    });
+    response.end(JSON.stringify({ status: "authorized" }));
+  });
+  await new Promise<void>((resolve) => worker.listen(socketPath, resolve));
+
+  const provisioner: WorkerProvisioner = {
+    async ensureWorker() {
+      return {
+	accountName: "cap_0123456789abcdef0123",
+	endpoint: { kind: "unix", address: socketPath },
+      };
+    },
+  };
+  process.env.USER_API_KEYS = JSON.stringify([
+    { key: "user-key-12345678", tenantId: "tenant-a", userId: "user-a" },
+  ]);
+  process.env.AUTH_ADMIN_KEYS = "admin-key-123456";
+  process.env.PROVISION_SYNC = "1";
+  const notifications: string[] = [];
+  const gateway = createApp({
+    userWorkerProxy: new UserWorkerProxy(provisioner, 30_000, generationStateFile),
+    onAuthorizedProvisioningUrl: (url) => { notifications.push(url); },
+  }).listen(0);
+  await new Promise<void>((resolve) => gateway.once("listening", resolve));
+
+  try {
+    const port = (gateway.address() as AddressInfo).port;
+    const headers = {
+      authorization: "Bearer admin-key-123456",
+      "content-type": "application/json",
+      "x-cli-proxy-user-key": "user-key-12345678",
+    };
+    const rejected = await fetch(`http://127.0.0.1:${port}/v1/auth/fake/sessions`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ provisioning_url: "https://collavre.test/agents/vrex/new.json" }),
+    });
+    assert.equal(rejected.status, 400);
+    assert.ok(rejectedGeneration && rejectedGeneration > retainedGeneration);
+    assert.equal((await readFile(generationStateFile, "utf8")).trim(), retainedGeneration);
+
+    const retained = await fetch(`http://127.0.0.1:${port}/v1/auth/fake/sessions/retained`, { headers });
+    await retained.arrayBuffer();
+    assert.deepEqual(notifications, [retainedUrl]);
+
+    const accepted = await fetch(`http://127.0.0.1:${port}/v1/auth/fake/sessions`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ provisioning_url: "https://collavre.test/agents/vrex/retry.json" }),
+    });
+    assert.equal(accepted.status, 201);
+    assert.ok(acceptedGeneration && rejectedGeneration && acceptedGeneration > rejectedGeneration);
+    assert.equal((await readFile(generationStateFile, "utf8")).trim(), acceptedGeneration);
+  } finally {
+    await new Promise<void>((resolve) => gateway.close(() => resolve()));
+    await new Promise<void>((resolve) => worker.close(() => resolve()));
+    await rm(socketPath, { force: true });
+    await rm(generationStateFile, { force: true });
+  }
+});
+
 test("gateway consumes a worker provisioning notification without exposing its private header", async () => {
   const socketPath = `/tmp/cap-worker-${randomUUID().slice(0, 8)}.sock`;
   const generationStateFile = `/tmp/cap-generation-${randomUUID().slice(0, 8)}.state`;

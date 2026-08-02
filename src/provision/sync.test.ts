@@ -1004,4 +1004,35 @@ describe("provision sync", () => {
     const state = JSON.parse(readFileSync(path.join(stateDir, "provision.lock.json"), "utf8"));
     assert.equal(state.installed[key].uncommitted, true);
   });
+
+  test("startup status omits an unresolved upgrade journal", () => {
+    const key = "skill/startup-upgrade";
+    writeFileSync(path.join(stateDir, "provision.lock.json"), JSON.stringify({
+      version: 1,
+      approved: [key],
+      revoked: [],
+      installed: {
+	[key]: {
+	  sha256: "a".repeat(64),
+	  files: ["SKILL.md"],
+	  directories: [],
+	  fileHashes: { "SKILL.md": sha(Buffer.from("stable")) },
+	  installedAt: new Date().toISOString(),
+	  pending: {
+	    sha256: "b".repeat(64),
+	    files: ["SKILL.md"],
+	    directories: [],
+	    fileHashes: { "SKILL.md": sha(Buffer.from("candidate")) },
+	    installedAt: new Date().toISOString(),
+	  },
+	},
+      },
+    }));
+
+    initProvisioning();
+
+    assert.equal(statusOf(getStatus(), "startup-upgrade"), undefined);
+    const state = JSON.parse(readFileSync(path.join(stateDir, "provision.lock.json"), "utf8"));
+    assert.equal(state.installed[key].pending.sha256, "b".repeat(64));
+  });
 });

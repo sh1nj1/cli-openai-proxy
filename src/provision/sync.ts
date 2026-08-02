@@ -124,9 +124,9 @@ export function initProvisioning(hooks: {
     // What the lockfile already records survives a restart in the status view,
     // so an operator sees their installs before (and without) the next sync.
     itemViews = Object.entries(loadState().installed)
-      // A pre-exposure first-install claim is not an install. Leave it out
-      // until a target-touching operation reconciles the journal.
-      .filter(([, record]) => !record.uncommitted)
+      // An unresolved journal does not prove which complete tree is visible.
+      // Leave it out until a target-touching operation reconciles the state.
+      .filter(([, record]) => !record.uncommitted && !record.pending)
       .map(([key, record]) => {
 	const [type, ...rest] = key.split("/");
 	return { type: type ?? "skill", name: rest.join("/"), status: "installed" as const, sha256: record.sha256 };
