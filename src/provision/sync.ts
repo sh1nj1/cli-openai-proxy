@@ -865,7 +865,10 @@ export async function approveItem(type: string, name: string): Promise<Provision
   }
   if (inFlight) syncRequested = true;
   await serialize(() => {
-    if (approvalGeneration !== manifestGeneration || lastManifestGeneration !== approvalGeneration) {
+    const stillKnown = approvalGeneration === manifestGeneration
+      && lastManifestGeneration === approvalGeneration
+      && lastManifest?.items.some((item) => item.type === type && item.name === name);
+    if (!stillKnown) {
       throw new ProvisionError(`No item "${key}" in the current manifest`, "unknown_item");
     }
     const state = loadState();

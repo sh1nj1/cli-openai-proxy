@@ -256,6 +256,28 @@ describe("provision sync", () => {
     assert.equal(existsSync(path.join(skillsDir, "target", "SKILL.md")), true);
   });
 
+  test("approval queued behind a same-URL refresh rechecks manifest membership", async () => {
+    const target = serveSkill("/removed-before-approval.tgz", "target");
+    const manifestUrl = serveManifest([
+      { type: "skill", name: "removed-before-approval", ...target },
+    ]);
+    registerManifestUrl(manifestUrl);
+    await syncNow();
+
+    responses.set("/provision.json", { schema: "agent-provisioning/v1", items: [] });
+    let release!: () => void;
+    responseGates.set("/provision.json", new Promise<void>((resolve) => { release = resolve; }));
+    const refresh = syncNow();
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    const approval = codeOf(() => approveItem("skill", "removed-before-approval"));
+    release();
+
+    await refresh;
+    assert.equal(await approval, "unknown_item");
+    const state = JSON.parse(readFileSync(path.join(stateDir, "provision.lock.json"), "utf8"));
+    assert.equal(state.approved.includes("skill/removed-before-approval"), false);
+  });
+
   test("PROVISION_AUTOAPPLY=auto installs without the approval stop", async () => {
     process.env.PROVISION_AUTOAPPLY = "auto";
     initProvisioning();
