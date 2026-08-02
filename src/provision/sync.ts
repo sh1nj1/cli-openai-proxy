@@ -79,6 +79,17 @@ let afterFirstInstallMove: ((target: string) => void) | undefined;
 let afterRemovalAudit: ((target: string) => void) | undefined;
 let afterRemovalIsolation: ((target: string) => void) | undefined;
 
+class SupersededSyncError extends Error {
+  constructor() {
+    super("Provisioning sync was superseded by a newer manifest URL.");
+    this.name = "SupersededSyncError";
+  }
+}
+
+function assertCurrentGeneration(generation: number): void {
+  if (generation !== manifestGeneration) throw new SupersededSyncError();
+}
+
 function serialize<T>(operation: () => Promise<T> | T): Promise<T> {
   pendingOperations += 1;
   const result = operationTail.then(operation, operation);
@@ -414,7 +425,7 @@ function removalSnapshot(record: InstalledRecord): {
   const snapshots: InstalledSnapshot[] = [record, ...(record.pending ? [record.pending] : [])];
   const files = [...new Set(snapshots.flatMap((snapshot) => snapshot.files))];
   const directories = [...new Set(snapshots.flatMap((snapshot) => snapshot.directories ?? []))];
-  const fileHashes: Record<string, string | string[]> = {};
+  const fileHashes = Object.create(null) as Record<string, string | string[]>;
   for (const file of files) {
     const owners = snapshots.filter((snapshot) => snapshot.files.includes(file));
     const hashes = owners.map((snapshot) => snapshot.fileHashes?.[file]);
@@ -522,7 +533,7 @@ function migrateLegacyDesiredItems(
   return failures;
 }
 
-async function runSync(): Promise<ProvisionStatusView> {
+async function runSync(generation: number): Promise<ProvisionStatusView> {
   if (!enabled) {
     throw new ProvisionError("Provisioning is disabled. Set PROVISION_SYNC=1 to enable it.", "provisioning_disabled");
   }
@@ -532,6 +543,7 @@ async function runSync(): Promise<ProvisionStatusView> {
   const url = manifestUrl;
   const allowlist = getAllowlist();
   const manifest = await fetchManifest(url);
+  assertCurrentGeneration(generation);
   lastManifest = manifest;
 
   const state = loadState();
@@ -621,7 +633,7 @@ async function runSync(): Promise<ProvisionStatusView> {
 	])]
 	: undefined;
       const managedFileHashes: Record<string, string[]> | undefined = previousRecord
-	? {}
+	? Object.create(null) as Record<string, string[]>
 	: undefined;
       if (managedFileHashes && previousRecord) {
 	for (const snapshot of [previousRecord, previousRecord.pending]) {
@@ -644,6 +656,7 @@ async function runSync(): Promise<ProvisionStatusView> {
 	  {
 	    skillsDir: skillsDir(),
 	    checkUrl,
+	    beforeMutation: () => assertCurrentGeneration(generation),
 	    managedFiles,
 	    managedDirectories,
 	    managedFileHashes,
@@ -704,6 +717,7 @@ async function runSync(): Promise<ProvisionStatusView> {
       if (!state.approved.includes(key)) state.approved.push(key);
       views.push({ type: item.type, name: item.name, status: "installed", sha256: item.sha256 });
     } catch (err) {
+      if (err instanceof SupersededSyncError) throw err;
       const journal = state.installed[key];
       if (journal?.pending) {
 	state.installed[key] = reconcileUpgradeJournal(item.name, journal);
@@ -768,7 +782,7 @@ export async function syncNow(): Promise<ProvisionStatusView> {
       syncRequested = false;
       const startedGeneration = manifestGeneration;
       try {
-	result = await serialize(runSync);
+	result = await serialize(() => runSync(startedGeneration));
       } catch (err) {
 	// A superseded URL's failure must not prevent the newly registered URL
 	// from running; only surface an error from the still-current generation.

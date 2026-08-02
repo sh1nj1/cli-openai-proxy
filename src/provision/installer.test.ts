@@ -164,6 +164,23 @@ describe("provision installer", () => {
     assert.match(readFileSync(path.join(skillsDir, "demo", "SKILL.md"), "utf-8"), /Use wisely/);
   });
 
+  test("records a root-level __proto__ file as an own artifact hash", async () => {
+    const contents = "prototype-safe";
+    const { url, sha256 } = serve("/proto-name.tgz", makeTarGz([
+      { name: "__proto__", content: contents },
+    ]));
+
+    const result = await installSkill({ name: "demo", url, sha256 }, { skillsDir });
+
+    assert.equal(Object.getPrototypeOf(result.fileHashes), null);
+    assert.equal(Object.hasOwn(result.fileHashes, "__proto__"), true);
+    assert.equal(result.fileHashes.__proto__, sha(Buffer.from(contents)));
+    assert.equal(
+      Object.hasOwn(JSON.parse(JSON.stringify(result.fileHashes)) as object, "__proto__"),
+      true,
+    );
+  });
+
   test("flattens the common single-top-dir tarball layout", async () => {
     const { url, sha256 } = serve("/b.tgz", makeTarGz([
       { name: "demo-1.0.0/", type: "dir" },

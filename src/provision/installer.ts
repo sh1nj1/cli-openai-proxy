@@ -164,7 +164,7 @@ function assertArchiveSafe(archivePath: string): boolean {
 function auditTree(root: string): InstallResult {
   const files: string[] = [];
   const directories: string[] = [];
-  const fileHashes: Record<string, string> = {};
+  const fileHashes = Object.create(null) as Record<string, string>;
   let total = 0;
   const walk = (dir: string): void => {
     for (const entry of readdirSync(dir)) {
@@ -247,6 +247,8 @@ export async function installSkill(
     firstInstallMarker?: string;
     /** Existing managed paths; an upgrade must not erase additions outside this set. */
     managedFiles?: string[];
+    /** Abort before any filesystem mutation when the caller's desired state changed. */
+    beforeMutation?: () => void;
     /** Existing managed directories; omitted for legacy lockfiles that did not track them. */
     managedDirectories?: string[];
     /** Accepted hashes for existing managed files, including either journal snapshot. */
@@ -281,6 +283,7 @@ export async function installSkill(
     );
   }
   assertDecompressionBounded(buf);
+  opts.beforeMutation?.();
 
   const archiveDir = mkdtempSync(path.join(tmpdir(), "provision-archive-"));
   // Staging lives INSIDE skillsDir so the final rename is same-filesystem (atomic),

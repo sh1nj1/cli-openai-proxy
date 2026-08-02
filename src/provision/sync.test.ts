@@ -33,10 +33,10 @@ import { ProvisionError } from "./types.js";
 import { firstInstallMarkerPath } from "./installer.js";
 
 /** Single-file tar.gz, enough for sync-level tests (installer has its own suite). */
-function skillArchive(content: string): Buffer {
+function skillArchive(content: string, fileName = "SKILL.md"): Buffer {
   const body = Buffer.from(content);
   const header = Buffer.alloc(512);
-  header.write("SKILL.md", 0, 100, "utf-8");
+  header.write(fileName, 0, 100, "utf-8");
   header.write("0000644", 100, 8, "ascii");
   header.write("0000000", 108, 8, "ascii");
   header.write("0000000", 116, 8, "ascii");
@@ -1182,7 +1182,12 @@ describe("provision sync", () => {
 
   test("a manifest URL change during sync queues and awaits a follow-up sync", async () => {
     process.env.PROVISION_AUTOAPPLY = "auto";
-    initProvisioning();
+    let firstExposed = false;
+    initProvisioning({
+      afterFirstInstallMove: (target) => {
+	if (path.basename(target) === "first") firstExposed = true;
+      },
+    });
     const first = serveSkill("/first.tgz", "first");
     const second = serveSkill("/second.tgz", "second");
     responses.set("/first.json", { schema: "agent-provisioning/v1", items: [{ type: "skill", name: "first", ...first }] });
@@ -1198,8 +1203,66 @@ describe("provision sync", () => {
     await Promise.all([firstSync, switched]);
 
     assert.equal(getStatus().manifest_url, `${baseUrl}/second.json`);
+    assert.equal(firstExposed, false);
     assert.equal(existsSync(path.join(skillsDir, "first")), false);
     assert.equal(existsSync(path.join(skillsDir, "second", "SKILL.md")), true);
+  });
+
+  test("a superseded manifest fetch performs no filesystem mutation", async () => {
+    process.env.PROVISION_AUTOAPPLY = "auto";
+    let firstExposed = false;
+    initProvisioning({
+      afterFirstInstallMove: (target) => {
+	if (path.basename(target) === "first") firstExposed = true;
+      },
+    });
+    const first = serveSkill("/first.tgz", "first");
+    const second = serveSkill("/second.tgz", "second");
+    responses.set("/first.json", { schema: "agent-provisioning/v1", items: [{ type: "skill", name: "first", ...first }] });
+    responses.set("/second.json", { schema: "agent-provisioning/v1", items: [{ type: "skill", name: "second", ...second }] });
+    let release!: () => void;
+    responseGates.set("/first.json", new Promise<void>((resolve) => { release = resolve; }));
+
+    registerManifestUrl(`${baseUrl}/first.json`);
+    const firstSync = syncNow();
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    const switched = handleAuthorizedSession(`${baseUrl}/second.json`);
+    release();
+    await Promise.all([firstSync, switched]);
+
+    assert.equal(firstExposed, false);
+    assert.equal(existsSync(path.join(skillsDir, "first")), false);
+    assert.equal(existsSync(path.join(skillsDir, "second", "SKILL.md")), true);
+  });
+
+  test("persists and removes a root-level __proto__ artifact after reload", async () => {
+    process.env.PROVISION_AUTOAPPLY = "auto";
+    initProvisioning();
+    const archive = skillArchive("managed", "__proto__");
+    responses.set("/proto.tgz", archive);
+    registerManifestUrl(serveManifest([{
+      type: "skill",
+      name: "proto-name",
+      url: `${baseUrl}/proto.tgz`,
+      sha256: sha(archive),
+    }]));
+    await syncNow();
+
+    const persisted = JSON.parse(
+      readFileSync(path.join(stateDir, "provision.lock.json"), "utf8"),
+    ) as { installed: Record<string, { fileHashes: Record<string, string> }> };
+    assert.equal(
+      Object.hasOwn(persisted.installed["skill/proto-name"]!.fileHashes, "__proto__"),
+      true,
+    );
+
+    registerManifestUrl(serveManifest([]));
+    await syncNow();
+    assert.equal(existsSync(path.join(skillsDir, "proto-name")), false);
+    const recovery = readdirSync(skillsDir)
+      .find((entry) => entry.startsWith(".provision-removed-"));
+    assert.notEqual(recovery, undefined);
+    assert.equal(readFileSync(path.join(skillsDir, recovery!, "__proto__"), "utf8"), "managed");
   });
 
   test("shutdown waits for an active sync before clearing module state", async () => {
