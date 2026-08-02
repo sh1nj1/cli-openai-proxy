@@ -13,8 +13,18 @@ BASE_URL="http://127.0.0.1:3457"
 # Force /tmp: Docker Desktop on macOS does not share the default $TMPDIR
 # (/var/folders/...), which would silently break the bind mount.
 ENV_FILE="$(mktemp /tmp/cli-openai-proxy-smoke.XXXXXX)"
-printf 'USER_API_KEYS=%s\n' \
-  "'[{\"key\":\"${KEY}\",\"tenantId\":\"smoke\",\"userId\":\"user-a\"}]'" > "${ENV_FILE}"
+
+write_seed() {
+  local path="$1"
+  local key="$2"
+  # HOST/PORT deliberately conflict with the container endpoint. The
+  # container-only network env must win after this shared gateway env loads.
+  printf 'USER_API_KEYS=%s\nHOST=127.0.0.1\nPORT=9999\n' \
+    "'[{\"key\":\"${key}\",\"tenantId\":\"smoke\",\"userId\":\"user-a\"}]'" \
+    > "${path}"
+}
+
+write_seed "${ENV_FILE}" "${KEY}"
 
 compose() {
   HOST_PORT=3457 GATEWAY_ENV_FILE="${ENV_FILE}" INSTALL_CLIS="" \
@@ -57,9 +67,7 @@ expect 200 -H "Authorization: Bearer ${KEY}" "${BASE_URL}/v1/usage"
 # container runs, and this asserts stop/start re-resolves the source path.
 echo "==> rotating key and restarting"
 ROTATED_KEY="smoke-key-rotated-89abcdef0123456789abcdef"
-printf 'USER_API_KEYS=%s\n' \
-  "'[{\"key\":\"${ROTATED_KEY}\",\"tenantId\":\"smoke\",\"userId\":\"user-a\"}]'" \
-  > "${ENV_FILE}.next"
+write_seed "${ENV_FILE}.next" "${ROTATED_KEY}"
 mv "${ENV_FILE}.next" "${ENV_FILE}"
 compose restart --timeout 30
 
@@ -96,9 +104,7 @@ expect 000 -H "Authorization: Bearer ${ROTATED_KEY}" "${BASE_URL}/v1/usage"
 
 # Recovery: repopulating the seed brings the gateway back on the next boot.
 echo "==> restoring seed and restarting"
-printf 'USER_API_KEYS=%s\n' \
-  "'[{\"key\":\"${ROTATED_KEY}\",\"tenantId\":\"smoke\",\"userId\":\"user-a\"}]'" \
-  > "${ENV_FILE}.next"
+write_seed "${ENV_FILE}.next" "${ROTATED_KEY}"
 mv "${ENV_FILE}.next" "${ENV_FILE}"
 compose restart --timeout 30
 

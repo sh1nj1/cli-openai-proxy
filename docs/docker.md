@@ -50,6 +50,10 @@ The seed is authoritative on every boot. To rotate keys, edit
 ordered after the seed install, so a removed key is never accepted again,
 even transiently.
 
+`HOST` and `PORT` entries in the seed do not change the container endpoint.
+The image always binds the gateway to `0.0.0.0:3456` inside the container;
+use `HOST_BIND` and `HOST_PORT` in Compose to control host-side exposure.
+
 Truncating `gateway.env` to an empty file revokes everything: on the next
 restart the persisted copy inside the container is deleted and the gateway is
 held down for the entire boot. This is deliberate fail-closed behavior — with

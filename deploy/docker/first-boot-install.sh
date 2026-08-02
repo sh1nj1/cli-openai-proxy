@@ -8,6 +8,7 @@ set -euo pipefail
 SEED="/run/host-config/gateway.env"
 GATEWAY_UNIT_DIR="/etc/systemd/system/cli-openai-proxy-gateway.service.d"
 CONFIG_OK_FLAG="/run/cli-openai-proxy-config-ok"
+NETWORK_ENV="/run/cli-openai-proxy-container-network.env"
 
 # Docker creates /run/host-config as 0755 on the container's writable tmpfs
 # (the ro bind mount only applies to the file inside it), so any cap_* worker
@@ -43,11 +44,17 @@ systemctl daemon-reload
 # correct for the bare-metal install this unit is shared with. In a container,
 # docker's published-port forwarding connects to the container's external
 # interface, not its loopback, so a container deployment must bind all
-# interfaces; the compose port mapping is the actual access boundary. This
-# drop-in is container-only and never touches the shared bare-metal unit.
+# interfaces; the compose port mapping is the actual access boundary. Load a
+# container-only env file after the shared unit's gateway.env so a HOST or PORT
+# entry in the seed cannot override the published endpoint.
+cat > "${NETWORK_ENV}" <<'EOF'
+HOST=0.0.0.0
+PORT=3456
+EOF
+chmod 0644 "${NETWORK_ENV}"
 cat > "${GATEWAY_UNIT_DIR}/docker-bind.conf" <<'EOF'
 [Service]
-Environment=HOST=0.0.0.0
+EnvironmentFile=/run/cli-openai-proxy-container-network.env
 EOF
 chmod 0644 "${GATEWAY_UNIT_DIR}/docker-bind.conf"
 systemctl daemon-reload
