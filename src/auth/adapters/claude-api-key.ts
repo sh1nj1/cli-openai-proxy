@@ -96,18 +96,22 @@ export class ClaudeApiKeySession implements EngineAuthSession {
 
     const validate = this.options.validate ?? fetchValidator();
     const timeoutMs = this.options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
-    const timeout = AbortSignal.timeout(timeoutMs);
+    // Not AbortSignal.timeout: its internal timer does not hold the event loop
+    // open, so a validator waiting only on the signal could see the process
+    // drain and exit before the deadline ever fires. A plain setTimeout does.
+    const timeoutAborter = new AbortController();
+    const timer = setTimeout(() => timeoutAborter.abort(), timeoutMs);
 
     let verdict: KeyVerdict;
     try {
-      verdict = await validate(key, AbortSignal.any([this.aborter.signal, timeout]));
+      verdict = await validate(key, AbortSignal.any([this.aborter.signal, timeoutAborter.signal]));
     } catch (err) {
       // Cancellation first: cancelling also aborts the combined signal, and
       // "cancelled" is the more truthful reason of the two.
       if (this.aborter.signal.aborted) {
         throw new AuthProvisioningError("Login was cancelled", "session_cancelled");
       }
-      if (timeout.aborted) {
+      if (timeoutAborter.signal.aborted) {
         throw new AuthProvisioningError(
           `Key validation did not finish within ${timeoutMs}ms`,
           "validation_timeout",
@@ -118,6 +122,8 @@ export class ClaudeApiKeySession implements EngineAuthSession {
         err instanceof Error ? err.message : String(err),
         "validation_unavailable",
       );
+    } finally {
+      clearTimeout(timer);
     }
 
     // A validator that ignores the signal can still return a verdict after
