@@ -110,6 +110,13 @@ export function loadState(): ProvisionStateFile {
 	  ))],
 	}
 	: {}),
+      ...(Array.isArray(parsed.upgradeRecoveries)
+	? {
+	  upgradeRecoveries: [...new Set(parsed.upgradeRecoveries.filter(
+	    (id): id is string => typeof id === "string" && RECOVERY_ID_PATTERN.test(id),
+	  ))],
+	}
+	: {}),
       installed,
     };
   } catch {

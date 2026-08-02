@@ -83,6 +83,8 @@ export interface ProvisionStateFile {
   revoked: string[];
   /** Exact random identities of removal recoveries this proxy may prune. */
   removalRecoveries?: string[];
+  /** Exact random identities of retained upgrade staging trees this proxy may prune. */
+  upgradeRecoveries?: string[];
   installed: Record<string, InstalledRecord>;
 }
 

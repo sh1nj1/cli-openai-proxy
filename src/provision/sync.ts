@@ -297,6 +297,50 @@ function finalizeRemovalRecoveries(state: ProvisionStateFile): void {
     existsSync(path.join(skillsDir(), `.provision-removed-${recoveryId}`))).slice(-3);
 }
 
+function prepareUpgradeRecovery(state: ProvisionStateFile): {
+  upgradeRecoveryId: string;
+  ownedUpgradeRecoveryIds: string[];
+} {
+  const upgradeRecoveryId = randomBytes(16).toString("hex");
+  const ownedUpgradeRecoveryIds = [
+    ...(state.upgradeRecoveries ?? []).filter((recoveryId) =>
+      existsSync(path.join(skillsDir(), `.provision-staging-${recoveryId}`))).slice(-3),
+    upgradeRecoveryId,
+  ];
+  state.upgradeRecoveries = ownedUpgradeRecoveryIds;
+  // Persist the exact identity before its staging directory can appear.
+  saveState(state);
+  return { upgradeRecoveryId, ownedUpgradeRecoveryIds };
+}
+
+function finalizeUpgradeRecoveries(state: ProvisionStateFile): void {
+  state.upgradeRecoveries = (state.upgradeRecoveries ?? []).filter((recoveryId) =>
+    existsSync(path.join(skillsDir(), `.provision-staging-${recoveryId}`))).slice(-3);
+}
+
+function removalSnapshot(record: InstalledRecord): {
+  files: string[];
+  directories?: string[];
+  fileHashes?: Record<string, string | string[]>;
+} {
+  const snapshots: InstalledSnapshot[] = [record, ...(record.pending ? [record.pending] : [])];
+  const files = [...new Set(snapshots.flatMap((snapshot) => snapshot.files))];
+  const directories = [...new Set(snapshots.flatMap((snapshot) => snapshot.directories ?? []))];
+  const fileHashes: Record<string, string | string[]> = {};
+  for (const file of files) {
+    const owners = snapshots.filter((snapshot) => snapshot.files.includes(file));
+    const hashes = owners.map((snapshot) => snapshot.fileHashes?.[file]);
+    if (hashes.every((hash): hash is string => hash !== undefined)) {
+      fileHashes[file] = [...new Set(hashes)];
+    }
+  }
+  return {
+    files,
+    ...(directories.length > 0 ? { directories } : {}),
+    ...(Object.keys(fileHashes).length > 0 ? { fileHashes } : {}),
+  };
+}
+
 function reconcileUpgradeJournal(name: string, record: InstalledRecord): InstalledRecord {
   if (!record.pending) return record;
   // A crash can leave either side of the swap visible. Whichever complete
@@ -394,48 +438,55 @@ async function runSync(): Promise<ProvisionStatusView> {
 	}
       }
       const firstInstallMarker = previousRecord ? undefined : randomBytes(16).toString("hex");
-      const result = await installSkill(
-        { name: item.name, url: item.url!, sha256: item.sha256! },
-	{
-	  skillsDir: skillsDir(),
-	  checkUrl,
-	  managedFiles,
-	  managedDirectories,
-	  managedFileHashes,
-	  firstInstallMarker,
-	  afterFirstInstallMove,
-	  beforeCommit: (candidate) => {
-	    const candidateRecord: InstalledSnapshot = {
-	      sha256: item.sha256!,
-	      files: candidate.files,
-	      directories: candidate.directories,
-	      fileHashes: candidate.fileHashes,
-	      installedAt: new Date().toISOString(),
-	    };
-	    const nextRecord: InstalledRecord = previousRecord
-	      ? { ...stableSnapshot(previousRecord), pending: candidateRecord }
-	      : {
-		...candidateRecord,
-		uncommitted: true,
-		installMarker: firstInstallMarker,
+      const upgradeRecovery = previousRecord ? prepareUpgradeRecovery(state) : undefined;
+      let result: Awaited<ReturnType<typeof installSkill>>;
+      try {
+	result = await installSkill(
+	  { name: item.name, url: item.url!, sha256: item.sha256! },
+	  {
+	    skillsDir: skillsDir(),
+	    checkUrl,
+	    managedFiles,
+	    managedDirectories,
+	    managedFileHashes,
+	    ...upgradeRecovery,
+	    firstInstallMarker,
+	    afterFirstInstallMove,
+	    beforeCommit: (candidate) => {
+	      const candidateRecord: InstalledSnapshot = {
+		sha256: item.sha256!,
+		files: candidate.files,
+		directories: candidate.directories,
+		fileHashes: candidate.fileHashes,
+		installedAt: new Date().toISOString(),
 	      };
-	    state.installed[key] = nextRecord;
-	    try {
-	      saveState(state);
-	    } catch (err) {
-	      if (previousRecord) state.installed[key] = previousRecord;
-	      else delete state.installed[key];
-	      throw err;
-	    }
-	    if (!previousRecord) {
-	      return () => {
-		delete state.installed[key];
+	      const nextRecord: InstalledRecord = previousRecord
+		? { ...stableSnapshot(previousRecord), pending: candidateRecord }
+		: {
+		  ...candidateRecord,
+		  uncommitted: true,
+		  installMarker: firstInstallMarker,
+		};
+	      state.installed[key] = nextRecord;
+	      try {
 		saveState(state);
-	      };
-	    }
+	      } catch (err) {
+		if (previousRecord) state.installed[key] = previousRecord;
+		else delete state.installed[key];
+		throw err;
+	      }
+	      if (!previousRecord) {
+		return () => {
+		  delete state.installed[key];
+		  saveState(state);
+		};
+	      }
+	    },
 	  },
-	},
-      );
+	);
+      } finally {
+	if (upgradeRecovery) finalizeUpgradeRecoveries(state);
+      }
       if (!previousRecord && reconcileFirstInstallJournals(state).has(key)) {
 	throw new ProvisionError(
 	  `First installation of "${item.name}" changed before ownership could be finalized`,
@@ -471,22 +522,12 @@ async function runSync(): Promise<ProvisionStatusView> {
       if (type === "skill") {
 	const recovery = prepareRemovalRecovery(state);
 	try {
+	  const snapshot = removalSnapshot(record);
 	  removeSkill(name, {
 	    skillsDir: skillsDir(),
-	    files: record.files,
-	    directories: record.directories,
-	    fileHashes: record.fileHashes,
+	    ...snapshot,
 	    ...recovery,
 	  });
-	  if (record.pending) {
-	    removeSkill(name, {
-	      skillsDir: skillsDir(),
-	      files: record.pending.files,
-	      directories: record.pending.directories,
-	      fileHashes: record.pending.fileHashes,
-	      ...recovery,
-	    });
-	  }
 	} finally {
 	  finalizeRemovalRecoveries(state);
 	}
@@ -588,22 +629,12 @@ export function deleteItem(type: string, name: string): Promise<{ removed: boole
     if (record && type === "skill") {
       const recovery = prepareRemovalRecovery(state);
       try {
+	const snapshot = removalSnapshot(record);
 	removeSkill(name, {
 	  skillsDir: skillsDir(),
-	  files: record.files,
-	  directories: record.directories,
-	  fileHashes: record.fileHashes,
+	  ...snapshot,
 	  ...recovery,
 	});
-	if (record.pending) {
-	  removeSkill(name, {
-	    skillsDir: skillsDir(),
-	    files: record.pending.files,
-	    directories: record.pending.directories,
-	    fileHashes: record.pending.fileHashes,
-	    ...recovery,
-	  });
-	}
       } finally {
 	finalizeRemovalRecoveries(state);
 	saveState(state);

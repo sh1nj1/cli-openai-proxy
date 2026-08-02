@@ -50,6 +50,9 @@ const RECOVERY_ID_PATTERN = /^[0-9a-f]{32}$/;
 const REMOVAL_RECOVERY_PREFIX = ".provision-removed-";
 const REMOVAL_RECOVERY_METADATA = ".recovery.json";
 const MAX_REMOVAL_RECOVERIES = 3;
+const UPGRADE_RECOVERY_PREFIX = ".provision-staging-";
+const UPGRADE_RECOVERY_METADATA = ".upgrade-recovery.json";
+const MAX_UPGRADE_RECOVERIES = 3;
 
 /** Same charset the manifest enforces; re-checked here so no other caller can widen it. */
 const NAME_PATTERN = /^[a-z0-9][a-z0-9_-]{0,63}$/i;
@@ -231,6 +234,10 @@ export async function installSkill(
     managedDirectories?: string[];
     /** Accepted hashes for existing managed files, including either journal snapshot. */
     managedFileHashes?: Record<string, string | string[]>;
+    /** New upgrade recovery identity preclaimed in the lockfile before staging begins. */
+    upgradeRecoveryId?: string;
+    /** Ordered exact upgrade recovery identities currently owned by the lockfile. */
+    ownedUpgradeRecoveryIds?: string[];
     /** Test seam for deterministically exercising restoration races. */
     afterPreviousMove?: () => void;
     /** Test seam for mutation between first exposure and journal reconciliation. */
@@ -258,7 +265,32 @@ export async function installSkill(
   // Staging lives INSIDE skillsDir so the final rename is same-filesystem (atomic),
   // and dot-prefixed so skill loaders scanning the directory skip it.
   mkdirSync(opts.skillsDir, { recursive: true });
-  const staging = mkdtempSync(path.join(opts.skillsDir, ".provision-staging-"));
+  let staging: string;
+  let ownedUpgradeRecoveryIds: string[] | undefined;
+  if (opts.upgradeRecoveryId !== undefined) {
+    if (!RECOVERY_ID_PATTERN.test(opts.upgradeRecoveryId) || opts.managedFiles === undefined) {
+      throw new ProvisionError("Invalid upgrade recovery identity", "invalid_item");
+    }
+    ownedUpgradeRecoveryIds = [...new Set([
+      ...(opts.ownedUpgradeRecoveryIds ?? []),
+      opts.upgradeRecoveryId,
+    ])];
+    cleanupUpgradeRecoveries(
+      opts.skillsDir,
+      ownedUpgradeRecoveryIds,
+      MAX_UPGRADE_RECOVERIES - 1,
+    );
+    staging = path.join(opts.skillsDir, `${UPGRADE_RECOVERY_PREFIX}${opts.upgradeRecoveryId}`);
+    mkdirSync(staging, { mode: 0o700 });
+    writeFileSync(path.join(staging, UPGRADE_RECOVERY_METADATA), JSON.stringify({
+      version: 1,
+      skill: item.name,
+      createdAt: new Date().toISOString(),
+      recoveryId: opts.upgradeRecoveryId,
+    }));
+  } else {
+    staging = mkdtempSync(path.join(opts.skillsDir, UPGRADE_RECOVERY_PREFIX));
+  }
   let preserveStaging = false;
   try {
     const archivePath = path.join(archiveDir, "artifact.tgz");
@@ -421,8 +453,14 @@ export async function installSkill(
     }
     return result;
   } finally {
-    if (!preserveStaging) rmSync(staging, { recursive: true, force: true });
-    rmSync(archiveDir, { recursive: true, force: true });
+    try {
+      if (!preserveStaging) rmSync(staging, { recursive: true, force: true });
+      if (ownedUpgradeRecoveryIds) {
+	cleanupUpgradeRecoveries(opts.skillsDir, ownedUpgradeRecoveryIds);
+      }
+    } finally {
+      rmSync(archiveDir, { recursive: true, force: true });
+    }
   }
 }
 
@@ -632,6 +670,40 @@ function cleanupRemovalRecoveries(
   }
 }
 
+function cleanupUpgradeRecoveries(
+  skillsDir: string,
+  ownedRecoveryIds: string[],
+  retain = MAX_UPGRADE_RECOVERIES,
+): void {
+  const recoveries: string[] = [];
+  for (const recoveryId of ownedRecoveryIds) {
+    if (!RECOVERY_ID_PATTERN.test(recoveryId)) continue;
+    const directory = path.join(skillsDir, `${UPGRADE_RECOVERY_PREFIX}${recoveryId}`);
+    try {
+      if (!lstatSync(directory).isDirectory()) continue;
+      const metadata = JSON.parse(
+	readFileSync(path.join(directory, UPGRADE_RECOVERY_METADATA), "utf8"),
+      ) as Record<string, unknown>;
+      const createdAt = typeof metadata.createdAt === "string" ? Date.parse(metadata.createdAt) : NaN;
+      if (metadata.version !== 1 || typeof metadata.skill !== "string"
+	|| !NAME_PATTERN.test(metadata.skill) || !Number.isFinite(createdAt)
+	|| metadata.recoveryId !== recoveryId) continue;
+      recoveries.push(directory);
+    } catch {
+      // A crash between mkdir and metadata creation can leave only an empty
+      // preclaimed directory. Remove that empty shell, never unknown content.
+      try {
+	rmdirSync(directory);
+      } catch {
+	// Missing, non-empty, or malformed entries do not establish ownership.
+      }
+    }
+  }
+  for (const recovery of recoveries.slice(0, Math.max(0, recoveries.length - retain))) {
+    rmSync(recovery, { recursive: true, force: true });
+  }
+}
+
 /** Remove only recorded regular files, leaving modified or added user content. */
 export function removeSkill(
   name: string,
@@ -639,7 +711,7 @@ export function removeSkill(
     skillsDir: string;
     files: string[];
     directories?: string[];
-    fileHashes?: Record<string, string>;
+    fileHashes?: Record<string, string | string[]>;
     /** New identity preclaimed in the lockfile before this removal begins. */
     recoveryId?: string;
     /** Ordered exact identities currently owned by the lockfile. */

@@ -1,7 +1,7 @@
 import { test, describe, before, after, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
 import { createHash } from "crypto";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "fs";
 import { createServer, type Server } from "http";
 import { tmpdir } from "os";
 import path from "path";
@@ -590,6 +590,76 @@ describe("provision sync", () => {
 
     assert.equal(statusOf(view, "remove-pending"), "removed");
     assert.equal(existsSync(target), false);
+  });
+
+  test("removal accepts either hash for a path shared by upgrade journal snapshots", async () => {
+    process.env.PROVISION_AUTOAPPLY = "auto";
+    initProvisioning();
+    const target = path.join(skillsDir, "remove-shared-pending");
+    mkdirSync(target);
+    writeFileSync(path.join(target, "SKILL.md"), "new contents");
+    writeFileSync(path.join(stateDir, "provision.lock.json"), JSON.stringify({
+      version: 1,
+      approved: ["skill/remove-shared-pending"],
+      revoked: [],
+      installed: {
+	"skill/remove-shared-pending": {
+	  sha256: "a".repeat(64),
+	  files: ["SKILL.md"],
+	  fileHashes: { "SKILL.md": sha(Buffer.from("old contents")) },
+	  installedAt: new Date().toISOString(),
+	  pending: {
+	    sha256: "b".repeat(64),
+	    files: ["SKILL.md"],
+	    fileHashes: { "SKILL.md": sha(Buffer.from("new contents")) },
+	    installedAt: new Date().toISOString(),
+	  },
+	},
+      },
+    }));
+    initProvisioning();
+    registerManifestUrl(serveManifest([]));
+
+    const view = await syncNow();
+
+    assert.equal(statusOf(view, "remove-shared-pending"), "removed");
+    assert.equal(existsSync(target), false);
+  });
+
+  test("upgrade staging recoveries are lockfile-owned and bounded", async () => {
+    process.env.PROVISION_AUTOAPPLY = "auto";
+    initProvisioning();
+    const spoofedId = "f".repeat(32);
+    const spoofed = path.join(skillsDir, `.provision-staging-${spoofedId}`);
+    mkdirSync(spoofed);
+    writeFileSync(path.join(spoofed, "keep.txt"), "user-owned");
+    writeFileSync(path.join(spoofed, ".upgrade-recovery.json"), JSON.stringify({
+      version: 1,
+      skill: "bounded-upgrade",
+      createdAt: "2020-01-01T00:00:00.000Z",
+      recoveryId: spoofedId,
+    }));
+
+    for (let version = 1; version <= 6; version += 1) {
+      const skill = serveSkill(`/bounded-upgrade-${version}.tgz`, `v${version}`);
+      registerManifestUrl(serveManifest([{
+	type: "skill",
+	name: "bounded-upgrade",
+	...skill,
+      }]));
+      assert.equal(statusOf(await syncNow(), "bounded-upgrade"), "installed");
+    }
+
+    const state = JSON.parse(readFileSync(path.join(stateDir, "provision.lock.json"), "utf8"));
+    assert.equal(state.upgradeRecoveries.length, 3);
+    assert.deepEqual(
+      readdirSync(skillsDir)
+	.filter((entry) => entry.startsWith(".provision-staging-")
+	  && entry !== `.provision-staging-${spoofedId}`)
+	.sort(),
+      state.upgradeRecoveries.map((id: string) => `.provision-staging-${id}`).sort(),
+    );
+    assert.equal(readFileSync(path.join(spoofed, "keep.txt"), "utf8"), "user-owned");
   });
 
   test("deleting an item uninstalls it and revokes its approval", async () => {

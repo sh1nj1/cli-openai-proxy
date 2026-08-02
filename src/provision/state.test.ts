@@ -32,6 +32,7 @@ describe("provision state", () => {
       approved: ["skill/pr-monitor"],
       revoked: [],
       removalRecoveries: ["f".repeat(32)],
+      upgradeRecoveries: ["e".repeat(32)],
       installed: {
         "skill/pr-monitor": {
           sha256: "a".repeat(64),
