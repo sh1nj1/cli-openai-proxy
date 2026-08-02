@@ -771,6 +771,27 @@ describe("provision installer", () => {
     );
   });
 
+  test("a failed artifact response is cancelled before the download error is reported", async () => {
+    const realFetch = globalThis.fetch;
+    let cancelled = false;
+    globalThis.fetch = async () => new Response(new ReadableStream({
+      cancel: () => { cancelled = true; },
+    }), { status: 503 });
+    try {
+      assert.equal(
+	await codeOf(() => installSkill({
+	  name: "demo",
+	  url: "https://example.invalid/failure.tgz",
+	  sha256: "0".repeat(64),
+	}, { skillsDir })),
+	"download_failed",
+      );
+      assert.equal(cancelled, true);
+    } finally {
+      globalThis.fetch = realFetch;
+    }
+  });
+
   test("no staging debris is left behind in skillsDir", async () => {
     const { url, sha256 } = serve("/i.tgz", makeTarGz([{ name: "SKILL.md", content: "ok" }]));
     await installSkill({ name: "demo", url, sha256 }, { skillsDir });
@@ -798,6 +819,65 @@ describe("provision installer", () => {
 
     assert.equal(readFileSync(path.join(candidate, "SKILL.md"), "utf8"), "preserved");
     assert.equal(existsSync(path.join(skillsDir, "demo")), false);
+  });
+
+  test("candidate cleanup preserves a pathname rebound before audit", async () => {
+    const { url, sha256 } = serve("/candidate-audit-rebind.tgz", makeTarGz([
+      { name: "SKILL.md", content: "audited original" },
+    ]));
+    const preservedOriginal = path.join(skillsDir, "preserved-original");
+    let candidate = "";
+
+    await assert.rejects(
+      installSkill({ name: "demo", url, sha256 }, {
+	skillsDir,
+	beforeCandidateAudit: (candidatePath) => {
+	  candidate = candidatePath;
+	  renameSync(candidatePath, preservedOriginal);
+	  mkdirSync(candidatePath);
+	  writeFileSync(path.join(candidatePath, "bad.bin"), Buffer.from([0]));
+	},
+      }),
+      (err: unknown) => err instanceof ProvisionError && err.code === "audit_failed",
+    );
+
+    assert.equal(readFileSync(path.join(preservedOriginal, "SKILL.md"), "utf8"), "audited original");
+    assert.deepEqual(readFileSync(path.join(candidate, "bad.bin")), Buffer.from([0]));
+  });
+
+  test("exposure rejects a candidate pathname rebound after audit", async () => {
+    const { url, sha256 } = serve("/candidate-exposure-rebind.tgz", makeTarGz([
+      { name: "SKILL.md", content: "audited original" },
+    ]));
+    const preservedOriginal = path.join(skillsDir, "preserved-audited-candidate");
+    const target = path.join(skillsDir, "demo");
+    let candidate = "";
+    let rolledBack = false;
+
+    await assert.rejects(
+      installSkill({ name: "demo", url, sha256 }, {
+	skillsDir,
+	beforeCommit: () => () => { rolledBack = true; },
+	beforeCandidateMove: () => {
+	  candidate = path.join(
+	    skillsDir,
+	    readdirSync(skillsDir).find((entry) => entry.startsWith(".provision-candidate-"))!,
+	  );
+	},
+	beforeCandidateRename: () => {
+	  renameSync(candidate, preservedOriginal);
+	  mkdirSync(candidate);
+	  writeFileSync(path.join(candidate, "SKILL.md"), "unaudited replacement");
+	},
+      }),
+      (err: unknown) => err instanceof ProvisionError
+	&& err.code === "untracked_content"
+	&& err.message.includes("unaudited candidate"),
+    );
+
+    assert.equal(rolledBack, true);
+    assert.equal(readFileSync(path.join(preservedOriginal, "SKILL.md"), "utf8"), "audited original");
+    assert.equal(readFileSync(path.join(target, "SKILL.md"), "utf8"), "unaudited replacement");
   });
 
   test("a body that streams past the size cap is aborted, not buffered to completion", async () => {

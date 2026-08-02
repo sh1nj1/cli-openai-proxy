@@ -80,6 +80,11 @@ async function download(url: string, checkUrl?: (url: string) => void): Promise<
     failCode: "download_failed",
   });
   if (!response.ok) {
+    try {
+      await response.body?.cancel();
+    } catch {
+      // Cancellation is best-effort; the HTTP failure must still be reported.
+    }
     throw new ProvisionError(`Download failed: HTTP ${response.status}`, "download_failed");
   }
   // The cap is enforced WHILE the body streams: a host that sends an oversized
@@ -263,6 +268,8 @@ export async function installSkill(
     afterFirstInstallMove?: (target: string) => void;
     /** Test seam for a target appearing immediately before candidate exposure. */
     beforeCandidateMove?: (target: string) => void;
+    /** Test seam for replacing the candidate before its static audit. */
+    beforeCandidateAudit?: (candidate: string) => void;
     /** Test seam for replacing the old reservation immediately before the atomic rename. */
     beforeCandidateRename?: (target: string) => void;
     /** Test seam for an addition made after the moved-aside tree passes its audit. */
@@ -294,6 +301,10 @@ export async function installSkill(
     `.provision-candidate-${randomBytes(16).toString("hex")}`,
   );
   mkdirSync(candidate, { mode: 0o700 });
+  const candidateIdentity = directoryIdentity(candidate);
+  if (candidateIdentity === null) {
+    throw new ProvisionError("Candidate directory identity is unavailable", "untracked_content");
+  }
   let staging: string;
   if (opts.upgradeRecoveryId !== undefined) {
     if (!RECOVERY_ID_PATTERN.test(opts.upgradeRecoveryId) || opts.managedFiles === undefined) {
@@ -327,8 +338,15 @@ export async function installSkill(
 
     // A root `./` entry can overwrite the candidate's mode. Restore access
     // before inspecting the direct sibling that will be atomically exposed.
+    opts.beforeCandidateAudit?.(candidate);
     normalizeExtractedModes(candidate);
     const result = auditTree(candidate);
+    if (!sameDirectoryIdentity(directoryIdentity(candidate), candidateIdentity)) {
+      throw new ProvisionError(
+	`Refusing to install "${item.name}" because its candidate directory changed during audit`,
+	"untracked_content",
+      );
+    }
     if (result.files.length === 0) {
       throw new ProvisionError("Archive contains no files", "archive_rejected");
     }
@@ -383,6 +401,7 @@ export async function installSkill(
 	  );
 	}
 	candidateExposed = true;
+	assertPublishedCandidate(target, candidateIdentity, item.name);
       } catch (err) {
 	preserveCandidate = targetExists(candidate);
 	rollbackCommit?.();
@@ -458,6 +477,7 @@ export async function installSkill(
 	);
       }
       candidateExposed = true;
+      assertPublishedCandidate(target, candidateIdentity, item.name);
     } catch (err) {
       if (err instanceof ProvisionError && err.code === "untracked_content") throw err;
       preserveCandidate = targetExists(candidate);
@@ -485,7 +505,11 @@ export async function installSkill(
     try {
       // Once exposed, the candidate pathname is vacant and no longer identifies
       // our audited tree. A same-UID process can reuse it before this finally.
-      if (!preserveCandidate && !candidateExposed) {
+      if (
+	!preserveCandidate
+	&& !candidateExposed
+	&& sameDirectoryIdentity(directoryIdentity(candidate), candidateIdentity)
+      ) {
 	rmSync(candidate, { recursive: true, force: true });
       }
     } finally {
@@ -587,6 +611,19 @@ function sameDirectoryIdentity(
   right: DirectoryIdentity | null,
 ): boolean {
   return left !== null && right !== null && left.dev === right.dev && left.ino === right.ino;
+}
+
+function assertPublishedCandidate(
+  target: string,
+  expected: DirectoryIdentity,
+  itemName: string,
+): void {
+  if (!sameDirectoryIdentity(directoryIdentity(target), expected)) {
+    throw new ProvisionError(
+      `Refusing to install "${itemName}" because an unaudited candidate reached the target`,
+      "untracked_content",
+    );
+  }
 }
 
 function managedTreeHasExactPaths(
