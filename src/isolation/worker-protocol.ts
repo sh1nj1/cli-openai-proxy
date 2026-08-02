@@ -3,9 +3,15 @@
  * before answering the caller; it may contain a manifest URL with credentials.
  */
 export const AUTHORIZED_PROVISIONING_HEADER = "x-cli-proxy-authorized-provisioning";
+/** Leaves ample room under Node's default aggregate HTTP header limit. */
+export const MAX_AUTHORIZED_PROVISIONING_HEADER_BYTES = 8 * 1024;
 
 export function encodeProvisioningUrl(url: string): string {
   return Buffer.from(url, "utf8").toString("base64url");
+}
+
+export function provisioningUrlFitsHeader(url: string): boolean {
+  return Buffer.byteLength(encodeProvisioningUrl(url), "ascii") <= MAX_AUTHORIZED_PROVISIONING_HEADER_BYTES;
 }
 
 export function decodeProvisioningUrl(value: string | string[] | undefined): string | undefined {

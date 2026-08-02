@@ -39,14 +39,23 @@ export type ProvisionItemStatus =
 /** Types this proxy version can install. Everything else reports `unsupported`. */
 export const SUPPORTED_PROVISION_TYPES: ReadonlySet<string> = new Set(["skill"]);
 
-/** One installed artifact as the lockfile records it. */
-export interface InstalledRecord {
+/** One filesystem snapshot owned by the proxy. */
+export interface InstalledSnapshot {
   sha256: string;
   /** Paths relative to the item's install dir — what removal may delete. */
   files: string[];
   /** Per-file content hashes used to detect and repair local drift. */
   fileHashes?: Record<string, string>;
   installedAt: string;
+}
+
+/** One installed artifact as the lockfile records it. */
+export interface InstalledRecord extends InstalledSnapshot {
+  /**
+   * Upgrade journal written before the directory swap. The stable snapshot is
+   * retained alongside it so either side of an interrupted swap stays owned.
+   */
+  pending?: InstalledSnapshot;
 }
 
 /**

@@ -20,7 +20,11 @@ import {
 } from "../auth/session-manager.js";
 import { clearCredential } from "../auth/token-store.js";
 import { AuthProvisioningError } from "../auth/types.js";
-import { AUTHORIZED_PROVISIONING_HEADER, encodeProvisioningUrl } from "../isolation/worker-protocol.js";
+import {
+  AUTHORIZED_PROVISIONING_HEADER,
+  encodeProvisioningUrl,
+  provisioningUrlFitsHeader,
+} from "../isolation/worker-protocol.js";
 
 /** Path prefix these handlers own. authMiddleware defers to this module's gate for it. */
 export const AUTH_PROVISIONING_PREFIX = "/v1/auth";
@@ -157,6 +161,10 @@ export async function handleCreateAuthSession(req: Request, res: Response): Prom
   const provisioningUrl = body?.provisioning_url;
   if (provisioningUrl !== undefined && (typeof provisioningUrl !== "string" || !parseable(provisioningUrl))) {
     fail(res, 400, "`provisioning_url` must be a valid URL.", "invalid_provisioning_url");
+    return;
+  }
+  if (typeof provisioningUrl === "string" && !provisioningUrlFitsHeader(provisioningUrl)) {
+    fail(res, 400, "`provisioning_url` is too long.", "invalid_provisioning_url");
     return;
   }
   try {

@@ -80,7 +80,9 @@ Three ways, all equivalent once registered:
    ```
 
    A provisioning failure never fails the login — it lands in the status
-   view's `last_error`.
+   view's `last_error`. URLs whose base64url representation exceeds 8 KiB are
+   rejected so the private worker-to-gateway notification stays within the
+   HTTP response-header budget.
 2. **At startup** — `PROVISION_MANIFEST_URL`.
 3. **Re-fetch** — once registered, the proxy re-pulls every
    `PROVISION_REFETCH_MS` (default 1h). Updating the JSON is all an external
@@ -142,8 +144,10 @@ The tombstone clears after the item leaves the manifest.
   untouched.
 - **Lockfile ownership.** `~/.cli-openai-proxy/provision.lock.json` records
   what the proxy installed, including per-file hashes used to repair missing
-  or modified files on the next sync; removal only ever touches what it lists. Skills a
-  user installed by hand are never overwritten or deleted — a manifest item
+  or modified files on the next sync. Upgrades journal both the stable and
+  candidate ownership snapshots before swapping directories, so an interrupted
+  swap is recoverable; removal only ever touches what the journal lists. Skills
+  a user installed by hand are never overwritten or deleted — a manifest item
   whose name collides with an untracked directory fails with
   `Refusing to replace untracked directory` instead of replacing it.
 - **TOFU approval.** In the default `approve` mode a first-seen `(type, name)`

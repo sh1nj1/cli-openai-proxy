@@ -350,6 +350,83 @@ describe("provision sync", () => {
     assert.equal(existsSync(path.join(skillsDir, "ownership")), false);
   });
 
+  test("a committed upgrade is recovered from a pending ownership transaction", async () => {
+    process.env.PROVISION_AUTOAPPLY = "auto";
+    initProvisioning();
+    const target = path.join(skillsDir, "recover-upgrade");
+    mkdirSync(target);
+    writeFileSync(path.join(target, "NEW.md"), "new contents");
+    const candidateSha = "b".repeat(64);
+    writeFileSync(path.join(stateDir, "provision.lock.json"), JSON.stringify({
+      version: 1,
+      approved: ["skill/recover-upgrade"],
+      revoked: [],
+      installed: {
+	"skill/recover-upgrade": {
+	  sha256: "a".repeat(64),
+	  files: ["OLD.md"],
+	  fileHashes: { "OLD.md": sha(Buffer.from("old contents")) },
+	  installedAt: new Date().toISOString(),
+	  pending: {
+	    sha256: candidateSha,
+	    files: ["NEW.md"],
+	    fileHashes: { "NEW.md": sha(Buffer.from("new contents")) },
+	    installedAt: new Date().toISOString(),
+	  },
+	},
+      },
+    }));
+    initProvisioning();
+    registerManifestUrl(serveManifest([{
+      type: "skill",
+      name: "recover-upgrade",
+      url: `${baseUrl}/must-not-download.tgz`,
+      sha256: candidateSha,
+    }]));
+
+    const view = await syncNow();
+
+    assert.equal(statusOf(view, "recover-upgrade"), "installed");
+    assert.equal(readFileSync(path.join(target, "NEW.md"), "utf8"), "new contents");
+    const state = JSON.parse(readFileSync(path.join(stateDir, "provision.lock.json"), "utf8"));
+    assert.equal(state.installed["skill/recover-upgrade"].sha256, candidateSha);
+    assert.equal(state.installed["skill/recover-upgrade"].pending, undefined);
+  });
+
+  test("removal after an interrupted upgrade recognizes candidate-owned files", async () => {
+    process.env.PROVISION_AUTOAPPLY = "auto";
+    initProvisioning();
+    const target = path.join(skillsDir, "remove-pending");
+    mkdirSync(target);
+    writeFileSync(path.join(target, "NEW.md"), "new contents");
+    writeFileSync(path.join(stateDir, "provision.lock.json"), JSON.stringify({
+      version: 1,
+      approved: ["skill/remove-pending"],
+      revoked: [],
+      installed: {
+	"skill/remove-pending": {
+	  sha256: "a".repeat(64),
+	  files: ["OLD.md"],
+	  fileHashes: { "OLD.md": sha(Buffer.from("old contents")) },
+	  installedAt: new Date().toISOString(),
+	  pending: {
+	    sha256: "b".repeat(64),
+	    files: ["NEW.md"],
+	    fileHashes: { "NEW.md": sha(Buffer.from("new contents")) },
+	    installedAt: new Date().toISOString(),
+	  },
+	},
+      },
+    }));
+    initProvisioning();
+    registerManifestUrl(serveManifest([]));
+
+    const view = await syncNow();
+
+    assert.equal(statusOf(view, "remove-pending"), "removed");
+    assert.equal(existsSync(target), false);
+  });
+
   test("deleting an item uninstalls it and revokes its approval", async () => {
     process.env.PROVISION_AUTOAPPLY = "auto";
     initProvisioning();

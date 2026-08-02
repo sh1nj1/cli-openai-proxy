@@ -32,6 +32,7 @@ import {
   SUPPORTED_PROVISION_TYPES,
   type ProvisionItemStatus,
   type InstalledRecord,
+  type InstalledSnapshot,
   type ProvisionManifest,
 } from "./types.js";
 
@@ -185,7 +186,7 @@ async function fetchManifest(url: string): Promise<ProvisionManifest> {
   return parseManifest(body);
 }
 
-function installedRecordIntact(name: string, record: InstalledRecord): boolean {
+function installedRecordIntact(name: string, record: InstalledSnapshot): boolean {
   if (!record.fileHashes || Object.keys(record.fileHashes).length !== record.files.length) return false;
   const root = path.join(skillsDir(), name);
   try {
@@ -200,6 +201,21 @@ function installedRecordIntact(name: string, record: InstalledRecord): boolean {
   } catch {
     return false;
   }
+}
+
+function stableSnapshot(record: InstalledRecord): InstalledSnapshot {
+  const { pending: _pending, ...stable } = record;
+  return stable;
+}
+
+function reconcileUpgradeJournal(name: string, record: InstalledRecord): InstalledRecord {
+  if (!record.pending) return record;
+  // A crash can leave either side of the swap visible. Whichever complete
+  // snapshot is on disk becomes stable; if neither is intact, retain both
+  // ownership sets so the next install/removal can recover safely.
+  if (installedRecordIntact(name, record.pending)) return { ...record.pending };
+  if (installedRecordIntact(name, record)) return { ...stableSnapshot(record) };
+  return record;
 }
 
 async function runSync(): Promise<ProvisionStatusView> {
@@ -225,6 +241,10 @@ async function runSync(): Promise<ProvisionStatusView> {
     if (!SUPPORTED_PROVISION_TYPES.has(item.type)) {
       views.push({ type: item.type, name: item.name, status: "unsupported" });
       continue;
+    }
+
+    if (state.installed[key]?.pending) {
+      state.installed[key] = reconcileUpgradeJournal(item.name, state.installed[key]!);
     }
 
     // Already-installed items count as approved: they were gated when first
@@ -261,27 +281,37 @@ async function runSync(): Promise<ProvisionStatusView> {
     try {
       checkUrl(item.url!);
       const previousRecord = state.installed[key];
+      const managedFiles = previousRecord
+	? [...new Set([...previousRecord.files, ...(previousRecord.pending?.files ?? [])])]
+	: undefined;
       const result = await installSkill(
         { name: item.name, url: item.url!, sha256: item.sha256! },
 	{
 	  skillsDir: skillsDir(),
 	  checkUrl,
-	  managedFiles: previousRecord?.files,
+	  managedFiles,
 	  beforeCommit: (candidate) => {
-	    state.installed[key] = {
+	    const candidateRecord: InstalledSnapshot = {
 	      sha256: item.sha256!,
 	      files: candidate.files,
 	      fileHashes: candidate.fileHashes,
 	      installedAt: new Date().toISOString(),
 	    };
+	    state.installed[key] = previousRecord
+	      ? { ...stableSnapshot(previousRecord), pending: candidateRecord }
+	      : candidateRecord;
 	    saveState(state);
 	  },
 	},
       );
-      // `beforeCommit` already persisted this exact record before the atomic
-      // rename. Keep the result reference explicit so this coupling is visible.
-      state.installed[key]!.files = result.files;
-      state.installed[key]!.fileHashes = result.fileHashes;
+      // Finalizing drops the upgrade journal. If this save later fails, the
+      // persisted stable+pending pair lets the next sync recognize either side.
+      state.installed[key] = {
+	sha256: item.sha256!,
+	files: result.files,
+	fileHashes: result.fileHashes,
+	installedAt: new Date().toISOString(),
+      };
       if (!state.approved.includes(key)) state.approved.push(key);
       views.push({ type: item.type, name: item.name, status: "installed", sha256: item.sha256 });
     } catch (err) {
@@ -305,6 +335,13 @@ async function runSync(): Promise<ProvisionStatusView> {
 	  files: record.files,
 	  fileHashes: record.fileHashes,
 	});
+	if (record.pending) {
+	  removeSkill(name, {
+	    skillsDir: skillsDir(),
+	    files: record.pending.files,
+	    fileHashes: record.pending.fileHashes,
+	  });
+	}
       }
       delete state.installed[key];
       views.push({ type: type ?? "skill", name, status: "removed" });
@@ -405,6 +442,13 @@ export function deleteItem(type: string, name: string): Promise<{ removed: boole
 	files: record.files,
 	fileHashes: record.fileHashes,
       });
+      if (record.pending) {
+	removeSkill(name, {
+	  skillsDir: skillsDir(),
+	  files: record.pending.files,
+	  fileHashes: record.pending.fileHashes,
+	});
+      }
     }
     delete state.installed[key];
     // Revoked, not just uninstalled: auto mode must not undo an explicit DELETE.

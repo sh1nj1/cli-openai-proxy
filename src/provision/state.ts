@@ -10,7 +10,7 @@
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from "fs";
 import { homedir } from "os";
 import path from "path";
-import type { InstalledRecord, ProvisionStateFile } from "./types.js";
+import type { InstalledRecord, InstalledSnapshot, ProvisionStateFile } from "./types.js";
 
 function stateDir(): string {
   return process.env.PROVISION_STATE_DIR?.trim() || path.join(homedir(), ".cli-openai-proxy");
@@ -29,7 +29,7 @@ function safeRelativeFile(value: unknown): value is string {
   return value.split(/[\\/]/).every((part) => part !== "" && part !== "." && part !== "..");
 }
 
-function installedRecord(value: unknown): InstalledRecord | null {
+function installedSnapshot(value: unknown): InstalledSnapshot | null {
   if (typeof value !== "object" || value === null || Array.isArray(value)) return null;
   const record = value as Record<string, unknown>;
   if (typeof record.sha256 !== "string" || !HASH_PATTERN.test(record.sha256)) return null;
@@ -51,6 +51,17 @@ function installedRecord(value: unknown): InstalledRecord | null {
     files: [...files],
     ...(fileHashes ? { fileHashes } : {}),
     installedAt: record.installedAt,
+  };
+}
+
+function installedRecord(value: unknown): InstalledRecord | null {
+  const stable = installedSnapshot(value);
+  if (!stable) return null;
+  const raw = value as Record<string, unknown>;
+  const pending = raw.pending === undefined ? null : installedSnapshot(raw.pending);
+  return {
+    ...stable,
+    ...(pending ? { pending } : {}),
   };
 }
 

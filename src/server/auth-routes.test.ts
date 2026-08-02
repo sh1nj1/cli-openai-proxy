@@ -276,6 +276,18 @@ describe("auth-routes", () => {
     assert.equal(JSON.stringify(res.payload).includes(manifestUrl), false, "private URL must stay out of JSON");
   });
 
+  test("provisioning_url is rejected before it can exceed the worker response-header budget", async () => {
+    const res = fakeRes();
+    await handleCreateAuthSession(fakeReq({
+      params: { engine: "fake" } as any,
+      body: { provisioning_url: `https://collavre.test/provision.json?token=${"a".repeat(16 * 1024)}` },
+    }), res);
+
+    assert.equal(res.statusCode, 400);
+    assert.equal((res.payload as { error: { code: string } }).error.code, "invalid_provisioning_url");
+    assert.match((res.payload as { error: { message: string } }).error.message, /too long/i);
+  });
+
   test("worker polling emits a device-code provisioning notification only once", async () => {
     let authorize!: () => void;
     const authorized = new Promise<void>((resolve) => { authorize = resolve; });
