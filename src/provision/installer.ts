@@ -197,6 +197,8 @@ export async function installSkill(
     managedFiles?: string[];
     /** Existing managed directories; omitted for legacy lockfiles that did not track them. */
     managedDirectories?: string[];
+    /** Test seam for deterministically exercising restoration races. */
+    afterPreviousMove?: () => void;
   },
 ): Promise<InstallResult> {
   if (!NAME_PATTERN.test(item.name)) {
@@ -217,6 +219,7 @@ export async function installSkill(
   // and dot-prefixed so skill loaders scanning the directory skip it.
   mkdirSync(opts.skillsDir, { recursive: true });
   const staging = mkdtempSync(path.join(opts.skillsDir, ".provision-staging-"));
+  let preserveStaging = false;
   try {
     const archivePath = path.join(archiveDir, "artifact.tgz");
     writeFileSync(archivePath, buf);
@@ -295,12 +298,24 @@ export async function installSkill(
     } catch (err) {
       if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
     }
+    opts.afterPreviousMove?.();
     if (hadPrevious && hasUntrackedContent(
       previous,
       new Set(opts.managedFiles!),
       opts.managedDirectories !== undefined ? new Set(opts.managedDirectories) : undefined,
     )) {
-      renameSync(previous, target);
+      try {
+	renameSync(previous, target);
+      } catch (err) {
+	if (!["EEXIST", "ENOTEMPTY"].includes((err as NodeJS.ErrnoException).code ?? "")) {
+	  throw err;
+	}
+	preserveStaging = true;
+	throw new ProvisionError(
+	  `Refusing to replace "${item.name}" because content was added during installation; prior contents preserved at "${previous}"`,
+	  "untracked_content",
+	);
+      }
       hadPrevious = false;
       throw new ProvisionError(
 	`Refusing to replace "${item.name}" because content was added during installation`,
@@ -310,12 +325,27 @@ export async function installSkill(
     try {
       renameSync(root, target);
     } catch (err) {
-      if (hadPrevious) renameSync(previous, target);
+      if (hadPrevious) {
+	try {
+	  renameSync(previous, target);
+	} catch (restoreErr) {
+	  if (!["EEXIST", "ENOTEMPTY"].includes(
+	    (restoreErr as NodeJS.ErrnoException).code ?? "",
+	  )) {
+	    throw restoreErr;
+	  }
+	  preserveStaging = true;
+	  throw new ProvisionError(
+	    `Upgrade failed and the target was recreated; prior contents preserved at "${previous}"`,
+	    "untracked_content",
+	  );
+	}
+      }
       throw err;
     }
     return result;
   } finally {
-    rmSync(staging, { recursive: true, force: true });
+    if (!preserveStaging) rmSync(staging, { recursive: true, force: true });
     rmSync(archiveDir, { recursive: true, force: true });
   }
 }
