@@ -490,6 +490,31 @@ describe("provision sync", () => {
     assert.equal(state.installed[`skill/${name}`], undefined);
   });
 
+  test("a rejected first-install journal is not finalized as stable ownership", async () => {
+    process.env.PROVISION_AUTOAPPLY = "auto";
+    initProvisioning({
+      afterFirstInstallMove: (target) => {
+	writeFileSync(path.join(target, "SKILL.md"), "changed after exposure");
+      },
+    });
+    const skill = serveSkill("/changed-after-exposure.tgz", "candidate contents");
+    registerManifestUrl(serveManifest([{
+      type: "skill",
+      name: "changed-after-exposure",
+      ...skill,
+    }]));
+
+    const view = await syncNow();
+
+    assert.equal(statusOf(view, "changed-after-exposure"), "failed");
+    assert.equal(
+      readFileSync(path.join(skillsDir, "changed-after-exposure", "SKILL.md"), "utf8"),
+      "changed after exposure",
+    );
+    const state = JSON.parse(readFileSync(path.join(stateDir, "provision.lock.json"), "utf8"));
+    assert.equal(state.installed["skill/changed-after-exposure"], undefined);
+  });
+
   test("a committed upgrade is recovered from a pending ownership transaction", async () => {
     process.env.PROVISION_AUTOAPPLY = "auto";
     initProvisioning();

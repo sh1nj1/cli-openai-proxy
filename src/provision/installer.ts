@@ -10,7 +10,7 @@
  */
 
 import { execFileSync } from "child_process";
-import { createHash } from "crypto";
+import { createHash, randomBytes } from "crypto";
 import {
   chmodSync,
   lstatSync,
@@ -46,6 +46,7 @@ const MAX_TOTAL_BYTES = 10 * 1024 * 1024;
 const MAX_DECOMPRESSED_BYTES = MAX_TOTAL_BYTES + 1024 * 1024;
 const DOWNLOAD_TIMEOUT_MS = 120_000;
 const INSTALL_MARKER_PATTERN = /^[0-9a-f]{32}$/;
+const RECOVERY_ID_PATTERN = /^[0-9a-f]{32}$/;
 const REMOVAL_RECOVERY_PREFIX = ".provision-removed-";
 const REMOVAL_RECOVERY_METADATA = ".recovery.json";
 const MAX_REMOVAL_RECOVERIES = 3;
@@ -232,6 +233,8 @@ export async function installSkill(
     managedFileHashes?: Record<string, string | string[]>;
     /** Test seam for deterministically exercising restoration races. */
     afterPreviousMove?: () => void;
+    /** Test seam for mutation between first exposure and journal reconciliation. */
+    afterFirstInstallMove?: (target: string) => void;
     /** Test seam for an addition made after the moved-aside tree passes its audit. */
     afterPreviousAudit?: (previousRoot: string) => void;
     /** Test seam for a mutation made after cleanup verifies an isolated file. */
@@ -336,6 +339,7 @@ export async function installSkill(
 	}
 	throw err;
       }
+      opts.afterFirstInstallMove?.(target);
       return result;
     }
     const previous = path.join(staging, "previous");
@@ -489,6 +493,8 @@ function removeManagedTree(
     quarantineParent?: string;
     /** Metadata for bounded removal recovery directories. */
     quarantineSkill?: string;
+    /** Exact lockfile-owned identity for this recovery directory. */
+    recoveryId?: string;
   },
 ): { clean: boolean; recoveryPath?: string } {
   if (!existsAsDirectory(root)) return { clean: !targetExists(root) };
@@ -516,15 +522,18 @@ function removeManagedTree(
       const stat = lstatSync(file);
       if (!stat.isFile()) continue;
       if (!quarantine) {
-	quarantine = mkdtempSync(path.join(
-	  opts.quarantineParent ?? root,
-	  opts.quarantineParent ? REMOVAL_RECOVERY_PREFIX : ".provision-cleanup-",
-	));
+	if (opts.quarantineParent && opts.recoveryId) {
+	  quarantine = path.join(opts.quarantineParent, `${REMOVAL_RECOVERY_PREFIX}${opts.recoveryId}`);
+	  mkdirSync(quarantine, { mode: 0o700 });
+	} else {
+	  quarantine = mkdtempSync(path.join(root, ".provision-cleanup-"));
+	}
 	if (opts.quarantineParent && opts.quarantineSkill) {
 	  writeFileSync(path.join(quarantine, REMOVAL_RECOVERY_METADATA), JSON.stringify({
 	    version: 1,
 	    skill: opts.quarantineSkill,
 	    createdAt: new Date().toISOString(),
+	    recoveryId: opts.recoveryId,
 	  }));
 	}
       }
@@ -597,18 +606,13 @@ function removeManagedTree(
 
 function cleanupRemovalRecoveries(
   skillsDir: string,
+  ownedRecoveryIds: string[],
   retain = MAX_REMOVAL_RECOVERIES,
 ): void {
-  let entries: string[];
-  try {
-    entries = readdirSync(skillsDir).filter((entry) => entry.startsWith(REMOVAL_RECOVERY_PREFIX));
-  } catch (err) {
-    if ((err as NodeJS.ErrnoException).code === "ENOENT") return;
-    throw err;
-  }
-  const recoveries: Array<{ directory: string; createdAt: number }> = [];
-  for (const entry of entries) {
-    const directory = path.join(skillsDir, entry);
+  const recoveries: string[] = [];
+  for (const recoveryId of ownedRecoveryIds) {
+    if (!RECOVERY_ID_PATTERN.test(recoveryId)) continue;
+    const directory = path.join(skillsDir, `${REMOVAL_RECOVERY_PREFIX}${recoveryId}`);
     try {
       if (!lstatSync(directory).isDirectory()) continue;
       const metadata = JSON.parse(
@@ -616,15 +620,15 @@ function cleanupRemovalRecoveries(
       ) as Record<string, unknown>;
       const createdAt = typeof metadata.createdAt === "string" ? Date.parse(metadata.createdAt) : NaN;
       if (metadata.version !== 1 || typeof metadata.skill !== "string"
-	|| !NAME_PATTERN.test(metadata.skill) || !Number.isFinite(createdAt)) continue;
-      recoveries.push({ directory, createdAt });
+	|| !NAME_PATTERN.test(metadata.skill) || !Number.isFinite(createdAt)
+	|| metadata.recoveryId !== recoveryId) continue;
+      recoveries.push(directory);
     } catch {
-      // Unknown similarly-named directories are not ours to delete.
+      // Missing or malformed entries do not establish positive ownership.
     }
   }
-  recoveries.sort((a, b) => a.createdAt - b.createdAt);
   for (const recovery of recoveries.slice(0, Math.max(0, recoveries.length - retain))) {
-    rmSync(recovery.directory, { recursive: true, force: true });
+    rmSync(recovery, { recursive: true, force: true });
   }
 }
 
@@ -636,6 +640,10 @@ export function removeSkill(
     files: string[];
     directories?: string[];
     fileHashes?: Record<string, string>;
+    /** New identity preclaimed in the lockfile before this removal begins. */
+    recoveryId?: string;
+    /** Ordered exact identities currently owned by the lockfile. */
+    ownedRecoveryIds?: string[];
   },
 ): { recoveryPath?: string } {
   if (!NAME_PATTERN.test(name)) {
@@ -643,7 +651,12 @@ export function removeSkill(
   }
   // Make room first so a crash after quarantine creation cannot exceed the
   // documented bound; the final pass handles calls that created no quarantine.
-  cleanupRemovalRecoveries(opts.skillsDir, MAX_REMOVAL_RECOVERIES - 1);
+  const recoveryId = opts.recoveryId ?? randomBytes(16).toString("hex");
+  if (!RECOVERY_ID_PATTERN.test(recoveryId)) {
+    throw new ProvisionError("Invalid recovery identity", "invalid_item");
+  }
+  const ownedRecoveryIds = [...new Set([...(opts.ownedRecoveryIds ?? []), recoveryId])];
+  cleanupRemovalRecoveries(opts.skillsDir, ownedRecoveryIds, MAX_REMOVAL_RECOVERIES - 1);
   const result = removeManagedTree(path.join(opts.skillsDir, name), {
     ...opts,
     // An already-open descriptor can mutate the isolated inode after its hash
@@ -652,7 +665,8 @@ export function removeSkill(
     preserveIsolatedFiles: true,
     quarantineParent: opts.skillsDir,
     quarantineSkill: name,
+    recoveryId,
   });
-  cleanupRemovalRecoveries(opts.skillsDir);
+  cleanupRemovalRecoveries(opts.skillsDir, ownedRecoveryIds);
   return { recoveryPath: result.recoveryPath };
 }

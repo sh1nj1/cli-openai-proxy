@@ -31,6 +31,7 @@ describe("provision state", () => {
       version: 1 as const,
       approved: ["skill/pr-monitor"],
       revoked: [],
+      removalRecoveries: ["f".repeat(32)],
       installed: {
         "skill/pr-monitor": {
           sha256: "a".repeat(64),

@@ -24,6 +24,7 @@ export function stateFilePath(): string {
 const emptyState = (): ProvisionStateFile => ({ version: 1, approved: [], revoked: [], installed: {} });
 const HASH_PATTERN = /^[0-9a-f]{64}$/i;
 const INSTALL_MARKER_PATTERN = /^[0-9a-f]{32}$/;
+const RECOVERY_ID_PATTERN = /^[0-9a-f]{32}$/;
 const KEY_PATTERN = /^[a-z0-9][a-z0-9_-]{0,63}\/[a-z0-9][a-z0-9_-]{0,63}$/i;
 
 function safeRelativeFile(value: unknown): value is string {
@@ -102,6 +103,13 @@ export function loadState(): ProvisionStateFile {
       revoked: Array.isArray(parsed.revoked)
 	? parsed.revoked.filter((k): k is string => typeof k === "string" && KEY_PATTERN.test(k))
         : [],
+      ...(Array.isArray(parsed.removalRecoveries)
+	? {
+	  removalRecoveries: [...new Set(parsed.removalRecoveries.filter(
+	    (id): id is string => typeof id === "string" && RECOVERY_ID_PATTERN.test(id),
+	  ))],
+	}
+	: {}),
       installed,
     };
   } catch {

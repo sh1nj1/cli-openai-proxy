@@ -75,6 +75,7 @@ let operationTail: Promise<void> = Promise.resolve();
 let pendingOperations = 0;
 let shuttingDown = false;
 let shutdownPromise: Promise<void> | null = null;
+let afterFirstInstallMove: ((target: string) => void) | undefined;
 
 function serialize<T>(operation: () => Promise<T> | T): Promise<T> {
   pendingOperations += 1;
@@ -103,12 +104,16 @@ function refetchMs(): number {
   return Number.isFinite(parsed) && parsed >= 0 ? parsed : DEFAULT_REFETCH_MS;
 }
 
-export function initProvisioning(): {
+export function initProvisioning(hooks: {
+  /** Test seam for a mutation immediately after a first install is exposed. */
+  afterFirstInstallMove?: (target: string) => void;
+} = {}): {
   enabled: boolean;
   autoApply: "auto" | "approve";
   manifestUrl: string | null;
 } {
   resetProvisioning();
+  afterFirstInstallMove = hooks.afterFirstInstallMove;
   const raw = process.env.PROVISION_SYNC?.trim().toLowerCase() ?? "";
   enabled = ["1", "true", "yes", "enabled"].includes(raw);
   autoApply = process.env.PROVISION_AUTOAPPLY?.trim().toLowerCase() === "auto" ? "auto" : "approve";
@@ -236,8 +241,9 @@ function firstInstallMarkerStatus(
 }
 
 /** Resolve every first-install journal before its target can be inspected. */
-function reconcileFirstInstallJournals(state: ProvisionStateFile): void {
+function reconcileFirstInstallJournals(state: ProvisionStateFile): Set<string> {
   let changed = false;
+  const rejected = new Set<string>();
   for (const [key, record] of Object.entries(state.installed)) {
     if (!record.uncommitted) continue;
     const name = key.slice(key.indexOf("/") + 1);
@@ -246,6 +252,7 @@ function reconcileFirstInstallJournals(state: ProvisionStateFile): void {
       && installedRecordIntact(name, record);
     if (!exposed) {
       delete state.installed[key];
+      rejected.add(key);
     } else {
       const next = { ...record };
       delete next.uncommitted;
@@ -270,6 +277,24 @@ function reconcileFirstInstallJournals(state: ProvisionStateFile): void {
     changed = true;
   }
   if (changed) saveState(state);
+  return rejected;
+}
+
+function prepareRemovalRecovery(state: ProvisionStateFile): {
+  recoveryId: string;
+  ownedRecoveryIds: string[];
+} {
+  const recoveryId = randomBytes(16).toString("hex");
+  const ownedRecoveryIds = [...(state.removalRecoveries ?? []), recoveryId];
+  state.removalRecoveries = ownedRecoveryIds;
+  // Persist the exact identity before its recovery directory can appear.
+  saveState(state);
+  return { recoveryId, ownedRecoveryIds };
+}
+
+function finalizeRemovalRecoveries(state: ProvisionStateFile): void {
+  state.removalRecoveries = (state.removalRecoveries ?? []).filter((recoveryId) =>
+    existsSync(path.join(skillsDir(), `.provision-removed-${recoveryId}`))).slice(-3);
 }
 
 function reconcileUpgradeJournal(name: string, record: InstalledRecord): InstalledRecord {
@@ -378,6 +403,7 @@ async function runSync(): Promise<ProvisionStatusView> {
 	  managedDirectories,
 	  managedFileHashes,
 	  firstInstallMarker,
+	  afterFirstInstallMove,
 	  beforeCommit: (candidate) => {
 	    const candidateRecord: InstalledSnapshot = {
 	      sha256: item.sha256!,
@@ -410,7 +436,12 @@ async function runSync(): Promise<ProvisionStatusView> {
 	  },
 	},
       );
-      if (!previousRecord) reconcileFirstInstallJournals(state);
+      if (!previousRecord && reconcileFirstInstallJournals(state).has(key)) {
+	throw new ProvisionError(
+	  `First installation of "${item.name}" changed before ownership could be finalized`,
+	  "untracked_content",
+	);
+      }
       // Finalizing drops the upgrade journal. If this save later fails, the
       // persisted stable+pending pair lets the next sync recognize either side.
       state.installed[key] = {
@@ -438,19 +469,26 @@ async function runSync(): Promise<ProvisionStatusView> {
     try {
       const record = state.installed[key]!;
       if (type === "skill") {
-	removeSkill(name, {
-	  skillsDir: skillsDir(),
-	  files: record.files,
-	  directories: record.directories,
-	  fileHashes: record.fileHashes,
-	});
-	if (record.pending) {
+	const recovery = prepareRemovalRecovery(state);
+	try {
 	  removeSkill(name, {
 	    skillsDir: skillsDir(),
-	    files: record.pending.files,
-	    directories: record.pending.directories,
-	    fileHashes: record.pending.fileHashes,
+	    files: record.files,
+	    directories: record.directories,
+	    fileHashes: record.fileHashes,
+	    ...recovery,
 	  });
+	  if (record.pending) {
+	    removeSkill(name, {
+	      skillsDir: skillsDir(),
+	      files: record.pending.files,
+	      directories: record.pending.directories,
+	      fileHashes: record.pending.fileHashes,
+	      ...recovery,
+	    });
+	  }
+	} finally {
+	  finalizeRemovalRecoveries(state);
 	}
       }
       delete state.installed[key];
@@ -548,19 +586,27 @@ export function deleteItem(type: string, name: string): Promise<{ removed: boole
     const installed = key in state.installed;
     const record = state.installed[key];
     if (record && type === "skill") {
-      removeSkill(name, {
-	skillsDir: skillsDir(),
-	files: record.files,
-	directories: record.directories,
-	fileHashes: record.fileHashes,
-      });
-      if (record.pending) {
+      const recovery = prepareRemovalRecovery(state);
+      try {
 	removeSkill(name, {
 	  skillsDir: skillsDir(),
-	  files: record.pending.files,
-	  directories: record.pending.directories,
-	  fileHashes: record.pending.fileHashes,
+	  files: record.files,
+	  directories: record.directories,
+	  fileHashes: record.fileHashes,
+	  ...recovery,
 	});
+	if (record.pending) {
+	  removeSkill(name, {
+	    skillsDir: skillsDir(),
+	    files: record.pending.files,
+	    directories: record.pending.directories,
+	    fileHashes: record.pending.fileHashes,
+	    ...recovery,
+	  });
+	}
+      } finally {
+	finalizeRemovalRecoveries(state);
+	saveState(state);
       }
     }
     delete state.installed[key];
@@ -604,6 +650,7 @@ function clearProvisioningState(): void {
   operationTail = Promise.resolve();
   pendingOperations = 0;
   shuttingDown = false;
+  afterFirstInstallMove = undefined;
 }
 
 /**

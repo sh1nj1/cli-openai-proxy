@@ -673,14 +673,25 @@ describe("provision installer", () => {
     const similarlyNamedUserDirectory = path.join(skillsDir, ".provision-removed-user");
     mkdirSync(similarlyNamedUserDirectory);
     writeFileSync(path.join(similarlyNamedUserDirectory, "keep.txt"), "user-owned");
+    writeFileSync(path.join(similarlyNamedUserDirectory, ".recovery.json"), JSON.stringify({
+      version: 1,
+      skill: "demo",
+      createdAt: "2020-01-01T00:00:00.000Z",
+      recoveryId: "b".repeat(32),
+    }));
+    const ownedRecoveryIds: string[] = [];
 
     for (let index = 0; index < 5; index += 1) {
+      const recoveryId = index.toString(16).padStart(32, "0");
+      ownedRecoveryIds.push(recoveryId);
       const result = await installSkill({ name: "demo", url, sha256 }, { skillsDir });
       removeSkill("demo", {
 	skillsDir,
 	files: result.files,
 	fileHashes: result.fileHashes,
 	directories: result.directories,
+	recoveryId,
+	ownedRecoveryIds,
       });
     }
 

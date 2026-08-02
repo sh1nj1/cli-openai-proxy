@@ -81,6 +81,8 @@ export interface ProvisionStateFile {
   approved: string[];
   /** Explicit DELETE tombstones; override auto-apply while the item stays desired. */
   revoked: string[];
+  /** Exact random identities of removal recoveries this proxy may prune. */
+  removalRecoveries?: string[];
   installed: Record<string, InstalledRecord>;
 }
 
