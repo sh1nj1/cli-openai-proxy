@@ -423,6 +423,44 @@ describe("provision installer", () => {
     assert.equal(readFileSync(path.join(previousRoot, "late-addition.md"), "utf-8"), "must survive");
   });
 
+  test("an upgrade preserves a file modified after cleanup hashes it", async () => {
+    const v1 = serve("/cleanup-hash-race-v1.tgz", makeTarGz([{ name: "SKILL.md", content: "v1" }]));
+    const previous = await installSkill(
+      { name: "demo", url: v1.url, sha256: v1.sha256 },
+      { skillsDir },
+    );
+    const v2 = serve("/cleanup-hash-race-v2.tgz", makeTarGz([{ name: "SKILL.md", content: "v2" }]));
+
+    await assert.rejects(
+      installSkill(
+	{ name: "demo", url: v2.url, sha256: v2.sha256 },
+	{
+	  skillsDir,
+	  managedFiles: previous.files,
+	  managedDirectories: previous.directories,
+	  managedFileHashes: previous.fileHashes,
+	  afterCleanupHash: (previousRoot, relative) => {
+	    assert.equal(relative, "SKILL.md");
+	    writeFileSync(path.join(previousRoot, relative), "modified after cleanup hash");
+	  },
+	},
+      ),
+      (err: unknown) => err instanceof ProvisionError
+	&& err.code === "untracked_content"
+	&& /preserved at/.test(err.message),
+    );
+
+    assert.equal(readFileSync(path.join(skillsDir, "demo", "SKILL.md"), "utf-8"), "v2");
+    const preserved = readdirSync(skillsDir)
+      .filter((entry) => entry.startsWith(".provision-staging-"));
+    assert.equal(preserved.length, 1);
+    const previousRoot = path.join(skillsDir, preserved[0]!, "previous");
+    assert.equal(
+      readFileSync(path.join(previousRoot, "SKILL.md"), "utf-8"),
+      "modified after cleanup hash",
+    );
+  });
+
   test("a download error surfaces as download_failed", async () => {
     assert.equal(
       await codeOf(() =>

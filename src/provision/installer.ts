@@ -203,6 +203,8 @@ export async function installSkill(
     afterPreviousMove?: () => void;
     /** Test seam for an addition made after the moved-aside tree passes its audit. */
     afterPreviousAudit?: (previousRoot: string) => void;
+    /** Test seam for a mutation made after cleanup verifies an isolated file. */
+    afterCleanupHash?: (previousRoot: string, relative: string) => void;
   },
 ): Promise<InstallResult> {
   if (!NAME_PATTERN.test(item.name)) {
@@ -357,6 +359,7 @@ export async function installSkill(
 	files: opts.managedFiles!,
 	directories: opts.managedDirectories,
 	fileHashes: opts.managedFileHashes,
+	afterFileHash: (relative) => opts.afterCleanupHash?.(previous, relative),
       });
       if (!removedPrevious) {
 	throw new ProvisionError(
@@ -433,12 +436,14 @@ function removeManagedTree(
     files: string[];
     directories?: string[];
     fileHashes?: Record<string, string | string[]>;
+    afterFileHash?: (relative: string) => void;
   },
 ): boolean {
   if (!existsAsDirectory(root)) return !targetExists(root);
 
-  const removable: Array<{ file: string; relative: string }> = [];
-  for (const relative of opts.files) {
+  const removed: string[] = [];
+  let quarantine: string | undefined;
+  for (const [index, relative] of opts.files.entries()) {
     const file = managedPath(root, relative);
     if (!file) continue;
     const parts = managedPathParts(relative)!;
@@ -458,25 +463,46 @@ function removeManagedTree(
     try {
       const stat = lstatSync(file);
       if (!stat.isFile()) continue;
+      quarantine ??= mkdtempSync(path.join(root, ".provision-cleanup-"));
+      const isolated = path.join(quarantine, String(index));
+      renameSync(file, isolated);
       const expected = opts.fileHashes?.[relative];
       if (expected) {
-	const actual = createHash("sha256").update(readFileSync(file)).digest("hex");
+	const actual = createHash("sha256").update(readFileSync(isolated)).digest("hex");
 	const accepted = Array.isArray(expected) ? expected : [expected];
-	if (!accepted.includes(actual)) continue;
+	if (!accepted.includes(actual)) {
+	  try {
+	    renameSync(isolated, file);
+	  } catch (err) {
+	    if (!["EEXIST", "ENOTEMPTY", "ENOENT"].includes(
+	      (err as NodeJS.ErrnoException).code ?? "",
+	    )) throw err;
+	  }
+	  continue;
+	}
       }
-      removable.push({ file, relative });
+      opts.afterFileHash?.(relative);
+      rmSync(isolated, { force: true });
+      removed.push(relative);
     } catch (err) {
       if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
     }
   }
 
-  for (const { file } of removable) rmSync(file, { force: true });
+  if (quarantine) {
+    try {
+      rmdirSync(quarantine);
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code;
+      if (code !== "ENOENT" && code !== "ENOTEMPTY") throw err;
+    }
+  }
   const directories = new Set<string>();
   for (const relative of opts.directories ?? []) {
     const directory = managedPath(root, relative);
     if (directory) directories.add(directory);
   }
-  for (const { relative } of removable) {
+  for (const relative of removed) {
     let current = path.dirname(managedPath(root, relative)!);
     while (current !== root && current.startsWith(`${root}${path.sep}`)) {
       directories.add(current);
