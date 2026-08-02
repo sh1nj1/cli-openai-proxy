@@ -167,7 +167,12 @@ export async function readResponseBody(
       chunks.push(Buffer.from(step.value));
     }
   } finally {
-    void reader.cancel().catch(() => {});
+    try {
+      await reader.cancel();
+    } catch {
+      // Cancellation is best-effort, but the next transfer must not start while
+      // this response is still releasing its stream resources.
+    }
   }
   return Buffer.concat(chunks);
 }

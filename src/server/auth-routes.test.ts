@@ -20,6 +20,7 @@ import {
   AUTHORIZED_PROVISIONING_HEADER,
   PROVISIONING_GENERATION_HEADER,
   PROVISIONING_SESSION_TTL_HEADER,
+  SUPERSEDED_PROVISIONING_GENERATION_HEADER,
   decodeProvisioningUrl,
 } from "../isolation/worker-protocol.js";
 
@@ -323,6 +324,56 @@ describe("auth-routes", () => {
     const expiresAt = Date.parse((created.payload as { expiresAt: string }).expiresAt);
     assert.ok(expiresAt >= before + 300_000);
     assert.ok(expiresAt <= Date.now() + 300_000);
+  });
+
+  test("worker create reports only the provisioning generation it actually superseded", async () => {
+    const generation = "019865f4-50d6-7000-8000-000000000001";
+    const first = fakeRes();
+    await handleCreateAuthSession(fakeReq({
+      app: { locals: { cliProxyRole: "worker" } } as any,
+      headers: { [PROVISIONING_GENERATION_HEADER]: generation },
+      params: { engine: "fake" } as any,
+      body: { provisioning_url: "https://collavre.test/provision.json" },
+    }), first);
+
+    const replacement = fakeRes();
+    await handleCreateAuthSession(fakeReq({
+      app: { locals: { cliProxyRole: "worker" } } as any,
+      params: { engine: "fake" } as any,
+    }), replacement);
+
+    assert.equal(replacement.statusCode, 201);
+    assert.equal(replacement.headers[SUPERSEDED_PROVISIONING_GENERATION_HEADER], generation);
+
+    const next = fakeRes();
+    await handleCreateAuthSession(fakeReq({
+      app: { locals: { cliProxyRole: "worker" } } as any,
+      params: { engine: "fake" } as any,
+    }), next);
+    assert.equal(next.headers[SUPERSEDED_PROVISIONING_GENERATION_HEADER], undefined);
+
+    const retainedGeneration = "019865f4-50d6-7000-8000-000000000002";
+    const retained = fakeRes();
+    await handleCreateAuthSession(fakeReq({
+      app: { locals: { cliProxyRole: "worker" } } as any,
+      headers: { [PROVISIONING_GENERATION_HEADER]: retainedGeneration },
+      params: { engine: "fake" } as any,
+      body: { provisioning_url: "https://collavre.test/retained.json" },
+    }), retained);
+    const { sessionId } = retained.payload as { sessionId: string };
+    const authorized = fakeRes();
+    await handleSubmitAuthSession(fakeReq({
+      app: { locals: { cliProxyRole: "worker" } } as any,
+      params: { engine: "fake", sessionId } as any,
+      body: { value: "code" },
+    }), authorized);
+
+    const afterAuthorized = fakeRes();
+    await handleCreateAuthSession(fakeReq({
+      app: { locals: { cliProxyRole: "worker" } } as any,
+      params: { engine: "fake" } as any,
+    }), afterAuthorized);
+    assert.equal(afterAuthorized.headers[SUPERSEDED_PROVISIONING_GENERATION_HEADER], undefined);
   });
 
   test("provisioning_url is rejected before it can exceed the worker response-header budget", async () => {

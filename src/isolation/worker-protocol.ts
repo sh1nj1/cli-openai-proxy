@@ -7,6 +7,8 @@ export const AUTHORIZED_PROVISIONING_HEADER = "x-cli-proxy-authorized-provisioni
 export const PROVISIONING_GENERATION_HEADER = "x-cli-proxy-provisioning-generation";
 /** Gateway-selected auth-session lifetime shared with an isolated worker. */
 export const PROVISIONING_SESSION_TTL_HEADER = "x-cli-proxy-provisioning-session-ttl-ms";
+/** Exact prior gateway binding that the worker disposed while starting a session. */
+export const SUPERSEDED_PROVISIONING_GENERATION_HEADER = "x-cli-proxy-superseded-provisioning-generation";
 /** Leaves ample room under Node's default aggregate HTTP header limit. */
 export const MAX_AUTHORIZED_PROVISIONING_HEADER_BYTES = 8 * 1024;
 

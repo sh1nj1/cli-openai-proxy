@@ -14,6 +14,7 @@ import {
   AUTHORIZED_PROVISIONING_HEADER,
   PROVISIONING_GENERATION_HEADER,
   PROVISIONING_SESSION_TTL_HEADER,
+  SUPERSEDED_PROVISIONING_GENERATION_HEADER,
   decodeProvisioningGeneration,
   decodeProvisioningUrl,
   provisioningUrlFitsHeader,
@@ -39,6 +40,7 @@ const PRIVATE_HEADERS = new Set([
   "x-cli-proxy-identity-signature",
   PROVISIONING_GENERATION_HEADER,
   PROVISIONING_SESSION_TTL_HEADER,
+  SUPERSEDED_PROVISIONING_GENERATION_HEADER,
 ]);
 
 const REGENERATED_BODY_HEADERS = new Set(["content-encoding", "content-length"]);
@@ -233,6 +235,7 @@ function copyResponseHeaders(source: IncomingHttpHeaders, destination: Response)
       && name.toLowerCase() !== AUTHORIZED_PROVISIONING_HEADER
       && name.toLowerCase() !== PROVISIONING_GENERATION_HEADER
       && name.toLowerCase() !== PROVISIONING_SESSION_TTL_HEADER
+      && name.toLowerCase() !== SUPERSEDED_PROVISIONING_GENERATION_HEADER
     ) {
       destination.setHeader(name, value);
     }
@@ -326,12 +329,23 @@ export class UserWorkerProxy {
 	    issuedBinding ? getAuthSessionTtlMs() : undefined,
 	  ),
         },
-        (workerResponse) => {
+	(workerResponse) => {
           clearReadinessTimer();
+	  const supersededGeneration = decodeProvisioningGeneration(
+	    workerResponse.headers[SUPERSEDED_PROVISIONING_GENERATION_HEADER],
+	  );
 	  const bindingToFinalize = workerResponse.statusCode === 201 ? issuedBinding : undefined;
-	  if (sessionCollection && workerResponse.statusCode === 201 && !bindingToFinalize) {
+	  if (
+	    !bindingToFinalize
+	    && (issuedBinding || (sessionCollection && supersededGeneration))
+	  ) {
 	    try {
-	      this.releaseIssuedEngineSessions(target.accountName, sessionCollection.engine);
+	      this.releaseWorkerResponseBindings(
+		issuedBinding,
+		target.accountName,
+		sessionCollection?.engine,
+		supersededGeneration,
+	      );
 	    } catch (error) {
 	      workerResponse.resume();
 	      if (!clientClosed && !res.destroyed) this.sendFailure(res, error);
@@ -347,16 +361,6 @@ export class UserWorkerProxy {
 	  ) {
 	    try {
 	      this.releaseIssuedSession(target.accountName, cancelledSession.engine, cancelledSession.sessionId);
-	    } catch (error) {
-	      workerResponse.resume();
-	      if (!clientClosed && !res.destroyed) this.sendFailure(res, error);
-	      resolve();
-	      return;
-	    }
-	  }
-	  if (issuedBinding && !bindingToFinalize) {
-	    try {
-	      this.releaseIssuedGeneration(issuedBinding);
 	    } catch (error) {
 	      workerResponse.resume();
 	      if (!clientClosed && !res.destroyed) this.sendFailure(res, error);
@@ -404,7 +408,11 @@ export class UserWorkerProxy {
 	    if (bindingToFinalize) {
 	      const responseBody = sessionResponseTooLarge ? undefined : Buffer.concat(sessionResponseChunks);
 	      try {
-		if (!responseBody || !this.bindIssuedGenerationToSession(bindingToFinalize, responseBody)) {
+		if (!responseBody || !this.bindIssuedGenerationToSession(
+		  bindingToFinalize,
+		  responseBody,
+		  supersededGeneration,
+		)) {
 		  throw new WorkerIsolationError(
 		    "Worker returned an invalid provisioning session response",
 		    "worker_unavailable",
@@ -418,7 +426,12 @@ export class UserWorkerProxy {
 	      } catch (error) {
 		let failure = error;
 		try {
-		  this.releaseIssuedGeneration(bindingToFinalize);
+		  this.releaseWorkerResponseBindings(
+		    bindingToFinalize,
+		    target.accountName,
+		    sessionCollection?.engine,
+		    supersededGeneration,
+		  );
 		} catch (releaseError) {
 		  failure = releaseError;
 		}
@@ -429,9 +442,14 @@ export class UserWorkerProxy {
 	  });
 	  workerResponse.on("error", (error) => {
 	    let failure: unknown = error;
-	    if (issuedBinding) {
+	    if (issuedBinding || (sessionCollection && supersededGeneration)) {
 	      try {
-		this.releaseIssuedGeneration(issuedBinding);
+		this.releaseWorkerResponseBindings(
+		  issuedBinding,
+		  target.accountName,
+		  sessionCollection?.engine,
+		  supersededGeneration,
+		);
 	      } catch (releaseError) {
 		failure = releaseError;
 	      }
@@ -524,6 +542,7 @@ export class UserWorkerProxy {
   private bindIssuedGenerationToSession(
     binding: IssuedProvisioningBinding,
     responseBody: Buffer,
+    supersededGeneration?: string,
   ): boolean {
     if (this.issuedProvisioningBindings.get(binding.generation) !== binding) return false;
     let sessionId: unknown;
@@ -549,16 +568,16 @@ export class UserWorkerProxy {
     const finalized = { ...binding, sessionId, expiresAt };
     const previousBindings = new Map(this.issuedProvisioningBindings);
     this.issuedProvisioningBindings.set(binding.generation, finalized);
-    for (const [generation, existing] of this.issuedProvisioningBindings) {
-      if (
-	generation < binding.generation
-	&& existing.accountName === binding.accountName
-	&& existing.engine === binding.engine
-      ) {
-	// A successful worker create supersedes every older session for this engine,
-	// including a create whose response was interrupted before finalization.
-	this.issuedProvisioningBindings.delete(generation);
-      }
+    const superseded = supersededGeneration
+      ? this.issuedProvisioningBindings.get(supersededGeneration)
+      : undefined;
+    if (
+      supersededGeneration !== undefined
+      && supersededGeneration !== binding.generation
+      && superseded?.accountName === binding.accountName
+      && superseded.engine === binding.engine
+    ) {
+      this.issuedProvisioningBindings.delete(supersededGeneration);
     }
     try {
       saveIssuedProvisioningState(issuedGenerationStateFile(this.generationStateFile), {
@@ -583,9 +602,19 @@ export class UserWorkerProxy {
     ));
   }
 
-  private releaseIssuedEngineSessions(accountName: string, engine: string): void {
+  private releaseWorkerResponseBindings(
+    issuedBinding: IssuedProvisioningBinding | undefined,
+    accountName: string,
+    engine: string | undefined,
+    supersededGeneration: string | undefined,
+  ): void {
     this.releaseIssuedBindings((binding) => (
-      binding.accountName === accountName && binding.engine === engine
+      binding === issuedBinding
+      || (
+	binding.generation === supersededGeneration
+	&& binding.accountName === accountName
+	&& binding.engine === engine
+      )
     ));
   }
 

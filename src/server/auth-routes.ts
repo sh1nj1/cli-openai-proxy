@@ -25,6 +25,7 @@ import {
   AUTHORIZED_PROVISIONING_HEADER,
   PROVISIONING_GENERATION_HEADER,
   PROVISIONING_SESSION_TTL_HEADER,
+  SUPERSEDED_PROVISIONING_GENERATION_HEADER,
   decodeProvisioningGeneration,
   decodeProvisioningSessionTtl,
   encodeProvisioningUrl,
@@ -189,6 +190,9 @@ export async function handleCreateAuthSession(req: Request, res: Response): Prom
       provisioningUrl,
       provisioningGeneration,
       sessionTtlMs,
+      onSupersededProvisioningGeneration: workerRequest
+	? (generation) => res.setHeader(SUPERSEDED_PROVISIONING_GENERATION_HEADER, generation)
+	: undefined,
     }));
   } catch (err) {
     sendError(res, err);

@@ -1,6 +1,6 @@
 import { test, describe, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
-import { parseManifest, checkUrlAllowed, fetchWithPolicy, getAllowlist } from "./manifest.js";
+import { parseManifest, checkUrlAllowed, fetchWithPolicy, getAllowlist, readResponseBody } from "./manifest.js";
 import { ProvisionError } from "./types.js";
 
 const valid = () => ({
@@ -232,5 +232,38 @@ describe("provision manifest", () => {
     } finally {
       globalThis.fetch = realFetch;
     }
+  });
+
+  test("an oversized response finishes cancellation before reporting the size failure", async () => {
+    let cancellationStarted!: () => void;
+    let finishCancellation!: () => void;
+    const started = new Promise<void>((resolve) => { cancellationStarted = resolve; });
+    const finishing = new Promise<void>((resolve) => { finishCancellation = resolve; });
+    const response = new Response(new ReadableStream({
+      start(controller) {
+	controller.enqueue(new Uint8Array(2));
+      },
+      async cancel() {
+	cancellationStarted();
+	await finishing;
+      },
+    }));
+
+    let rejected = false;
+    const result = assert.rejects(
+      readResponseBody(response, {
+	maxBytes: 1,
+	tooLargeCode: "manifest_too_large",
+	readErrorCode: "manifest_read_failed",
+	label: "Manifest",
+      }),
+      (err: unknown) => err instanceof ProvisionError && err.code === "manifest_too_large",
+    ).then(() => { rejected = true; });
+
+    await started;
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.equal(rejected, false, "the size failure must wait for stream cancellation");
+    finishCancellation();
+    await result;
   });
 });

@@ -88,7 +88,7 @@ const byEngine = new Map<string, string>();
  * overwrite the same credential. Reserving the engine here — before the await —
  * makes the one-session-per-engine invariant hold DURING start, not just after.
  */
-const starting = new Map<string, { handle: EngineAuthSession }>();
+const starting = new Map<string, { handle: EngineAuthSession; provisioningGeneration?: string }>();
 
 function view(record: SessionRecord): SessionView {
   const {
@@ -132,6 +132,7 @@ export async function createSession(
     provisioningUrl?: string;
     provisioningGeneration?: string;
     sessionTtlMs?: number;
+    onSupersededProvisioningGeneration?: (generation: string) => void;
   } = {},
 ): Promise<SessionView> {
   const descriptor = resolveEngine(engine);
@@ -162,18 +163,26 @@ export async function createSession(
   const existingId = byEngine.get(engine);
   if (existingId) {
     const existing = byId.get(existingId);
-    if (existing) dispose(existing, "cancelled");
+    if (existing) {
+      if (existing.provisioningGeneration) {
+	opts.onSupersededProvisioningGeneration?.(existing.provisioningGeneration);
+      }
+      dispose(existing, "cancelled");
+    }
   }
   // Supersede a start that has not registered yet, killing its child now rather
   // than leaving two logins alive until one of them times out.
   const superseded = starting.get(engine);
   if (superseded) {
     starting.delete(engine);
+    if (superseded.provisioningGeneration) {
+      opts.onSupersededProvisioningGeneration?.(superseded.provisioningGeneration);
+    }
     superseded.handle.cancel();
   }
 
   const handle = flowDescriptor.createSession();
-  const reservation = { handle };
+  const reservation = { handle, provisioningGeneration: opts.provisioningGeneration };
   starting.set(engine, reservation);
 
   // Our reservation is only ever removed by a later start taking the slot (or by

@@ -21,6 +21,7 @@ import {
   AUTHORIZED_PROVISIONING_HEADER,
   PROVISIONING_GENERATION_HEADER,
   PROVISIONING_SESSION_TTL_HEADER,
+  SUPERSEDED_PROVISIONING_GENERATION_HEADER,
   encodeProvisioningUrl,
 } from "./worker-protocol.js";
 
@@ -482,10 +483,18 @@ test("gateway reclaims bindings for superseded and cancelled worker sessions", a
   const socketPath = `/tmp/cap-worker-${randomUUID().slice(0, 8)}.sock`;
   const generationStateFile = `/tmp/cap-generation-${randomUUID().slice(0, 8)}.state`;
   let created = 0;
+  let previousGeneration: string | undefined;
   const worker = http.createServer((request, response) => {
     if (request.method === "POST") {
       created += 1;
-      response.writeHead(201, { "content-type": "application/json" });
+      const generation = request.headers[PROVISIONING_GENERATION_HEADER] as string | undefined;
+      response.writeHead(201, {
+	"content-type": "application/json",
+	...(previousGeneration
+	  ? { [SUPERSEDED_PROVISIONING_GENERATION_HEADER]: previousGeneration }
+	  : {}),
+      });
+      previousGeneration = generation;
       response.end(JSON.stringify({
 	sessionId: `session-${created}`,
 	status: "pending",
@@ -533,6 +542,7 @@ test("gateway reclaims bindings for superseded and cancelled worker sessions", a
 	}),
       });
       assert.equal(response.status, 201);
+      assert.equal(response.headers.get(SUPERSEDED_PROVISIONING_GENERATION_HEADER), null);
       await response.arrayBuffer();
     }
     const afterSupersession = JSON.parse(await readFile(`${generationStateFile}.issued`, "utf8")) as {
@@ -627,7 +637,7 @@ test("disabled provisioning ignores auth URLs without writing generation state",
   assert.equal(result.generation, undefined);
 });
 
-test("rejected creates preserve retained notifications while successful creates supersede them", async () => {
+test("new creates preserve retained authorized provisioning notifications", async () => {
   const socketPath = `/tmp/cap-worker-${randomUUID().slice(0, 8)}.sock`;
   const generationStateFile = `/tmp/cap-generation-${randomUUID().slice(0, 8)}.state`;
   const retainedGeneration = "019865f4-50d6-7000-8000-000000000001";
@@ -723,7 +733,7 @@ test("rejected creates preserve retained notifications while successful creates 
       { headers },
     );
     await retainedAfterPending.arrayBuffer();
-    assert.deepEqual(notifications, [retainedUrl]);
+    assert.deepEqual(notifications, [retainedUrl, retainedUrl]);
   } finally {
     await new Promise<void>((resolve) => gateway.close(() => resolve()));
     await new Promise<void>((resolve) => worker.close(() => resolve()));
@@ -733,7 +743,7 @@ test("rejected creates preserve retained notifications while successful creates 
   }
 });
 
-test("a successful plain session supersedes retained provisioning bindings", async () => {
+test("a successful plain session preserves an authorized retained provisioning binding", async () => {
   const socketPath = `/tmp/cap-worker-${randomUUID().slice(0, 8)}.sock`;
   const generationStateFile = `/tmp/cap-generation-${randomUUID().slice(0, 8)}.state`;
   const retainedGeneration = "019865f4-50d6-7000-8000-000000000001";
@@ -815,7 +825,7 @@ test("a successful plain session supersedes retained provisioning bindings", asy
 
     const retained = await fetch(`http://127.0.0.1:${port}/v1/auth/fake/sessions/retained`, { headers });
     await retained.arrayBuffer();
-    assert.deepEqual(notifications, []);
+    assert.deepEqual(notifications, [retainedUrl]);
   } finally {
     await new Promise<void>((resolve) => gateway.close(() => resolve()));
     await new Promise<void>((resolve) => worker.close(() => resolve()));
