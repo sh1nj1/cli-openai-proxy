@@ -666,6 +666,30 @@ describe("provision installer", () => {
     assert.equal(readFileSync(path.join(recoveryPath!, "0"), "utf8"), "written after removal");
   });
 
+  test("removeSkill bounds retained recovery directories", async () => {
+    const { url, sha256 } = serve("/bounded-removal.tgz", makeTarGz([
+      { name: "SKILL.md", content: "recoverable" },
+    ]));
+    const similarlyNamedUserDirectory = path.join(skillsDir, ".provision-removed-user");
+    mkdirSync(similarlyNamedUserDirectory);
+    writeFileSync(path.join(similarlyNamedUserDirectory, "keep.txt"), "user-owned");
+
+    for (let index = 0; index < 5; index += 1) {
+      const result = await installSkill({ name: "demo", url, sha256 }, { skillsDir });
+      removeSkill("demo", {
+	skillsDir,
+	files: result.files,
+	fileHashes: result.fileHashes,
+	directories: result.directories,
+      });
+    }
+
+    const recoveries = readdirSync(skillsDir).filter((entry) =>
+      entry.startsWith(".provision-removed-") && entry !== ".provision-removed-user");
+    assert.equal(recoveries.length, 3);
+    assert.equal(readFileSync(path.join(similarlyNamedUserDirectory, "keep.txt"), "utf8"), "user-owned");
+  });
+
   test("removeSkill deletes empty directories owned by the archive", async () => {
     const { url, sha256 } = serve("/empty-dir.tgz", makeTarGz([
       { name: "SKILL.md", content: "ok" },

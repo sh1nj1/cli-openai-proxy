@@ -20,6 +20,7 @@ import {
   syncNow,
 } from "./sync.js";
 import { ProvisionError } from "./types.js";
+import { firstInstallMarkerPath } from "./installer.js";
 
 /** Single-file tar.gz, enough for sync-level tests (installer has its own suite). */
 function skillArchive(content: string): Buffer {
@@ -411,6 +412,7 @@ describe("provision sync", () => {
 	  fileHashes: { "SKILL.md": sha(Buffer.from("registry contents")) },
 	  installedAt: new Date().toISOString(),
 	  uncommitted: true,
+	  installMarker: "a".repeat(32),
 	},
       },
     }));
@@ -429,6 +431,63 @@ describe("provision sync", () => {
     );
     const state = JSON.parse(readFileSync(path.join(stateDir, "provision.lock.json"), "utf8"));
     assert.equal(state.installed["skill/interrupted-first-install"], undefined);
+  });
+
+  test("DELETE discards a pre-exposure claim before inspecting its target", async () => {
+    const name = "delete-preclaim";
+    const marker = "b".repeat(32);
+    const target = path.join(skillsDir, name);
+    mkdirSync(target);
+    writeFileSync(path.join(target, "SKILL.md"), "candidate contents");
+    writeFileSync(path.join(stateDir, "provision.lock.json"), JSON.stringify({
+      version: 1,
+      approved: [],
+      revoked: [],
+      installed: {
+	[`skill/${name}`]: {
+	  sha256: "c".repeat(64),
+	  files: ["SKILL.md"],
+	  fileHashes: { "SKILL.md": sha(Buffer.from("candidate contents")) },
+	  installedAt: new Date().toISOString(),
+	  uncommitted: true,
+	  installMarker: marker,
+	},
+      },
+    }));
+
+    assert.deepEqual(await deleteItem("skill", name), { removed: false });
+    assert.equal(readFileSync(path.join(target, "SKILL.md"), "utf8"), "candidate contents");
+    const state = JSON.parse(readFileSync(path.join(stateDir, "provision.lock.json"), "utf8"));
+    assert.equal(state.installed[`skill/${name}`], undefined);
+  });
+
+  test("DELETE recovers an exposed first install before removing it", async () => {
+    const name = "delete-exposed";
+    const marker = "d".repeat(32);
+    const target = path.join(skillsDir, name);
+    mkdirSync(target);
+    writeFileSync(path.join(target, "SKILL.md"), "installed contents");
+    writeFileSync(firstInstallMarkerPath(target, marker), marker);
+    writeFileSync(path.join(stateDir, "provision.lock.json"), JSON.stringify({
+      version: 1,
+      approved: [],
+      revoked: [],
+      installed: {
+	[`skill/${name}`]: {
+	  sha256: "e".repeat(64),
+	  files: ["SKILL.md"],
+	  fileHashes: { "SKILL.md": sha(Buffer.from("installed contents")) },
+	  installedAt: new Date().toISOString(),
+	  uncommitted: true,
+	  installMarker: marker,
+	},
+      },
+    }));
+
+    assert.deepEqual(await deleteItem("skill", name), { removed: true });
+    assert.equal(existsSync(target), false);
+    const state = JSON.parse(readFileSync(path.join(stateDir, "provision.lock.json"), "utf8"));
+    assert.equal(state.installed[`skill/${name}`], undefined);
   });
 
   test("a committed upgrade is recovered from a pending ownership transaction", async () => {

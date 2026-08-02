@@ -13,8 +13,8 @@
  * removal only ever touches what the lockfile records as ours.
  */
 
-import { createHash } from "crypto";
-import { existsSync, lstatSync, readFileSync } from "fs";
+import { createHash, randomBytes } from "crypto";
+import { existsSync, lstatSync, readFileSync, unlinkSync } from "fs";
 import { homedir } from "os";
 import path from "path";
 import { takeProxySecret } from "../config.js";
@@ -26,7 +26,7 @@ import {
   parseManifest,
   readResponseBody,
 } from "./manifest.js";
-import { installSkill, removeSkill } from "./installer.js";
+import { firstInstallMarkerPath, installSkill, removeSkill } from "./installer.js";
 import { loadState, saveState } from "./state.js";
 import {
   ProvisionError,
@@ -35,6 +35,7 @@ import {
   type InstalledRecord,
   type InstalledSnapshot,
   type ProvisionManifest,
+  type ProvisionStateFile,
 } from "./types.js";
 
 export interface ProvisionItemView {
@@ -211,8 +212,64 @@ function installedRecordIntact(name: string, record: InstalledSnapshot): boolean
 }
 
 function stableSnapshot(record: InstalledRecord): InstalledSnapshot {
-  const { pending: _pending, uncommitted: _uncommitted, ...stable } = record;
+  const {
+    pending: _pending,
+    uncommitted: _uncommitted,
+    installMarker: _installMarker,
+    ...stable
+  } = record;
   return stable;
+}
+
+function firstInstallMarkerStatus(
+  name: string,
+  marker: string,
+): "matching" | "missing" | "modified" {
+  const file = firstInstallMarkerPath(path.join(skillsDir(), name), marker);
+  try {
+    if (!lstatSync(file).isFile()) return "modified";
+    return readFileSync(file, "utf8") === marker ? "matching" : "modified";
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") return "missing";
+    throw err;
+  }
+}
+
+/** Resolve every first-install journal before its target can be inspected. */
+function reconcileFirstInstallJournals(state: ProvisionStateFile): void {
+  let changed = false;
+  for (const [key, record] of Object.entries(state.installed)) {
+    if (!record.uncommitted) continue;
+    const name = key.slice(key.indexOf("/") + 1);
+    const exposed = record.installMarker !== undefined
+      && firstInstallMarkerStatus(name, record.installMarker) === "matching"
+      && installedRecordIntact(name, record);
+    if (!exposed) {
+      delete state.installed[key];
+    } else {
+      const next = { ...record };
+      delete next.uncommitted;
+      state.installed[key] = next;
+    }
+    changed = true;
+  }
+  // Persist ownership (or its rejection) before marker cleanup and before any
+  // caller is allowed to inspect or mutate the visible target.
+  if (changed) saveState(state);
+
+  changed = false;
+  for (const [key, record] of Object.entries(state.installed)) {
+    if (record.uncommitted || !record.installMarker) continue;
+    const name = key.slice(key.indexOf("/") + 1);
+    if (firstInstallMarkerStatus(name, record.installMarker) === "matching") {
+      unlinkSync(firstInstallMarkerPath(path.join(skillsDir(), name), record.installMarker));
+    }
+    const next = { ...record };
+    delete next.installMarker;
+    state.installed[key] = next;
+    changed = true;
+  }
+  if (changed) saveState(state);
 }
 
 function reconcileUpgradeJournal(name: string, record: InstalledRecord): InstalledRecord {
@@ -238,17 +295,7 @@ async function runSync(): Promise<ProvisionStatusView> {
   lastManifest = manifest;
 
   const state = loadState();
-  // A crash can occur after a first-install ownership preclaim is persisted but
-  // before its candidate is exposed. The visible target is therefore
-  // ambiguous and must be treated as user-owned after restart. Persist the
-  // discarded claim before inspecting or mutating any target.
-  let discardedUncommittedClaim = false;
-  for (const [key, record] of Object.entries(state.installed)) {
-    if (!record.uncommitted) continue;
-    delete state.installed[key];
-    discardedUncommittedClaim = true;
-  }
-  if (discardedUncommittedClaim) saveState(state);
+  reconcileFirstInstallJournals(state);
   const views: ProvisionItemView[] = [];
   const desired = new Set<string>();
 
@@ -321,6 +368,7 @@ async function runSync(): Promise<ProvisionStatusView> {
 	  }
 	}
       }
+      const firstInstallMarker = previousRecord ? undefined : randomBytes(16).toString("hex");
       const result = await installSkill(
         { name: item.name, url: item.url!, sha256: item.sha256! },
 	{
@@ -329,6 +377,7 @@ async function runSync(): Promise<ProvisionStatusView> {
 	  managedFiles,
 	  managedDirectories,
 	  managedFileHashes,
+	  firstInstallMarker,
 	  beforeCommit: (candidate) => {
 	    const candidateRecord: InstalledSnapshot = {
 	      sha256: item.sha256!,
@@ -339,7 +388,11 @@ async function runSync(): Promise<ProvisionStatusView> {
 	    };
 	    const nextRecord: InstalledRecord = previousRecord
 	      ? { ...stableSnapshot(previousRecord), pending: candidateRecord }
-	      : { ...candidateRecord, uncommitted: true };
+	      : {
+		...candidateRecord,
+		uncommitted: true,
+		installMarker: firstInstallMarker,
+	      };
 	    state.installed[key] = nextRecord;
 	    try {
 	      saveState(state);
@@ -357,6 +410,7 @@ async function runSync(): Promise<ProvisionStatusView> {
 	  },
 	},
       );
+      if (!previousRecord) reconcileFirstInstallJournals(state);
       // Finalizing drops the upgrade journal. If this save later fails, the
       // persisted stable+pending pair lets the next sync recognize either side.
       state.installed[key] = {
@@ -490,6 +544,7 @@ export function deleteItem(type: string, name: string): Promise<{ removed: boole
   if (inFlight) syncRequested = true;
   return serialize(() => {
     const state = loadState();
+    reconcileFirstInstallJournals(state);
     const installed = key in state.installed;
     const record = state.installed[key];
     if (record && type === "skill") {

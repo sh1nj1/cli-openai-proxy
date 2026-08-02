@@ -23,6 +23,7 @@ export function stateFilePath(): string {
 
 const emptyState = (): ProvisionStateFile => ({ version: 1, approved: [], revoked: [], installed: {} });
 const HASH_PATTERN = /^[0-9a-f]{64}$/i;
+const INSTALL_MARKER_PATTERN = /^[0-9a-f]{32}$/;
 const KEY_PATTERN = /^[a-z0-9][a-z0-9_-]{0,63}\/[a-z0-9][a-z0-9_-]{0,63}$/i;
 
 function safeRelativeFile(value: unknown): value is string {
@@ -69,6 +70,9 @@ function installedRecord(value: unknown): InstalledRecord | null {
   return {
     ...stable,
     ...(raw.uncommitted === true ? { uncommitted: true as const } : {}),
+    ...(typeof raw.installMarker === "string" && INSTALL_MARKER_PATTERN.test(raw.installMarker)
+      ? { installMarker: raw.installMarker }
+      : {}),
     ...(pending ? { pending } : {}),
   };
 }

@@ -56,6 +56,7 @@ describe("provision state", () => {
 	  fileHashes: { "SKILL.md": "b".repeat(64) },
 	  installedAt: "2026-08-02T00:00:00.000Z",
 	  uncommitted: true as const,
+	  installMarker: "c".repeat(32),
 	},
       },
     };

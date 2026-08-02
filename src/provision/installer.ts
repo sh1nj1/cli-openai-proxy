@@ -45,9 +45,20 @@ const MAX_TOTAL_BYTES = 10 * 1024 * 1024;
 /** Content cap plus slack for tar headers and padding (~512B per entry). */
 const MAX_DECOMPRESSED_BYTES = MAX_TOTAL_BYTES + 1024 * 1024;
 const DOWNLOAD_TIMEOUT_MS = 120_000;
+const INSTALL_MARKER_PATTERN = /^[0-9a-f]{32}$/;
+const REMOVAL_RECOVERY_PREFIX = ".provision-removed-";
+const REMOVAL_RECOVERY_METADATA = ".recovery.json";
+const MAX_REMOVAL_RECOVERIES = 3;
 
 /** Same charset the manifest enforces; re-checked here so no other caller can widen it. */
 const NAME_PATTERN = /^[a-z0-9][a-z0-9_-]{0,63}$/i;
+
+export function firstInstallMarkerPath(root: string, marker: string): string {
+  if (!INSTALL_MARKER_PATTERN.test(marker)) {
+    throw new ProvisionError("Invalid first-install marker", "invalid_item");
+  }
+  return path.join(root, `.provision-install-${marker}`);
+}
 
 /**
  * A skill is instructions loaded into a model's prompt; one that tells the
@@ -211,6 +222,8 @@ export async function installSkill(
     checkUrl?: (url: string) => void;
     /** Persist ownership before exposure; return an undo for a failed first-install rename. */
     beforeCommit?: (result: InstallResult) => void | (() => void);
+    /** Random journal marker that moves atomically with a first-install candidate. */
+    firstInstallMarker?: string;
     /** Existing managed paths; an upgrade must not erase additions outside this set. */
     managedFiles?: string[];
     /** Existing managed directories; omitted for legacy lockfiles that did not track them. */
@@ -296,6 +309,12 @@ export async function installSkill(
     // Persist ownership before either the old or new target moves. First
     // installs recheck after this write and undo the preclaim if exposure fails;
     // upgrades retain their stable+pending recovery journal on swap failures.
+    if (firstInstall && opts.firstInstallMarker) {
+      writeFileSync(firstInstallMarkerPath(root, opts.firstInstallMarker), opts.firstInstallMarker, {
+	flag: "wx",
+	mode: 0o600,
+      });
+    }
     const rollbackCommit = opts.beforeCommit?.(result);
     if (firstInstall) {
       if (targetExists(target)) {
@@ -468,6 +487,8 @@ function removeManagedTree(
     preserveIsolatedFiles?: boolean;
     /** Place retained inode links outside root so an uninstall can remove its visible target. */
     quarantineParent?: string;
+    /** Metadata for bounded removal recovery directories. */
+    quarantineSkill?: string;
   },
 ): { clean: boolean; recoveryPath?: string } {
   if (!existsAsDirectory(root)) return { clean: !targetExists(root) };
@@ -494,10 +515,19 @@ function removeManagedTree(
     try {
       const stat = lstatSync(file);
       if (!stat.isFile()) continue;
-      quarantine ??= mkdtempSync(path.join(
-	opts.quarantineParent ?? root,
-	opts.quarantineParent ? ".provision-removed-" : ".provision-cleanup-",
-      ));
+      if (!quarantine) {
+	quarantine = mkdtempSync(path.join(
+	  opts.quarantineParent ?? root,
+	  opts.quarantineParent ? REMOVAL_RECOVERY_PREFIX : ".provision-cleanup-",
+	));
+	if (opts.quarantineParent && opts.quarantineSkill) {
+	  writeFileSync(path.join(quarantine, REMOVAL_RECOVERY_METADATA), JSON.stringify({
+	    version: 1,
+	    skill: opts.quarantineSkill,
+	    createdAt: new Date().toISOString(),
+	  }));
+	}
+      }
       const isolated = path.join(quarantine, String(index));
       renameSync(file, isolated);
       const expected = opts.fileHashes?.[relative];
@@ -565,6 +595,39 @@ function removeManagedTree(
   return { clean, recoveryPath };
 }
 
+function cleanupRemovalRecoveries(
+  skillsDir: string,
+  retain = MAX_REMOVAL_RECOVERIES,
+): void {
+  let entries: string[];
+  try {
+    entries = readdirSync(skillsDir).filter((entry) => entry.startsWith(REMOVAL_RECOVERY_PREFIX));
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") return;
+    throw err;
+  }
+  const recoveries: Array<{ directory: string; createdAt: number }> = [];
+  for (const entry of entries) {
+    const directory = path.join(skillsDir, entry);
+    try {
+      if (!lstatSync(directory).isDirectory()) continue;
+      const metadata = JSON.parse(
+	readFileSync(path.join(directory, REMOVAL_RECOVERY_METADATA), "utf8"),
+      ) as Record<string, unknown>;
+      const createdAt = typeof metadata.createdAt === "string" ? Date.parse(metadata.createdAt) : NaN;
+      if (metadata.version !== 1 || typeof metadata.skill !== "string"
+	|| !NAME_PATTERN.test(metadata.skill) || !Number.isFinite(createdAt)) continue;
+      recoveries.push({ directory, createdAt });
+    } catch {
+      // Unknown similarly-named directories are not ours to delete.
+    }
+  }
+  recoveries.sort((a, b) => a.createdAt - b.createdAt);
+  for (const recovery of recoveries.slice(0, Math.max(0, recoveries.length - retain))) {
+    rmSync(recovery.directory, { recursive: true, force: true });
+  }
+}
+
 /** Remove only recorded regular files, leaving modified or added user content. */
 export function removeSkill(
   name: string,
@@ -578,6 +641,9 @@ export function removeSkill(
   if (!NAME_PATTERN.test(name)) {
     throw new ProvisionError(`Invalid skill name "${name}"`, "invalid_item");
   }
+  // Make room first so a crash after quarantine creation cannot exceed the
+  // documented bound; the final pass handles calls that created no quarantine.
+  cleanupRemovalRecoveries(opts.skillsDir, MAX_REMOVAL_RECOVERIES - 1);
   const result = removeManagedTree(path.join(opts.skillsDir, name), {
     ...opts,
     // An already-open descriptor can mutate the isolated inode after its hash
@@ -585,6 +651,8 @@ export function removeSkill(
     // removing the visible skill target.
     preserveIsolatedFiles: true,
     quarantineParent: opts.skillsDir,
+    quarantineSkill: name,
   });
+  cleanupRemovalRecoveries(opts.skillsDir);
   return { recoveryPath: result.recoveryPath };
 }

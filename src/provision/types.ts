@@ -54,10 +54,16 @@ export interface InstalledSnapshot {
 /** One installed artifact as the lockfile records it. */
 export interface InstalledRecord extends InstalledSnapshot {
   /**
-   * First-install ownership written before exposure. A restart must discard
-   * this claim without touching the target because the rename may not have run.
+   * First-install ownership written before exposure. Recovery uses the random
+   * installMarker to decide whether the candidate rename completed.
    */
   uncommitted?: true;
+  /**
+   * Random marker placed in the candidate before its first atomic exposure.
+   * Its presence after restart distinguishes an exposed install from a
+   * preclaim whose rename never ran.
+   */
+  installMarker?: string;
   /**
    * Upgrade journal written before the directory swap. The stable snapshot is
    * retained alongside it so either side of an interrupted swap stays owned.
