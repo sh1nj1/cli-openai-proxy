@@ -169,7 +169,7 @@ describe("auth-routes", () => {
     const data = (res.payload as { data: Array<{ engine: string; flow: string; flows: string[] }> }).data;
     // `flow` stays the default so a caller written against single-flow engines keeps working.
     assert.deepEqual(data.find((e) => e.engine === "claude"), {
-      engine: "claude", flow: "paste-code", flows: ["paste-code"],
+      engine: "claude", flow: "paste-code", flows: ["paste-code", "api-key"],
     });
     assert.deepEqual(data.find((e) => e.engine === "codex"), {
       engine: "codex", flow: "api-key", flows: ["api-key", "device-code"],

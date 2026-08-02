@@ -29,6 +29,16 @@ function stubRunner(result: CommandResult | Error): void {
   commandRunner.run = run;
 }
 
+describe("claude flows", () => {
+  // Order is the API contract: the first flow is what a caller naming none gets,
+  // and existing paste-code callers must keep getting paste-code.
+  test("offers paste-code (default) and api-key, both credential-injecting", () => {
+    const flows = resolveEngine("claude")!.flows;
+    assert.deepStrictEqual(flows.map((f) => f.flow), ["paste-code", "api-key"]);
+    assert.ok(flows.every((f) => f.injectsCredential), "claude credentials only reach the CLI via injection");
+  });
+});
+
 describe("claude auth status", () => {
   beforeEach(() => {
     clearAllCredentials();
