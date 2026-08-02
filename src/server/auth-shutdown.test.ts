@@ -10,6 +10,7 @@
 
 import { test, afterEach } from "node:test";
 import assert from "node:assert/strict";
+import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
 import { startServer, stopServer, getServer } from "./index.js";
 import { engineRegistry } from "../auth/registry.js";
@@ -111,6 +112,47 @@ test("a pending session is not resolvable after an in-process restart", async ()
   assert.equal(res.status, 404, "a session must not be resolvable after a restart");
   const body = (await res.json()) as { error: { code: string } };
   assert.equal(body.error.code, "unknown_session");
+});
+
+test("shutdown stops accepting auth sessions before provisioning fetches drain", async () => {
+  let releaseManifest!: () => void;
+  const manifestGate = new Promise<void>((resolve) => { releaseManifest = resolve; });
+  let manifestRequested!: () => void;
+  const manifestRequest = new Promise<void>((resolve) => { manifestRequested = resolve; });
+  const manifestServer = createServer(async (_req, res) => {
+    manifestRequested();
+    await manifestGate;
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({ schema: "agent-provisioning/v1", items: [] }));
+  });
+  await new Promise<void>((resolve) => manifestServer.listen(0, "127.0.0.1", resolve));
+  const manifestPort = (manifestServer.address() as AddressInfo).port;
+
+  process.env.PROVISION_SYNC = "1";
+  process.env.PROVISION_REFETCH_MS = "0";
+  process.env.PROVISION_MANIFEST_URL = `http://127.0.0.1:${manifestPort}/manifest.json`;
+  const port = await boot();
+  await manifestRequest;
+
+  const stopping = stopServer();
+  let createResponse: Response | undefined;
+  try {
+    createResponse = await fetch(`http://127.0.0.1:${port}/v1/auth/fake/sessions`, {
+      method: "POST",
+      headers: authHeaders,
+    });
+  } catch {
+    // Expected: close() stops accepting before provisioning is allowed to drain.
+  } finally {
+    releaseManifest();
+    await stopping;
+    await new Promise<void>((resolve, reject) => {
+      manifestServer.close((err) => err ? reject(err) : resolve());
+    });
+  }
+
+  assert.equal(createResponse, undefined, "shutdown must reject sessions during provisioning drain");
+  assert.equal(created.length, 0, "no auth child may be created after shutdown begins");
 });
 
 test("startup logs do not expose credentials from a fixed manifest URL", async () => {

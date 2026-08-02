@@ -290,32 +290,36 @@ export async function startServer(config: ServerConfig): Promise<Server> {
  * Stop the HTTP server
  */
 export async function stopServer(): Promise<void> {
-  // Before the early return and before close(): auth sessions live in module
-  // state, not on the listener, so a pending paste-code session would keep its
-  // pty child alive until its TTL and stay submittable after the next
-  // startServer(). Cancelling first also unblocks an in-flight submit, which
-  // close() would otherwise wait on.
+  const server = serverInstance;
+  // Start draining before any await so shutdown cannot admit a new auth
+  // session while provisioning waits for a bounded network fetch.
+  const closing = server
+    ? new Promise<void>((resolve, reject) => {
+	server.close((err) => err ? reject(err) : resolve());
+      })
+    : Promise.resolve();
+
+  // Auth sessions live in module state, not on the listener. Cancelling the
+  // current set also unblocks an in-flight submit that close() is draining.
   resetSessions();
 
   // Also module state: the refetch timer and registered manifest URL would
   // otherwise survive into (and act during) the next startServer().
-  await shutdownProvisioning();
+  const [provisioningResult, closeResult] = await Promise.allSettled([
+    shutdownProvisioning(),
+    closing,
+  ]);
 
-  if (!serverInstance) {
-    return;
+  // A request already executing when close() began can finish session creation
+  // after the first reset. Drain it, then sweep module state once more.
+  resetSessions();
+
+  if (closeResult.status === "fulfilled" && server && serverInstance === server) {
+    console.log("[Server] Stopped");
+    serverInstance = null;
   }
-
-  return new Promise((resolve, reject) => {
-    serverInstance!.close((err) => {
-      if (err) {
-        reject(err);
-      } else {
-        console.log("[Server] Stopped");
-        serverInstance = null;
-        resolve();
-      }
-    });
-  });
+  if (closeResult.status === "rejected") throw closeResult.reason;
+  if (provisioningResult.status === "rejected") throw provisioningResult.reason;
 }
 
 /**
