@@ -601,6 +601,13 @@ async function runSync(generation: number): Promise<ProvisionStatusView> {
     if (state.installed[key]?.sha256 === item.sha256
       && !state.installed[key]!.installMarker
       && installedRecordIntact(item.name, state.installed[key]!)) {
+      if (state.installed[key]!.removalRecoveryId) {
+	delete state.installed[key]!.removalRecoveryId;
+	finalizeRemovalRecoveries(state);
+	// Persist reconciliation before reporting the intact target as installed.
+	// Otherwise a second crash leaves startup status hiding a healthy item.
+	saveState(state);
+      }
       views.push({ type: item.type, name: item.name, status: "installed", sha256: item.sha256 });
       continue;
     }

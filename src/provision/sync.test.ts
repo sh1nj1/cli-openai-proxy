@@ -263,6 +263,37 @@ describe("provision sync", () => {
     assert.equal(existsSync(path.join(skillsDir, "pr-monitor", "SKILL.md")), true);
   });
 
+  test("an intact target clears an interrupted removal preclaim on idempotent sync", async () => {
+    process.env.PROVISION_AUTOAPPLY = "auto";
+    initProvisioning();
+    const name = "intact-removal-preclaim";
+    const skill = serveSkill("/intact-removal-preclaim.tgz", "managed");
+    const manifestUrl = serveManifest([{ type: "skill", name, ...skill }]);
+    registerManifestUrl(manifestUrl);
+    await syncNow();
+
+    initProvisioning({
+      afterRemovalAudit: () => {
+	throw new Error("simulated interruption before isolation");
+      },
+    });
+    await assert.rejects(deleteItem("skill", name), /simulated interruption/);
+    const lockfile = path.join(stateDir, "provision.lock.json");
+    const interrupted = JSON.parse(readFileSync(lockfile, "utf8"));
+    assert.match(interrupted.installed[`skill/${name}`].removalRecoveryId, /^[a-f0-9]{32}$/);
+
+    initProvisioning();
+    assert.equal(statusOf(getStatus(), name), undefined);
+    registerManifestUrl(manifestUrl);
+    assert.equal(statusOf(await syncNow(), name), "installed");
+    const reconciled = JSON.parse(readFileSync(lockfile, "utf8"));
+    assert.equal(reconciled.installed[`skill/${name}`].removalRecoveryId, undefined);
+    assert.deepEqual(reconciled.removalRecoveries, []);
+
+    initProvisioning();
+    assert.equal(statusOf(getStatus(), name), "installed");
+  });
+
   test("a legacy uppercase lockfile item migrates to lowercase in one sync", async () => {
     const legacyName = "Demo";
     const canonicalName = "demo";
