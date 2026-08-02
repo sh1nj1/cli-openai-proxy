@@ -12,6 +12,7 @@ export const DEFAULT_TIMEOUT_MS = 0;
 // to finish at 10 minutes by default, then exits — cutting off longer runs.
 // 0 = wait until subagents finish (no ceiling).
 export const DEFAULT_BG_WAIT_CEILING_MS = 0;
+export const DEFAULT_AUTH_SESSION_TTL_MS = 10 * 60_000;
 
 const KEEPALIVE_INTERVAL_MS = 15000;
 export { KEEPALIVE_INTERVAL_MS };
@@ -31,8 +32,8 @@ export function getTimeoutMs(): number {
 }
 
 /**
- * Env vars that authenticate callers TO the proxy. They gate the proxy's own
- * surface and mean nothing to the CLIs it spawns.
+ * Env vars that authenticate callers TO the proxy or carry proxy-only registry
+ * credentials. They mean nothing to the CLIs it spawns.
  *
  * Completion runs launch an agentic CLI with permissions skipped, so an ordinary
  * caller can just ask the model to print its environment. Inherited, AUTH_ADMIN_KEYS
@@ -45,6 +46,7 @@ export const PROXY_ONLY_SECRET_VARS = [
   "AUTH_ADMIN_KEYS",
   "USER_API_KEYS",
   "USER_IDENTITY_HMAC_SECRET",
+  "PROVISION_MANIFEST_URL",
 ] as const;
 
 /** What each secret was at boot, so a re-init survives its own removal from the env. */
@@ -149,4 +151,9 @@ export function getWorkerConnectTimeoutMs(): number {
   if (!raw) return 15_000;
   const parsed = Number.parseInt(raw, 10);
   return Number.isFinite(parsed) && parsed > 0 ? parsed : 15_000;
+}
+
+export function getAuthSessionTtlMs(): number {
+  const raw = Number(process.env.AUTH_SESSION_TTL_MS);
+  return Number.isFinite(raw) && raw > 0 ? raw : DEFAULT_AUTH_SESSION_TTL_MS;
 }

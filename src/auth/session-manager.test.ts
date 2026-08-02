@@ -260,7 +260,38 @@ describe("session-manager", () => {
     await inFlight;
   });
 
-  test("a successful submit stores the credential and releases the session", async () => {
+  test("a submit superseded while awaiting the adapter cannot authorize the old session", async () => {
+    behavior = { credential: true, submitDelayMs: 50 };
+    const first = await createSession("fake");
+    const inFlight = submitSession("fake", first.sessionId, "stale-code");
+
+    const replacement = await createSession("fake");
+    await assert.rejects(inFlight, (err: AuthProvisioningError) => {
+      assert.strictEqual(err.code, "session_superseded");
+      return true;
+    });
+
+    assert.deepStrictEqual(getProvisionedAuthEnv("fake"), {});
+    assert.throws(() => getSession("fake", first.sessionId));
+    assert.strictEqual(getSession("fake", replacement.sessionId).status, "pending");
+  });
+
+  test("a submit cancelled while awaiting the adapter cannot authorize the disposed session", async () => {
+    behavior = { credential: true, submitDelayMs: 50 };
+    const view = await createSession("fake");
+    const inFlight = submitSession("fake", view.sessionId, "stale-code");
+
+    cancelSession("fake", view.sessionId);
+    await assert.rejects(inFlight, (err: AuthProvisioningError) => {
+      assert.strictEqual(err.code, "session_superseded");
+      return true;
+    });
+
+    assert.deepStrictEqual(getProvisionedAuthEnv("fake"), {});
+    assert.throws(() => getSession("fake", view.sessionId));
+  });
+
+  test("a successful submit stores the credential, releases the engine slot, and retains the result", async () => {
     behavior = { credential: true };
     const view = await createSession("fake");
     const result = await submitSession("fake", view.sessionId, "code-1");
@@ -268,6 +299,11 @@ describe("session-manager", () => {
     assert.strictEqual(result.status, "authorized");
     assert.deepStrictEqual(getProvisionedAuthEnv("fake"), { FAKE_TOKEN: "tok-code-1" });
     assert.strictEqual(created[0].cancelled, true);
+    assert.strictEqual(getSession("fake", view.sessionId).status, "authorized");
+
+    const next = await createSession("fake");
+    assert.strictEqual(getSession("fake", next.sessionId).status, "pending");
+    assert.strictEqual(getSession("fake", view.sessionId).status, "authorized");
   });
 
   // A rejected credential is a completed attempt, not a transport failure.
@@ -281,13 +317,11 @@ describe("session-manager", () => {
     assert.deepStrictEqual(getProvisionedAuthEnv("fake"), {});
   });
 
-  test("a session cannot be submitted twice", async () => {
+  test("an authorized submit can be retried without driving the adapter twice", async () => {
     const view = await createSession("fake");
-    await submitSession("fake", view.sessionId, "code");
-    await assert.rejects(submitSession("fake", view.sessionId, "code"), (err: AuthProvisioningError) => {
-      assert.strictEqual(err.code, "unknown_session");
-      return true;
-    });
+    assert.strictEqual((await submitSession("fake", view.sessionId, "code")).status, "authorized");
+    assert.strictEqual((await submitSession("fake", view.sessionId, "ignored-retry")).status, "authorized");
+    assert.deepStrictEqual(created[0].submitted, ["code"]);
   });
 
   // Otherwise a session id leaked from one engine's route could drive another's.

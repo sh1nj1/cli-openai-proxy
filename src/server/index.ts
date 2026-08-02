@@ -20,8 +20,17 @@ import {
   handleSubmitAuthSession,
   initAuthAdmin,
 } from "./auth-routes.js";
+import {
+  PROVISION_PREFIX,
+  handleProvisionApprove,
+  handleProvisionDelete,
+  handleProvisionStatus,
+  handleProvisionSync,
+  provisionAdminMiddleware,
+} from "./provision-routes.js";
 import { getTimeoutMs } from "../config.js";
 import { resetSessions } from "../auth/session-manager.js";
+import { handleAuthorizedSession, initProvisioning, shutdownProvisioning } from "../provision/sync.js";
 import { initRequestIdentity, requireRequestIdentity } from "../isolation/request-identity.js";
 import type { UserWorkerProxy } from "../isolation/worker-proxy.js";
 
@@ -36,6 +45,8 @@ export interface ServerConfig {
 export interface AppConfig {
   role?: "gateway" | "worker";
   userWorkerProxy?: UserWorkerProxy;
+  /** Test seam; production defaults to the gateway-owned provisioning engine. */
+  onAuthorizedProvisioningUrl?: (url: string) => void | Promise<void>;
 }
 
 let serverInstance: Server | null = null;
@@ -62,6 +73,8 @@ export function createApp(config: AppConfig = {}): Express {
   const app = express();
   const role = config.role ?? "gateway";
   const userWorkerProxy = config.userWorkerProxy;
+  let onAuthorizedProvisioningUrl: AppConfig["onAuthorizedProvisioningUrl"];
+  app.locals.cliProxyRole = role;
 
   if (role === "gateway") {
     // Identity mappings must initialize first: mapped user keys are also valid
@@ -75,6 +88,16 @@ export function createApp(config: AppConfig = {}): Express {
       adminStatus.enabled
         ? `[Server] CLI auth provisioning enabled (${adminStatus.keyCount} admin key(s))`
         : "[Server] CLI auth provisioning disabled (set AUTH_ADMIN_KEYS to enable)",
+    );
+    const provisionStatus = initProvisioning();
+    if (provisionStatus.enabled) {
+      onAuthorizedProvisioningUrl = config.onAuthorizedProvisioningUrl ?? handleAuthorizedSession;
+    }
+    console.log(
+      provisionStatus.enabled
+        ? `[Server] Agent provisioning enabled (mode: ${provisionStatus.autoApply}`
+	  + `${provisionStatus.manifestUrl ? ", fixed manifest configured" : ""})`
+        : "[Server] Agent provisioning disabled (set PROVISION_SYNC=1 to enable)",
     );
     if (userWorkerProxy) {
       console.log(
@@ -126,6 +149,10 @@ export function createApp(config: AppConfig = {}): Express {
   // wrong admin key (or one sent while the feature is off) before its body is buffered.
   if (role === "gateway") app.use(AUTH_PROVISIONING_PREFIX, authAdminMiddleware);
 
+  // And for agent provisioning — its own opt-in (PROVISION_SYNC) plus the same
+  // admin keys, checked before any body is buffered.
+  if (role === "gateway") app.use(PROVISION_PREFIX, provisionAdminMiddleware);
+
   // A valid shared API key alone cannot select an OS user. Resolve the immutable
   // identity before buffering JSON, preserving the same unauthenticated-body DoS
   // boundary as the two API-key gates above.
@@ -150,7 +177,7 @@ export function createApp(config: AppConfig = {}): Express {
     if (!userWorkerProxy) return [handler];
     return [
       (req, res) => {
-        void userWorkerProxy.forward(req, res);
+	void userWorkerProxy.forward(req, res, onAuthorizedProvisioningUrl);
       },
     ];
   };
@@ -170,6 +197,14 @@ export function createApp(config: AppConfig = {}): Express {
   app.post(`${AUTH_PROVISIONING_PREFIX}/:engine/sessions/:sessionId`, ...scoped(handleSubmitAuthSession));
   app.delete(`${AUTH_PROVISIONING_PREFIX}/:engine/sessions/:sessionId`, ...scoped(handleCancelAuthSession));
   app.delete(`${AUTH_PROVISIONING_PREFIX}/:engine/credential`, ...scoped(handleForgetCredential));
+
+  // Agent provisioning (gated above). Deliberately NOT scoped(): artifacts
+  // install into the GATEWAY process's skills dir. Per-user Linux workers run
+  // with their own HOME and do not see it — see docs/provisioning.md.
+  app.get(PROVISION_PREFIX, handleProvisionStatus);
+  app.post(`${PROVISION_PREFIX}/sync`, handleProvisionSync);
+  app.post(`${PROVISION_PREFIX}/items/:type/:name/approve`, handleProvisionApprove);
+  app.delete(`${PROVISION_PREFIX}/items/:type/:name`, handleProvisionDelete);
 
   // 404 handler
   app.use((_req: Request, res: Response) => {
@@ -255,28 +290,36 @@ export async function startServer(config: ServerConfig): Promise<Server> {
  * Stop the HTTP server
  */
 export async function stopServer(): Promise<void> {
-  // Before the early return and before close(): auth sessions live in module
-  // state, not on the listener, so a pending paste-code session would keep its
-  // pty child alive until its TTL and stay submittable after the next
-  // startServer(). Cancelling first also unblocks an in-flight submit, which
-  // close() would otherwise wait on.
+  const server = serverInstance;
+  // Start draining before any await so shutdown cannot admit a new auth
+  // session while provisioning waits for a bounded network fetch.
+  const closing = server
+    ? new Promise<void>((resolve, reject) => {
+	server.close((err) => err ? reject(err) : resolve());
+      })
+    : Promise.resolve();
+
+  // Auth sessions live in module state, not on the listener. Cancelling the
+  // current set also unblocks an in-flight submit that close() is draining.
   resetSessions();
 
-  if (!serverInstance) {
-    return;
-  }
+  // Also module state: the refetch timer and registered manifest URL would
+  // otherwise survive into (and act during) the next startServer().
+  const [provisioningResult, closeResult] = await Promise.allSettled([
+    shutdownProvisioning(),
+    closing,
+  ]);
 
-  return new Promise((resolve, reject) => {
-    serverInstance!.close((err) => {
-      if (err) {
-        reject(err);
-      } else {
-        console.log("[Server] Stopped");
-        serverInstance = null;
-        resolve();
-      }
-    });
-  });
+  // A request already executing when close() began can finish session creation
+  // after the first reset. Drain it, then sweep module state once more.
+  resetSessions();
+
+  if (closeResult.status === "fulfilled" && server && serverInstance === server) {
+    console.log("[Server] Stopped");
+    serverInstance = null;
+  }
+  if (closeResult.status === "rejected") throw closeResult.reason;
+  if (provisioningResult.status === "rejected") throw provisioningResult.reason;
 }
 
 /**

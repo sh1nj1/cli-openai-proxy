@@ -11,6 +11,7 @@
 import type { Request, Response, NextFunction } from "express";
 import { takeProxySecret } from "../config.js";
 import { AUTH_PROVISIONING_PREFIX } from "./auth-routes.js";
+import { PROVISION_PREFIX } from "./provision-routes.js";
 import { mappedCompletionKeys } from "../isolation/request-identity.js";
 
 let validKeys: Set<string> | null = null;
@@ -61,6 +62,13 @@ export function authMiddleware(req: Request, res: Response, next: NextFunction):
   // checking them here would reject the correct credential. They are gated by
   // their own fail-closed middleware (disabled entirely without AUTH_ADMIN_KEYS).
   if (req.path.startsWith(AUTH_PROVISIONING_PREFIX)) {
+    next();
+    return;
+  }
+
+  // Same for agent provisioning: admin-key gated by its own fail-closed
+  // middleware (404 without PROVISION_SYNC=1).
+  if (req.path.startsWith(PROVISION_PREFIX)) {
     next();
     return;
   }

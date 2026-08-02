@@ -174,6 +174,11 @@ Starts an attempt, superseding any existing pending one for that engine. The
 body may name a `flow` (`{"flow": "device-code"}`); omitted means the engine's
 default. A flow the engine does not offer answers `400 unsupported_flow`.
 
+The body may also carry a `provisioning_url`: a manifest the proxy pulls and
+applies once this login reaches `authorized`, wiring auth and agent
+capabilities in a single request. Ignored unless `PROVISION_SYNC=1`; see
+[provisioning.md](provisioning.md).
+
 The engine's single session slot is claimed before the CLI is asked for its URL,
 so two overlapping starts cannot both take it. The loser is answered `409
 session_superseded` as soon as it is superseded — not after its own URL wait

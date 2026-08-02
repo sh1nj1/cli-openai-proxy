@@ -6,10 +6,10 @@
  * bounded: at most one *pending* session per engine (a new start cancels the
  * old), every session is reaped after a TTL, and server shutdown drops them all.
  *
- * "device-code" sessions finish without a submit request, so their terminal
- * status arrives asynchronously (see settleWhenDone). A concluded session stays
- * queryable until its TTL — the poll that discovers the outcome needs something
- * to read — but releases its engine slot immediately.
+ * Concluded sessions stay queryable until their TTL. Device-code callers need to
+ * poll for the outcome, while paste-code/API-key callers may need to retry after
+ * an authorized worker response (and its provisioning notification) is lost.
+ * Either way, the engine slot is released immediately.
  *
  * Sessions are not persisted. A proxy restart drops them and the caller simply
  * restarts the flow — the same trade-off as the memory-only token store. That
@@ -19,7 +19,12 @@
  */
 
 import { randomUUID } from "crypto";
-import { TRUST_COMPLETION_CALLERS_VAR, trustsCompletionCallers } from "../config.js";
+import {
+  getAuthSessionTtlMs,
+  TRUST_COMPLETION_CALLERS_VAR,
+  trustsCompletionCallers,
+} from "../config.js";
+import { handleAuthorizedSession } from "../provision/sync.js";
 import { resolveEngine } from "./registry.js";
 import { setCredential } from "./token-store.js";
 import {
@@ -44,10 +49,24 @@ export interface SessionView {
   error?: { message: string; code: string };
 }
 
+export interface SessionProvisioningNotification {
+  url: string;
+  generation: string;
+}
+
 interface SessionRecord extends Omit<SessionView, "expiresAt"> {
   expiresAt: number;
   handle: EngineAuthSession;
   timer: NodeJS.Timeout;
+  /**
+   * Manifest URL the caller asked to sync once this login succeeds. Held on the
+   * record (not in SessionView) because it only matters at the authorized
+   * transition — and the device-code flow reaches that transition without a
+   * request to carry it.
+   */
+  provisioningUrl?: string;
+  /** Gateway-issued ordering identity paired with provisioningUrl. */
+  provisioningGeneration?: string;
   /**
    * Set for the duration of submit(). Not part of SessionView: the session is
    * still "pending" to an observer — nothing has been decided yet — and this only
@@ -55,8 +74,6 @@ interface SessionRecord extends Omit<SessionView, "expiresAt"> {
    */
   submitting: boolean;
 }
-
-const DEFAULT_TTL_MS = 10 * 60_000;
 
 const byId = new Map<string, SessionRecord>();
 const byEngine = new Map<string, string>();
@@ -71,15 +88,18 @@ const byEngine = new Map<string, string>();
  * overwrite the same credential. Reserving the engine here — before the await —
  * makes the one-session-per-engine invariant hold DURING start, not just after.
  */
-const starting = new Map<string, { handle: EngineAuthSession }>();
-
-function ttlMs(): number {
-  const raw = Number(process.env.AUTH_SESSION_TTL_MS);
-  return Number.isFinite(raw) && raw > 0 ? raw : DEFAULT_TTL_MS;
-}
+const starting = new Map<string, { handle: EngineAuthSession; provisioningGeneration?: string }>();
 
 function view(record: SessionRecord): SessionView {
-  const { handle: _handle, timer: _timer, submitting: _submitting, expiresAt, ...rest } = record;
+  const {
+    handle: _handle,
+    timer: _timer,
+    submitting: _submitting,
+    provisioningUrl: _provisioningUrl,
+    provisioningGeneration: _provisioningGeneration,
+    expiresAt,
+    ...rest
+  } = record;
   return { ...rest, expiresAt: new Date(expiresAt).toISOString() };
 }
 
@@ -105,7 +125,16 @@ function supersededError(engine: string): AuthProvisioningError {
  * no record is kept in that case, so a failed start leaves nothing to reap.
  * `flow` picks among the engine's flows; omitted means the engine's default.
  */
-export async function createSession(engine: string, flow?: string): Promise<SessionView> {
+export async function createSession(
+  engine: string,
+  flow?: string,
+  opts: {
+    provisioningUrl?: string;
+    provisioningGeneration?: string;
+    sessionTtlMs?: number;
+    onSupersededProvisioningGeneration?: (generation: string) => void;
+  } = {},
+): Promise<SessionView> {
   const descriptor = resolveEngine(engine);
   if (!descriptor) {
     throw new AuthProvisioningError(`Unknown engine "${engine}"`, "unknown_engine");
@@ -134,18 +163,26 @@ export async function createSession(engine: string, flow?: string): Promise<Sess
   const existingId = byEngine.get(engine);
   if (existingId) {
     const existing = byId.get(existingId);
-    if (existing) dispose(existing, "cancelled");
+    if (existing) {
+      if (existing.provisioningGeneration) {
+	opts.onSupersededProvisioningGeneration?.(existing.provisioningGeneration);
+      }
+      dispose(existing, "cancelled");
+    }
   }
   // Supersede a start that has not registered yet, killing its child now rather
   // than leaving two logins alive until one of them times out.
   const superseded = starting.get(engine);
   if (superseded) {
     starting.delete(engine);
+    if (superseded.provisioningGeneration) {
+      opts.onSupersededProvisioningGeneration?.(superseded.provisioningGeneration);
+    }
     superseded.handle.cancel();
   }
 
   const handle = flowDescriptor.createSession();
-  const reservation = { handle };
+  const reservation = { handle, provisioningGeneration: opts.provisioningGeneration };
   starting.set(engine, reservation);
 
   // Our reservation is only ever removed by a later start taking the slot (or by
@@ -174,11 +211,12 @@ export async function createSession(engine: string, flow?: string): Promise<Sess
   }
 
   const sessionId = randomUUID();
-  const expiresAt = Date.now() + ttlMs();
+  const sessionTtlMs = opts.sessionTtlMs ?? getAuthSessionTtlMs();
+  const expiresAt = Date.now() + sessionTtlMs;
   const timer = setTimeout(() => {
     const record = byId.get(sessionId);
     if (record) dispose(record, "failed");
-  }, ttlMs());
+  }, sessionTtlMs);
   // Do not hold the event loop open for a pending login.
   timer.unref?.();
 
@@ -194,6 +232,8 @@ export async function createSession(engine: string, flow?: string): Promise<Sess
     handle,
     timer,
     submitting: false,
+    provisioningUrl: opts.provisioningUrl,
+    provisioningGeneration: opts.provisioningGeneration,
   };
   byId.set(sessionId, record);
   byEngine.set(engine, sessionId);
@@ -219,6 +259,9 @@ function settleWhenDone(record: SessionRecord): void {
     (result) => {
       if (result.credential) setCredential(record.engine, result.credential);
       conclude("authorized");
+      // Only on the transition this call made: a session already concluded (or
+      // superseded) must not re-trigger a sync from a stale outcome.
+      if (record.status === "authorized") void handleAuthorizedSession(record.provisioningUrl);
     },
     (err) => {
       const message = err instanceof Error ? err.message : String(err);
@@ -244,6 +287,10 @@ export async function submitSession(
   input: string,
 ): Promise<SessionView> {
   const record = requireSession(engine, sessionId);
+  // Successful submit results remain queryable until TTL so a worker response
+  // lost before the gateway observes its private provisioning header can be
+  // retried. Do not re-drive the adapter or provisioning side effect.
+  if (record.status === "authorized" && !record.handle.wait) return view(record);
   if (record.status !== "pending") {
     throw new AuthProvisioningError(
       `Session is already ${record.status}`,
@@ -273,26 +320,62 @@ export async function submitSession(
 
   try {
     const result = await record.handle.submit(input);
+    // A newer create, explicit cancellation, or TTL reap can dispose this
+    // record while the adapter is still submitting. Its late success no longer
+    // has authority to change credentials or register a manifest.
+    if (byId.get(sessionId) !== record || record.status !== "pending") {
+      throw supersededError(engine);
+    }
     if (result.credential) setCredential(engine, result.credential);
-    // Snapshot before dispose(), which removes the record from the maps.
-    const authorized: SessionView = { ...view(record), status: "authorized" };
-    dispose(record, "authorized");
-    return authorized;
+    record.status = "authorized";
+    record.handle.cancel();
+    if (byEngine.get(record.engine) === record.sessionId) byEngine.delete(record.engine);
+    // Fire-and-forget: provisioning is a follow-on to a successful login, and
+    // its failure must not turn this response into an error (see sync.ts).
+    void handleAuthorizedSession(record.provisioningUrl);
+    return view(record);
   } catch (err) {
+    // Do not resurrect or rewrite a record already disposed by another request.
+    if (byId.get(sessionId) !== record || record.status !== "pending") {
+      throw supersededError(engine);
+    }
     const message = err instanceof Error ? err.message : String(err);
     const code = err instanceof AuthProvisioningError ? err.code : "submit_failed";
     const failed: SessionView = { ...view(record), status: "failed", error: { message, code } };
     dispose(record, "failed");
     return failed;
   } finally {
-    // Both paths dispose, so the record is already unreachable; released anyway so
-    // the flag can never outlive the attempt that set it.
+    // The authorized path remains queryable until TTL; the flag must still be
+    // released so retries return the retained result.
     record.submitting = false;
   }
 }
 
 export function getSession(engine: string, sessionId: string): SessionView {
   return view(requireSession(engine, sessionId));
+}
+
+function provisioningNotification(record: SessionRecord): SessionProvisioningNotification | undefined {
+  return record.provisioningUrl && record.provisioningGeneration
+    ? { url: record.provisioningUrl, generation: record.provisioningGeneration }
+    : undefined;
+}
+
+/** Read a paste-code/API-key session's private, ordered provisioning notification. */
+export function getSessionProvisioningNotification(
+  engine: string,
+  sessionId: string,
+): SessionProvisioningNotification | undefined {
+  return provisioningNotification(requireSession(engine, sessionId));
+}
+
+/** Return a completed device-code session's retryable worker-to-gateway notification. */
+export function getAuthorizedProvisioningNotification(
+  engine: string,
+  sessionId: string,
+): SessionProvisioningNotification | undefined {
+  const record = requireSession(engine, sessionId);
+  return record.status === "authorized" ? provisioningNotification(record) : undefined;
 }
 
 export function cancelSession(engine: string, sessionId: string): SessionView {

@@ -7,6 +7,7 @@ import {
   handleAuthStatus,
   handleCreateAuthSession,
   handleForgetCredential,
+  handleGetAuthSession,
   handleSubmitAuthSession,
   initAuthAdmin,
 } from "./auth-routes.js";
@@ -15,17 +16,27 @@ import { engineRegistry } from "../auth/registry.js";
 import { resetSessions } from "../auth/session-manager.js";
 import { clearAllCredentials, setCredential } from "../auth/token-store.js";
 import type { EngineAuthDescriptor, EngineAuthSession } from "../auth/types.js";
+import {
+  AUTHORIZED_PROVISIONING_HEADER,
+  PROVISIONING_GENERATION_HEADER,
+  PROVISIONING_SESSION_TTL_HEADER,
+  SUPERSEDED_PROVISIONING_GENERATION_HEADER,
+  decodeProvisioningUrl,
+} from "../isolation/worker-protocol.js";
 
 interface FakeRes extends Response {
   statusCode: number;
   payload: unknown;
+  headers: Record<string, string>;
 }
 
 function fakeRes(): FakeRes {
   const res: any = {};
   res.statusCode = 200;
   res.payload = undefined;
+  res.headers = {};
   res.status = (code: number) => { res.statusCode = code; return res; };
+  res.setHeader = (name: string, value: string) => { res.headers[name.toLowerCase()] = value; return res; };
   res.json = (obj: unknown) => { res.payload = obj; return res; };
   return res as FakeRes;
 }
@@ -248,6 +259,181 @@ describe("auth-routes", () => {
       );
       assert.equal((res.payload as { status: string }).status, "authorized");
     }
+  });
+
+  test("worker submit returns an internal provisioning notification on authorization", async () => {
+    const manifestUrl = "https://collavre.test/agents/vrex/provision.json?token=secret";
+    const generation = "019865f4-50d6-7000-8000-000000000001";
+    const created = fakeRes();
+    await handleCreateAuthSession(fakeReq({
+      app: { locals: { cliProxyRole: "worker" } } as any,
+      headers: { [PROVISIONING_GENERATION_HEADER]: generation },
+      params: { engine: "fake" } as any,
+      body: { provisioning_url: manifestUrl },
+    }), created);
+    const { sessionId } = created.payload as { sessionId: string };
+
+    const res = fakeRes();
+    await handleSubmitAuthSession(fakeReq({
+      app: { locals: { cliProxyRole: "worker" } } as any,
+      params: { engine: "fake", sessionId } as any,
+      body: { value: "code" },
+    }), res);
+
+    assert.equal((res.payload as { status: string }).status, "authorized");
+    assert.equal(decodeProvisioningUrl(res.headers[AUTHORIZED_PROVISIONING_HEADER]), manifestUrl);
+    assert.equal(res.headers[PROVISIONING_GENERATION_HEADER], generation);
+    assert.equal(JSON.stringify(res.payload).includes(manifestUrl), false, "private URL must stay out of JSON");
+
+    const retried = fakeRes();
+    await handleSubmitAuthSession(fakeReq({
+      app: { locals: { cliProxyRole: "worker" } } as any,
+      params: { engine: "fake", sessionId } as any,
+      body: { value: "code" },
+    }), retried);
+    assert.equal((retried.payload as { status: string }).status, "authorized");
+    assert.equal(
+      decodeProvisioningUrl(retried.headers[AUTHORIZED_PROVISIONING_HEADER]),
+      manifestUrl,
+      "a retried submit must recover a notification lost before the gateway received it",
+    );
+
+    const polled = fakeRes();
+    handleGetAuthSession(fakeReq({
+      app: { locals: { cliProxyRole: "worker" } } as any,
+      params: { engine: "fake", sessionId } as any,
+    }), polled);
+    assert.equal((polled.payload as { status: string }).status, "authorized");
+    assert.equal(decodeProvisioningUrl(polled.headers[AUTHORIZED_PROVISIONING_HEADER]), manifestUrl);
+  });
+
+  test("worker provisioning sessions use the gateway-supplied TTL", async () => {
+    const generation = "019865f4-50d6-7000-8000-000000000001";
+    const before = Date.now();
+    const created = fakeRes();
+    await handleCreateAuthSession(fakeReq({
+      app: { locals: { cliProxyRole: "worker" } } as any,
+      headers: {
+	[PROVISIONING_GENERATION_HEADER]: generation,
+	[PROVISIONING_SESSION_TTL_HEADER]: "300000",
+      },
+      params: { engine: "fake" } as any,
+      body: { provisioning_url: "https://collavre.test/provision.json" },
+    }), created);
+
+    const expiresAt = Date.parse((created.payload as { expiresAt: string }).expiresAt);
+    assert.ok(expiresAt >= before + 300_000);
+    assert.ok(expiresAt <= Date.now() + 300_000);
+  });
+
+  test("worker create reports only the provisioning generation it actually superseded", async () => {
+    const generation = "019865f4-50d6-7000-8000-000000000001";
+    const first = fakeRes();
+    await handleCreateAuthSession(fakeReq({
+      app: { locals: { cliProxyRole: "worker" } } as any,
+      headers: { [PROVISIONING_GENERATION_HEADER]: generation },
+      params: { engine: "fake" } as any,
+      body: { provisioning_url: "https://collavre.test/provision.json" },
+    }), first);
+
+    const replacement = fakeRes();
+    await handleCreateAuthSession(fakeReq({
+      app: { locals: { cliProxyRole: "worker" } } as any,
+      params: { engine: "fake" } as any,
+    }), replacement);
+
+    assert.equal(replacement.statusCode, 201);
+    assert.equal(replacement.headers[SUPERSEDED_PROVISIONING_GENERATION_HEADER], generation);
+
+    const next = fakeRes();
+    await handleCreateAuthSession(fakeReq({
+      app: { locals: { cliProxyRole: "worker" } } as any,
+      params: { engine: "fake" } as any,
+    }), next);
+    assert.equal(next.headers[SUPERSEDED_PROVISIONING_GENERATION_HEADER], undefined);
+
+    const retainedGeneration = "019865f4-50d6-7000-8000-000000000002";
+    const retained = fakeRes();
+    await handleCreateAuthSession(fakeReq({
+      app: { locals: { cliProxyRole: "worker" } } as any,
+      headers: { [PROVISIONING_GENERATION_HEADER]: retainedGeneration },
+      params: { engine: "fake" } as any,
+      body: { provisioning_url: "https://collavre.test/retained.json" },
+    }), retained);
+    const { sessionId } = retained.payload as { sessionId: string };
+    const authorized = fakeRes();
+    await handleSubmitAuthSession(fakeReq({
+      app: { locals: { cliProxyRole: "worker" } } as any,
+      params: { engine: "fake", sessionId } as any,
+      body: { value: "code" },
+    }), authorized);
+
+    const afterAuthorized = fakeRes();
+    await handleCreateAuthSession(fakeReq({
+      app: { locals: { cliProxyRole: "worker" } } as any,
+      params: { engine: "fake" } as any,
+    }), afterAuthorized);
+    assert.equal(afterAuthorized.headers[SUPERSEDED_PROVISIONING_GENERATION_HEADER], undefined);
+  });
+
+  test("provisioning_url is rejected before it can exceed the worker response-header budget", async () => {
+    const res = fakeRes();
+    await handleCreateAuthSession(fakeReq({
+      params: { engine: "fake" } as any,
+      body: { provisioning_url: `https://collavre.test/provision.json?token=${"a".repeat(16 * 1024)}` },
+    }), res);
+
+    assert.equal(res.statusCode, 400);
+    assert.equal((res.payload as { error: { code: string } }).error.code, "invalid_provisioning_url");
+    assert.match((res.payload as { error: { message: string } }).error.message, /too long/i);
+  });
+
+  test("worker polling repeats a device-code provisioning notification until the session expires", async () => {
+    let authorize!: () => void;
+    const authorized = new Promise<void>((resolve) => { authorize = resolve; });
+    const deviceDescriptor: EngineAuthDescriptor = {
+      engine: "fake",
+      flows: [{
+	flow: "device-code",
+	createSession: () => ({
+	  async start() { return { instructions: "wait" }; },
+	  async submit() { return {}; },
+	  cancel() {},
+	  async wait() { await authorized; return {}; },
+	}),
+      }],
+      checkStatus: async () => ({ state: "unknown" }),
+    };
+    engineRegistry.resolve = (engine) => (engine === "fake" ? deviceDescriptor : realResolve(engine));
+    const manifestUrl = "https://collavre.test/agents/vrex/provision.json";
+    const generation = "019865f4-50d6-7000-8000-000000000002";
+    const created = fakeRes();
+    await handleCreateAuthSession(fakeReq({
+      app: { locals: { cliProxyRole: "worker" } } as any,
+      headers: { [PROVISIONING_GENERATION_HEADER]: generation },
+      params: { engine: "fake" } as any,
+      body: { provisioning_url: manifestUrl },
+    }), created);
+    const { sessionId } = created.payload as { sessionId: string };
+    authorize();
+    await new Promise((resolve) => setImmediate(resolve));
+
+    const request = fakeReq({
+      app: { locals: { cliProxyRole: "worker" } } as any,
+      params: { engine: "fake", sessionId } as any,
+    });
+    const first = fakeRes();
+    handleGetAuthSession(request, first);
+    assert.equal(decodeProvisioningUrl(first.headers[AUTHORIZED_PROVISIONING_HEADER]), manifestUrl);
+    assert.equal(first.headers[PROVISIONING_GENERATION_HEADER], generation);
+
+    const second = fakeRes();
+    handleGetAuthSession(request, second);
+    assert.equal(
+      decodeProvisioningUrl(second.headers[AUTHORIZED_PROVISIONING_HEADER]),
+      manifestUrl,
+      "a retry must recover when the first worker response was lost before the gateway received it",
+    );
   });
 
   test("a submit with no credential in the body is a 400, not a 500", async () => {

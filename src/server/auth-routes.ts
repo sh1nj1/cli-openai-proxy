@@ -13,11 +13,24 @@ import { engineRegistry, resolveEngine } from "../auth/registry.js";
 import {
   cancelSession,
   createSession,
+  getAuthorizedProvisioningNotification,
+  getSessionProvisioningNotification,
   getSession,
   submitSession,
+  type SessionProvisioningNotification,
 } from "../auth/session-manager.js";
 import { clearCredential } from "../auth/token-store.js";
 import { AuthProvisioningError } from "../auth/types.js";
+import {
+  AUTHORIZED_PROVISIONING_HEADER,
+  PROVISIONING_GENERATION_HEADER,
+  PROVISIONING_SESSION_TTL_HEADER,
+  SUPERSEDED_PROVISIONING_GENERATION_HEADER,
+  decodeProvisioningGeneration,
+  decodeProvisioningSessionTtl,
+  encodeProvisioningUrl,
+  provisioningUrlFitsHeader,
+} from "../isolation/worker-protocol.js";
 
 /** Path prefix these handlers own. authMiddleware defers to this module's gate for it. */
 export const AUTH_PROVISIONING_PREFIX = "/v1/auth";
@@ -95,6 +108,26 @@ function sendError(res: Response, err: unknown): void {
  * `flow` repeats the default — the shape callers relied on when engines had
  * exactly one flow, kept so they keep working unchanged.
  */
+function parseable(url: string): boolean {
+  try {
+    new URL(url);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function notifyGatewayWhenWorker(
+  req: Request,
+  res: Response,
+  notification: SessionProvisioningNotification | undefined,
+): void {
+  if (notification && req.app?.locals.cliProxyRole === "worker") {
+    res.setHeader(AUTHORIZED_PROVISIONING_HEADER, encodeProvisioningUrl(notification.url));
+    res.setHeader(PROVISIONING_GENERATION_HEADER, notification.generation);
+  }
+}
+
 function flowFields(engine: string): { flow: string; flows: string[] } {
   const flows = resolveEngine(engine)!.flows.map((f) => f.flow);
   return { flow: flows[0]!, flows };
@@ -120,17 +153,47 @@ export async function handleAuthStatus(req: Request, res: Response): Promise<voi
   }
 }
 
-/** POST /v1/auth/:engine/sessions — body may name a `flow`; omitted means the engine's default. */
+/**
+ * POST /v1/auth/:engine/sessions — body may name a `flow` (omitted means the
+ * engine's default) and a `provisioning_url`: a manifest the proxy pulls and
+ * applies once this login succeeds (see src/provision/sync.ts). The URL is
+ * validated here but acted on only if PROVISION_SYNC=1 — with provisioning off
+ * it is accepted and ignored, so one Collavre client works against both setups.
+ */
 export async function handleCreateAuthSession(req: Request, res: Response): Promise<void> {
   const engine = engineOf(req, res);
   if (!engine) return;
-  const flow = (req.body as Record<string, unknown> | undefined)?.flow;
+  const body = req.body as Record<string, unknown> | undefined;
+  const flow = body?.flow;
   if (flow !== undefined && typeof flow !== "string") {
     fail(res, 400, "`flow` must be a string naming one of the engine's flows.", "invalid_flow");
     return;
   }
+  const provisioningUrl = body?.provisioning_url;
+  if (provisioningUrl !== undefined && (typeof provisioningUrl !== "string" || !parseable(provisioningUrl))) {
+    fail(res, 400, "`provisioning_url` must be a valid URL.", "invalid_provisioning_url");
+    return;
+  }
+  if (typeof provisioningUrl === "string" && !provisioningUrlFitsHeader(provisioningUrl)) {
+    fail(res, 400, "`provisioning_url` is too long.", "invalid_provisioning_url");
+    return;
+  }
   try {
-    res.status(201).json(await createSession(engine, flow));
+    const workerRequest = req.app?.locals.cliProxyRole === "worker";
+    const provisioningGeneration = workerRequest
+      ? decodeProvisioningGeneration(req.headers[PROVISIONING_GENERATION_HEADER])
+      : undefined;
+    const sessionTtlMs = workerRequest && provisioningGeneration
+      ? decodeProvisioningSessionTtl(req.headers[PROVISIONING_SESSION_TTL_HEADER])
+      : undefined;
+    res.status(201).json(await createSession(engine, flow, {
+      provisioningUrl,
+      provisioningGeneration,
+      sessionTtlMs,
+      onSupersededProvisioningGeneration: workerRequest
+	? (generation) => res.setHeader(SUPERSEDED_PROVISIONING_GENERATION_HEADER, generation)
+	: undefined,
+    }));
   } catch (err) {
     sendError(res, err);
   }
@@ -153,7 +216,13 @@ export async function handleSubmitAuthSession(req: Request, res: Response): Prom
     return;
   }
   try {
-    res.json(await submitSession(engine, String(req.params.sessionId ?? ""), raw));
+    const sessionId = String(req.params.sessionId ?? "");
+    const notification = req.app?.locals.cliProxyRole === "worker"
+      ? getSessionProvisioningNotification(engine, sessionId)
+      : undefined;
+    const result = await submitSession(engine, sessionId, raw);
+    if (result.status === "authorized") notifyGatewayWhenWorker(req, res, notification);
+    res.json(result);
   } catch (err) {
     sendError(res, err);
   }
@@ -164,7 +233,12 @@ export function handleGetAuthSession(req: Request, res: Response): void {
   const engine = engineOf(req, res);
   if (!engine) return;
   try {
-    res.json(getSession(engine, String(req.params.sessionId ?? "")));
+    const sessionId = String(req.params.sessionId ?? "");
+    const result = getSession(engine, sessionId);
+    if (req.app?.locals.cliProxyRole === "worker" && result.status === "authorized") {
+      notifyGatewayWhenWorker(req, res, getAuthorizedProvisioningNotification(engine, sessionId));
+    }
+    res.json(result);
   } catch (err) {
     sendError(res, err);
   }
