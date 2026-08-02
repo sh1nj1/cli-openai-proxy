@@ -54,9 +54,10 @@ export function fetchValidator(fetchFn: typeof fetch = fetch): ValidateKeyFn {
       // An abort is the session's own doing (cancel or timeout); let it map the
       // reason instead of blaming the network here.
       if (signal.aborted) throw err;
-      const message = err instanceof Error ? err.message : String(err);
+      // fetch/Headers errors can quote the rejected header value, so exposing
+      // the underlying message here could leak the submitted credential.
       throw new AuthProvisioningError(
-        `Could not reach the Anthropic API to validate the key: ${message}`,
+        "Could not reach the Anthropic API to validate the key",
         "validation_unavailable",
       );
     }

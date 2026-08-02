@@ -183,13 +183,17 @@ describe("fetchValidator", () => {
     );
   });
 
-  test("a network failure is no verdict at all", async () => {
-    const fetchFn = (async () => { throw new TypeError("fetch failed"); }) as unknown as typeof fetch;
+  test("a network failure is sanitized because fetch errors can include the key", async () => {
+    const key = "sk-ant-secret\ninvalid";
+    const fetchFn = (async () => {
+      throw new TypeError(`Headers.append: "${key}" is an invalid header value`);
+    }) as unknown as typeof fetch;
     await assert.rejects(
-      fetchValidator(fetchFn)("k", new AbortController().signal),
+      fetchValidator(fetchFn)(key, new AbortController().signal),
       (err: AuthProvisioningError) => {
         assert.strictEqual(err.code, "validation_unavailable");
-        assert.match(err.message, /fetch failed/);
+        assert.strictEqual(err.message, "Could not reach the Anthropic API to validate the key");
+        assert.ok(!err.message.includes(key), "the key must never be echoed");
         return true;
       },
     );
