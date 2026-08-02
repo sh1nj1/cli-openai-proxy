@@ -34,6 +34,7 @@ describe("provision state", () => {
         "skill/pr-monitor": {
           sha256: "a".repeat(64),
           files: ["SKILL.md"],
+	  directories: ["examples", "examples/empty"],
           installedAt: "2026-08-02T00:00:00.000Z",
         },
       },
@@ -58,6 +59,12 @@ describe("provision state", () => {
       installed: {
 	"skill/null-record": null,
 	"skill/bad-hash": { sha256: "no", files: [], installedAt: "today" },
+	"skill/bad-directory": {
+	  sha256: "a".repeat(64),
+	  files: ["SKILL.md"],
+	  directories: ["../outside"],
+	  installedAt: new Date().toISOString(),
+	},
 	"../escape": { sha256: "a".repeat(64), files: ["../outside"], installedAt: new Date().toISOString() },
 	"skill/good": {
 	  sha256: "b".repeat(64),

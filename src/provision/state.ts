@@ -36,6 +36,12 @@ function installedSnapshot(value: unknown): InstalledSnapshot | null {
   if (!Array.isArray(record.files) || record.files.length === 0 || !record.files.every(safeRelativeFile)) return null;
   const files = record.files as string[];
   if (new Set(files).size !== files.length) return null;
+  let directories: string[] | undefined;
+  if (record.directories !== undefined) {
+    if (!Array.isArray(record.directories) || !record.directories.every(safeRelativeFile)) return null;
+    directories = record.directories as string[];
+    if (new Set(directories).size !== directories.length) return null;
+  }
   if (typeof record.installedAt !== "string" || !Number.isFinite(Date.parse(record.installedAt))) return null;
   let fileHashes: Record<string, string> | undefined;
   if (record.fileHashes !== undefined) {
@@ -49,6 +55,7 @@ function installedSnapshot(value: unknown): InstalledSnapshot | null {
   return {
     sha256: record.sha256.toLowerCase(),
     files: [...files],
+    ...(directories !== undefined ? { directories: [...directories] } : {}),
     ...(fileHashes ? { fileHashes } : {}),
     installedAt: record.installedAt,
   };

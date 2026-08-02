@@ -143,10 +143,11 @@ The tombstone clears after the item leaves the manifest.
   target and swaps in atomically; a failed upgrade leaves the previous install
   untouched.
 - **Lockfile ownership.** `~/.cli-openai-proxy/provision.lock.json` records
-  what the proxy installed, including per-file hashes used to repair missing
-  or modified files on the next sync. Upgrades journal both the stable and
-  candidate ownership snapshots before swapping directories, so an interrupted
-  swap is recoverable; removal only ever touches what the journal lists. Skills
+  what the proxy installed, including archive-owned directories and per-file
+  hashes used to repair missing or modified content on the next sync. Upgrades
+  journal both the stable and candidate ownership snapshots before swapping
+  directories, so an interrupted swap is recoverable; removal only ever
+  touches what the journal lists and removes directories only when empty. Skills
   a user installed by hand are never overwritten or deleted — a manifest item
   whose name collides with an untracked directory fails with
   `Refusing to replace untracked directory` instead of replacing it.

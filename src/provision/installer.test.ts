@@ -308,8 +308,32 @@ describe("provision installer", () => {
   test("removeSkill deletes the skill directory", async () => {
     const { url, sha256 } = serve("/k.tgz", makeTarGz([{ name: "SKILL.md", content: "ok" }]));
     const result = await installSkill({ name: "demo", url, sha256 }, { skillsDir });
-    removeSkill("demo", { skillsDir, files: result.files, fileHashes: result.fileHashes });
+    removeSkill("demo", {
+      skillsDir,
+      files: result.files,
+      fileHashes: result.fileHashes,
+      directories: result.directories,
+    });
     assert.equal(existsSync(path.join(skillsDir, "demo")), false);
     assert.equal(lstatSync(skillsDir).isDirectory(), true);
+  });
+
+  test("removeSkill deletes empty directories owned by the archive", async () => {
+    const { url, sha256 } = serve("/empty-dir.tgz", makeTarGz([
+      { name: "SKILL.md", content: "ok" },
+      { name: "examples/", type: "dir" },
+      { name: "examples/empty/", type: "dir" },
+    ]));
+    const result = await installSkill({ name: "demo", url, sha256 }, { skillsDir });
+
+    assert.deepEqual(result.directories, ["examples", "examples/empty"]);
+    removeSkill("demo", {
+      skillsDir,
+      files: result.files,
+      fileHashes: result.fileHashes,
+      directories: result.directories,
+    });
+
+    assert.equal(existsSync(path.join(skillsDir, "demo")), false);
   });
 });

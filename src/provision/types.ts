@@ -44,6 +44,8 @@ export interface InstalledSnapshot {
   sha256: string;
   /** Paths relative to the item's install dir — what removal may delete. */
   files: string[];
+  /** Archive-owned directories, including empty ones, that removal may clean up. */
+  directories?: string[];
   /** Per-file content hashes used to detect and repair local drift. */
   fileHashes?: Record<string, string>;
   installedAt: string;

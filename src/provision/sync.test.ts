@@ -234,6 +234,28 @@ describe("provision sync", () => {
     assert.equal(existsSync(path.join(skillsDir, "aaa")), false);
   });
 
+  test("removal cleans archive-owned empty directories so the item can be re-added", async () => {
+    process.env.PROVISION_AUTOAPPLY = "auto";
+    initProvisioning();
+    const skill = serveSkill("/empty-dir.tgz", "managed");
+    const desired = [{ type: "skill", name: "empty-dir", ...skill }];
+    registerManifestUrl(serveManifest(desired));
+    await syncNow();
+    mkdirSync(path.join(skillsDir, "empty-dir", "examples", "empty"), { recursive: true });
+    const lockfile = path.join(stateDir, "provision.lock.json");
+    const state = JSON.parse(readFileSync(lockfile, "utf8"));
+    state.installed["skill/empty-dir"].directories = ["examples", "examples/empty"];
+    writeFileSync(lockfile, JSON.stringify(state));
+    assert.equal(existsSync(path.join(skillsDir, "empty-dir", "examples", "empty")), true);
+
+    registerManifestUrl(serveManifest([]));
+    assert.equal(statusOf(await syncNow(), "empty-dir"), "removed");
+    assert.equal(existsSync(path.join(skillsDir, "empty-dir")), false);
+
+    registerManifestUrl(serveManifest(desired));
+    assert.equal(statusOf(await syncNow(), "empty-dir"), "installed");
+  });
+
   test("removal preserves files added beneath a managed skill by the user", async () => {
     process.env.PROVISION_AUTOAPPLY = "auto";
     initProvisioning();
@@ -266,6 +288,24 @@ describe("provision sync", () => {
     assert.match(view.data.find((item) => item.name === "upgrade")?.error ?? "", /untracked/i);
     assert.equal(readFileSync(path.join(skillsDir, "upgrade", "SKILL.md"), "utf8"), "v1");
     assert.equal(readFileSync(path.join(skillsDir, "upgrade", "user-notes.md"), "utf8"), "keep me");
+  });
+
+  test("an upgrade refuses to erase an untracked empty directory", async () => {
+    process.env.PROVISION_AUTOAPPLY = "auto";
+    initProvisioning();
+    const first = serveSkill("/empty-user-dir-v1.tgz", "v1");
+    registerManifestUrl(serveManifest([{ type: "skill", name: "empty-user-dir", ...first }]));
+    await syncNow();
+    const userDirectory = path.join(skillsDir, "empty-user-dir", "user-empty");
+    mkdirSync(userDirectory);
+
+    const second = serveSkill("/empty-user-dir-v2.tgz", "v2");
+    registerManifestUrl(serveManifest([{ type: "skill", name: "empty-user-dir", ...second }]));
+    const view = await syncNow();
+
+    assert.equal(statusOf(view, "empty-user-dir"), "failed");
+    assert.match(view.data.find((item) => item.name === "empty-user-dir")?.error ?? "", /untracked/i);
+    assert.equal(existsSync(userDirectory), true);
   });
 
   test("an unknown item type reports unsupported and is otherwise ignored", async () => {

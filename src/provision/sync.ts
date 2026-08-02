@@ -191,6 +191,10 @@ function installedRecordIntact(name: string, record: InstalledSnapshot): boolean
   const root = path.join(skillsDir(), name);
   try {
     if (!lstatSync(root).isDirectory()) return false;
+    if (record.directories?.some((relative) => {
+      const directory = path.join(root, ...relative.split("/"));
+      return !lstatSync(directory).isDirectory();
+    })) return false;
     return record.files.every((relative) => {
       const file = path.join(root, ...relative.split("/"));
       const stat = lstatSync(file);
@@ -284,16 +288,25 @@ async function runSync(): Promise<ProvisionStatusView> {
       const managedFiles = previousRecord
 	? [...new Set([...previousRecord.files, ...(previousRecord.pending?.files ?? [])])]
 	: undefined;
+      const managedDirectories = previousRecord && previousRecord.directories !== undefined
+	&& (!previousRecord.pending || previousRecord.pending.directories !== undefined)
+	? [...new Set([
+	  ...previousRecord.directories,
+	  ...(previousRecord.pending?.directories ?? []),
+	])]
+	: undefined;
       const result = await installSkill(
         { name: item.name, url: item.url!, sha256: item.sha256! },
 	{
 	  skillsDir: skillsDir(),
 	  checkUrl,
 	  managedFiles,
+	  managedDirectories,
 	  beforeCommit: (candidate) => {
 	    const candidateRecord: InstalledSnapshot = {
 	      sha256: item.sha256!,
 	      files: candidate.files,
+	      directories: candidate.directories,
 	      fileHashes: candidate.fileHashes,
 	      installedAt: new Date().toISOString(),
 	    };
@@ -309,6 +322,7 @@ async function runSync(): Promise<ProvisionStatusView> {
       state.installed[key] = {
 	sha256: item.sha256!,
 	files: result.files,
+	directories: result.directories,
 	fileHashes: result.fileHashes,
 	installedAt: new Date().toISOString(),
       };
@@ -333,12 +347,14 @@ async function runSync(): Promise<ProvisionStatusView> {
 	removeSkill(name, {
 	  skillsDir: skillsDir(),
 	  files: record.files,
+	  directories: record.directories,
 	  fileHashes: record.fileHashes,
 	});
 	if (record.pending) {
 	  removeSkill(name, {
 	    skillsDir: skillsDir(),
 	    files: record.pending.files,
+	    directories: record.pending.directories,
 	    fileHashes: record.pending.fileHashes,
 	  });
 	}
@@ -440,12 +456,14 @@ export function deleteItem(type: string, name: string): Promise<{ removed: boole
       removeSkill(name, {
 	skillsDir: skillsDir(),
 	files: record.files,
+	directories: record.directories,
 	fileHashes: record.fileHashes,
       });
       if (record.pending) {
 	removeSkill(name, {
 	  skillsDir: skillsDir(),
 	  files: record.pending.files,
+	  directories: record.pending.directories,
 	  fileHashes: record.pending.fileHashes,
 	});
       }

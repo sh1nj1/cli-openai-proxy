@@ -31,6 +31,8 @@ import { ProvisionError } from "./types.js";
 export interface InstallResult {
   /** Installed file paths relative to the skill's directory. */
   files: string[];
+  /** Installed directory paths, including empty directories. */
+  directories: string[];
   /** Hashes of installed contents, used by periodic drift repair. */
   fileHashes: Record<string, string>;
 }
@@ -125,6 +127,7 @@ function assertArchiveSafe(archivePath: string): void {
 /** Walk the extracted tree, enforcing the audit, returning relative file paths. */
 function auditTree(root: string): InstallResult {
   const files: string[] = [];
+  const directories: string[] = [];
   const fileHashes: Record<string, string> = {};
   let total = 0;
   const walk = (dir: string): void => {
@@ -135,6 +138,7 @@ function auditTree(root: string): InstallResult {
         throw new ProvisionError("Extracted tree contains a symlink", "archive_rejected");
       }
       if (stat.isDirectory()) {
+	directories.push(path.relative(root, full).split(path.sep).join("/"));
         walk(full);
         continue;
       }
@@ -164,7 +168,7 @@ function auditTree(root: string): InstallResult {
     }
   };
   walk(root);
-  return { files, fileHashes };
+  return { files, directories, fileHashes };
 }
 
 export async function installSkill(
@@ -176,6 +180,8 @@ export async function installSkill(
     beforeCommit?: (result: InstallResult) => void;
     /** Existing managed paths; an upgrade must not erase additions outside this set. */
     managedFiles?: string[];
+    /** Existing managed directories; omitted for legacy lockfiles that did not track them. */
+    managedDirectories?: string[];
   },
 ): Promise<InstallResult> {
   if (!NAME_PATTERN.test(item.name)) {
@@ -223,7 +229,11 @@ export async function installSkill(
     }
 
     const target = path.join(opts.skillsDir, item.name);
-    if (opts.managedFiles && hasUntrackedFiles(target, new Set(opts.managedFiles))) {
+    if (opts.managedFiles && hasUntrackedContent(
+      target,
+      new Set(opts.managedFiles),
+      opts.managedDirectories !== undefined ? new Set(opts.managedDirectories) : undefined,
+    )) {
       throw new ProvisionError(
 	`Refusing to replace "${item.name}" because it contains untracked files`,
 	"untracked_content",
@@ -254,7 +264,11 @@ export async function installSkill(
   }
 }
 
-function hasUntrackedFiles(root: string, managed: Set<string>): boolean {
+function hasUntrackedContent(
+  root: string,
+  managedFiles: Set<string>,
+  managedDirectories?: Set<string>,
+): boolean {
   try {
     if (!lstatSync(root).isDirectory()) return true;
   } catch (err) {
@@ -266,11 +280,13 @@ function hasUntrackedFiles(root: string, managed: Set<string>): boolean {
       const full = path.join(dir, entry);
       const stat = lstatSync(full);
       if (stat.isDirectory()) {
+	const relative = path.relative(root, full).split(path.sep).join("/");
+	if (managedDirectories && !managedDirectories.has(relative)) return true;
 	if (walk(full)) return true;
 	continue;
       }
       const relative = path.relative(root, full).split(path.sep).join("/");
-      if (!stat.isFile() || !managed.has(relative)) return true;
+      if (!stat.isFile() || !managedFiles.has(relative)) return true;
     }
     return false;
   };
@@ -296,7 +312,12 @@ function managedPath(root: string, relative: string): string | null {
 /** Remove only recorded regular files, leaving modified or added user content. */
 export function removeSkill(
   name: string,
-  opts: { skillsDir: string; files: string[]; fileHashes?: Record<string, string> },
+  opts: {
+    skillsDir: string;
+    files: string[];
+    directories?: string[];
+    fileHashes?: Record<string, string>;
+  },
 ): void {
   if (!NAME_PATTERN.test(name)) {
     throw new ProvisionError(`Invalid skill name "${name}"`, "invalid_item");
@@ -337,6 +358,10 @@ export function removeSkill(
 
   for (const { file } of removable) rmSync(file, { force: true });
   const directories = new Set<string>();
+  for (const relative of opts.directories ?? []) {
+    const directory = managedPath(root, relative);
+    if (directory) directories.add(directory);
+  }
   for (const { relative } of removable) {
     let current = path.dirname(managedPath(root, relative)!);
     while (current !== root && current.startsWith(`${root}${path.sep}`)) {
@@ -344,7 +369,7 @@ export function removeSkill(
       current = path.dirname(current);
     }
   }
-  for (const directory of [...directories].sort((a, b) => b.length - a.length)) {
+  for (const directory of [...directories].sort((a, b) => b.split(path.sep).length - a.split(path.sep).length)) {
     try {
       rmdirSync(directory);
     } catch (err) {
