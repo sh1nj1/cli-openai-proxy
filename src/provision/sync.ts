@@ -145,7 +145,7 @@ export function initProvisioning(hooks: {
     itemViews = Object.entries(loadState().installed)
       // An unresolved journal does not prove which complete tree is visible.
       // Leave it out until a target-touching operation reconciles the state.
-      .filter(([, record]) => !record.uncommitted && !record.pending)
+      .filter(([, record]) => !record.uncommitted && !record.pending && !record.removalRecoveryId)
       .map(([key, record]) => {
 	const [type, ...rest] = canonicalStateKey(key).split("/");
 	return { type: type ?? "skill", name: rest.join("/"), status: "installed" as const, sha256: record.sha256 };

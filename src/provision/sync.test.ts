@@ -1403,4 +1403,36 @@ describe("provision sync", () => {
     const state = JSON.parse(readFileSync(path.join(stateDir, "provision.lock.json"), "utf8"));
     assert.equal(state.installed[key].pending.sha256, "b".repeat(64));
   });
+
+  test("startup status omits an interrupted removal", () => {
+    const key = "skill/startup-removal";
+    const removalRecoveryId = "c".repeat(32);
+    writeFileSync(path.join(stateDir, "provision.lock.json"), JSON.stringify({
+      version: 1,
+      approved: [key],
+      revoked: [],
+      removalRecoveries: [removalRecoveryId],
+      installed: {
+	[key]: {
+	  sha256: "a".repeat(64),
+	  files: ["SKILL.md"],
+	  directories: [],
+	  fileHashes: { "SKILL.md": sha(Buffer.from("isolated")) },
+	  installedAt: new Date().toISOString(),
+	  removalRecoveryId,
+	},
+      },
+    }));
+    mkdirSync(path.join(skillsDir, `.provision-removed-${removalRecoveryId}`));
+    writeFileSync(
+      path.join(skillsDir, `.provision-removed-${removalRecoveryId}`, "SKILL.md"),
+      "isolated",
+    );
+
+    initProvisioning();
+
+    assert.equal(statusOf(getStatus(), "startup-removal"), undefined);
+    const state = JSON.parse(readFileSync(path.join(stateDir, "provision.lock.json"), "utf8"));
+    assert.equal(state.installed[key].removalRecoveryId, removalRecoveryId);
+  });
 });
