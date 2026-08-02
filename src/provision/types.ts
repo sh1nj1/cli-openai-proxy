@@ -69,6 +69,8 @@ export interface InstalledRecord extends InstalledSnapshot {
    * retained alongside it so either side of an interrupted swap stays owned.
    */
   pending?: InstalledSnapshot;
+  /** Removal recovery preclaim persisted before the visible target is inspected. */
+  removalRecoveryId?: string;
 }
 
 /**

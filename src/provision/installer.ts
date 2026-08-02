@@ -251,6 +251,8 @@ export async function installSkill(
     managedDirectories?: string[];
     /** Accepted hashes for existing managed files, including either journal snapshot. */
     managedFileHashes?: Record<string, string | string[]>;
+    /** Require positive ownership evidence after moving aside an interrupted-removal target. */
+    requireVerifiedOwnership?: boolean;
     /** New upgrade recovery identity preclaimed in the lockfile before staging begins. */
     upgradeRecoveryId?: string;
     /** Test seam for deterministically exercising restoration races. */
@@ -400,21 +402,32 @@ export async function installSkill(
       if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
     }
     opts.afterPreviousMove?.();
-    if (hadPrevious && hasUntrackedContent(
-      previous,
-      new Set(opts.managedFiles!),
-      opts.managedDirectories !== undefined ? new Set(opts.managedDirectories) : undefined,
-    )) {
+    const previousHasUntrackedContent = hadPrevious && hasUntrackedContent(
+	previous,
+	new Set(opts.managedFiles!),
+	opts.managedDirectories !== undefined ? new Set(opts.managedDirectories) : undefined,
+    );
+    const previousLacksVerifiedOwnership = hadPrevious
+      && opts.requireVerifiedOwnership
+      && !managedTreeHasVerifiedOwnedFile(
+	previous,
+	opts.managedFiles!,
+	opts.managedFileHashes,
+      );
+    if (previousHasUntrackedContent || previousLacksVerifiedOwnership) {
+      const reason = previousLacksVerifiedOwnership
+	? "ownership could not be verified after interrupted removal"
+	: "content was added during installation";
       const restored = moveDirectoryNoReplace(previous, target);
       if (!restored) {
 	throw new ProvisionError(
-	  `Refusing to replace "${item.name}" because content was added during installation; prior contents preserved at "${previous}"`,
+	  `Refusing to replace "${item.name}" because ${reason}; prior contents preserved at "${previous}"`,
 	  "untracked_content",
 	);
       }
       hadPrevious = false;
       throw new ProvisionError(
-	`Refusing to replace "${item.name}" because content was added during installation`,
+	`Refusing to replace "${item.name}" because ${reason}`,
 	"untracked_content",
       );
     }

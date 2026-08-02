@@ -39,6 +39,7 @@ describe("provision state", () => {
           files: ["SKILL.md"],
 	  directories: ["examples", "examples/empty"],
           installedAt: "2026-08-02T00:00:00.000Z",
+	  removalRecoveryId: "f".repeat(32),
         },
       },
     };

@@ -207,9 +207,8 @@ async function fetchManifest(url: string): Promise<ProvisionManifest> {
   return parseManifest(body);
 }
 
-function installedRecordIntact(name: string, record: InstalledSnapshot): boolean {
+function installedSnapshotIntactAt(root: string, record: InstalledSnapshot): boolean {
   if (!record.fileHashes || Object.keys(record.fileHashes).length !== record.files.length) return false;
-  const root = path.join(skillsDir(), name);
   try {
     if (!lstatSync(root).isDirectory()) return false;
     if (record.directories?.some((relative) => {
@@ -226,6 +225,25 @@ function installedRecordIntact(name: string, record: InstalledSnapshot): boolean
   } catch {
     return false;
   }
+}
+
+function installedRecordIntact(name: string, record: InstalledSnapshot): boolean {
+  return installedSnapshotIntactAt(path.join(skillsDir(), name), record);
+}
+
+function hasInterruptedRemovalForRecord(
+  state: ProvisionStateFile,
+  record: InstalledRecord,
+): boolean {
+  if (record.removalRecoveryId) return true;
+  // Compatibility for recoveries created before installed records carried the
+  // removal preclaim directly. A complete verified snapshot links the retained
+  // tree to this record without making unrelated recoveries disable drift repair.
+  const snapshots = [stableSnapshot(record), ...(record.pending ? [record.pending] : [])];
+  return (state.removalRecoveries ?? []).some((recoveryId) => {
+    const recovery = path.join(skillsDir(), `.provision-removed-${recoveryId}`);
+    return snapshots.some((snapshot) => installedSnapshotIntactAt(recovery, snapshot));
+  });
 }
 
 function installedRecordMatchesEntireTree(name: string, record: InstalledSnapshot): boolean {
@@ -264,6 +282,7 @@ function stableSnapshot(record: InstalledRecord): InstalledSnapshot {
     pending: _pending,
     uncommitted: _uncommitted,
     installMarker: _installMarker,
+    removalRecoveryId: _removalRecoveryId,
     ...stable
   } = record;
   return stable;
@@ -349,11 +368,13 @@ function reconcileFirstInstallJournals(state: ProvisionStateFile): Set<string> {
   return rejected;
 }
 
-function prepareRemovalRecovery(state: ProvisionStateFile): {
+function prepareRemovalRecovery(state: ProvisionStateFile, key: string): {
   recoveryId: string;
 } {
   const recoveryId = randomBytes(16).toString("hex");
   state.removalRecoveries = [...(state.removalRecoveries ?? []), recoveryId];
+  const record = state.installed[key];
+  if (record) record.removalRecoveryId = recoveryId;
   // Persist the exact identity before its recovery directory can appear.
   saveState(state);
   return { recoveryId };
@@ -465,7 +486,7 @@ function migrateLegacyDesiredItems(
       continue;
     }
     try {
-      const recovery = prepareRemovalRecovery(state);
+      const recovery = prepareRemovalRecovery(state, legacyKey);
       try {
 	const snapshot = removalSnapshot(record);
 	removeSkill(legacyName, {
@@ -612,6 +633,9 @@ async function runSync(): Promise<ProvisionStatusView> {
 	}
       }
       const firstInstallMarker = previousRecord ? undefined : randomBytes(16).toString("hex");
+      const requireVerifiedOwnership = previousRecord
+	? hasInterruptedRemovalForRecord(state, previousRecord)
+	: false;
       const upgradeRecovery = previousRecord ? prepareUpgradeRecovery(state) : undefined;
       let result: Awaited<ReturnType<typeof installSkill>>;
       try {
@@ -623,6 +647,7 @@ async function runSync(): Promise<ProvisionStatusView> {
 	    managedFiles,
 	    managedDirectories,
 	    managedFileHashes,
+	    requireVerifiedOwnership,
 	    ...upgradeRecovery,
 	    firstInstallMarker,
 	    afterFirstInstallMove,
@@ -700,7 +725,7 @@ async function runSync(): Promise<ProvisionStatusView> {
     try {
       const record = state.installed[key]!;
       if (canonicalType === "skill") {
-	const recovery = prepareRemovalRecovery(state);
+	const recovery = prepareRemovalRecovery(state, key);
 	try {
 	  const snapshot = removalSnapshot(record);
 	  removeSkill(name, {
@@ -815,7 +840,7 @@ export function deleteItem(type: string, name: string): Promise<{ removed: boole
     const record = installedKey ? state.installed[installedKey] : undefined;
     if (record && type === "skill") {
 	const installedName = installedKey!.slice(installedKey!.indexOf("/") + 1);
-      const recovery = prepareRemovalRecovery(state);
+      const recovery = prepareRemovalRecovery(state, installedKey!);
       try {
 	const snapshot = removalSnapshot(record);
 	removeSkill(installedName, {

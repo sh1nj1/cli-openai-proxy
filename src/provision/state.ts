@@ -85,6 +85,9 @@ function installedRecord(value: unknown): InstalledRecord | null {
     ...(typeof raw.installMarker === "string" && INSTALL_MARKER_PATTERN.test(raw.installMarker)
       ? { installMarker: raw.installMarker }
       : {}),
+    ...(typeof raw.removalRecoveryId === "string" && RECOVERY_ID_PATTERN.test(raw.removalRecoveryId)
+      ? { removalRecoveryId: raw.removalRecoveryId }
+      : {}),
     ...(pending ? { pending } : {}),
   };
 }
