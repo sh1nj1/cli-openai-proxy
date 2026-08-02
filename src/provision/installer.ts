@@ -49,10 +49,9 @@ const INSTALL_MARKER_PATTERN = /^[0-9a-f]{32}$/;
 const RECOVERY_ID_PATTERN = /^[0-9a-f]{32}$/;
 const REMOVAL_RECOVERY_PREFIX = ".provision-removed-";
 const UPGRADE_RECOVERY_PREFIX = ".provision-staging-";
-const UPGRADE_RECOVERY_METADATA = ".upgrade-recovery.json";
 
-/** Same charset the manifest enforces; re-checked here so no other caller can widen it. */
-const NAME_PATTERN = /^[a-z0-9][a-z0-9_-]{0,63}$/i;
+/** Same lowercase charset the manifest enforces; re-checked for non-manifest callers. */
+const NAME_PATTERN = /^[a-z0-9][a-z0-9_-]{0,63}$/;
 
 export function firstInstallMarkerPath(root: string, marker: string): string {
   if (!INSTALL_MARKER_PATTERN.test(marker)) {
@@ -294,17 +293,12 @@ export async function installSkill(
       throw new ProvisionError("Invalid upgrade recovery identity", "invalid_item");
     }
     staging = path.join(opts.skillsDir, `${UPGRADE_RECOVERY_PREFIX}${opts.upgradeRecoveryId}`);
-    mkdirSync(staging, { mode: 0o700 });
-    writeFileSync(path.join(staging, UPGRADE_RECOVERY_METADATA), JSON.stringify({
-      version: 1,
-      skill: item.name,
-      createdAt: new Date().toISOString(),
-      recoveryId: opts.upgradeRecoveryId,
-    }));
   } else {
-    staging = mkdtempSync(path.join(opts.skillsDir, UPGRADE_RECOVERY_PREFIX));
+    staging = path.join(
+      opts.skillsDir,
+      `${UPGRADE_RECOVERY_PREFIX}${randomBytes(16).toString("hex")}`,
+    );
   }
-  let preserveStaging = false;
   let preserveCandidate = false;
   try {
     const archivePath = path.join(archiveDir, "artifact.tgz");
@@ -388,10 +382,17 @@ export async function installSkill(
       opts.afterFirstInstallMove?.(target);
       return result;
     }
-    const previous = path.join(staging, "previous");
+    // Keep the previous tree as a direct sibling of its target. Both moving it
+    // aside and restoring it can then use one atomic no-replace syscall.
+    const previous = staging;
     let hadPrevious = false;
     try {
-      renameSync(target, previous);
+      if (!moveDirectoryNoReplace(target, previous)) {
+	throw new ProvisionError(
+	  `Upgrade recovery path already exists for "${item.name}"`,
+	  "untracked_content",
+	);
+      }
       hadPrevious = true;
     } catch (err) {
       if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
@@ -402,13 +403,8 @@ export async function installSkill(
       new Set(opts.managedFiles!),
       opts.managedDirectories !== undefined ? new Set(opts.managedDirectories) : undefined,
     )) {
-      try {
-	renameSync(previous, target);
-      } catch (err) {
-	if (!["EEXIST", "ENOTEMPTY"].includes((err as NodeJS.ErrnoException).code ?? "")) {
-	  throw err;
-	}
-	preserveStaging = true;
+      const restored = moveDirectoryNoReplace(previous, target);
+      if (!restored) {
 	throw new ProvisionError(
 	  `Refusing to replace "${item.name}" because content was added during installation; prior contents preserved at "${previous}"`,
 	  "untracked_content",
@@ -431,7 +427,6 @@ export async function installSkill(
       )) {
 	preserveCandidate = true;
 	if (hadPrevious) {
-	  preserveStaging = true;
 	  throw new ProvisionError(
 	    `Upgrade failed because the target was recreated; prior contents preserved at "${previous}" and candidate at "${candidate}"`,
 	    "untracked_content",
@@ -444,41 +439,30 @@ export async function installSkill(
       }
     } catch (err) {
       if (err instanceof ProvisionError && err.code === "untracked_content") throw err;
-      if (hadPrevious) {
-	preserveStaging = true;
-      }
       preserveCandidate = targetExists(candidate);
       throw err;
     }
     if (hadPrevious) {
       // The staging name is writable by the same UID and cannot stay bound to
-      // the audited inode during pathname cleanup. Retain the whole previous
+      // the audited inode during a post-exposure check. Retain the whole previous
       // tree instead; explicit operator cleanup is the only safe lifecycle.
-      preserveStaging = true;
-      const previousCleanup = removeManagedTree(previous, {
+      const previousAudit = removeManagedTree(previous, {
 	files: opts.managedFiles!,
 	directories: opts.managedDirectories,
 	fileHashes: opts.managedFileHashes,
 	afterRootAudit: opts.afterPreviousRetention,
       });
-      if (!previousCleanup.clean) {
+      if (!previousAudit.clean) {
 	throw new ProvisionError(
 	  `Upgrade completed, but content added during installation was preserved at "${previous}"`,
 	  "untracked_content",
 	);
       }
-      preserveStaging = previousCleanup.recoveryPath !== undefined;
     }
     return result;
   } finally {
     try {
-      try {
-	if (!preserveCandidate) rmSync(candidate, { recursive: true, force: true });
-      } finally {
-	if (!preserveStaging) {
-	  rmSync(staging, { recursive: true, force: true });
-	}
-      }
+      if (!preserveCandidate) rmSync(candidate, { recursive: true, force: true });
     } finally {
       rmSync(archiveDir, { recursive: true, force: true });
     }

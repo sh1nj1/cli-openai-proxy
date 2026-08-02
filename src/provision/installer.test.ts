@@ -246,6 +246,15 @@ describe("provision installer", () => {
     assert.equal(existsSync(path.join(skillsDir, "demo")), false);
   });
 
+  test("an uppercase skill name is refused before download", async () => {
+    const code = await codeOf(() => installSkill({
+      name: "Demo",
+      url: "https://example.invalid/demo.tgz",
+      sha256: "0".repeat(64),
+    }, { skillsDir }));
+    assert.equal(code, "invalid_item");
+  });
+
   test("a traversal entry name is refused before extraction", async () => {
     const { url, sha256 } = serve("/d.tgz", makeTarGz([
       { name: "../escape.md", content: "gotcha" },
@@ -498,7 +507,7 @@ describe("provision installer", () => {
       .filter((entry) => entry.startsWith(".provision-staging-"));
     assert.equal(preserved.length, 1);
     assert.equal(
-      readFileSync(path.join(skillsDir, preserved[0]!, "previous", "SKILL.md"), "utf8"),
+      readFileSync(path.join(skillsDir, preserved[0]!, "SKILL.md"), "utf8"),
       "v1",
     );
   });
@@ -531,7 +540,7 @@ describe("provision installer", () => {
     assert.equal(readFileSync(path.join(target, "user.md"), "utf-8"), "user-owned");
   });
 
-  test("an upgrade preserves the previous tree when restoration loses a race", async () => {
+  test("an upgrade preserves an empty directory that wins the restoration race", async () => {
     const v1 = serve("/restore-race-v1.tgz", makeTarGz([{ name: "SKILL.md", content: "v1" }]));
     const previous = await installSkill(
       { name: "demo", url: v1.url, sha256: v1.sha256 },
@@ -552,18 +561,17 @@ describe("provision installer", () => {
 	  },
 	  afterPreviousMove: () => {
 	    mkdirSync(target);
-	    writeFileSync(path.join(target, "racing-owner.md"), "also survives");
 	  },
 	},
       ),
       (err: unknown) => err instanceof ProvisionError && err.code === "untracked_content",
     );
 
-    assert.equal(readFileSync(path.join(target, "racing-owner.md"), "utf-8"), "also survives");
+    assert.deepEqual(readdirSync(target), []);
     const preserved = readdirSync(skillsDir)
       .filter((entry) => entry.startsWith(".provision-staging-"));
     assert.equal(preserved.length, 1);
-    const previousRoot = path.join(skillsDir, preserved[0]!, "previous");
+    const previousRoot = path.join(skillsDir, preserved[0]!);
     assert.equal(readFileSync(path.join(previousRoot, "SKILL.md"), "utf-8"), "v1");
     assert.equal(readFileSync(path.join(previousRoot, "late-addition.md"), "utf-8"), "must survive");
   });
@@ -599,7 +607,7 @@ describe("provision installer", () => {
     const preserved = readdirSync(skillsDir)
       .filter((entry) => entry.startsWith(".provision-staging-"));
     assert.equal(preserved.length, 1);
-    const previousRoot = path.join(skillsDir, preserved[0]!, "previous");
+    const previousRoot = path.join(skillsDir, preserved[0]!);
     assert.equal(readFileSync(path.join(previousRoot, "SKILL.md"), "utf-8"), "modified after audit");
     assert.equal(readFileSync(path.join(previousRoot, "late-addition.md"), "utf-8"), "must survive");
   });
@@ -629,7 +637,7 @@ describe("provision installer", () => {
     const preserved = readdirSync(skillsDir)
       .filter((entry) => entry.startsWith(".provision-staging-"));
     assert.equal(preserved.length, 1);
-    const previousRoot = path.join(skillsDir, preserved[0]!, "previous");
+    const previousRoot = path.join(skillsDir, preserved[0]!);
     assert.equal(
       readFileSync(path.join(previousRoot, "SKILL.md"), "utf-8"),
       "modified after retention audit",
@@ -671,7 +679,7 @@ describe("provision installer", () => {
     const preserved = readdirSync(skillsDir)
       .filter((entry) => entry.startsWith(".provision-staging-"));
     assert.equal(preserved.length, 1);
-    const previousRoot = path.join(skillsDir, preserved[0]!, "previous");
+    const previousRoot = path.join(skillsDir, preserved[0]!);
     assert.equal(
       readFileSync(path.join(previousRoot, "SKILL.md"), "utf-8"),
       "modified through open descriptor",
@@ -730,7 +738,7 @@ describe("provision installer", () => {
     }
 
     const firstRecovery = path.join(skillsDir, `.provision-staging-${firstRecoveryId}`);
-    const previousDirectory = path.join(firstRecovery, "previous");
+    const previousDirectory = firstRecovery;
     assert.equal(
       readFileSync(path.join(previousDirectory, "SKILL.md"), "utf8"),
       "user change after later upgrades",

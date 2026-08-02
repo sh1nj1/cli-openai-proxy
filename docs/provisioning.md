@@ -54,8 +54,9 @@ credentials, and a completion key is not accepted.
   `type: "skill"`; a type this proxy version does not know reports
   `unsupported` in the status view rather than failing the sync — a newer
   external app can ship new types before every proxy understands them.
-- `name` must match `[a-z0-9][a-z0-9_-]{0,63}` — it becomes a directory
-  segment.
+- `name` must match `[a-z0-9][a-z0-9_-]{0,63}` — uppercase is rejected so
+  names remain unique on case-insensitive filesystems; the name becomes a
+  directory segment.
 - `sha256` pins the artifact. A mismatch refuses the install.
 - **The manifest never chooses paths.** Each type maps to a hardcoded sandbox
   (`skill` → `~/.claude/skills/{name}`); there is no `path` field by design,

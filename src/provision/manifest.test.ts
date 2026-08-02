@@ -58,10 +58,10 @@ describe("provision manifest", () => {
     assert.equal(codeOf(() => parseManifest(manifest)), "invalid_item");
   });
 
-  // The name becomes a directory segment under the type's sandbox; a traversal
-  // or hidden-file name must die at parse time, before any install logic runs.
-  test("path-hostile names are refused", () => {
-    for (const name of ["../evil", "a/b", ".hidden", "..", "", "a".repeat(80)]) {
+  // The name becomes a directory segment under the type's sandbox; traversal,
+  // hidden-file, and case-folding aliases must die before install logic runs.
+  test("path-hostile and non-canonical names are refused", () => {
+    for (const name of ["../evil", "a/b", ".hidden", "..", "", "Demo", "a".repeat(80)]) {
       const manifest = valid();
       (manifest.items[0] as Record<string, unknown>).name = name;
       assert.equal(codeOf(() => parseManifest(manifest)), "invalid_item", `name=${JSON.stringify(name)}`);

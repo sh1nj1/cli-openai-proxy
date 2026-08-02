@@ -18,9 +18,10 @@ export const MANIFEST_SCHEMA = "agent-provisioning/v1";
 
 /**
  * Names become directory segments under a type's sandbox, so the charset is the
- * whole traversal defense at this layer: no separators, no dots, bounded length.
+ * whole traversal defense at this layer: lowercase only (so keys remain unique
+ * on case-insensitive filesystems), no separators, no dots, bounded length.
  */
-const NAME_PATTERN = /^[a-z0-9][a-z0-9_-]{0,63}$/i;
+const NAME_PATTERN = /^[a-z0-9][a-z0-9_-]{0,63}$/;
 
 /** Route params share the manifest's name rules — one charset, one traversal defense. */
 export function isValidItemName(name: string): boolean {
