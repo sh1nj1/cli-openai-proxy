@@ -27,7 +27,12 @@ import {
   readResponseBody,
 } from "./manifest.js";
 import { firstInstallMarkerPath, installSkill, removeSkill } from "./installer.js";
-import { loadState, saveState } from "./state.js";
+import {
+  loadRegisteredManifestUrl,
+  loadState,
+  saveRegisteredManifestUrl,
+  saveState,
+} from "./state.js";
 import {
   ProvisionError,
   SUPPORTED_PROVISION_TYPES,
@@ -62,8 +67,10 @@ const MAX_MANIFEST_BYTES = 1024 * 1024;
 
 let enabled = false;
 let autoApply: "auto" | "approve" = "approve";
+let manifestPersistenceKeys: string[] = [];
 let manifestUrl: string | null = null;
 let lastManifest: ProvisionManifest | null = null;
+let lastManifestGeneration: number | null = null;
 let lastSyncAt: string | null = null;
 let lastError: string | null = null;
 let itemViews: ProvisionItemView[] = [];
@@ -136,6 +143,10 @@ export function initProvisioning(hooks: {
   const raw = process.env.PROVISION_SYNC?.trim().toLowerCase() ?? "";
   enabled = ["1", "true", "yes", "enabled"].includes(raw);
   autoApply = process.env.PROVISION_AUTOAPPLY?.trim().toLowerCase() === "auto" ? "auto" : "approve";
+  manifestPersistenceKeys = (takeProxySecret("AUTH_ADMIN_KEYS") ?? "")
+    .split(",")
+    .map((key) => key.trim())
+    .filter(Boolean);
   // Consume even while provisioning is disabled: a signed URL left in the
   // gateway environment is readable through /proc by same-uid CLI children.
   const fixed = takeProxySecret("PROVISION_MANIFEST_URL")?.trim();
@@ -150,10 +161,22 @@ export function initProvisioning(hooks: {
 	const [type, ...rest] = canonicalStateKey(key).split("/");
 	return { type: type ?? "skill", name: rest.join("/"), status: "installed" as const, sha256: record.sha256 };
       });
-    if (fixed) {
-      registerManifestUrl(fixed);
+    const startupManifestUrl = fixed || loadRegisteredManifestUrl(manifestPersistenceKeys);
+    if (startupManifestUrl) {
+      try {
+	registerManifestUrl(startupManifestUrl);
+      } catch (err) {
+	// A persisted auth URL is untrusted startup input and may no longer
+	// satisfy a changed allowlist. Keep the gateway available for a new login.
+	if (!fixed) {
+	  lastError = err instanceof Error ? err.message : String(err);
+	  return { enabled, autoApply, manifestUrl };
+	}
+	throw err;
+      }
       // A fixed startup URL is itself a request to provision now. The interval
-      // is drift repair, not the first-run trigger (and may be disabled).
+      // is drift repair, not the first-run trigger (and may be disabled). The
+      // same applies to an auth registration restored after a process restart.
       void syncNow().catch(() => {
 	// syncNow records lastError; startup remains available for status/retry
       });
@@ -179,13 +202,18 @@ function startRefetchTimer(): void {
   refetchTimer.unref?.();
 }
 
-export function registerManifestUrl(url: string): void {
+export function registerManifestUrl(url: string, options: { persist?: boolean } = {}): void {
   assertAcceptingOperations();
   if (!enabled) return;
   checkUrlAllowed(url, { allowlist: getAllowlist() });
+  if (options.persist) saveRegisteredManifestUrl(url, manifestPersistenceKeys[0]);
   if (manifestUrl !== url) {
     manifestUrl = url;
     manifestGeneration += 1;
+    // Approvals are consent to the manifest currently registered. A previously
+    // fetched manifest must not authorize names while the replacement is pending.
+    lastManifest = null;
+    lastManifestGeneration = null;
     if (inFlight) syncRequested = true;
   }
   startRefetchTimer();
@@ -545,6 +573,7 @@ async function runSync(generation: number): Promise<ProvisionStatusView> {
   const manifest = await fetchManifest(url);
   assertCurrentGeneration(generation);
   lastManifest = manifest;
+  lastManifestGeneration = generation;
 
   const state = loadState();
   reconcileFirstInstallJournals(state);
@@ -825,15 +854,20 @@ export function getStatus(): ProvisionStatusView {
 export async function approveItem(type: string, name: string): Promise<ProvisionStatusView> {
   assertAcceptingOperations();
   const key = `${type}/${name}`;
+  const approvalGeneration = manifestGeneration;
   // Approval is consent to something the operator has SEEN: only names the
   // current manifest carries can be approved, so the list cannot be pre-seeded
   // with grants for items that never appeared.
-  const known = lastManifest?.items.some((item) => item.type === type && item.name === name);
+  const known = lastManifestGeneration === approvalGeneration
+    && lastManifest?.items.some((item) => item.type === type && item.name === name);
   if (!known) {
     throw new ProvisionError(`No item "${key}" in the current manifest`, "unknown_item");
   }
   if (inFlight) syncRequested = true;
   await serialize(() => {
+    if (approvalGeneration !== manifestGeneration || lastManifestGeneration !== approvalGeneration) {
+      throw new ProvisionError(`No item "${key}" in the current manifest`, "unknown_item");
+    }
     const state = loadState();
     state.revoked = state.revoked.filter((entry) => entry !== key);
     if (!state.approved.includes(key)) state.approved.push(key);
@@ -894,7 +928,7 @@ export function deleteItem(type: string, name: string): Promise<{ removed: boole
 export async function handleAuthorizedSession(url: string | undefined): Promise<void> {
   if (!enabled || !url) return;
   try {
-    registerManifestUrl(url);
+    registerManifestUrl(url, { persist: true });
     await syncNow();
   } catch (err) {
     lastError = err instanceof Error ? err.message : String(err);
@@ -906,8 +940,10 @@ function clearProvisioningState(): void {
   refetchTimer = null;
   enabled = false;
   autoApply = "approve";
+  manifestPersistenceKeys = [];
   manifestUrl = null;
   lastManifest = null;
+  lastManifestGeneration = null;
   lastSyncAt = null;
   lastError = null;
   itemViews = [];

@@ -7,7 +7,14 @@
  * empty state: worst case the next sync reinstalls, which is idempotent.
  */
 
-import { mkdirSync, readFileSync, renameSync, writeFileSync } from "fs";
+import {
+  createCipheriv,
+  createDecipheriv,
+  randomBytes,
+  randomUUID,
+  scryptSync,
+} from "crypto";
+import { mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "fs";
 import { homedir } from "os";
 import path from "path";
 import { managedPathParts } from "./path-policy.js";
@@ -19,6 +26,80 @@ export function provisionStateDir(): string {
 
 export function stateFilePath(): string {
   return path.join(provisionStateDir(), "provision.lock.json");
+}
+
+export function registeredManifestFilePath(): string {
+  return path.join(provisionStateDir(), "provision.manifest.json");
+}
+
+const MAX_REGISTERED_MANIFEST_BYTES = 16 * 1024;
+const MANIFEST_CIPHER_AAD = Buffer.from("cli-openai-proxy/provision-manifest/v1", "utf8");
+
+function decodeField(value: unknown, expectedBytes?: number): Buffer | null {
+  if (typeof value !== "string" || !/^[A-Za-z0-9_-]+$/.test(value)) return null;
+  const decoded = Buffer.from(value, "base64url");
+  return expectedBytes === undefined || decoded.length === expectedBytes ? decoded : null;
+}
+
+/** Load the last auth-delivered registry without trusting persisted input. */
+export function loadRegisteredManifestUrl(keys: readonly string[]): string | null {
+  const file = registeredManifestFilePath();
+  try {
+    if (statSync(file).size > MAX_REGISTERED_MANIFEST_BYTES) return null;
+    const parsed = JSON.parse(readFileSync(file, "utf8")) as unknown;
+    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return null;
+    const record = parsed as Record<string, unknown>;
+    if (record.version !== 1) return null;
+    const salt = decodeField(record.salt, 16);
+    const iv = decodeField(record.iv, 12);
+    const tag = decodeField(record.tag, 16);
+    const ciphertext = decodeField(record.ciphertext);
+    if (!salt || !iv || !tag || !ciphertext || ciphertext.length === 0) return null;
+    for (const key of keys) {
+      try {
+	const decipher = createDecipheriv("aes-256-gcm", scryptSync(key, salt, 32), iv);
+	decipher.setAAD(MANIFEST_CIPHER_AAD);
+	decipher.setAuthTag(tag);
+	const url = Buffer.concat([decipher.update(ciphertext), decipher.final()]).toString("utf8");
+	if (url.length > 0 && Buffer.byteLength(url, "utf8") <= MAX_REGISTERED_MANIFEST_BYTES) return url;
+      } catch {
+	// Try the next configured admin key; rotation may have changed ordering.
+      }
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+/** Persist signed query URLs outside the non-secret ownership lockfile. */
+export function saveRegisteredManifestUrl(url: string, key: string | undefined): void {
+  if (!key) throw new Error("Cannot persist an auth-delivered manifest URL without an auth-admin key.");
+  const salt = randomBytes(16);
+  const iv = randomBytes(12);
+  const cipher = createCipheriv("aes-256-gcm", scryptSync(key, salt, 32), iv);
+  cipher.setAAD(MANIFEST_CIPHER_AAD);
+  const ciphertext = Buffer.concat([cipher.update(url, "utf8"), cipher.final()]);
+  const record = {
+    version: 1,
+    salt: salt.toString("base64url"),
+    iv: iv.toString("base64url"),
+    tag: cipher.getAuthTag().toString("base64url"),
+    ciphertext: ciphertext.toString("base64url"),
+  };
+  const file = registeredManifestFilePath();
+  mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
+  const temporary = `${file}.tmp-${process.pid}-${randomUUID()}`;
+  try {
+    writeFileSync(temporary, `${JSON.stringify(record)}\n`, {
+      encoding: "utf8",
+      mode: 0o600,
+      flag: "wx",
+    });
+    renameSync(temporary, file);
+  } finally {
+    rmSync(temporary, { force: true });
+  }
 }
 
 const emptyState = (): ProvisionStateFile => ({ version: 1, approved: [], revoked: [], installed: {} });

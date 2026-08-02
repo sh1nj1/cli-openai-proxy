@@ -4,7 +4,14 @@ import { mkdtempSync, rmSync, readFileSync, writeFileSync, mkdirSync } from "fs"
 import { tmpdir } from "os";
 import path from "path";
 import { MAX_MANAGED_PATH_LENGTH } from "./path-policy.js";
-import { loadState, saveState, stateFilePath } from "./state.js";
+import {
+  loadRegisteredManifestUrl,
+  loadState,
+  registeredManifestFilePath,
+  saveRegisteredManifestUrl,
+  saveState,
+  stateFilePath,
+} from "./state.js";
 
 describe("provision state", () => {
   let dir: string;
@@ -24,6 +31,15 @@ describe("provision state", () => {
 
   test("a missing lockfile loads as the empty state", () => {
     assert.deepEqual(loadState(), { version: 1, approved: [], revoked: [], installed: {} });
+  });
+
+  test("an auth-delivered manifest URL is encrypted for its auth-admin key", () => {
+    const url = "https://registry.test/provision.json?token=secret";
+    saveRegisteredManifestUrl(url, "admin-secret");
+
+    assert.equal(readFileSync(registeredManifestFilePath(), "utf8").includes("token=secret"), false);
+    assert.equal(loadRegisteredManifestUrl(["wrong-key"]), null);
+    assert.equal(loadRegisteredManifestUrl(["another-key", "admin-secret"]), url);
   });
 
   test("saved state round-trips", () => {

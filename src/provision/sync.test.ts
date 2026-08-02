@@ -10,6 +10,7 @@ import {
   readFileSync,
   renameSync,
   rmSync,
+  statSync,
   writeFileSync,
 } from "fs";
 import { createServer, type Server } from "http";
@@ -31,6 +32,7 @@ import {
 } from "./sync.js";
 import { ProvisionError } from "./types.js";
 import { firstInstallMarkerPath } from "./installer.js";
+import { registeredManifestFilePath } from "./state.js";
 
 /** Single-file tar.gz, enough for sync-level tests (installer has its own suite). */
 function skillArchive(content: string, fileName = "SKILL.md"): Buffer {
@@ -64,6 +66,7 @@ const SAVED_VARS = [
   "PROVISION_STATE_DIR",
   "PROVISION_SKILLS_DIR",
   "PROVISION_REFETCH_MS",
+  "AUTH_ADMIN_KEYS",
 ] as const;
 
 describe("provision sync", () => {
@@ -122,6 +125,7 @@ describe("provision sync", () => {
     process.env.PROVISION_STATE_DIR = stateDir;
     process.env.PROVISION_SKILLS_DIR = skillsDir;
     process.env.PROVISION_SYNC = "1";
+    process.env.AUTH_ADMIN_KEYS = "test-admin-secret";
     responses.clear();
     responseGates.clear();
     redirects.clear();
@@ -1332,6 +1336,69 @@ describe("provision sync", () => {
     await handleAuthorizedSession(manifestUrl);
     assert.equal(getStatus().manifest_url, manifestUrl);
     assert.equal(existsSync(path.join(skillsDir, "pr-monitor", "SKILL.md")), true);
+  });
+
+  test("an auth-delivered manifest registration survives restart and resumes drift repair", async () => {
+    process.env.PROVISION_AUTOAPPLY = "auto";
+    process.env.PROVISION_REFETCH_MS = "10";
+    initProvisioning();
+    const skill = serveSkill("/persistent.tgz", "persistent");
+    const manifestPath = "/persistent.json?token=secret";
+    const manifestUrl = `${baseUrl}${manifestPath}`;
+    responses.set(manifestPath, {
+      schema: "agent-provisioning/v1",
+      items: [{ type: "skill", name: "persistent", ...skill }],
+    });
+
+    await handleAuthorizedSession(manifestUrl);
+    assert.equal(existsSync(path.join(skillsDir, "persistent", "SKILL.md")), true);
+    assert.equal(statSync(registeredManifestFilePath()).mode & 0o777, 0o600);
+    assert.equal(
+      readFileSync(registeredManifestFilePath(), "utf8").includes("token=secret"),
+      false,
+      "a same-uid CLI must not recover the signed URL from provisioning state",
+    );
+
+    await shutdownProvisioning();
+    responses.set(manifestPath, { schema: "agent-provisioning/v1", items: [] });
+    initProvisioning();
+    await syncNow();
+
+    assert.equal(getStatus().manifest_url, manifestUrl);
+    assert.equal(existsSync(path.join(skillsDir, "persistent")), false);
+
+    responses.set(manifestPath, {
+      schema: "agent-provisioning/v1",
+      items: [{ type: "skill", name: "persistent", ...skill }],
+    });
+    const deadline = Date.now() + 1_000;
+    while (!existsSync(path.join(skillsDir, "persistent", "SKILL.md")) && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    assert.equal(existsSync(path.join(skillsDir, "persistent", "SKILL.md")), true);
+  });
+
+  test("a replacement manifest invalidates approvals from the previous generation", async () => {
+    const skill = serveSkill("/stale-approval.tgz", "stale");
+    responses.set("/first.json", {
+      schema: "agent-provisioning/v1",
+      items: [{ type: "skill", name: "stale", ...skill }],
+    });
+    responses.set("/second.json", { schema: "agent-provisioning/v1", items: [] });
+    registerManifestUrl(`${baseUrl}/first.json`);
+    await syncNow();
+
+    let release!: () => void;
+    responseGates.set("/second.json", new Promise<void>((resolve) => { release = resolve; }));
+    registerManifestUrl(`${baseUrl}/second.json`);
+    const switching = syncNow();
+    await new Promise((resolve) => setTimeout(resolve, 20));
+
+    assert.equal(await codeOf(() => approveItem("skill", "stale")), "unknown_item");
+    release();
+    await switching;
+    const state = JSON.parse(readFileSync(path.join(stateDir, "provision.lock.json"), "utf8"));
+    assert.equal(state.approved.includes("skill/stale"), false);
   });
 
   test("a sync failure after an authorized session is recorded, not thrown", async () => {
