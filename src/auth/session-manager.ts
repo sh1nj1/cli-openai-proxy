@@ -320,6 +320,12 @@ export async function submitSession(
 
   try {
     const result = await record.handle.submit(input);
+    // A newer create, explicit cancellation, or TTL reap can dispose this
+    // record while the adapter is still submitting. Its late success no longer
+    // has authority to change credentials or register a manifest.
+    if (byId.get(sessionId) !== record || record.status !== "pending") {
+      throw supersededError(engine);
+    }
     if (result.credential) setCredential(engine, result.credential);
     record.status = "authorized";
     record.handle.cancel();
@@ -329,6 +335,10 @@ export async function submitSession(
     void handleAuthorizedSession(record.provisioningUrl);
     return view(record);
   } catch (err) {
+    // Do not resurrect or rewrite a record already disposed by another request.
+    if (byId.get(sessionId) !== record || record.status !== "pending") {
+      throw supersededError(engine);
+    }
     const message = err instanceof Error ? err.message : String(err);
     const code = err instanceof AuthProvisioningError ? err.code : "submit_failed";
     const failed: SessionView = { ...view(record), status: "failed", error: { message, code } };

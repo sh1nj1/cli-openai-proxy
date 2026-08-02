@@ -260,6 +260,37 @@ describe("session-manager", () => {
     await inFlight;
   });
 
+  test("a submit superseded while awaiting the adapter cannot authorize the old session", async () => {
+    behavior = { credential: true, submitDelayMs: 50 };
+    const first = await createSession("fake");
+    const inFlight = submitSession("fake", first.sessionId, "stale-code");
+
+    const replacement = await createSession("fake");
+    await assert.rejects(inFlight, (err: AuthProvisioningError) => {
+      assert.strictEqual(err.code, "session_superseded");
+      return true;
+    });
+
+    assert.deepStrictEqual(getProvisionedAuthEnv("fake"), {});
+    assert.throws(() => getSession("fake", first.sessionId));
+    assert.strictEqual(getSession("fake", replacement.sessionId).status, "pending");
+  });
+
+  test("a submit cancelled while awaiting the adapter cannot authorize the disposed session", async () => {
+    behavior = { credential: true, submitDelayMs: 50 };
+    const view = await createSession("fake");
+    const inFlight = submitSession("fake", view.sessionId, "stale-code");
+
+    cancelSession("fake", view.sessionId);
+    await assert.rejects(inFlight, (err: AuthProvisioningError) => {
+      assert.strictEqual(err.code, "session_superseded");
+      return true;
+    });
+
+    assert.deepStrictEqual(getProvisionedAuthEnv("fake"), {});
+    assert.throws(() => getSession("fake", view.sessionId));
+  });
+
   test("a successful submit stores the credential, releases the engine slot, and retains the result", async () => {
     behavior = { credential: true };
     const view = await createSession("fake");
