@@ -12,6 +12,7 @@ import {
   readdirSync,
   readFileSync,
   rmSync,
+  symlinkSync,
   writeSync,
   writeFileSync,
 } from "fs";
@@ -387,6 +388,90 @@ describe("provision installer", () => {
     assert.equal(rolledBack, true);
     assert.equal(readFileSync(path.join(target, "user.md"), "utf-8"), "user-owned");
     assert.equal(existsSync(path.join(target, "SKILL.md")), false);
+  });
+
+  test("a first install does not replace an empty directory created at exposure", async () => {
+    const { url, sha256 } = serve("/empty-target-race.tgz", makeTarGz([
+      { name: "SKILL.md", content: "managed" },
+    ]));
+    const target = path.join(skillsDir, "demo");
+    let rolledBack = false;
+
+    await assert.rejects(
+      installSkill(
+	{ name: "demo", url, sha256 },
+	{
+	  skillsDir,
+	  beforeCommit: () => () => { rolledBack = true; },
+	  beforeCandidateMove: () => mkdirSync(target),
+	},
+      ),
+      (err: unknown) => err instanceof ProvisionError && err.code === "untracked_content",
+    );
+
+    assert.equal(rolledBack, true);
+    assert.equal(lstatSync(target).isDirectory(), true);
+    assert.deepEqual(readdirSync(target), []);
+  });
+
+  test("a first install does not replace a symlink created at exposure", async () => {
+    const { url, sha256 } = serve("/symlink-target-race.tgz", makeTarGz([
+      { name: "SKILL.md", content: "managed" },
+    ]));
+    const target = path.join(skillsDir, "demo");
+    const userDirectory = path.join(skillsDir, "user-owned");
+    mkdirSync(userDirectory);
+
+    await assert.rejects(
+      installSkill(
+	{ name: "demo", url, sha256 },
+	{
+	  skillsDir,
+	  beforeCandidateMove: () => symlinkSync(userDirectory, target),
+	},
+      ),
+      (err: unknown) => err instanceof ProvisionError && err.code === "untracked_content",
+    );
+
+    assert.equal(lstatSync(target).isSymbolicLink(), true);
+    assert.equal(existsSync(path.join(userDirectory, "SKILL.md")), false);
+  });
+
+  test("an upgrade does not replace an empty directory created at exposure", async () => {
+    const v1 = serve("/empty-upgrade-target-v1.tgz", makeTarGz([
+      { name: "SKILL.md", content: "v1" },
+    ]));
+    const previous = await installSkill(
+      { name: "demo", url: v1.url, sha256: v1.sha256 },
+      { skillsDir },
+    );
+    const target = path.join(skillsDir, "demo");
+    const v2 = serve("/empty-upgrade-target-v2.tgz", makeTarGz([
+      { name: "SKILL.md", content: "v2" },
+    ]));
+
+    await assert.rejects(
+      installSkill(
+	{ name: "demo", url: v2.url, sha256: v2.sha256 },
+	{
+	  skillsDir,
+	  managedFiles: previous.files,
+	  managedDirectories: previous.directories,
+	  beforeCandidateMove: () => mkdirSync(target),
+	},
+      ),
+      (err: unknown) => err instanceof ProvisionError && err.code === "untracked_content",
+    );
+
+    assert.equal(lstatSync(target).isDirectory(), true);
+    assert.deepEqual(readdirSync(target), []);
+    const preserved = readdirSync(skillsDir)
+      .filter((entry) => entry.startsWith(".provision-staging-"));
+    assert.equal(preserved.length, 1);
+    assert.equal(
+      readFileSync(path.join(skillsDir, preserved[0]!, "previous", "SKILL.md"), "utf8"),
+      "v1",
+    );
   });
 
   test("an upgrade restores additions made after its initial ownership audit", async () => {

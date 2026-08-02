@@ -243,6 +243,8 @@ export async function installSkill(
     afterPreviousMove?: () => void;
     /** Test seam for mutation between first exposure and journal reconciliation. */
     afterFirstInstallMove?: (target: string) => void;
+    /** Test seam for a target appearing immediately before candidate exposure. */
+    beforeCandidateMove?: (target: string) => void;
     /** Test seam for an addition made after the moved-aside tree passes its audit. */
     afterPreviousAudit?: (previousRoot: string) => void;
     /** Test seam for a mutation made after cleanup verifies an isolated file. */
@@ -352,15 +354,15 @@ export async function installSkill(
 	);
       }
       try {
-	renameSync(root, target);
-      } catch (err) {
-	rollbackCommit?.();
-	if (["EEXIST", "ENOTEMPTY"].includes((err as NodeJS.ErrnoException).code ?? "")) {
+	opts.beforeCandidateMove?.(target);
+	if (!moveDirectoryNoReplace(root, target)) {
 	  throw new ProvisionError(
 	    `Refusing to replace "${item.name}" because the target appeared during installation`,
 	    "untracked_content",
 	  );
 	}
+      } catch (err) {
+	rollbackCommit?.();
 	throw err;
       }
       opts.afterFirstInstallMove?.(target);
@@ -400,17 +402,24 @@ export async function installSkill(
     }
     if (hadPrevious) opts.afterPreviousAudit?.(previous);
     try {
-      renameSync(root, target);
+      opts.beforeCandidateMove?.(target);
+      if (!moveDirectoryNoReplace(root, target)) {
+	if (hadPrevious) {
+	  preserveStaging = true;
+	  throw new ProvisionError(
+	    `Upgrade failed because the target was recreated; prior contents preserved at "${previous}"`,
+	    "untracked_content",
+	  );
+	}
+	throw new ProvisionError(
+	  `Refusing to replace "${item.name}" because the target appeared during installation`,
+	  "untracked_content",
+	);
+      }
     } catch (err) {
+      if (err instanceof ProvisionError && err.code === "untracked_content") throw err;
       if (hadPrevious) {
-	try {
-	  renameSync(previous, target);
-	} catch (restoreErr) {
-	  if (!["EEXIST", "ENOTEMPTY"].includes(
-	    (restoreErr as NodeJS.ErrnoException).code ?? "",
-	  )) {
-	    throw restoreErr;
-	  }
+	if (!moveDirectoryNoReplace(previous, target)) {
 	  preserveStaging = true;
 	  throw new ProvisionError(
 	    `Upgrade failed and the target was recreated; prior contents preserved at "${previous}"`,
@@ -465,6 +474,40 @@ export async function installSkill(
       rmSync(archiveDir, { recursive: true, force: true });
     }
   }
+}
+
+/**
+ * Publish a directory without replacing an entry created by another process.
+ * Windows rename already refuses an existing directory. On POSIX, where rename
+ * replaces an empty directory or symlink, an unsearchable empty directory first
+ * reserves the name atomically and is then replaced by the candidate in one
+ * rename. A competing mkdir/symlink therefore either wins before the reservation
+ * or cannot claim the name afterward.
+ */
+function moveDirectoryNoReplace(source: string, target: string): boolean {
+  if (process.platform === "win32") {
+    try {
+      renameSync(source, target);
+      return true;
+    } catch (err) {
+      if (targetExists(target)) return false;
+      throw err;
+    }
+  }
+
+  try {
+    // Write-only prevents ordinary same-user readers from retaining a directory
+    // descriptor while still allowing POSIX rename to replace our reservation.
+    mkdirSync(target, { mode: 0o200 });
+  } catch (err) {
+    if (targetExists(target)) return false;
+    throw err;
+  }
+
+  // If this unexpectedly fails, retain the reservation: removing by pathname
+  // could erase a different empty directory swapped in after the failure.
+  renameSync(source, target);
+  return true;
 }
 
 function targetExists(target: string): boolean {
