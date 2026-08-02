@@ -16,7 +16,11 @@ import { engineRegistry } from "../auth/registry.js";
 import { resetSessions } from "../auth/session-manager.js";
 import { clearAllCredentials, setCredential } from "../auth/token-store.js";
 import type { EngineAuthDescriptor, EngineAuthSession } from "../auth/types.js";
-import { AUTHORIZED_PROVISIONING_HEADER, decodeProvisioningUrl } from "../isolation/worker-protocol.js";
+import {
+  AUTHORIZED_PROVISIONING_HEADER,
+  PROVISIONING_GENERATION_HEADER,
+  decodeProvisioningUrl,
+} from "../isolation/worker-protocol.js";
 
 interface FakeRes extends Response {
   statusCode: number;
@@ -257,8 +261,11 @@ describe("auth-routes", () => {
 
   test("worker submit returns an internal provisioning notification on authorization", async () => {
     const manifestUrl = "https://collavre.test/agents/vrex/provision.json?token=secret";
+    const generation = "019865f4-50d6-7000-8000-000000000001";
     const created = fakeRes();
     await handleCreateAuthSession(fakeReq({
+      app: { locals: { cliProxyRole: "worker" } } as any,
+      headers: { [PROVISIONING_GENERATION_HEADER]: generation },
       params: { engine: "fake" } as any,
       body: { provisioning_url: manifestUrl },
     }), created);
@@ -273,6 +280,7 @@ describe("auth-routes", () => {
 
     assert.equal((res.payload as { status: string }).status, "authorized");
     assert.equal(decodeProvisioningUrl(res.headers[AUTHORIZED_PROVISIONING_HEADER]), manifestUrl);
+    assert.equal(res.headers[PROVISIONING_GENERATION_HEADER], generation);
     assert.equal(JSON.stringify(res.payload).includes(manifestUrl), false, "private URL must stay out of JSON");
 
     const retried = fakeRes();
@@ -327,8 +335,11 @@ describe("auth-routes", () => {
     };
     engineRegistry.resolve = (engine) => (engine === "fake" ? deviceDescriptor : realResolve(engine));
     const manifestUrl = "https://collavre.test/agents/vrex/provision.json";
+    const generation = "019865f4-50d6-7000-8000-000000000002";
     const created = fakeRes();
     await handleCreateAuthSession(fakeReq({
+      app: { locals: { cliProxyRole: "worker" } } as any,
+      headers: { [PROVISIONING_GENERATION_HEADER]: generation },
       params: { engine: "fake" } as any,
       body: { provisioning_url: manifestUrl },
     }), created);
@@ -343,6 +354,7 @@ describe("auth-routes", () => {
     const first = fakeRes();
     handleGetAuthSession(request, first);
     assert.equal(decodeProvisioningUrl(first.headers[AUTHORIZED_PROVISIONING_HEADER]), manifestUrl);
+    assert.equal(first.headers[PROVISIONING_GENERATION_HEADER], generation);
 
     const second = fakeRes();
     handleGetAuthSession(request, second);

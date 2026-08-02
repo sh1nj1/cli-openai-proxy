@@ -17,7 +17,11 @@ import {
 import type { WorkerProvisioner } from "./types.js";
 import { WorkerIsolationError } from "./types.js";
 import { UserWorkerProxy } from "./worker-proxy.js";
-import { AUTHORIZED_PROVISIONING_HEADER, encodeProvisioningUrl } from "./worker-protocol.js";
+import {
+  AUTHORIZED_PROVISIONING_HEADER,
+  PROVISIONING_GENERATION_HEADER,
+  encodeProvisioningUrl,
+} from "./worker-protocol.js";
 
 afterEach(() => {
   resetCapturedProxySecrets();
@@ -117,10 +121,12 @@ test("gateway provisions by authenticated identity and strips private headers", 
 test("gateway consumes a worker provisioning notification without exposing its private header", async () => {
   const socketPath = `/tmp/cap-worker-${randomUUID().slice(0, 8)}.sock`;
   const manifestUrl = "https://collavre.test/agents/vrex/provision.json?token=secret";
+  const generation = "019865f4-50d6-7000-8000-000000000001";
   const worker = http.createServer((_request, response) => {
     response.writeHead(200, {
       "content-type": "application/json",
       [AUTHORIZED_PROVISIONING_HEADER]: encodeProvisioningUrl(manifestUrl),
+      [PROVISIONING_GENERATION_HEADER]: generation,
     });
     response.end(JSON.stringify({ status: "authorized" }));
   });
@@ -155,8 +161,83 @@ test("gateway consumes a worker provisioning notification without exposing its p
     });
     assert.equal(response.status, 200);
     assert.equal(response.headers.get(AUTHORIZED_PROVISIONING_HEADER), null);
+    assert.equal(response.headers.get(PROVISIONING_GENERATION_HEADER), null);
     assert.deepEqual(await response.json(), { status: "authorized" });
     assert.deepEqual(notifications, [manifestUrl]);
+  } finally {
+    await new Promise<void>((resolve) => gateway.close(() => resolve()));
+    await new Promise<void>((resolve) => worker.close(() => resolve()));
+    await rm(socketPath, { force: true });
+  }
+});
+
+test("gateway ignores a retained session notification after a newer session registers", async () => {
+  const socketPath = `/tmp/cap-worker-${randomUUID().slice(0, 8)}.sock`;
+  const generations = new Map<string, string>();
+  const urls = new Map([
+    ["session-a", "https://collavre.test/agents/vrex/a.json"],
+    ["session-b", "https://collavre.test/agents/vrex/b.json"],
+  ]);
+  let created = 0;
+  const worker = http.createServer((request, response) => {
+    if (request.method === "POST" && request.url === "/v1/auth/fake/sessions") {
+      const sessionId = created++ === 0 ? "session-a" : "session-b";
+      generations.set(sessionId, String(request.headers[PROVISIONING_GENERATION_HEADER]));
+      response.writeHead(201, { "content-type": "application/json" });
+      response.end(JSON.stringify({ sessionId, status: "pending" }));
+      return;
+    }
+    const sessionId = request.url?.split("/").at(-1) ?? "";
+    response.writeHead(200, {
+      "content-type": "application/json",
+      [AUTHORIZED_PROVISIONING_HEADER]: encodeProvisioningUrl(urls.get(sessionId)!),
+      [PROVISIONING_GENERATION_HEADER]: generations.get(sessionId)!,
+    });
+    response.end(JSON.stringify({ sessionId, status: "authorized" }));
+  });
+  await new Promise<void>((resolve) => worker.listen(socketPath, resolve));
+
+  const provisioner: WorkerProvisioner = {
+    async ensureWorker() {
+      return {
+	accountName: "cap_0123456789abcdef0123",
+	endpoint: { kind: "unix", address: socketPath },
+      };
+    },
+  };
+  process.env.USER_API_KEYS = JSON.stringify([
+    { key: "user-key-12345678", tenantId: "tenant-a", userId: "user-a" },
+  ]);
+  process.env.AUTH_ADMIN_KEYS = "admin-key-123456";
+  const notifications: string[] = [];
+  const gateway = createApp({
+    userWorkerProxy: new UserWorkerProxy(provisioner),
+    onAuthorizedProvisioningUrl: (url) => { notifications.push(url); },
+  }).listen(0);
+  await new Promise<void>((resolve) => gateway.once("listening", resolve));
+
+  try {
+    const port = (gateway.address() as AddressInfo).port;
+    const headers = {
+      authorization: "Bearer admin-key-123456",
+      "content-type": "application/json",
+      [PROVISIONING_GENERATION_HEADER]: "ffffffff-ffff-7fff-bfff-ffffffffffff",
+      "x-cli-proxy-user-key": "user-key-12345678",
+    };
+    const create = () => fetch(`http://127.0.0.1:${port}/v1/auth/fake/sessions`, {
+      method: "POST",
+      headers,
+      body: "{}",
+    }).then((response) => response.json() as Promise<{ sessionId: string }>);
+    const first = await create();
+    const second = await create();
+    assert.notEqual(generations.get(first.sessionId), headers[PROVISIONING_GENERATION_HEADER]);
+    assert.ok(generations.get(first.sessionId)! < generations.get(second.sessionId)!);
+
+    await fetch(`http://127.0.0.1:${port}/v1/auth/fake/sessions/${second.sessionId}`, { headers });
+    await fetch(`http://127.0.0.1:${port}/v1/auth/fake/sessions/${first.sessionId}`, { headers });
+
+    assert.deepEqual(notifications, [urls.get(second.sessionId)]);
   } finally {
     await new Promise<void>((resolve) => gateway.close(() => resolve()));
     await new Promise<void>((resolve) => worker.close(() => resolve()));

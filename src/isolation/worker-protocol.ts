@@ -3,8 +3,12 @@
  * before answering the caller; it may contain a manifest URL with credentials.
  */
 export const AUTHORIZED_PROVISIONING_HEADER = "x-cli-proxy-authorized-provisioning";
+/** Gateway-issued ordering identity, echoed by the worker with an authorized URL. */
+export const PROVISIONING_GENERATION_HEADER = "x-cli-proxy-provisioning-generation";
 /** Leaves ample room under Node's default aggregate HTTP header limit. */
 export const MAX_AUTHORIZED_PROVISIONING_HEADER_BYTES = 8 * 1024;
+
+const UUID_V7 = /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
 export function encodeProvisioningUrl(url: string): string {
   return Buffer.from(url, "utf8").toString("base64url");
@@ -22,4 +26,8 @@ export function decodeProvisioningUrl(value: string | string[] | undefined): str
   } catch {
     return undefined;
   }
+}
+
+export function decodeProvisioningGeneration(value: string | string[] | undefined): string | undefined {
+  return typeof value === "string" && UUID_V7.test(value) ? value.toLowerCase() : undefined;
 }

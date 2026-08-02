@@ -45,6 +45,11 @@ export interface SessionView {
   error?: { message: string; code: string };
 }
 
+export interface SessionProvisioningNotification {
+  url: string;
+  generation: string;
+}
+
 interface SessionRecord extends Omit<SessionView, "expiresAt"> {
   expiresAt: number;
   handle: EngineAuthSession;
@@ -56,6 +61,8 @@ interface SessionRecord extends Omit<SessionView, "expiresAt"> {
    * request to carry it.
    */
   provisioningUrl?: string;
+  /** Gateway-issued ordering identity paired with provisioningUrl. */
+  provisioningGeneration?: string;
   /**
    * Set for the duration of submit(). Not part of SessionView: the session is
    * still "pending" to an observer — nothing has been decided yet — and this only
@@ -92,6 +99,7 @@ function view(record: SessionRecord): SessionView {
     timer: _timer,
     submitting: _submitting,
     provisioningUrl: _provisioningUrl,
+    provisioningGeneration: _provisioningGeneration,
     expiresAt,
     ...rest
   } = record;
@@ -123,7 +131,7 @@ function supersededError(engine: string): AuthProvisioningError {
 export async function createSession(
   engine: string,
   flow?: string,
-  opts: { provisioningUrl?: string } = {},
+  opts: { provisioningUrl?: string; provisioningGeneration?: string } = {},
 ): Promise<SessionView> {
   const descriptor = resolveEngine(engine);
   if (!descriptor) {
@@ -214,6 +222,7 @@ export async function createSession(
     timer,
     submitting: false,
     provisioningUrl: opts.provisioningUrl,
+    provisioningGeneration: opts.provisioningGeneration,
   };
   byId.set(sessionId, record);
   byEngine.set(engine, sessionId);
@@ -325,15 +334,27 @@ export function getSession(engine: string, sessionId: string): SessionView {
   return view(requireSession(engine, sessionId));
 }
 
-/** Read a paste-code/API-key session's private provisioning URL. */
-export function getSessionProvisioningUrl(engine: string, sessionId: string): string | undefined {
-  return requireSession(engine, sessionId).provisioningUrl;
+function provisioningNotification(record: SessionRecord): SessionProvisioningNotification | undefined {
+  return record.provisioningUrl && record.provisioningGeneration
+    ? { url: record.provisioningUrl, generation: record.provisioningGeneration }
+    : undefined;
 }
 
-/** Return a completed device-code session's URL for retryable worker-to-gateway notification. */
-export function getAuthorizedProvisioningUrl(engine: string, sessionId: string): string | undefined {
+/** Read a paste-code/API-key session's private, ordered provisioning notification. */
+export function getSessionProvisioningNotification(
+  engine: string,
+  sessionId: string,
+): SessionProvisioningNotification | undefined {
+  return provisioningNotification(requireSession(engine, sessionId));
+}
+
+/** Return a completed device-code session's retryable worker-to-gateway notification. */
+export function getAuthorizedProvisioningNotification(
+  engine: string,
+  sessionId: string,
+): SessionProvisioningNotification | undefined {
   const record = requireSession(engine, sessionId);
-  return record.status === "authorized" ? record.provisioningUrl : undefined;
+  return record.status === "authorized" ? provisioningNotification(record) : undefined;
 }
 
 export function cancelSession(engine: string, sessionId: string): SessionView {

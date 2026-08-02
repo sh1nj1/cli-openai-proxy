@@ -1,10 +1,16 @@
 import http, { type IncomingHttpHeaders } from "node:http";
 import type { Request, Response } from "express";
+import { v7 as uuidv7 } from "uuid";
 import { getWorkerConnectTimeoutMs } from "../config.js";
 import { requestIdentity } from "./request-identity.js";
 import type { WorkerProvisioner, WorkerTarget } from "./types.js";
 import { WorkerIsolationError } from "./types.js";
-import { AUTHORIZED_PROVISIONING_HEADER, decodeProvisioningUrl } from "./worker-protocol.js";
+import {
+  AUTHORIZED_PROVISIONING_HEADER,
+  PROVISIONING_GENERATION_HEADER,
+  decodeProvisioningGeneration,
+  decodeProvisioningUrl,
+} from "./worker-protocol.js";
 
 const HOP_BY_HOP_HEADERS = new Set([
   "connection",
@@ -24,6 +30,7 @@ const PRIVATE_HEADERS = new Set([
   "x-cli-proxy-user-id",
   "x-cli-proxy-identity-timestamp",
   "x-cli-proxy-identity-signature",
+  PROVISIONING_GENERATION_HEADER,
 ]);
 
 const REGENERATED_BODY_HEADERS = new Set(["content-encoding", "content-length"]);
@@ -37,7 +44,11 @@ const PUBLIC_FAILURE_MESSAGES: Record<WorkerIsolationError["code"], string> = {
   worker_unavailable: "User worker unavailable",
 };
 
-function outgoingHeaders(headers: IncomingHttpHeaders, body: Buffer): IncomingHttpHeaders {
+function outgoingHeaders(
+  headers: IncomingHttpHeaders,
+  body: Buffer,
+  provisioningGeneration?: string,
+): IncomingHttpHeaders {
   const result: IncomingHttpHeaders = {};
   for (const [name, value] of Object.entries(headers)) {
     const lower = name.toLowerCase();
@@ -52,6 +63,7 @@ function outgoingHeaders(headers: IncomingHttpHeaders, body: Buffer): IncomingHt
   }
   result["content-length"] = String(body.length);
   result["content-type"] ??= "application/json";
+  if (provisioningGeneration) result[PROVISIONING_GENERATION_HEADER] = provisioningGeneration;
   return result;
 }
 
@@ -61,6 +73,7 @@ function copyResponseHeaders(source: IncomingHttpHeaders, destination: Response)
       value !== undefined
       && !HOP_BY_HOP_HEADERS.has(name.toLowerCase())
       && name.toLowerCase() !== AUTHORIZED_PROVISIONING_HEADER
+      && name.toLowerCase() !== PROVISIONING_GENERATION_HEADER
     ) {
       destination.setHeader(name, value);
     }
@@ -68,6 +81,8 @@ function copyResponseHeaders(source: IncomingHttpHeaders, destination: Response)
 }
 
 export class UserWorkerProxy {
+  private latestProvisioningGeneration: string | undefined;
+
   constructor(
     private readonly provisioner: WorkerProvisioner,
     private readonly connectTimeoutMs = getWorkerConnectTimeoutMs(),
@@ -97,6 +112,10 @@ export class UserWorkerProxy {
     if (clientClosed || res.destroyed) return;
 
     const body = req.body === undefined ? Buffer.alloc(0) : Buffer.from(JSON.stringify(req.body));
+    const provisioningGeneration = req.method === "POST"
+      && /^\/v1\/auth\/[^/]+\/sessions\/?$/.test(req.path)
+      ? uuidv7()
+      : undefined;
     await new Promise<void>((resolve) => {
       let readinessTimer: ReturnType<typeof setTimeout> | undefined;
       const clearReadinessTimer = () => {
@@ -108,19 +127,22 @@ export class UserWorkerProxy {
           socketPath: target.endpoint.address,
           path: req.originalUrl,
           method: req.method,
-          headers: outgoingHeaders(req.headers, body),
+	  headers: outgoingHeaders(req.headers, body, provisioningGeneration),
         },
         (workerResponse) => {
           clearReadinessTimer();
 	  const provisioningUrl = decodeProvisioningUrl(
 	    workerResponse.headers[AUTHORIZED_PROVISIONING_HEADER],
 	  );
-	  if (provisioningUrl && onAuthorizedProvisioningUrl) {
-	    void Promise.resolve(onAuthorizedProvisioningUrl(provisioningUrl)).catch((error) => {
-	      console.error(
-		`[UserWorkerProxy] provisioning notification failed: ${error instanceof Error ? error.message : String(error)}`,
-	      );
-	    });
+	  const responseGeneration = decodeProvisioningGeneration(
+	    workerResponse.headers[PROVISIONING_GENERATION_HEADER],
+	  );
+	  if (provisioningUrl && responseGeneration && onAuthorizedProvisioningUrl) {
+	    this.relayProvisioningNotification(
+	      provisioningUrl,
+	      responseGeneration,
+	      onAuthorizedProvisioningUrl,
+	    );
 	  }
           res.status(workerResponse.statusCode ?? 502);
           copyResponseHeaders(workerResponse.headers, res);
@@ -150,6 +172,22 @@ export class UserWorkerProxy {
       request.end(body);
     });
     res.off("close", closeUpstream);
+  }
+
+  private relayProvisioningNotification(
+    url: string,
+    generation: string,
+    callback: (url: string) => void | Promise<void>,
+  ): void {
+    if (this.latestProvisioningGeneration && generation < this.latestProvisioningGeneration) return;
+    if (!this.latestProvisioningGeneration || generation > this.latestProvisioningGeneration) {
+      this.latestProvisioningGeneration = generation;
+    }
+    void Promise.resolve(callback(url)).catch((error) => {
+      console.error(
+	`[UserWorkerProxy] provisioning notification failed: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    });
   }
 
   private sendFailure(res: Response, error: unknown): void {

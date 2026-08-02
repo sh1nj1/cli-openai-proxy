@@ -13,15 +13,18 @@ import { engineRegistry, resolveEngine } from "../auth/registry.js";
 import {
   cancelSession,
   createSession,
-  getAuthorizedProvisioningUrl,
-  getSessionProvisioningUrl,
+  getAuthorizedProvisioningNotification,
+  getSessionProvisioningNotification,
   getSession,
   submitSession,
+  type SessionProvisioningNotification,
 } from "../auth/session-manager.js";
 import { clearCredential } from "../auth/token-store.js";
 import { AuthProvisioningError } from "../auth/types.js";
 import {
   AUTHORIZED_PROVISIONING_HEADER,
+  PROVISIONING_GENERATION_HEADER,
+  decodeProvisioningGeneration,
   encodeProvisioningUrl,
   provisioningUrlFitsHeader,
 } from "../isolation/worker-protocol.js";
@@ -111,9 +114,14 @@ function parseable(url: string): boolean {
   }
 }
 
-function notifyGatewayWhenWorker(req: Request, res: Response, url: string | undefined): void {
-  if (url && req.app?.locals.cliProxyRole === "worker") {
-    res.setHeader(AUTHORIZED_PROVISIONING_HEADER, encodeProvisioningUrl(url));
+function notifyGatewayWhenWorker(
+  req: Request,
+  res: Response,
+  notification: SessionProvisioningNotification | undefined,
+): void {
+  if (notification && req.app?.locals.cliProxyRole === "worker") {
+    res.setHeader(AUTHORIZED_PROVISIONING_HEADER, encodeProvisioningUrl(notification.url));
+    res.setHeader(PROVISIONING_GENERATION_HEADER, notification.generation);
   }
 }
 
@@ -168,7 +176,10 @@ export async function handleCreateAuthSession(req: Request, res: Response): Prom
     return;
   }
   try {
-    res.status(201).json(await createSession(engine, flow, { provisioningUrl }));
+    const provisioningGeneration = req.app?.locals.cliProxyRole === "worker"
+      ? decodeProvisioningGeneration(req.headers[PROVISIONING_GENERATION_HEADER])
+      : undefined;
+    res.status(201).json(await createSession(engine, flow, { provisioningUrl, provisioningGeneration }));
   } catch (err) {
     sendError(res, err);
   }
@@ -192,11 +203,11 @@ export async function handleSubmitAuthSession(req: Request, res: Response): Prom
   }
   try {
     const sessionId = String(req.params.sessionId ?? "");
-    const provisioningUrl = req.app?.locals.cliProxyRole === "worker"
-      ? getSessionProvisioningUrl(engine, sessionId)
+    const notification = req.app?.locals.cliProxyRole === "worker"
+      ? getSessionProvisioningNotification(engine, sessionId)
       : undefined;
     const result = await submitSession(engine, sessionId, raw);
-    if (result.status === "authorized") notifyGatewayWhenWorker(req, res, provisioningUrl);
+    if (result.status === "authorized") notifyGatewayWhenWorker(req, res, notification);
     res.json(result);
   } catch (err) {
     sendError(res, err);
@@ -211,7 +222,7 @@ export function handleGetAuthSession(req: Request, res: Response): void {
     const sessionId = String(req.params.sessionId ?? "");
     const result = getSession(engine, sessionId);
     if (req.app?.locals.cliProxyRole === "worker" && result.status === "authorized") {
-      notifyGatewayWhenWorker(req, res, getAuthorizedProvisioningUrl(engine, sessionId));
+      notifyGatewayWhenWorker(req, res, getAuthorizedProvisioningNotification(engine, sessionId));
     }
     res.json(result);
   } catch (err) {
