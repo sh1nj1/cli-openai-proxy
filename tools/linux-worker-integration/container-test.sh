@@ -59,6 +59,14 @@ step "Production image ships no devDependencies"
 [[ ! -e /opt/app/node_modules/typescript ]] \
   || fail "devDependencies leaked into the runtime image"
 
+step "Immutable release includes the auth UI runtime asset"
+release_root="$(sed -n \
+  's|^ExecStart=[^ ]* \([^ ]*\)/dist/server/standalone\.js$|\1|p' \
+  /etc/systemd/system/cli-openai-proxy-gateway.service)"
+[[ -n "${release_root}" ]] || fail "could not resolve immutable release from gateway unit"
+[[ -f "${release_root}/tools/auth-test.html" ]] \
+  || fail "auth UI asset is missing from immutable release: ${release_root}"
+
 step "Configuring per-user API keys and starting the gateway"
 cat > /etc/cli-openai-proxy/gateway.env <<EOF
 USER_API_KEYS='[{"key":"${KEY_A}","tenantId":"itest","userId":"user-a"},{"key":"${KEY_B}","tenantId":"itest","userId":"user-b"}]'
