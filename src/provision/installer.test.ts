@@ -1,6 +1,7 @@
 import { test, describe, before, after, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
-import { createHash } from "crypto";
+import { execFileSync, spawn } from "child_process";
+import { createHash, randomBytes } from "crypto";
 import {
   closeSync,
   existsSync,
@@ -87,6 +88,96 @@ function makeTarGz(entries: TarEntry[]): Buffer {
 
 const sha = (buf: Buffer) => createHash("sha256").update(buf).digest("hex");
 
+async function serveGitRepository(
+  files: Record<string, string>,
+  opts: { addGitlink?: boolean; objectFormat?: "sha1" | "sha256" } = {},
+): Promise<{ url: string; rev: string; close: () => Promise<void> }> {
+  const root = mkdtempSync(path.join(tmpdir(), "provision-git-test-"));
+  const source = path.join(root, "source");
+  const bare = path.join(root, "skill.git");
+  mkdirSync(source);
+  execFileSync("git", [
+    "init",
+    "--quiet",
+    ...(opts.objectFormat === "sha256" ? ["--object-format=sha256"] : []),
+  ], { cwd: source });
+  for (const [relative, contents] of Object.entries(files)) {
+    const destination = path.join(source, ...relative.split("/"));
+    mkdirSync(path.dirname(destination), { recursive: true });
+    writeFileSync(destination, contents);
+  }
+  execFileSync("git", ["add", "."], { cwd: source });
+  execFileSync("git", [
+    "-c", "user.name=Provision Test",
+    "-c", "user.email=provision@example.invalid",
+    "commit", "--quiet", "-m", "fixture",
+  ], { cwd: source });
+  execFileSync("git", ["branch", "-M", "main"], { cwd: source });
+  if (opts.addGitlink) {
+    const childRev = execFileSync("git", ["rev-parse", "HEAD"], { cwd: source, encoding: "utf8" }).trim();
+    execFileSync("git", ["update-index", "--add", "--cacheinfo", `160000,${childRev},vendor/child`], {
+      cwd: source,
+    });
+    execFileSync("git", [
+      "-c", "user.name=Provision Test",
+      "-c", "user.email=provision@example.invalid",
+      "commit", "--quiet", "-m", "gitlink fixture",
+    ], { cwd: source });
+  }
+  const rev = execFileSync("git", ["rev-parse", "HEAD"], { cwd: source, encoding: "utf8" }).trim();
+  execFileSync("git", ["clone", "--quiet", "--bare", source, bare]);
+  execFileSync("git", ["--git-dir", bare, "config", "uploadpack.allowFilter", "false"]);
+
+  const repositoryServer = createServer((req, res) => {
+    const requestUrl = new URL(req.url ?? "/", "http://127.0.0.1");
+    const backend = spawn("git", ["http-backend"], {
+      env: {
+	...process.env,
+	GIT_PROJECT_ROOT: root,
+	GIT_HTTP_EXPORT_ALL: "1",
+	PATH_INFO: requestUrl.pathname,
+	QUERY_STRING: requestUrl.search.slice(1),
+	REQUEST_METHOD: req.method ?? "GET",
+	CONTENT_TYPE: req.headers["content-type"] ?? "",
+	CONTENT_LENGTH: req.headers["content-length"] ?? "",
+      },
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+    const chunks: Buffer[] = [];
+    backend.stdout.on("data", (chunk: Buffer) => chunks.push(chunk));
+    backend.on("close", () => {
+      const response = Buffer.concat(chunks);
+      const boundary = response.indexOf("\r\n\r\n");
+      if (boundary < 0) {
+	res.statusCode = 500;
+	res.end();
+	return;
+      }
+      for (const header of response.subarray(0, boundary).toString("utf8").split("\r\n")) {
+	const separator = header.indexOf(":");
+	if (separator < 0) continue;
+	const name = header.slice(0, separator);
+	const value = header.slice(separator + 1).trim();
+	if (name.toLowerCase() === "status") res.statusCode = Number.parseInt(value, 10);
+	else res.setHeader(name, value);
+      }
+      res.end(response.subarray(boundary + 4));
+    });
+    req.pipe(backend.stdin);
+  });
+  await new Promise<void>((resolve) => repositoryServer.listen(0, "127.0.0.1", resolve));
+  const address = repositoryServer.address() as { port: number };
+  return {
+    url: `http://127.0.0.1:${address.port}/skill.git`,
+    rev,
+    close: async () => {
+      repositoryServer.closeAllConnections?.();
+      await new Promise<void>((resolve, reject) => repositoryServer.close((err) => err ? reject(err) : resolve()));
+      rmSync(root, { recursive: true, force: true });
+    },
+  };
+}
+
 describe("provision installer", () => {
   let server: Server;
   let baseUrl: string;
@@ -162,6 +253,128 @@ describe("provision installer", () => {
     const result = await installSkill({ name: "demo", url, sha256 }, { skillsDir });
     assert.deepEqual(result.files, ["SKILL.md"]);
     assert.match(readFileSync(path.join(skillsDir, "demo", "SKILL.md"), "utf-8"), /Use wisely/);
+  });
+
+  test("installs a pinned git repository subpath into skillsDir/name", async () => {
+    const repository = await serveGitRepository({
+      "skills/demo/SKILL.md": "---\nname: demo\n---\nFrom git.",
+      "skills/demo/notes/extra.md": "extra",
+      "skills/other/SKILL.md": "not selected",
+      "README.md": "repository root",
+    });
+    try {
+      const result = await installSkill({
+	name: "demo",
+	git: { url: repository.url, rev: repository.rev, path: "skills/demo" },
+      }, { skillsDir });
+      assert.deepEqual(result.files.sort(), ["SKILL.md", "notes/extra.md"]);
+      assert.equal(readFileSync(path.join(skillsDir, "demo", "SKILL.md"), "utf8").includes("From git."), true);
+      assert.equal(existsSync(path.join(skillsDir, "demo", "README.md")), false);
+    } finally {
+      await repository.close();
+    }
+  });
+
+  test("installs a pinned git repository root", async () => {
+    const repository = await serveGitRepository({ "SKILL.md": "Root git skill." });
+    try {
+      const result = await installSkill({
+	name: "demo",
+	git: { url: repository.url, rev: repository.rev },
+      }, { skillsDir });
+      assert.deepEqual(result.files, ["SKILL.md"]);
+      assert.equal(readFileSync(path.join(skillsDir, "demo", "SKILL.md"), "utf8"), "Root git skill.");
+    } finally {
+      await repository.close();
+    }
+  });
+
+  test("installs a pinned SHA-256 git repository", async () => {
+    const repository = await serveGitRepository(
+      { "SKILL.md": "SHA-256 git skill." },
+      { objectFormat: "sha256" },
+    );
+    try {
+      assert.equal(repository.rev.length, 64);
+      const result = await installSkill({
+	name: "demo",
+	git: { url: repository.url, rev: repository.rev },
+      }, { skillsDir });
+      assert.deepEqual(result.files, ["SKILL.md"]);
+      assert.equal(readFileSync(path.join(skillsDir, "demo", "SKILL.md"), "utf8"), "SHA-256 git skill.");
+    } finally {
+      await repository.close();
+    }
+  });
+
+  test("resolves and installs a git branch", async () => {
+    const repository = await serveGitRepository({ "SKILL.md": "Branch git skill." });
+    try {
+      const result = await installSkill({
+	name: "demo",
+	git: { url: repository.url, rev: "main" },
+      }, { skillsDir });
+      assert.deepEqual(result.files, ["SKILL.md"]);
+      assert.equal(readFileSync(path.join(skillsDir, "demo", "SKILL.md"), "utf8"), "Branch git skill.");
+    } finally {
+      await repository.close();
+    }
+  });
+
+  test("git repository URLs with credential-like query strings are refused", async () => {
+    assert.equal(await codeOf(() => installSkill({
+      name: "demo",
+      git: {
+	url: "https://github.com/example/skill.git?token=secret",
+	rev: "a".repeat(40),
+      },
+    }, { skillsDir })), "url_not_allowed");
+  });
+
+  test("git sources containing submodules are refused", async () => {
+    const repository = await serveGitRepository({ "SKILL.md": "Root git skill." }, { addGitlink: true });
+    try {
+      assert.equal(await codeOf(() => installSkill({
+	name: "demo",
+	git: { url: repository.url, rev: repository.rev },
+      }, { skillsDir })), "git_source_rejected");
+      assert.equal(existsSync(path.join(skillsDir, "demo")), false);
+    } finally {
+      await repository.close();
+    }
+  });
+
+  test("git source archive generation is bounded before extraction", async () => {
+    const largeFiles = Object.fromEntries(Array.from({ length: 13 }, (_, index) => [
+      `part-${index}.md`,
+      "x".repeat(900 * 1024),
+    ]));
+    const repository = await serveGitRepository(largeFiles);
+    try {
+      assert.equal(await codeOf(() => installSkill({
+	name: "demo",
+	git: { url: repository.url, rev: repository.rev },
+      }, { skillsDir })), "audit_failed");
+      assert.equal(existsSync(path.join(skillsDir, "demo")), false);
+    } finally {
+      await repository.close();
+    }
+  });
+
+  test("git fetch is bounded when a server ignores blob filters", async () => {
+    const repository = await serveGitRepository({
+      "skills/demo/SKILL.md": "selected",
+      "outside/large.txt": randomBytes(18 * 1024 * 1024).toString("base64"),
+    });
+    try {
+      assert.equal(await codeOf(() => installSkill({
+	name: "demo",
+	git: { url: repository.url, rev: repository.rev, path: "skills/demo" },
+      }, { skillsDir })), "audit_failed");
+      assert.equal(existsSync(path.join(skillsDir, "demo")), false);
+    } finally {
+      await repository.close();
+    }
   });
 
   test("records a root-level __proto__ file as an own artifact hash", async () => {

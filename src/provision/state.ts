@@ -17,6 +17,7 @@ import {
 import { linkSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "fs";
 import { homedir } from "os";
 import path from "path";
+import { isCanonicalGitPath, isGitObjectId, isValidGitRevision } from "./git-source.js";
 import { managedPathParts } from "./path-policy.js";
 import type { InstalledRecord, InstalledSnapshot, ProvisionStateFile } from "./types.js";
 
@@ -194,8 +195,30 @@ function installedSnapshot(value: unknown): InstalledSnapshot | null {
       || typeof hash !== "string" || !HASH_PATTERN.test(hash))) return null;
     fileHashes = Object.fromEntries(entries) as Record<string, string>;
   }
+  const rawSource = record.source;
+  const rawGitSource = typeof rawSource === "object" && rawSource !== null && !Array.isArray(rawSource)
+    ? rawSource as Record<string, unknown>
+    : null;
+  const gitRef = rawGitSource?.ref ?? rawGitSource?.rev;
+  const source = typeof rawSource === "object"
+    && rawSource !== null
+    && !Array.isArray(rawSource)
+    && rawGitSource?.type === "git"
+    && isValidGitRevision(gitRef)
+    && isGitObjectId(rawGitSource.rev)
+    && (rawGitSource.path === undefined || isCanonicalGitPath(rawGitSource.path))
+    ? {
+	type: "git" as const,
+	ref: gitRef,
+	rev: (rawGitSource.rev as string).toLowerCase(),
+	...(rawGitSource.path !== undefined
+	  ? { path: rawGitSource.path as string }
+	  : {}),
+      }
+    : undefined;
   return {
     sha256: record.sha256.toLowerCase(),
+    ...(source ? { source } : {}),
     files: [...files],
     ...(directories !== undefined ? { directories: [...directories] } : {}),
     ...(fileHashes ? { fileHashes } : {}),

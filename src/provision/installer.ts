@@ -9,7 +9,7 @@
  * pinning guarantees WHAT arrived and the audit bounds what it can say.
  */
 
-import { execFileSync } from "child_process";
+import { execFile, execFileSync, spawn } from "child_process";
 import { createHash, randomBytes } from "crypto";
 import {
   chmodSync,
@@ -24,11 +24,17 @@ import {
 } from "fs";
 import { tmpdir } from "os";
 import path from "path";
+import { promisify } from "util";
 import { gunzipSync } from "zlib";
 import { fetchWithPolicy, readResponseBody } from "./manifest.js";
+import { isGitObjectId } from "./git-source.js";
 import { managedPathParts, MAX_MANAGED_PATH_LENGTH } from "./path-policy.js";
 import { renameDirectoryNoReplace } from "./rename-no-replace.js";
-import { ProvisionError, type InstalledDirectoryIdentity } from "./types.js";
+import {
+  ProvisionError,
+  type GitProvisionSource,
+  type InstalledDirectoryIdentity,
+} from "./types.js";
 
 export interface InstallResult {
   /** Installed file paths relative to the skill's directory. */
@@ -44,12 +50,15 @@ const MAX_FILE_BYTES = 1024 * 1024;
 const MAX_TOTAL_BYTES = 10 * 1024 * 1024;
 /** Content cap plus slack for tar headers and padding (~512B per entry). */
 const MAX_DECOMPRESSED_BYTES = MAX_TOTAL_BYTES + 1024 * 1024;
+const MAX_GIT_METADATA_BYTES = 2 * 1024 * 1024;
+const MAX_GIT_FETCH_BYTES = 16 * 1024 * 1024;
 const DOWNLOAD_TIMEOUT_MS = 120_000;
 const INSTALL_MARKER_PATTERN = /^[0-9a-f]{32}$/;
 const RECOVERY_ID_PATTERN = /^[0-9a-f]{32}$/;
 const REMOVAL_RECOVERY_PREFIX = ".provision-removed-";
 const UPGRADE_RECOVERY_PREFIX = ".provision-staging-";
 const REJECTED_RECOVERY_PREFIX = ".provision-rejected-";
+const execFileAsync = promisify(execFile);
 
 /** Same lowercase charset the manifest enforces; re-checked for non-manifest callers. */
 const NAME_PATTERN = /^[a-z0-9][a-z0-9_-]{0,63}$/;
@@ -123,15 +132,18 @@ function assertDecompressionBounded(buf: Buffer): void {
  * entries (a symlinked directory would let a later entry write through it) and
  * any traversal or absolute name.
  */
-function assertArchiveSafe(archivePath: string): boolean {
+function assertArchiveSafe(archivePath: string, compressed = true): boolean {
   let verbose: string;
   let names: string;
   try {
     const opts = { encoding: "utf-8" as const, maxBuffer: MAX_ARCHIVE_BYTES };
-    verbose = execFileSync("tar", ["-tvzf", archivePath], opts);
-    names = execFileSync("tar", ["-tzf", archivePath], opts);
+    verbose = execFileSync("tar", [compressed ? "-tvzf" : "-tvf", archivePath], opts);
+    names = execFileSync("tar", [compressed ? "-tzf" : "-tf", archivePath], opts);
   } catch {
-    throw new ProvisionError("Artifact is not a readable tar.gz", "archive_rejected");
+    throw new ProvisionError(
+      compressed ? "Artifact is not a readable tar.gz" : "Git source is not a readable tar archive",
+      "archive_rejected",
+    );
   }
   const verboseEntries = verbose.split("\n").filter(Boolean);
   for (const line of verboseEntries) {
@@ -164,6 +176,318 @@ function assertArchiveSafe(archivePath: string): boolean {
     && members.every((entry) => entry.parts[0] === wrapper)
     && members.some((entry) => entry.parts.length > 1)
     && !members.some((entry) => entry.parts.length === 1 && !entry.isDirectory);
+}
+
+type InstallSkillItem =
+  | { name: string; url: string; sha256: string; git?: never }
+  | {
+      name: string;
+      git: GitProvisionSource;
+      resolvedGitRevision?: string;
+      url?: never;
+      sha256?: never;
+    };
+
+interface PreparedSource {
+  archivePath: string;
+  compressed: boolean;
+  stripWrapper: boolean;
+}
+
+const NULL_DEVICE = process.platform === "win32" ? "NUL" : "/dev/null";
+const GIT_CONFIG_ARGS = [
+  "-c", `core.hooksPath=${NULL_DEVICE}`,
+  "-c", "credential.helper=",
+  "-c", "protocol.allow=never",
+  "-c", "protocol.https.allow=always",
+  "-c", "protocol.http.allow=always",
+  "-c", "http.followRedirects=false",
+  "-c", "submodule.recurse=false",
+];
+
+function gitEnvironment(): NodeJS.ProcessEnv {
+  const inherited = Object.fromEntries(
+    Object.entries(process.env).filter(([key]) => !key.startsWith("GIT_")),
+  );
+  return {
+    ...inherited,
+    GIT_CONFIG_NOSYSTEM: "1",
+    GIT_CONFIG_GLOBAL: NULL_DEVICE,
+    GIT_TERMINAL_PROMPT: "0",
+    GIT_PROTOCOL_FROM_USER: "0",
+    GIT_LFS_SKIP_SMUDGE: "1",
+    GIT_NO_LAZY_FETCH: "1",
+  };
+}
+
+function gitError(err: unknown): ProvisionError {
+  return (err as NodeJS.ErrnoException).code === "ENOENT"
+    ? new ProvisionError("git is required to install a git source", "git_unavailable")
+    : new ProvisionError("Git source fetch or inspection failed", "git_fetch_failed");
+}
+
+async function runGit(args: string[], opts: { cwd?: string; maxBuffer?: number } = {}): Promise<string> {
+  try {
+    const result = await execFileAsync("git", [...GIT_CONFIG_ARGS, ...args], {
+      cwd: opts.cwd,
+      encoding: "utf8",
+      maxBuffer: opts.maxBuffer ?? MAX_GIT_METADATA_BYTES,
+      timeout: DOWNLOAD_TIMEOUT_MS,
+      env: gitEnvironment(),
+    });
+    return result.stdout;
+  } catch (err) {
+    throw gitError(err);
+  }
+}
+
+async function runGitArchive(args: string[], cwd: string): Promise<Buffer> {
+  try {
+    const result = await execFileAsync("git", [...GIT_CONFIG_ARGS, ...args], {
+      cwd,
+      encoding: null,
+      maxBuffer: MAX_DECOMPRESSED_BYTES,
+      timeout: DOWNLOAD_TIMEOUT_MS,
+      env: gitEnvironment(),
+    });
+    return Buffer.isBuffer(result.stdout) ? result.stdout : Buffer.from(result.stdout);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ERR_CHILD_PROCESS_STDIO_MAXBUFFER") {
+      throw new ProvisionError(
+	`Git source archive exceeds ${MAX_DECOMPRESSED_BYTES} bytes`,
+	"audit_failed",
+      );
+    }
+    throw gitError(err);
+  }
+}
+
+function directorySize(root: string): number {
+  let total = 0;
+  const visit = (entryPath: string): void => {
+    let stat;
+    try {
+      stat = lstatSync(entryPath);
+    } catch {
+      return;
+    }
+    if (!stat.isDirectory()) {
+      total += stat.size;
+      return;
+    }
+    let entries: string[];
+    try {
+      entries = readdirSync(entryPath);
+    } catch {
+      return;
+    }
+    for (const entry of entries) visit(path.join(entryPath, entry));
+  };
+  visit(root);
+  return total;
+}
+
+/**
+ * A remote may ignore partial-clone filters. Bound the incoming pack while git
+ * runs so content outside the selected path cannot consume unbounded disk.
+ */
+async function runBoundedGitFetch(args: string[], cwd: string): Promise<void> {
+  await new Promise<void>((resolve, reject) => {
+    const detached = process.platform !== "win32";
+    const child = spawn("git", [...GIT_CONFIG_ARGS, ...args], {
+      cwd,
+      detached,
+      env: gitEnvironment(),
+      stdio: "ignore",
+    });
+    let settled = false;
+    let exceeded = false;
+    let timedOut = false;
+
+    const terminate = (): void => {
+      if (child.pid === undefined) return;
+      try {
+	if (detached) process.kill(-child.pid, "SIGKILL");
+	else child.kill("SIGKILL");
+      } catch {
+	// The process may have exited between inspection and termination.
+      }
+    };
+    const finish = (err?: ProvisionError): void => {
+      if (settled) return;
+      settled = true;
+      clearInterval(sizeTimer);
+      clearTimeout(timeoutTimer);
+      if (err) reject(err);
+      else resolve();
+    };
+    const sizeTimer = setInterval(() => {
+      if (directorySize(cwd) <= MAX_GIT_FETCH_BYTES) return;
+      exceeded = true;
+      terminate();
+    }, 10);
+    const timeoutTimer = setTimeout(() => {
+      timedOut = true;
+      terminate();
+    }, DOWNLOAD_TIMEOUT_MS);
+
+    child.once("error", (err) => finish(gitError(err)));
+    child.once("close", (code) => {
+      if (exceeded || directorySize(cwd) > MAX_GIT_FETCH_BYTES) {
+	finish(new ProvisionError(
+	  `Git fetch exceeds ${MAX_GIT_FETCH_BYTES} bytes`,
+	  "audit_failed",
+	));
+	return;
+      }
+      if (timedOut || code !== 0) {
+	finish(new ProvisionError("Git source fetch or inspection failed", "git_fetch_failed"));
+	return;
+      }
+      finish();
+    });
+  });
+}
+
+function validateGitRepositoryUrl(url: string, checkUrl?: (url: string) => void): void {
+  checkUrl?.(url);
+  let parsed: URL;
+  try {
+    parsed = new URL(url);
+  } catch {
+    throw new ProvisionError("Git repository URL is invalid", "invalid_url");
+  }
+  // Public HTTPS only. Query strings commonly carry private credentials and
+  // would also be visible in the git argv. Loopback HTTP exists for tests.
+  const loopback = new Set(["localhost", "127.0.0.1", "::1", "[::1]"]);
+  if (parsed.username || parsed.password
+    || (parsed.protocol !== "https:"
+      && !(parsed.protocol === "http:" && loopback.has(parsed.hostname.toLowerCase())))) {
+    throw new ProvisionError("Git repository URL must use public HTTPS", "url_not_allowed");
+  }
+  if (parsed.search || parsed.hash) {
+    throw new ProvisionError("Git repository URLs cannot contain a query or fragment", "url_not_allowed");
+  }
+}
+
+/** Resolve a mutable branch to the commit that this sync will install. */
+export async function resolveGitRevision(
+  source: GitProvisionSource,
+  checkUrl?: (url: string) => void,
+): Promise<string> {
+  validateGitRepositoryUrl(source.url, checkUrl);
+  if (isGitObjectId(source.rev)) return source.rev.toLowerCase();
+
+  const fullRef = `refs/heads/${source.rev}`;
+  const output = await runGit(["ls-remote", "--refs", source.url, fullRef]);
+  const matches = output.trim().split("\n").filter(Boolean);
+  if (matches.length !== 1) {
+    throw new ProvisionError("Git branch did not resolve to one commit", "git_revision_not_found");
+  }
+  const [revision, advertisedRef, ...extra] = matches[0]!.split("\t");
+  if (!isGitObjectId(revision) || advertisedRef !== fullRef || extra.length > 0) {
+    throw new ProvisionError("Git branch returned an invalid revision", "git_revision_mismatch");
+  }
+  return revision.toLowerCase();
+}
+
+async function prepareGitSource(
+  source: GitProvisionSource,
+  resolvedRevision: string | undefined,
+  temporary: string,
+  checkUrl?: (url: string) => void,
+): Promise<PreparedSource> {
+  const revision = resolvedRevision ?? await resolveGitRevision(source, checkUrl);
+  if (!isGitObjectId(revision)) {
+    throw new ProvisionError("Resolved git revision must be a full commit SHA", "git_revision_mismatch");
+  }
+  // A pre-resolved revision came from the sync engine; still enforce URL policy
+  // here so direct installer callers cannot bypass it.
+  if (resolvedRevision !== undefined) validateGitRepositoryUrl(source.url, checkUrl);
+
+  const repository = path.join(temporary, "repository.git");
+  await runGit([
+    "init",
+    "--bare",
+    ...(revision.length === 64 ? ["--object-format=sha256"] : []),
+    repository,
+  ]);
+  await runBoundedGitFetch([
+    "fetch",
+    "--depth=1",
+    "--filter=blob:limit=1048577",
+    "--no-tags",
+    source.url,
+    revision,
+  ], repository);
+
+  const fetched = (await runGit(["rev-parse", "FETCH_HEAD"], { cwd: repository })).trim().toLowerCase();
+  const objectType = (await runGit(["cat-file", "-t", revision], { cwd: repository })).trim();
+  if (fetched !== revision.toLowerCase() || objectType !== "commit") {
+    throw new ProvisionError("Git source did not resolve to the expected commit", "git_revision_mismatch");
+  }
+
+  const treeish = source.path ? `${revision}:${source.path}` : revision;
+  if (source.path
+    && (await runGit(["cat-file", "-t", treeish], { cwd: repository })).trim() !== "tree") {
+    throw new ProvisionError("Git source path is not a directory", "git_path_not_found");
+  }
+  const tree = await runGit(["ls-tree", "-r", treeish], {
+    cwd: repository,
+    maxBuffer: MAX_GIT_METADATA_BYTES,
+  });
+  if (tree.split("\n").some((entry) => entry.startsWith("160000 commit "))) {
+    throw new ProvisionError("Git source contains a submodule", "git_source_rejected");
+  }
+  const missing = await runGit([
+    "rev-list",
+    "--objects",
+    "--missing=print",
+    revision,
+    ...(source.path ? ["--", source.path] : []),
+  ], {
+    cwd: repository,
+    maxBuffer: MAX_GIT_METADATA_BYTES,
+  });
+  if (missing.split("\n").some((entry) => entry.startsWith("?"))) {
+    throw new ProvisionError(
+      `Git source contains a file exceeding ${MAX_FILE_BYTES} bytes`,
+      "audit_failed",
+    );
+  }
+
+  const archivePath = path.join(temporary, "git-source.tar");
+  const archive = await runGitArchive(["archive", "--format=tar", treeish], repository);
+  writeFileSync(archivePath, archive);
+  assertArchiveSafe(archivePath, false);
+  return { archivePath, compressed: false, stripWrapper: false };
+}
+
+async function prepareSource(
+  item: InstallSkillItem,
+  temporary: string,
+  checkUrl?: (url: string) => void,
+): Promise<PreparedSource> {
+  if (item.git) {
+    return prepareGitSource(item.git, item.resolvedGitRevision, temporary, checkUrl);
+  }
+
+  const buf = await download(item.url, checkUrl);
+  const digest = createHash("sha256").update(buf).digest("hex");
+  if (digest !== item.sha256.toLowerCase()) {
+    throw new ProvisionError(
+      `sha256 mismatch for "${item.name}": manifest pinned ${item.sha256}, artifact is ${digest}`,
+      "sha256_mismatch",
+    );
+  }
+  assertDecompressionBounded(buf);
+  const archivePath = path.join(temporary, "artifact.tgz");
+  writeFileSync(archivePath, buf);
+  return {
+    archivePath,
+    compressed: true,
+    stripWrapper: assertArchiveSafe(archivePath),
+  };
 }
 
 /** Walk the extracted tree, enforcing the audit, returning relative file paths. */
@@ -243,7 +567,7 @@ function normalizeExtractedModes(root: string): void {
 }
 
 export async function installSkill(
-  item: { name: string; url: string; sha256: string },
+  item: InstallSkillItem,
   opts: {
     skillsDir: string;
     checkUrl?: (url: string) => void;
@@ -287,18 +611,21 @@ export async function installSkill(
   if (!NAME_PATTERN.test(item.name)) {
     throw new ProvisionError(`Invalid skill name "${item.name}"`, "invalid_item");
   }
-  const buf = await download(item.url, opts.checkUrl);
-  const digest = createHash("sha256").update(buf).digest("hex");
-  if (digest !== item.sha256.toLowerCase()) {
-    throw new ProvisionError(
-      `sha256 mismatch for "${item.name}": manifest pinned ${item.sha256}, artifact is ${digest}`,
-      "sha256_mismatch",
-    );
+  const archiveDir = mkdtempSync(path.join(tmpdir(), "provision-source-"));
+  let prepared: PreparedSource;
+  try {
+    prepared = await prepareSource(item, archiveDir, opts.checkUrl);
+  } catch (err) {
+    rmSync(archiveDir, { recursive: true, force: true });
+    throw err;
   }
-  assertDecompressionBounded(buf);
-  opts.beforeMutation?.();
+  try {
+    opts.beforeMutation?.();
+  } catch (err) {
+    rmSync(archiveDir, { recursive: true, force: true });
+    throw err;
+  }
 
-  const archiveDir = mkdtempSync(path.join(tmpdir(), "provision-archive-"));
   // Staging lives INSIDE skillsDir so the final rename is same-filesystem (atomic),
   // and dot-prefixed so skill loaders scanning the directory skip it.
   mkdirSync(opts.skillsDir, { recursive: true });
@@ -331,17 +658,13 @@ export async function installSkill(
   let candidateExposed = false;
   let rejectedCandidateIsolated = false;
   try {
-    const archivePath = path.join(archiveDir, "artifact.tgz");
-    writeFileSync(archivePath, buf);
-    const stripWrapper = assertArchiveSafe(archivePath);
-
     try {
       execFileSync("tar", [
-	"-xzf",
-	archivePath,
+	prepared.compressed ? "-xzf" : "-xf",
+	prepared.archivePath,
 	"-C",
 	candidate,
-	...(stripWrapper ? ["--strip-components=1"] : []),
+	...(prepared.stripWrapper ? ["--strip-components=1"] : []),
       ]);
     } catch {
       throw new ProvisionError("Extraction failed", "archive_rejected");

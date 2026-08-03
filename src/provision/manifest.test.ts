@@ -43,6 +43,69 @@ describe("provision manifest", () => {
     assert.equal(manifest.items[0]!.name, "pr-monitor");
   });
 
+  test("a git source accepts a pinned commit or branch and optional repository subpath", () => {
+    const raw = valid() as unknown as Record<string, unknown>;
+    raw.items = [{
+      type: "skill",
+      name: "pr-monitor",
+      git: {
+	url: "https://github.com/example/skills.git",
+	rev: "A".repeat(40),
+	path: "skills/pr-monitor",
+      },
+    }];
+    assert.deepEqual(parseManifest(raw).items[0]!.git, {
+      url: "https://github.com/example/skills.git",
+      rev: "a".repeat(40),
+      path: "skills/pr-monitor",
+    });
+    (raw.items as Array<Record<string, unknown>>)[0]!.git = {
+      url: "https://github.com/example/skills.git",
+      rev: "release/v2",
+      path: "skills/pr-monitor",
+    };
+    assert.equal(parseManifest(raw).items[0]!.git?.rev, "release/v2");
+  });
+
+  test("a GitHub tree URL supplies the repository, branch, and subpath", () => {
+    const raw = valid() as unknown as Record<string, unknown>;
+    raw.items = [{
+      type: "skill",
+      name: "collavre",
+      git: { url: "https://github.com/sh1nj1/plan42/tree/main/skills/collavre" },
+    }];
+    assert.deepEqual(parseManifest(raw).items[0]!.git, {
+      url: "https://github.com/sh1nj1/plan42.git",
+      rev: "main",
+      path: "skills/collavre",
+    });
+  });
+
+  test("a GitHub tree URL cannot conflict with explicit revision fields", () => {
+    for (const extra of [{ rev: "main" }, { path: "skills/other" }]) {
+      const raw = valid() as unknown as Record<string, unknown>;
+      raw.items = [{
+	type: "skill",
+	name: "collavre",
+	git: {
+	  url: "https://github.com/sh1nj1/plan42/tree/main/skills/collavre",
+	  ...extra,
+	},
+      }];
+      assert.equal(codeOf(() => parseManifest(raw)), "invalid_item");
+    }
+  });
+
+  test("a git source may provision the repository root", () => {
+    const raw = valid() as unknown as Record<string, unknown>;
+    raw.items = [{
+      type: "skill",
+      name: "root-skill",
+      git: { url: "https://github.com/example/skill.git", rev: "b".repeat(40) },
+    }];
+    assert.equal(parseManifest(raw).items[0]!.git?.path, undefined);
+  });
+
   test("a manifest with another schema id is refused", () => {
     assert.equal(codeOf(() => parseManifest({ ...valid(), schema: "something/v2" })), "invalid_manifest");
   });
@@ -73,6 +136,51 @@ describe("provision manifest", () => {
       const manifest = valid();
       delete (manifest.items[0] as Record<string, unknown>)[field];
       assert.equal(codeOf(() => parseManifest(manifest)), "invalid_item", `missing ${field}`);
+    }
+  });
+
+  test("archive and git sources are mutually exclusive", () => {
+    const manifest = valid();
+    (manifest.items[0] as Record<string, unknown>).git = {
+      url: "https://github.com/example/skills.git",
+      rev: "a".repeat(40),
+    };
+    assert.equal(codeOf(() => parseManifest(manifest)), "invalid_item");
+  });
+
+  test("git refs must be full commit SHAs or safe branch names", () => {
+    for (const rev of [
+      "-main",
+      "refs//heads/main",
+      "feature..x",
+      "topic@{1}",
+      "bad ref",
+      "foo\\bar",
+      "a".repeat(256),
+    ]) {
+      const raw = valid() as unknown as Record<string, unknown>;
+      raw.items = [{
+	type: "skill",
+	name: "pr-monitor",
+	git: { url: "https://github.com/example/skills.git", rev },
+      }];
+      assert.equal(codeOf(() => parseManifest(raw)), "invalid_item", `rev=${rev}`);
+    }
+  });
+
+  test("git paths must be canonical repository-relative directories", () => {
+    for (const gitPath of ["", ".", "..", "/skill", "skill/", "skills//demo", "skills\\demo", "skills\ndemo"]) {
+      const raw = valid() as unknown as Record<string, unknown>;
+      raw.items = [{
+	type: "skill",
+	name: "pr-monitor",
+	git: {
+	  url: "https://github.com/example/skills.git",
+	  rev: "a".repeat(40),
+	  path: gitPath,
+	},
+      }];
+      assert.equal(codeOf(() => parseManifest(raw)), "invalid_item", `path=${JSON.stringify(gitPath)}`);
     }
   });
 

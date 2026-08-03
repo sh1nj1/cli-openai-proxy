@@ -58,6 +58,12 @@ describe("provision state", () => {
       installed: {
         "skill/pr-monitor": {
           sha256: "a".repeat(64),
+	  source: {
+	    type: "git" as const,
+	    ref: "main",
+	    rev: "b".repeat(40),
+	    path: "skills/pr-monitor",
+	  },
           files: ["SKILL.md"],
 	  directories: ["examples", "examples/empty"],
           installedAt: "2026-08-02T00:00:00.000Z",
@@ -67,6 +73,30 @@ describe("provision state", () => {
     };
     saveState(state);
     assert.deepEqual(loadState(), state);
+  });
+
+  test("a pre-branch git source treats its pinned revision as both ref and commit", () => {
+    mkdirSync(path.dirname(stateFilePath()), { recursive: true });
+    writeFileSync(stateFilePath(), JSON.stringify({
+      version: 1,
+      approved: ["skill/demo"],
+      revoked: [],
+      installed: {
+	"skill/demo": {
+	  sha256: "a".repeat(64),
+	  source: { type: "git", rev: "b".repeat(40), path: "skills/demo" },
+	  files: ["SKILL.md"],
+	  installedAt: "2026-08-02T00:00:00.000Z",
+	},
+      },
+    }));
+
+    assert.deepEqual(loadState().installed["skill/demo"]?.source, {
+      type: "git",
+      ref: "b".repeat(40),
+      rev: "b".repeat(40),
+      path: "skills/demo",
+    });
   });
 
   test("legacy consent keys are canonicalized while installed path spelling is retained", () => {
