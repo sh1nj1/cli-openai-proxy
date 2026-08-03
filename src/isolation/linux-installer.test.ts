@@ -352,6 +352,54 @@ test("Multi-user install builds as an unprivileged account before promotion", as
   assert.ok(validate >= 0 && validate < promote);
 });
 
+test("Multi-user releases are readable by service accounts after a private build", () => {
+  const scriptPath = fileURLToPath(
+    new URL("../../scripts/install-linux-user-workers.sh", import.meta.url),
+  );
+  execFileSync("bash", ["-c", `
+    set -e
+    source "$1"
+    scratch="$(mktemp -d)"
+    trap 'rm -rf -- "$scratch"' EXIT
+    release="$scratch/release"
+    outside="$scratch/outside"
+    mkdir -m 0700 -p "$release/dist/server" "$release/node_modules/example/bin"
+    printf 'server\n' > "$release/dist/server/standalone.js"
+    printf '#!/bin/sh\n' > "$release/node_modules/example/bin/tool"
+    printf 'outside\n' > "$outside"
+    chmod 0600 "$release/dist/server/standalone.js" "$outside"
+    chmod 0700 "$release/node_modules/example/bin/tool"
+    ln -s "$outside" "$release/node_modules/example/outside"
+    mode() {
+      if [[ "$(uname -s)" == Darwin ]]; then
+	stat -f %Lp "$1"
+      else
+	stat -c %a "$1"
+      fi
+    }
+
+    normalize_release_permissions "$release"
+
+    [[ "$(mode "$release/dist/server")" == 755 ]]
+    [[ "$(mode "$release/dist/server/standalone.js")" == 644 ]]
+    [[ "$(mode "$release/node_modules/example/bin/tool")" == 755 ]]
+    [[ "$(mode "$outside")" == 600 ]]
+  `, "bash", scriptPath], { stdio: "pipe" });
+});
+
+test("Multi-user release promotion rejects special files", () => {
+  const scriptPath = fileURLToPath(
+    new URL("../../scripts/install-linux-user-workers.sh", import.meta.url),
+  );
+  assert.throws(() => execFileSync("bash", ["-c", `
+    source "$1"
+    scratch="$(mktemp -d)"
+    trap 'rm -rf -- "$scratch"' EXIT
+    mkfifo "$scratch/untrusted-fifo"
+    normalize_release_permissions "$scratch"
+  `, "bash", scriptPath], { stdio: "pipe" }));
+});
+
 test("Multi-user install isolates and retires an invocation-scoped build account", () => {
   const scriptPath = fileURLToPath(
     new URL("../../scripts/install-linux-user-workers.sh", import.meta.url),

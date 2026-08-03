@@ -283,6 +283,27 @@ validate_build() {
     || die "Development dependencies remain in the production build"
 }
 
+normalize_release_permissions() {
+  local root="$1"
+  local entry
+
+  while IFS= read -r -d '' entry; do
+    if [[ -L "$entry" ]]; then
+      continue
+    elif [[ -d "$entry" ]]; then
+      chmod 0755 "$entry"
+    elif [[ -f "$entry" ]]; then
+      if [[ -x "$entry" ]]; then
+	chmod 0755 "$entry"
+      else
+	chmod 0644 "$entry"
+      fi
+    else
+      die "Refusing a non-file release entry: $entry"
+    fi
+  done < <(find "$root" -xdev -print0)
+}
+
 promote_release() {
   local link target
 
@@ -296,7 +317,9 @@ promote_release() {
   cp -a -- "$BUILD_ROOT/dist" "$BUILD_ROOT/node_modules" "$BUILD_ROOT/package.json" \
     "$RELEASE_STAGING/"
   chown -R root:root "$RELEASE_STAGING"
-  chmod -R go-w "$RELEASE_STAGING"
+  # Build output is created under umask 077. Root can validate those files, but
+  # service accounts need read access and directory traversal after promotion.
+  normalize_release_permissions "$RELEASE_STAGING"
 
   while IFS= read -r -d '' link; do
     target="$(readlink -f -- "$link" 2>/dev/null)" \
