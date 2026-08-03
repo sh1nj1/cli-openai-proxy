@@ -52,7 +52,7 @@ RUN rm -rf node_modules && npm ci --omit=dev
 FROM base AS runtime
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      systemd systemd-sysv dbus passwd \
+      systemd systemd-sysv dbus passwd git \
     && rm -rf /var/lib/apt/lists/*
 
 # Optional system-wide real CLIs for production, e.g.

@@ -24,6 +24,11 @@ The routes are gated by the same `AUTH_ADMIN_KEYS` as the auth provisioning
 API: installing prompt-loaded instructions is at least as sensitive as mutating
 credentials, and a completion key is not accepted.
 
+Git-backed items require a `git` executable on the service's `PATH`. The
+official Docker image includes it. Bare-metal hosts that use only `.tar.gz`
+sources do not need git; install the operating system's git package before
+enabling a manifest that contains `git` sources.
+
 | Env | Meaning |
 | --- | --- |
 | `PROVISION_SYNC` | `1` to enable. Unset = feature off (fail-closed). |
