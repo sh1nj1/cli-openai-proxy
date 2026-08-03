@@ -67,16 +67,7 @@ export function loadOrCreateLocalManifestKey(): string {
   // Another process won creation; its valid file is the source of truth.
   const winner = readFileSync(file, "utf8").trim();
   if (/^[A-Za-z0-9_-]{43}$/.test(winner)) return winner;
-  // Preserve self-healing for a corrupt key. Worker processes are single-instance
-  // per state dir, so recovery is not expected to contend.
-  const replacement = `${file}.replacement-${process.pid}-${randomUUID()}`;
-  try {
-    writeFileSync(replacement, `${key}\n`, { encoding: "utf8", mode: 0o600, flag: "wx" });
-    renameSync(replacement, file);
-    return key;
-  } finally {
-    rmSync(replacement, { force: true });
-  }
+  throw new Error(`Invalid local manifest key: ${file}`);
 }
 
 const MAX_REGISTERED_MANIFEST_BYTES = 16 * 1024;

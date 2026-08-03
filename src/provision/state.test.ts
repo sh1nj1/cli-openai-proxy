@@ -203,13 +203,11 @@ describe("provision state", () => {
     if (process.platform !== "win32") assert.equal(mode, 0o600);
   });
 
-  test("loadOrCreateLocalManifestKey atomically replaces an existing malformed key", () => {
+  test("loadOrCreateLocalManifestKey never replaces an existing malformed key", () => {
     const file = path.join(dir, "manifest.key");
     writeFileSync(file, "malformed\n", { mode: 0o600 });
-    const recovered = loadOrCreateLocalManifestKey();
-    assert.match(recovered, /^[A-Za-z0-9_-]{43}$/);
-    assert.equal(readFileSync(file, "utf8"), `${recovered}\n`);
-    assert.equal(loadOrCreateLocalManifestKey(), recovered);
+    assert.throws(() => loadOrCreateLocalManifestKey(), /Invalid local manifest key/);
+    assert.equal(readFileSync(file, "utf8"), "malformed\n");
   });
 
   test("manifest URL round-trips with the local key", () => {
