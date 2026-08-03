@@ -114,6 +114,17 @@ linux_node_runtime_validate_install_directory() {
   fi
 }
 
+linux_node_runtime_make_install_directory_traversable() {
+  local directory="$1"
+
+  [[ -d "$directory" && ! -L "$directory" ]] || {
+    linux_node_runtime_error "Managed Node.js path is not a regular directory: $directory"
+    return 1
+  }
+  linux_node_runtime_validate_install_directory "$directory" || return 1
+  linux_node_runtime_as_root "$LINUX_NODE_RUNTIME_CHMOD_BIN" 0755 "$directory"
+}
+
 linux_node_runtime_prepare_install_root() {
   local install_parent
 
@@ -318,7 +329,7 @@ linux_node_runtime_install() {
 
   final_dir="$LINUX_NODE_RUNTIME_INSTALL_ROOT/v${version}"
   staging_dir="$LINUX_NODE_RUNTIME_INSTALL_ROOT/.v${version}.install.$$"
-  if [[ ! -e "$final_dir" ]]; then
+  if [[ ! -e "$final_dir" && ! -L "$final_dir" ]]; then
     staging_error=""
     if ! linux_node_runtime_as_root "$LINUX_NODE_RUNTIME_INSTALL_BIN" -d -o root -g root -m 0755 \
       "$staging_dir"; then
@@ -330,6 +341,8 @@ linux_node_runtime_install() {
       staging_error="set Node.js staging ownership"
     elif ! linux_node_runtime_as_root "$LINUX_NODE_RUNTIME_CHMOD_BIN" -R go-w "$staging_dir"; then
       staging_error="remove write access from the Node.js staging tree"
+    elif ! linux_node_runtime_make_install_directory_traversable "$staging_dir"; then
+      staging_error="make the Node.js staging directory traversable"
     elif ! linux_node_runtime_as_root "$LINUX_NODE_RUNTIME_MV_BIN" "$staging_dir" "$final_dir"; then
       staging_error="publish the Node.js runtime"
     fi
@@ -339,6 +352,10 @@ linux_node_runtime_install() {
       "$rm_bin" -rf -- "$temp_dir"
       return 1
     fi
+  elif ! linux_node_runtime_make_install_directory_traversable "$final_dir"; then
+    linux_node_runtime_error "Failed to make the existing Node.js runtime traversable"
+    "$rm_bin" -rf -- "$temp_dir"
+    return 1
   fi
   "$rm_bin" -rf -- "$temp_dir"
 
