@@ -34,6 +34,7 @@ import { resetSessions } from "../auth/session-manager.js";
 import { handleAuthorizedSession, initProvisioning, shutdownProvisioning } from "../provision/sync.js";
 import { initRequestIdentity, requireRequestIdentity } from "../isolation/request-identity.js";
 import type { UserWorkerProxy } from "../isolation/worker-proxy.js";
+import { AUTH_UI_PATH, handleAuthUi } from "./auth-ui.js";
 
 export interface ServerConfig {
   port?: number;
@@ -76,12 +77,14 @@ export function createApp(config: AppConfig = {}): Express {
   const userWorkerProxy = config.userWorkerProxy;
   let onAuthorizedProvisioningUrl: AppConfig["onAuthorizedProvisioningUrl"];
   app.locals.cliProxyRole = role;
+  app.locals.authUiEnabled = false;
 
   if (role === "gateway") {
     // Identity mappings must initialize first: mapped user keys are also valid
     // completion keys, and initAuth captures that combined set.
     const { identity: identityStatus, auth: authStatus, admin: adminStatus } =
       initializeGatewaySecurity(userWorkerProxy !== undefined);
+    app.locals.authUiEnabled = adminStatus.enabled;
     if (authStatus.enabled) {
       console.log(`[Server] API key auth enabled (${authStatus.keyCount} key(s))`);
     }
@@ -195,13 +198,14 @@ export function createApp(config: AppConfig = {}): Express {
     if (!userWorkerProxy) return [handler];
     return [
       (req, res) => {
-	void userWorkerProxy.forward(req, res, onAuthorizedProvisioningUrl);
+	void userWorkerProxy.forward(req, res, onAuthorizedProvisioningUrl, app.locals.authUiEnabled === true);
       },
     ];
   };
 
   // Routes
   app.get("/health", handleHealth);
+  if (role === "gateway") app.get(AUTH_UI_PATH, handleAuthUi);
   app.get("/v1/models", handleModels);
   app.post("/v1/chat/completions", ...scoped(handleChatCompletions));
   app.get("/v1/usage", ...scoped(handleUsage));

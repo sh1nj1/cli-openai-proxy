@@ -38,6 +38,10 @@ export const AUTH_PROVISIONING_PREFIX = "/v1/auth";
 
 let adminKeys: Set<string> | null = null;
 
+export function authAdminEnabled(): boolean {
+  return adminKeys !== null;
+}
+
 export function initAuthAdmin(): { enabled: boolean; keyCount: number } {
   // Taken, not read. This is the higher-privilege key; a completion caller who can
   // make the model print its environment must not find it there (takeProxySecret).

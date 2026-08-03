@@ -19,6 +19,7 @@ import { WorkerIsolationError } from "./types.js";
 import { UserWorkerProxy } from "./worker-proxy.js";
 import {
   AUTHORIZED_PROVISIONING_HEADER,
+  AUTH_UI_AVAILABLE_HEADER,
   PROVISIONING_GENERATION_HEADER,
   PROVISIONING_SESSION_TTL_HEADER,
   SUPERSEDED_PROVISIONING_GENERATION_HEADER,
@@ -181,6 +182,7 @@ test("gateway provisions by authenticated identity and strips private headers", 
         authorization: "Bearer user-key-12345678",
         "content-type": "application/json",
         "x-cli-proxy-user-id": "attacker-controlled",
+	[AUTH_UI_AVAILABLE_HEADER]: "attacker-controlled",
       },
       body: JSON.stringify({ user: "also-untrusted", messages: [{ role: "user", content: "hi" }] }),
     });
@@ -189,6 +191,7 @@ test("gateway provisions by authenticated identity and strips private headers", 
     assert.deepEqual(identities, [{ tenantId: "tenant-a", userId: "user-a" }]);
     assert.equal(seenHeaders.authorization, undefined);
     assert.equal(seenHeaders["x-cli-proxy-user-id"], undefined);
+    assert.equal(seenHeaders[AUTH_UI_AVAILABLE_HEADER], "1", "gateway replaces a spoofed UI signal");
     assert.match(seenBody, /"user":"also-untrusted"/, "OpenAI user remains data, never authority");
 
     const authResponse = await fetch(`http://127.0.0.1:${port}/v1/auth/engines`, {

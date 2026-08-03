@@ -84,6 +84,7 @@ async function main(): Promise<void> {
     console.log(`  GET  ${baseUrl}/v1/usage`);
     console.log(`  GET  ${baseUrl}/v1/usage/recent`);
     console.log(`  GET  ${baseUrl}/health`);
+    if (security.admin.enabled) console.log(`  GET  ${baseUrl}/auth`);
 
     console.log("\n[Test]");
     console.log(`  curl -s ${baseUrl}/health | jq .`);

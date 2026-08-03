@@ -11,6 +11,7 @@
 import type { Request, Response, NextFunction } from "express";
 import { takeProxySecret } from "../config.js";
 import { AUTH_PROVISIONING_PREFIX } from "./auth-routes.js";
+import { AUTH_UI_PATH } from "./auth-ui.js";
 import { PROVISION_PREFIX } from "./provision-routes.js";
 import { mappedCompletionKeys } from "../isolation/request-identity.js";
 
@@ -52,8 +53,9 @@ export function authMiddleware(req: Request, res: Response, next: NextFunction):
     return;
   }
 
-  // Skip auth for health check
-  if (req.path === "/health") {
+  // The auth UI accepts the separate admin key inside the page and must be
+  // loadable before the browser can attach that key to provisioning requests.
+  if (req.path === "/health" || req.path === AUTH_UI_PATH) {
     next();
     return;
   }

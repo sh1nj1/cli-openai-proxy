@@ -45,7 +45,7 @@ function response(status, payload) {
   return { status, ok: status >= 200 && status < 300, json: async () => payload };
 }
 
-function loadPage(fetch) {
+function loadPage(fetch, location = { protocol: "file:", origin: "null", search: "" }) {
   assert.ok(script, "inline test-page script exists");
   const elements = Object.fromEntries(elementIds.map((id) => [id, new FakeElement()]));
   elements.baseUrl.value = "http://localhost:3456";
@@ -57,10 +57,32 @@ function loadPage(fetch) {
     },
     fetch,
     Option: FakeOption,
+    URLSearchParams,
+    window: { location },
     JSON,
   });
   return elements;
 }
+
+test("served page uses its own origin and preselects only a returned engine", async () => {
+  const elements = loadPage(async () => enginesResponse(), {
+    protocol: "https:", origin: "https://proxy.example", search: "?engine=codex",
+  });
+
+  assert.equal(elements.baseUrl.value, "https://proxy.example");
+  await elements.loadEngines.onclick();
+  assert.equal(elements.engine.value, "codex");
+});
+
+test("unknown engine query is never reflected into the selector", async () => {
+  const elements = loadPage(async () => enginesResponse(), {
+    protocol: "https:", origin: "https://proxy.example", search: "?engine=%3Cscript%3E",
+  });
+
+  await elements.loadEngines.onclick();
+  assert.equal(elements.engine.value, "claude");
+  assert.equal(elements.engine.children.some(({ value }) => value === "<script>"), false);
+});
 
 const enginesResponse = () => response(200, { object: "list", data: engineDescriptors });
 const sessionResponse = (id, userCode) => response(201, {
