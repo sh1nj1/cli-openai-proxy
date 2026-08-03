@@ -68,6 +68,82 @@ test("Node runtime preparation reuses an installer-managed runtime", () => {
   assert.match(selected, /\/v22\.13\.0\/bin\/node\n.*\/v22\.13\.0\/bin\/npm\n$/s);
 });
 
+test("Root-trusted Node runtimes must be usable by unprivileged accounts", () => {
+  const runtimePath = fileURLToPath(
+    new URL("../../scripts/linux-node-runtime.sh", import.meta.url),
+  );
+  execFileSync("bash", ["-c", `
+    set -e
+    source "$1"
+    scratch="$(mktemp -d)"
+    trap 'rm -rf -- "$scratch"' EXIT
+    runtime_root="$scratch/private/v22.13.0"
+    mkdir -p "$runtime_root/bin"
+    private_root="$(readlink -f -- "$scratch/private")"
+    printf '#!/usr/bin/env bash\\nexit 0\\n' > "$runtime_root/bin/node"
+    chmod 0755 "$runtime_root/bin/node"
+
+    LINUX_NODE_RUNTIME_READLINK_BIN="$(command -v readlink)"
+    LINUX_NODE_RUNTIME_DIRNAME_BIN="$(command -v dirname)"
+    fake_stat() {
+      case "\${*: -1}" in
+	"$private_root") printf '0 700\\n' ;;
+	*) printf '0 755\\n' ;;
+      esac
+    }
+    LINUX_NODE_RUNTIME_STAT_BIN=fake_stat
+
+    if linux_node_runtime_path_is_trusted "$runtime_root/bin/node" root; then
+      exit 9
+    fi
+    fake_stat() { printf '0 755\\n'; }
+    linux_node_runtime_path_is_trusted "$runtime_root/bin/node" root
+  `, "bash", runtimePath], { stdio: "pipe" });
+});
+
+test("Managed Node runtime parents are made traversable without trusting writable paths", () => {
+  const runtimePath = fileURLToPath(
+    new URL("../../scripts/linux-node-runtime.sh", import.meta.url),
+  );
+  execFileSync("bash", ["-c", `
+    set -e
+    source "$1"
+    scratch="$(mktemp -d)"
+    trap 'rm -rf -- "$scratch"' EXIT
+    install_parent="$scratch/managed"
+    LINUX_NODE_RUNTIME_INSTALL_ROOT="$install_parent/node"
+    mkdir -p "$LINUX_NODE_RUNTIME_INSTALL_ROOT"
+    LINUX_NODE_RUNTIME_DIRNAME_BIN="$(command -v dirname)"
+    LINUX_NODE_RUNTIME_INSTALL_BIN=fake_install
+    parent_mode=700
+    install_called=0
+    fake_stat() {
+      case "\${*: -1}" in
+	"$install_parent") printf '0 %s\\n' "$parent_mode" ;;
+	*) printf '0 755\\n' ;;
+      esac
+    }
+    fake_install() {
+      [[ "$1" == -d && "$2" == -o && "$3" == root
+	&& "$4" == -g && "$5" == root && "$6" == -m && "$7" == 0755
+	&& "$8" == "$install_parent" && "$9" == "$LINUX_NODE_RUNTIME_INSTALL_ROOT" ]]
+      install_called=1
+    }
+    linux_node_runtime_as_root() { "$@"; }
+    LINUX_NODE_RUNTIME_STAT_BIN=fake_stat
+
+    linux_node_runtime_prepare_install_root
+    [[ "$install_called" == 1 ]]
+
+    parent_mode=770
+    install_called=0
+    if linux_node_runtime_prepare_install_root; then
+      exit 9
+    fi
+    [[ "$install_called" == 0 ]]
+  `, "bash", runtimePath], { stdio: "pipe" });
+});
+
 test("Node runtime installation never promotes failed extraction or staging", () => {
   const runtimePath = fileURLToPath(
     new URL("../../scripts/linux-node-runtime.sh", import.meta.url),
@@ -94,6 +170,7 @@ test("Node runtime installation never promotes failed extraction or staging", ()
     LINUX_NODE_RUNTIME_READLINK_BIN="$(command -v readlink)"
 
     linux_node_runtime_ensure_download_tools() { return 0; }
+    linux_node_runtime_prepare_install_root() { return 0; }
     linux_node_runtime_command() {
       case "$1" in
       tar) printf '%s\\n' "$scratch/tar" ;;

@@ -79,6 +79,11 @@ linux_node_runtime_path_is_trusted() {
     (( (8#$mode & 8#022) == 0 )) || return 1
     if [[ "$trust_mode" == "root" ]]; then
       [[ "$owner" == "0" ]] || return 1
+      if [[ "$current" == "$resolved" ]]; then
+	(( (8#$mode & 8#005) == 8#005 )) || return 1
+      else
+	(( (8#$mode & 8#001) == 8#001 )) || return 1
+      fi
     else
       [[ "$owner" == "0" || "$owner" == "$EUID" ]] || return 1
     fi
@@ -87,6 +92,31 @@ linux_node_runtime_path_is_trusted() {
     [[ "$parent" != "$current" ]] || break
     current="$parent"
   done
+}
+
+linux_node_runtime_prepare_install_root() {
+  local install_parent directory metadata owner mode
+
+  install_parent="$($LINUX_NODE_RUNTIME_DIRNAME_BIN -- "$LINUX_NODE_RUNTIME_INSTALL_ROOT")"
+  for directory in "$install_parent" "$LINUX_NODE_RUNTIME_INSTALL_ROOT"; do
+    if [[ -e "$directory" || -L "$directory" ]]; then
+      [[ -d "$directory" && ! -L "$directory" ]] || {
+	linux_node_runtime_error "Managed Node.js path is not a regular directory: $directory"
+	return 1
+      }
+      metadata="$(LC_ALL=C "$LINUX_NODE_RUNTIME_STAT_BIN" -Lc '%u %a' -- "$directory" 2>/dev/null)" \
+	|| return 1
+      read -r owner mode <<<"$metadata"
+      [[ "$owner" == "0" && "$mode" =~ ^[0-7]+$ ]] \
+	&& (( (8#$mode & 8#022) == 0 )) || {
+	linux_node_runtime_error "Managed Node.js path has untrusted ownership or permissions: $directory"
+	return 1
+      }
+    fi
+  done
+
+  linux_node_runtime_as_root "$LINUX_NODE_RUNTIME_INSTALL_BIN" -d -o root -g root -m 0755 \
+    "$install_parent" "$LINUX_NODE_RUNTIME_INSTALL_ROOT"
 }
 
 linux_node_runtime_find_npm() {
@@ -205,6 +235,7 @@ linux_node_runtime_install() {
   local extract_dir final_dir staging_dir staging_error
   local sha_bin tar_bin mktemp_bin rm_bin
 
+  linux_node_runtime_prepare_install_root || return 1
   linux_node_runtime_ensure_download_tools || return 1
 
   case "$("$LINUX_NODE_RUNTIME_UNAME_BIN" -m)" in
@@ -279,7 +310,7 @@ linux_node_runtime_install() {
   if [[ ! -e "$final_dir" ]]; then
     staging_error=""
     if ! linux_node_runtime_as_root "$LINUX_NODE_RUNTIME_INSTALL_BIN" -d -o root -g root -m 0755 \
-      "$LINUX_NODE_RUNTIME_INSTALL_ROOT" "$staging_dir"; then
+      "$staging_dir"; then
       staging_error="create the Node.js staging directory"
     elif ! linux_node_runtime_as_root "$LINUX_NODE_RUNTIME_CP_BIN" -a \
       "$extract_dir/." "$staging_dir/"; then
@@ -341,6 +372,13 @@ linux_node_runtime_prepare() {
   if linux_node_runtime_find_existing "$minimum" "$trust_mode"; then
     linux_node_runtime_log "Using trusted Node.js $($LINUX_NODE_BIN --version): $LINUX_NODE_BIN"
     return 0
+  fi
+  if [[ -e "$LINUX_NODE_RUNTIME_INSTALL_ROOT" || -L "$LINUX_NODE_RUNTIME_INSTALL_ROOT" ]]; then
+    linux_node_runtime_prepare_install_root || return 1
+    if linux_node_runtime_find_existing "$minimum" "$trust_mode"; then
+      linux_node_runtime_log "Using trusted Node.js $($LINUX_NODE_BIN --version): $LINUX_NODE_BIN"
+      return 0
+    fi
   fi
   linux_node_runtime_install "$minimum" || return 1
   linux_node_runtime_log "Installed trusted Node.js $($LINUX_NODE_BIN --version): $LINUX_NODE_BIN"
