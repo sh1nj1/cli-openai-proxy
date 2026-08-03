@@ -32,6 +32,36 @@ export function registeredManifestFilePath(): string {
   return path.join(provisionStateDir(), "provision.manifest.json");
 }
 
+export function localManifestKeyFilePath(): string {
+  return path.join(provisionStateDir(), "manifest.key");
+}
+
+/**
+ * Per-state-dir encryption key for workers, which never receive AUTH_ADMIN_KEYS.
+ * The file lives beside the lockfile inside the user's 0700 HOME, so it grants
+ * nothing beyond what filesystem ownership already grants.
+ */
+export function loadOrCreateLocalManifestKey(): string {
+  const file = localManifestKeyFilePath();
+  try {
+    const existing = readFileSync(file, "utf8").trim();
+    if (/^[A-Za-z0-9_-]{43}$/.test(existing)) return existing;
+  } catch {
+    // Fall through to creation.
+  }
+  const key = randomBytes(32).toString("base64url");
+  mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
+  const temporary = `${file}.tmp-${process.pid}-${randomUUID()}`;
+  try {
+    writeFileSync(temporary, `${key}\n`, { encoding: "utf8", mode: 0o600, flag: "wx" });
+    renameSync(temporary, file);
+  } finally {
+    rmSync(temporary, { force: true });
+  }
+  // Another process may have won the rename race; the file is the truth.
+  return readFileSync(file, "utf8").trim();
+}
+
 const MAX_REGISTERED_MANIFEST_BYTES = 16 * 1024;
 const MANIFEST_CIPHER_AAD = Buffer.from("cli-openai-proxy/provision-manifest/v1", "utf8");
 

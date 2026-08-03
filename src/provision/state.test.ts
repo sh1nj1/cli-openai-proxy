@@ -1,6 +1,6 @@
 import { test, describe, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync, readFileSync, writeFileSync, mkdirSync } from "fs";
+import { mkdtempSync, rmSync, readFileSync, writeFileSync, mkdirSync, statSync } from "fs";
 import { tmpdir } from "os";
 import path from "path";
 import { MAX_MANAGED_PATH_LENGTH } from "./path-policy.js";
@@ -11,6 +11,7 @@ import {
   saveRegisteredManifestUrl,
   saveState,
   stateFilePath,
+  loadOrCreateLocalManifestKey,
 } from "./state.js";
 
 describe("provision state", () => {
@@ -191,5 +192,23 @@ describe("provision state", () => {
     saveState({ version: 1, approved: [], revoked: [], installed: {} });
     const contents = readFileSync(stateFilePath(), "utf-8");
     assert.deepEqual(JSON.parse(contents), { version: 1, approved: [], revoked: [], installed: {} });
+  });
+
+  test("loadOrCreateLocalManifestKey creates a 0600 key file and is stable across calls", () => {
+    const first = loadOrCreateLocalManifestKey();
+    const second = loadOrCreateLocalManifestKey();
+    assert.equal(first, second);
+    assert.match(first, /^[A-Za-z0-9_-]{40,}$/);
+    const mode = statSync(path.join(dir, "manifest.key")).mode & 0o777;
+    if (process.platform !== "win32") assert.equal(mode, 0o600);
+  });
+
+  test("manifest URL round-trips with the local key", () => {
+    const key = loadOrCreateLocalManifestKey();
+    saveRegisteredManifestUrl("https://example.com/provision.json?sig=abc", key);
+    assert.equal(
+      loadRegisteredManifestUrl([key]),
+      "https://example.com/provision.json?sig=abc",
+    );
   });
 });
