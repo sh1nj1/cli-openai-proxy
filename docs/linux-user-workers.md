@@ -157,6 +157,21 @@ The worker also owns the user's `/v1/auth/*` sessions and `/v1/usage` data.
 Thus CLI login state and usage are per user. `/health` and `/v1/models` remain
 gateway-level endpoints.
 
+## Agent provisioning (optional)
+
+Skill/instruction provisioning is off by default and is enabled per worker
+unit, not gateway-wide. Uncomment the block already present in
+`deploy/linux/cli-openai-proxy-worker@.service`:
+
+| Env | Meaning |
+| --- | --- |
+| `PROVISION_SYNC` | `1` to enable this worker's own provisioning engine, syncing into its own HOME. See [docs/provisioning.md](provisioning.md#per-user-scope-worker-mode). |
+| `PROVISION_ALLOWLIST` | Comma-separated hostnames allowed for the manifest and its artifacts. See [docs/provisioning.md](provisioning.md#enabling-it). |
+| `PROVISION_AUTOAPPLY` | `approve` (default) or `auto`. See [docs/provisioning.md](provisioning.md#enabling-it). |
+
+Leave `PROVISION_SYNC` unset on the gateway unit in this mode — see the
+anti-footgun note in [docs/provisioning.md](provisioning.md#per-user-scope-worker-mode).
+
 ## Multi-OS boundary
 
 Routing depends only on `WorkerProvisioner`, `WorkerTarget`, and `IpcEndpoint`.

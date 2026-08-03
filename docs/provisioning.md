@@ -34,6 +34,45 @@ credentials, and a completion key is not accepted.
 | `PROVISION_STATE_DIR` | Lockfile directory. Default `~/.cli-openai-proxy`. |
 | `PROVISION_SKILLS_DIR` | Install dir for `skill` items. Default `~/.claude/skills`. |
 
+## Per-user scope (worker mode)
+
+Where the engine runs depends on deployment mode, not on any new flag:
+
+- **Solo gateway** (no per-user workers) — one process-local engine, running
+  in the gateway's own HOME (`~/.claude/skills`, `~/.cli-openai-proxy`).
+- **Per-user Linux workers** (`deploy/linux/cli-openai-proxy-worker@.service`)
+  — each worker runs its own engine in its own HOME
+  (`/var/lib/cli-openai-proxy/users/%i/.claude/skills`,
+  `.../.cli-openai-proxy`). `PROVISION_SYNC` on the worker unit is the opt-in,
+  same as it is on a solo gateway; unset leaves that worker's
+  `/v1/provision/*` answering `404 provisioning_disabled` as usual.
+
+In worker mode `/v1/provision/*` still requires the admin key, and — like
+every other scoped route — also requires a user identity
+(`X-CLI-Proxy-User-Key` or the signed `X-CLI-Proxy-*` headers, see
+[docs/linux-user-workers.md](linux-user-workers.md#trusted-user-identity)).
+The gateway forwards the request to that user's worker, which answers from
+its own state — there is no cross-user status view or shared endpoint.
+
+Because each worker's lockfile lives inside that worker's own HOME, TOFU
+approvals are per user by construction: approving an item for one user's
+worker has no effect on any other user's `pending_approval` items.
+
+Workers never receive `AUTH_ADMIN_KEYS` (only the gateway holds it), so a
+worker's persisted manifest URL is encrypted at rest with a per-user
+`manifest.key` generated alongside its lockfile instead of the admin key
+material a solo gateway uses.
+
+**Anti-footgun:** do not set `PROVISION_SYNC=1` on the gateway unit while
+worker units also have it. A solo gateway's engine registers whatever
+provisioning URL an authorized login carries and syncs it as *the* manifest
+for that process; with per-user workers, the gateway still relays each
+worker's authorized-login notification upward, so a second gateway-side
+engine would repeatedly overwrite the gateway-global manifest and skills
+directory with whichever user logged in most recently. Keep `PROVISION_SYNC`
+on the gateway OFF in this mode — the commented-out block in the worker unit
+file calls this out for the same reason.
+
 ## The manifest
 
 ```json
@@ -177,13 +216,12 @@ enabling `PROVISION_SYNC` — and especially `PROVISION_AUTOAPPLY=auto` — as t
 same class of decision as `AUTH_TRUST_COMPLETION_CALLERS`: an explicit
 declaration that the manifest's publisher is inside your trust boundary.
 
-### Per-user Linux workers: a known limitation
+### Per-user Linux workers
 
-Provisioning installs into the **gateway process's** skills directory
-(`PROVISION_SKILLS_DIR`, default the gateway's `~/.claude/skills`). The
-per-user Linux workers (`deploy/linux/cli-openai-proxy-worker@.service`) run
-with their own `HOME=/var/lib/cli-openai-proxy/users/%i` and their own write
-scope, so they do not see what the gateway installed even when the status view
-reports it as `installed`. In that deployment, provisioning currently covers
-only engines running as the gateway user; distributing skills into worker
-homes (or a shared, per-engine load path) is future work.
+Provisioning installs into whichever process's HOME its engine runs in — see
+[Per-user scope (worker mode)](#per-user-scope-worker-mode) above. With
+`PROVISION_SYNC=1` on the worker units, each user's worker installs skills
+into that worker's own `~/.claude/skills`, so the CLI process that actually
+runs as that user sees them. Leaving `PROVISION_SYNC` unset on worker units
+(the default) leaves provisioning off for that deployment entirely; it does
+not fall back to installing into the gateway's HOME.
