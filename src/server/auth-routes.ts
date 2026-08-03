@@ -108,11 +108,6 @@ function sendError(res: Response, err: unknown): void {
   res.status(500).json({ error: { message, type: "server_error", code: null } });
 }
 
-/**
- * An engine's flows for a response body: `flows` lists every supported one,
- * `flow` repeats the default — the shape callers relied on when engines had
- * exactly one flow, kept so they keep working unchanged.
- */
 function parseable(url: string): boolean {
   try {
     new URL(url);
@@ -135,16 +130,16 @@ function notifyGatewayWhenWorker(
   }
 }
 
-function flowFields(engine: string): { flow: string; flows: string[] } {
-  const flows = resolveEngine(engine)!.flows.map((f) => f.flow);
-  return { flow: flows[0]!, flows };
+/** An engine's supported flows, in order — the first is the default a caller naming none gets. */
+function flowsOf(engine: string): string[] {
+  return resolveEngine(engine)!.flows.map((f) => f.flow);
 }
 
 /** GET /v1/auth/engines — lets the caller build its UI without hardcoding flows. */
 export function handleAuthEngines(_req: Request, res: Response): void {
   res.json({
     object: "list",
-    data: engineRegistry.ids().map((engine) => ({ engine, ...flowFields(engine) })),
+    data: engineRegistry.ids().map((engine) => ({ engine, flows: flowsOf(engine) })),
   });
 }
 
@@ -154,7 +149,7 @@ export async function handleAuthStatus(req: Request, res: Response): Promise<voi
   if (!engine) return;
   try {
     const status = await resolveEngine(engine)!.checkStatus();
-    res.json({ engine, ...flowFields(engine), ...status });
+    res.json({ engine, flows: flowsOf(engine), ...status });
   } catch (err) {
     sendError(res, err);
   }

@@ -169,14 +169,13 @@ All require `Authorization: Bearer <AUTH_ADMIN_KEYS entry>`.
 
 ```json
 { "object": "list", "data": [
-  { "engine": "claude", "flow": "paste-code", "flows": ["paste-code", "api-key"] },
-  { "engine": "codex",  "flow": "api-key",    "flows": ["api-key", "device-code"] }
+  { "engine": "claude", "flows": ["paste-code", "api-key"] },
+  { "engine": "codex",  "flows": ["api-key", "device-code"] }
 ] }
 ```
 
-`flows` lists every supported flow; `flow` repeats the default — the shape
-callers relied on when engines had exactly one flow, kept so they keep working
-unchanged. The status endpoint carries the same two fields.
+`flows` lists every supported flow in order; the first is the default a session
+request naming no flow gets. The status endpoint carries the same field.
 
 ### `GET /v1/auth/{engine}/status`
 

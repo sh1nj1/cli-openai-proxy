@@ -168,7 +168,7 @@ function syncFlowControls() {
 
 function syncEngine() {
   const descriptor = engines.find(({ engine: id }) => id === engine());
-  const flows = descriptor?.flows ?? (descriptor?.flow ? [descriptor.flow] : []);
+  const flows = descriptor?.flows ?? [];
   const selectedFlow = $("flow").value;
   $("flow").replaceChildren(...flows.map((name) => new Option(name, name)));
   if (flows.includes(selectedFlow)) $("flow").value = selectedFlow;
