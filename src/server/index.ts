@@ -27,6 +27,7 @@ import {
   handleProvisionStatus,
   handleProvisionSync,
   provisionAdminMiddleware,
+  provisionEnabledGate,
 } from "./provision-routes.js";
 import { getTimeoutMs } from "../config.js";
 import { resetSessions } from "../auth/session-manager.js";
@@ -107,6 +108,15 @@ export function createApp(config: AppConfig = {}): Express {
     }
   }
 
+  if (role === "worker") {
+    // Workers never receive AUTH_ADMIN_KEYS, so Task 1's local manifest-key
+    // persistence is what makes this call safe here.
+    const provisionStatus = initProvisioning();
+    if (provisionStatus.enabled) {
+      console.log(`[Server] Per-user agent provisioning enabled (mode: ${provisionStatus.autoApply})`);
+    }
+  }
+
   // Request logging (debug mode)
   app.use((req: Request, _res: Response, next: NextFunction) => {
     if (process.env.DEBUG) {
@@ -152,6 +162,10 @@ export function createApp(config: AppConfig = {}): Express {
   // And for agent provisioning — its own opt-in (PROVISION_SYNC) plus the same
   // admin keys, checked before any body is buffered.
   if (role === "gateway") app.use(PROVISION_PREFIX, provisionAdminMiddleware);
+
+  // Worker role skips the admin-key half: the gateway already authenticated
+  // the caller, and the worker's unix socket is per-user. Only the opt-in holds.
+  if (role === "worker") app.use(PROVISION_PREFIX, provisionEnabledGate);
 
   // A valid shared API key alone cannot select an OS user. Resolve the immutable
   // identity before buffering JSON, preserving the same unauthenticated-body DoS

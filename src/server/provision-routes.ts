@@ -5,7 +5,10 @@
  * (AUTH_ADMIN_KEYS — installing prompt-loaded instructions is at least as
  * sensitive as mutating credentials), and fail-closed behind its own opt-in:
  * without PROVISION_SYNC=1 every route answers 404, so upgrading the proxy
- * never exposes an install channel by itself.
+ * never exposes an install channel by itself. Worker role mounts only the
+ * opt-in gate (provisionEnabledGate): the gateway already authenticated the
+ * caller and each worker's unix socket is per-user, so a second admin-key
+ * check there would gate against a key the worker never receives.
  */
 
 import type { Request, Response, NextFunction } from "express";
@@ -26,13 +29,18 @@ function fail(res: Response, status: number, message: string, code: string): voi
   res.status(status).json({ error: { message, type: "invalid_request_error", code } });
 }
 
-export function provisionAdminMiddleware(req: Request, res: Response, next: NextFunction): void {
+/** The opt-in half of the gate; worker role mounts it without the admin-key half. */
+export function provisionEnabledGate(req: Request, res: Response, next: NextFunction): void {
   if (!provisionEnabled()) {
     fail(res, 404, "Provisioning is disabled. Set PROVISION_SYNC=1 to enable it.", "provisioning_disabled");
     return;
   }
+  next();
+}
+
+export function provisionAdminMiddleware(req: Request, res: Response, next: NextFunction): void {
   // The provisioning opt-in does not replace the key check: both gates hold.
-  authAdminMiddleware(req, res, next);
+  provisionEnabledGate(req, res, () => authAdminMiddleware(req, res, next));
 }
 
 function sendError(res: Response, err: unknown, invalidItemIsUpstream = false): void {
