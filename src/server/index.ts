@@ -159,9 +159,12 @@ export function createApp(config: AppConfig = {}): Express {
   // wrong admin key (or one sent while the feature is off) before its body is buffered.
   if (role === "gateway") app.use(AUTH_PROVISIONING_PREFIX, authAdminMiddleware);
 
-  // And for agent provisioning — its own opt-in (PROVISION_SYNC) plus the same
-  // admin keys, checked before any body is buffered.
-  if (role === "gateway") app.use(PROVISION_PREFIX, provisionAdminMiddleware);
+  // And for agent provisioning — admin key always required; the enabled/opt-in
+  // answer, though, belongs to whichever engine actually serves the request:
+  // the per-user worker when routing is active, this process otherwise.
+  if (role === "gateway") {
+    app.use(PROVISION_PREFIX, userWorkerProxy ? authAdminMiddleware : provisionAdminMiddleware);
+  }
 
   // Worker role skips the admin-key half: the gateway already authenticated
   // the caller, and the worker's unix socket is per-user. Only the opt-in holds.
@@ -177,6 +180,7 @@ export function createApp(config: AppConfig = {}): Express {
         "/v1/usage",
         "/v1/usage/recent",
         AUTH_PROVISIONING_PREFIX,
+        PROVISION_PREFIX,
       ],
       requireRequestIdentity,
     );
@@ -212,13 +216,13 @@ export function createApp(config: AppConfig = {}): Express {
   app.delete(`${AUTH_PROVISIONING_PREFIX}/:engine/sessions/:sessionId`, ...scoped(handleCancelAuthSession));
   app.delete(`${AUTH_PROVISIONING_PREFIX}/:engine/credential`, ...scoped(handleForgetCredential));
 
-  // Agent provisioning (gated above). Deliberately NOT scoped(): artifacts
-  // install into the GATEWAY process's skills dir. Per-user Linux workers run
-  // with their own HOME and do not see it — see docs/provisioning.md.
-  app.get(PROVISION_PREFIX, handleProvisionStatus);
-  app.post(`${PROVISION_PREFIX}/sync`, handleProvisionSync);
-  app.post(`${PROVISION_PREFIX}/items/:type/:name/approve`, handleProvisionApprove);
-  app.delete(`${PROVISION_PREFIX}/items/:type/:name`, handleProvisionDelete);
+  // Agent provisioning (gated above). With per-user workers each user's worker
+  // runs its own engine in its own HOME, so the surface forwards like /v1/auth;
+  // solo gateways keep the process-local engine.
+  app.get(PROVISION_PREFIX, ...scoped(handleProvisionStatus));
+  app.post(`${PROVISION_PREFIX}/sync`, ...scoped(handleProvisionSync));
+  app.post(`${PROVISION_PREFIX}/items/:type/:name/approve`, ...scoped(handleProvisionApprove));
+  app.delete(`${PROVISION_PREFIX}/items/:type/:name`, ...scoped(handleProvisionDelete));
 
   // 404 handler
   app.use((_req: Request, res: Response) => {
