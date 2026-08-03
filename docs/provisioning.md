@@ -64,14 +64,14 @@ worker's persisted manifest URL is encrypted at rest with a per-user
 material a solo gateway uses.
 
 **Anti-footgun:** do not set `PROVISION_SYNC=1` on the gateway unit while
-worker units also have it. A solo gateway's engine registers whatever
-provisioning URL an authorized login carries and syncs it as *the* manifest
-for that process; with per-user workers, the gateway still relays each
-worker's authorized-login notification upward, so a second gateway-side
-engine would repeatedly overwrite the gateway-global manifest and skills
-directory with whichever user logged in most recently. Keep `PROVISION_SYNC`
-on the gateway OFF in this mode — the commented-out block in the worker unit
-file calls this out for the same reason.
+worker units also have it. A worker with its local engine enabled deliberately
+keeps authorized-login provisioning notifications local, so normal logins do
+not overwrite gateway state. Even so, a gateway-side engine would retain and
+periodically sync its own separate, process-global manifest. A mixed rollout
+also leaves disabled workers using the legacy upward relay. Keep
+`PROVISION_SYNC` on the gateway OFF in worker mode so there is one clear owner
+per user — the commented-out block in the worker unit file calls this out for
+the same reason.
 
 ## The manifest
 

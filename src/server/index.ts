@@ -180,7 +180,7 @@ export function createApp(config: AppConfig = {}): Express {
         "/v1/usage",
         "/v1/usage/recent",
         AUTH_PROVISIONING_PREFIX,
-        PROVISION_PREFIX,
+	PROVISION_PREFIX,
       ],
       requireRequestIdentity,
     );
