@@ -167,6 +167,46 @@ test("Managed Node runtime parents are made traversable without trusting writabl
   `, "bash", runtimePath], { stdio: "pipe" });
 });
 
+test("Managed Node runtime version directories are safely made traversable", () => {
+  const runtimePath = fileURLToPath(
+    new URL("../../scripts/linux-node-runtime.sh", import.meta.url),
+  );
+  execFileSync("bash", ["-c", `
+    set -e
+    source "$1"
+    scratch="$(mktemp -d)"
+    trap 'rm -rf -- "$scratch"' EXIT
+    runtime_dir="$scratch/v22.23.2"
+    mkdir -m 0700 "$runtime_dir"
+    LINUX_NODE_RUNTIME_CHMOD_BIN=fake_chmod
+    chmod_calls=0
+    fake_stat() { printf '0 700\\n'; }
+    fake_chmod() {
+      [[ "$1" == 0755 && "$2" == "$runtime_dir" && "$#" == 2 ]] || exit 8
+      chmod_calls=$((chmod_calls + 1))
+    }
+    linux_node_runtime_as_root() { "$@"; }
+    LINUX_NODE_RUNTIME_STAT_BIN=fake_stat
+
+    linux_node_runtime_make_install_directory_traversable "$runtime_dir"
+    [[ "$chmod_calls" == 1 ]]
+
+    fake_stat() { printf '501 700\\n'; }
+    if linux_node_runtime_make_install_directory_traversable "$runtime_dir"; then
+      exit 9
+    fi
+    [[ "$chmod_calls" == 1 ]]
+
+    mv "$runtime_dir" "$scratch/target"
+    ln -s "$scratch/target" "$runtime_dir"
+    fake_stat() { printf '0 700\\n'; }
+    if linux_node_runtime_make_install_directory_traversable "$runtime_dir"; then
+      exit 10
+    fi
+    [[ "$chmod_calls" == 1 ]]
+  `, "bash", runtimePath], { stdio: "pipe" });
+});
+
 test("Node runtime preparation repairs roots before root-mode reuse and retries service-mode reuse", () => {
   const runtimePath = fileURLToPath(
     new URL("../../scripts/linux-node-runtime.sh", import.meta.url),
@@ -272,6 +312,24 @@ test("Node runtime installation never promotes failed extraction or staging", ()
     [[ ! -e "$marker" ]]
     [[ ! -e "$runtime_root/v22.13.0" ]]
   `, "bash", runtimePath], { stdio: "pipe" });
+});
+
+test("Node runtime installation fixes fresh and existing version directory access", async () => {
+  const script = await readScript("linux-node-runtime.sh");
+  const copy = script.indexOf('"$extract_dir/." "$staging_dir/"');
+  const removeWrites = script.indexOf('"$LINUX_NODE_RUNTIME_CHMOD_BIN" -R go-w "$staging_dir"');
+  const makeTraversable = script.indexOf(
+    'linux_node_runtime_make_install_directory_traversable "$staging_dir"',
+  );
+  const publish = script.indexOf('"$LINUX_NODE_RUNTIME_MV_BIN" "$staging_dir" "$final_dir"');
+
+  assert.ok(copy >= 0 && copy < removeWrites);
+  assert.ok(removeWrites < makeTraversable && makeTraversable < publish);
+  assert.match(
+    script,
+    /elif ! linux_node_runtime_make_install_directory_traversable "\$final_dir"/,
+  );
+  assert.match(script, /\[\[ ! -e "\$final_dir" && ! -L "\$final_dir" \]\]/);
 });
 
 test("Multi-user install builds as an unprivileged account before promotion", async () => {
