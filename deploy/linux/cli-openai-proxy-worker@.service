@@ -18,6 +18,13 @@ Environment=PATH=/usr/local/bin:/usr/bin:/bin
 # The gateway guarantees that only this OS user's authenticated requests reach
 # this socket, so a credential provisioned here is exposed only to the same user.
 Environment=AUTH_TRUST_COMPLETION_CALLERS=true
+# Per-user agent provisioning: each worker syncs manifests into its own HOME
+# (~/.claude/skills, ~/.cli-openai-proxy). Uncomment to enable; keep
+# PROVISION_SYNC OFF on the gateway unit in this mode or logins will also
+# rewrite the gateway-global manifest.
+#Environment=PROVISION_SYNC=1
+#Environment=PROVISION_ALLOWLIST=collavre.com
+#Environment=PROVISION_AUTOAPPLY=approve
 NoNewPrivileges=yes
 CapabilityBoundingSet=
 PrivateTmp=yes

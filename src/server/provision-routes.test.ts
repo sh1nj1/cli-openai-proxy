@@ -2,9 +2,11 @@ import { test, describe, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
 import { mkdtempSync, rmSync } from "fs";
 import { createServer } from "http";
+import type { Server } from "node:http";
+import type { AddressInfo } from "node:net";
 import { tmpdir } from "os";
 import path from "path";
-import type { Request, Response } from "express";
+import type { Express, Request, Response } from "express";
 import {
   PROVISION_PREFIX,
   handleProvisionApprove,
@@ -15,10 +17,18 @@ import {
 } from "./provision-routes.js";
 import { handleCreateAuthSession, initAuthAdmin } from "./auth-routes.js";
 import { authMiddleware, initAuth } from "./auth.js";
+import { createApp } from "./index.js";
 import { getStatus, initProvisioning, registerManifestUrl, shutdownProvisioning } from "../provision/sync.js";
 import { engineRegistry } from "../auth/registry.js";
 import { resetSessions } from "../auth/session-manager.js";
 import type { EngineAuthDescriptor, EngineAuthSession } from "../auth/types.js";
+
+/** Matches the fetch-against-a-listening-server idiom used by the sibling *-restart/*-ordering tests. */
+async function listen(app: Express): Promise<{ server: Server; port: number }> {
+  const server = app.listen(0);
+  await new Promise<void>((resolve) => server.once("listening", () => resolve()));
+  return { server, port: (server.address() as AddressInfo).port };
+}
 
 interface FakeRes extends Response {
   statusCode: number;
@@ -265,6 +275,36 @@ describe("provision-routes", () => {
       );
       assert.equal((res.payload as { status: string }).status, "authorized");
       assert.equal(getStatus().manifest_url, null);
+    });
+  });
+
+  describe("worker role", () => {
+    // Workers never receive AUTH_ADMIN_KEYS (the gateway already authenticated
+    // the caller), so their /v1/provision surface must open on the opt-in gate
+    // alone rather than requiring the admin-key gate too.
+    test("serves provision status without admin keys when PROVISION_SYNC=1", async () => {
+      process.env.PROVISION_SYNC = "1";
+      const { server, port } = await listen(createApp({ role: "worker" }));
+      try {
+	const response = await fetch(`http://127.0.0.1:${port}${PROVISION_PREFIX}`);
+	assert.equal(response.status, 200);
+	const body = await response.json() as { enabled: boolean };
+	assert.equal(body.enabled, true);
+      } finally {
+	await new Promise<void>((resolve, reject) => server.close((err) => err ? reject(err) : resolve()));
+      }
+    });
+
+    test("answers 404 provisioning_disabled when PROVISION_SYNC unset", async () => {
+      const { server, port } = await listen(createApp({ role: "worker" }));
+      try {
+	const response = await fetch(`http://127.0.0.1:${port}${PROVISION_PREFIX}`);
+	assert.equal(response.status, 404);
+	const body = await response.json() as { error: { code: string } };
+	assert.equal(body.error.code, "provisioning_disabled");
+      } finally {
+	await new Promise<void>((resolve, reject) => server.close((err) => err ? reject(err) : resolve()));
+      }
     });
   });
 });

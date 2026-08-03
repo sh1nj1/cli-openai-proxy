@@ -21,6 +21,7 @@ import {
 } from "../auth/session-manager.js";
 import { clearCredential } from "../auth/token-store.js";
 import { AuthProvisioningError } from "../auth/types.js";
+import { provisionEnabled } from "../provision/sync.js";
 import {
   AUTHORIZED_PROVISIONING_HEADER,
   PROVISIONING_GENERATION_HEADER,
@@ -122,7 +123,9 @@ function notifyGatewayWhenWorker(
   res: Response,
   notification: SessionProvisioningNotification | undefined,
 ): void {
-  if (notification && req.app?.locals.cliProxyRole === "worker") {
+  // With a worker-local engine the URL is applied here, in this user's HOME.
+  // Echoing it upward would additionally rewrite the gateway-global manifest.
+  if (notification && req.app?.locals.cliProxyRole === "worker" && !provisionEnabled()) {
     res.setHeader(AUTHORIZED_PROVISIONING_HEADER, encodeProvisioningUrl(notification.url));
     res.setHeader(PROVISIONING_GENERATION_HEADER, notification.generation);
   }

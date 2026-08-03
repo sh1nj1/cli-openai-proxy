@@ -14,7 +14,7 @@ import {
   randomUUID,
   scryptSync,
 } from "crypto";
-import { mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "fs";
+import { linkSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "fs";
 import { homedir } from "os";
 import path from "path";
 import { managedPathParts } from "./path-policy.js";
@@ -30,6 +30,53 @@ export function stateFilePath(): string {
 
 export function registeredManifestFilePath(): string {
   return path.join(provisionStateDir(), "provision.manifest.json");
+}
+
+export function localManifestKeyFilePath(): string {
+  return path.join(provisionStateDir(), "manifest.key");
+}
+
+/**
+ * Per-state-dir encryption key for workers, which never receive AUTH_ADMIN_KEYS.
+ * The file lives beside the lockfile inside the user's 0700 HOME, so it grants
+ * nothing beyond what filesystem ownership already grants.
+ */
+export function loadOrCreateLocalManifestKey(): string {
+  const file = localManifestKeyFilePath();
+  try {
+    const existing = readFileSync(file, "utf8").trim();
+    if (/^[A-Za-z0-9_-]{43}$/.test(existing)) return existing;
+  } catch {
+    // Fall through to creation.
+  }
+  const key = randomBytes(32).toString("base64url");
+  mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
+  const temporary = `${file}.tmp-${process.pid}-${randomUUID()}`;
+  try {
+    writeFileSync(temporary, `${key}\n`, { encoding: "utf8", mode: 0o600, flag: "wx" });
+    try {
+      // Hard-link creation is atomic and never replaces a key another process won.
+      linkSync(temporary, file);
+      return key;
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
+    }
+  } finally {
+    rmSync(temporary, { force: true });
+  }
+  // Another process won creation; its valid file is the source of truth.
+  const winner = readFileSync(file, "utf8").trim();
+  if (/^[A-Za-z0-9_-]{43}$/.test(winner)) return winner;
+  // Preserve self-healing for a corrupt key. Worker processes are single-instance
+  // per state dir, so recovery is not expected to contend.
+  const replacement = `${file}.replacement-${process.pid}-${randomUUID()}`;
+  try {
+    writeFileSync(replacement, `${key}\n`, { encoding: "utf8", mode: 0o600, flag: "wx" });
+    renameSync(replacement, file);
+    return key;
+  } finally {
+    rmSync(replacement, { force: true });
+  }
 }
 
 const MAX_REGISTERED_MANIFEST_BYTES = 16 * 1024;

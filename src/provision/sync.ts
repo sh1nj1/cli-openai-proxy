@@ -44,6 +44,7 @@ import {
 } from "./installer.js";
 import {
   loadRegisteredManifestUrl,
+  loadOrCreateLocalManifestKey,
   loadState,
   saveRegisteredManifestUrl,
   saveState,
@@ -163,10 +164,15 @@ export function initProvisioning(hooks: {
   const raw = process.env.PROVISION_SYNC?.trim().toLowerCase() ?? "";
   enabled = ["1", "true", "yes", "enabled"].includes(raw);
   autoApply = process.env.PROVISION_AUTOAPPLY?.trim().toLowerCase() === "auto" ? "auto" : "approve";
-  manifestPersistenceKeys = (takeProxySecret("AUTH_ADMIN_KEYS") ?? "")
+  const adminKeys = (takeProxySecret("AUTH_ADMIN_KEYS") ?? "")
     .split(",")
     .map((key) => key.trim())
     .filter(Boolean);
+  // Workers have no admin keys; a per-state-dir key keeps persistence working
+  // there without weakening the admin-key encryption used on the gateway.
+  manifestPersistenceKeys = adminKeys.length > 0 || !enabled
+    ? adminKeys
+    : [loadOrCreateLocalManifestKey()];
   // Consume even while provisioning is disabled: a signed URL left in the
   // gateway environment is readable through /proc by same-uid CLI children.
   const fixed = takeProxySecret("PROVISION_MANIFEST_URL")?.trim();
