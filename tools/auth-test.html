@@ -65,6 +65,8 @@
   <input id="baseUrl" value="http://localhost:3456">
   <label for="adminKey">Admin key (AUTH_ADMIN_KEYS)</label>
   <input id="adminKey" type="password" autocomplete="off">
+  <label for="apiKey">Completion / user key (API_KEYS or USER_API_KEYS)</label>
+  <input id="apiKey" type="password" autocomplete="off">
 </fieldset>
 
 <fieldset>
@@ -94,8 +96,6 @@
 
 <fieldset>
   <legend>Completion test</legend>
-  <label for="apiKey">API key (API_KEYS)</label>
-  <input id="apiKey" type="password" autocomplete="off">
   <label for="model">Model</label>
   <input id="model" value="paperclip/claude_local">
   <button id="testCompletion">Send test completion</button>
@@ -128,9 +128,17 @@ function show(status, body) {
 
 const currentBase = () => $("baseUrl").value.replace(/\/+$/, "");
 
-async function call(method, path, { body, key, base, okStatus } = {}) {
+function authHeaders(key, userKey) {
+  const headers = { Authorization: `Bearer ${key}` };
+  if (userKey) headers["X-CLI-Proxy-User-Key"] = userKey;
+  return headers;
+}
+
+async function call(method, path, { body, key, userKey, base, okStatus } = {}) {
   base = base ?? currentBase();
-  const headers = { Authorization: `Bearer ${key ?? $("adminKey").value}` };
+  key = key ?? $("adminKey").value;
+  userKey = userKey ?? $("apiKey").value;
+  const headers = authHeaders(key, userKey);
   if (body) headers["Content-Type"] = "application/json";
   show("…", `${method} ${path}`);
   try {
@@ -195,20 +203,23 @@ $("createSession").onclick = async (e) => {
     if (!target || !targetFlow) return show("!", "Load engines and select a login flow first.");
     const base = currentBase();
     const key = $("adminKey").value;
+    const userKey = $("apiKey").value;
     // The server supersedes only same-engine sessions on the same server; a
     // pending session for a different engine — or on a different server — would
     // keep its CLI child alive until TTL, so cancel it where it was created,
     // with the key it was created under. 404 means it is already gone; on any
     // other failure keep the session tracked so cancellation can be retried.
-    if (session && (session.engine !== target || session.base !== base)) {
+    if (session && (
+      session.engine !== target || session.base !== base || session.userKey !== userKey
+    )) {
       const gone = await call("DELETE", `/v1/auth/${session.engine}/sessions/${session.id}`,
-        { base: session.base, key: session.key, okStatus: 404 });
+	{ base: session.base, key: session.key, userKey: session.userKey, okStatus: 404 });
       if (!gone) return;
       session = null;
       clearSessionInfo();
     }
     const created = await call("POST", `/v1/auth/${target}/sessions`, {
-      body: { flow: targetFlow }, base, key,
+      body: { flow: targetFlow }, base, key, userKey,
     });
     if (!created) {
       // A same-engine recreation disposes the tracked session server-side
@@ -219,8 +230,9 @@ $("createSession").onclick = async (e) => {
       // error on screen) and drop the record only on a confirmed 404.
       if (session && session.engine === target && session.base === base) {
         const probe = session;
+	const headers = authHeaders(probe.key, probe.userKey);
         const gone = await fetch(`${probe.base}/v1/auth/${probe.engine}/sessions/${probe.id}`, {
-          headers: { Authorization: `Bearer ${probe.key}` },
+	  headers,
         }).then((r) => r.status === 404, () => false);
         if (gone && session && session.id === probe.id && session.base === probe.base) {
           session = null;
@@ -233,7 +245,7 @@ $("createSession").onclick = async (e) => {
     clearSessionInfo();
     session = {
       id: created.sessionId, engine: created.engine ?? target,
-      flow: created.flow ?? targetFlow, base, key,
+      flow: created.flow ?? targetFlow, base, key, userKey,
     };
     syncFlowControls();
     const info = $("sessionInfo");
@@ -265,7 +277,8 @@ $("submitCode").onclick = async (e) => {
   e.target.disabled = true;
   try {
     const done = await call("POST", `/v1/auth/${submitted.engine}/sessions/${submitted.id}`,
-      { body: { value }, base: submitted.base, key: submitted.key, okStatus: 404 });
+      { body: { value }, base: submitted.base, key: submitted.key,
+	userKey: submitted.userKey, okStatus: 404 });
     if (!done) return;
     // A 404 (error envelope, not a session view) confirms the session no longer
     // exists server-side — expired or the server restarted — so drop the dead
@@ -303,7 +316,7 @@ $("pollSession").onclick = async () => {
   if (!session) return show("!", "Create a session first.");
   const polled = session;
   const res = await call("GET", `/v1/auth/${polled.engine}/sessions/${polled.id}`,
-    { base: polled.base, key: polled.key, okStatus: 404 });
+    { base: polled.base, key: polled.key, userKey: polled.userKey, okStatus: 404 });
   // A terminal device-code result needs no submit or cancel; a 404 also means
   // the server already forgot the session. Drop either locally so a later
   // Create never depends on reaching this server just to clean up stale state.
@@ -322,7 +335,7 @@ $("cancelSession").onclick = async () => {
   // it again at a server that may no longer be reachable and refuse to proceed.
   // Skip if Create already replaced the record while the DELETE was in flight.
   const done = await call("DELETE", `/v1/auth/${cancelled.engine}/sessions/${cancelled.id}`,
-    { base: cancelled.base, key: cancelled.key, okStatus: 404 });
+    { base: cancelled.base, key: cancelled.key, userKey: cancelled.userKey, okStatus: 404 });
   if (!done) return;
   if (session && session.id === cancelled.id && session.base === cancelled.base) {
     session = null;

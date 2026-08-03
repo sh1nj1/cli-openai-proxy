@@ -43,6 +43,9 @@ navigation cannot attach the admin Authorization header. It contains no secret;
 the user enters the admin key in a password field, and the page sends it only as
 a Bearer header to same-origin `/v1/auth/*` requests. The response is non-cacheable
 and uses a nonce CSP, `frame-ancestors 'none'`, and `X-Frame-Options: DENY`.
+In per-user worker mode, enter the affected caller's `USER_API_KEYS` key in the
+completion/user-key field as well; the page sends it as `X-CLI-Proxy-User-Key`
+while keeping the admin key in `Authorization`.
 
 Both key sets are read into memory at startup and **removed from the process
 environment**, so neither is inherited by the CLI children a completion spawns.

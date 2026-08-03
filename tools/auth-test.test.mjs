@@ -116,23 +116,50 @@ test("auth test page drives the codex subscription device-code flow", async () =
   });
 
   await selectDeviceCode(elements);
+  elements.apiKey.value = "mapped-user-key";
   assert.deepEqual(elements.flow.children.map(({ value }) => value), ["api-key", "device-code"]);
   assert.equal(elements.model.value, "paperclip/codex_local");
   assert.equal(elements.submissionControls.hidden, true);
   await elements.createSession.onclick({ target: elements.createSession });
 
   assert.deepEqual(JSON.parse(requests[1].init.body), { flow: "device-code" });
+  assert.equal(requests[1].init.headers["X-CLI-Proxy-User-Key"], "mapped-user-key");
   assert.equal(elements.userCode.textContent, "ABCD-EFGH");
   assert.equal(elements.userCodeInfo.hidden, false);
   assert.equal(elements.sessionInfo.children[1].href, "https://auth.openai.com/codex/device");
 
   await elements.pollSession.onclick();
   assert.match(requests[2].url, /\/v1\/auth\/codex\/sessions\/session-1$/);
+  assert.equal(requests[2].init.headers["X-CLI-Proxy-User-Key"], "mapped-user-key");
   assert.equal(elements.userCodeInfo.hidden, true);
 
   elements.flow.value = "api-key";
   elements.flow.onchange();
   assert.equal(elements.submissionControls.hidden, false, "terminal poll releases the device-code controls");
+});
+
+test("auth session keeps its original user identity when the connection fields change", async () => {
+  const requests = [];
+  const responses = [
+    enginesResponse(),
+    sessionResponse("session-identity", "IDENTITY-CODE"),
+    response(200, {
+      sessionId: "session-identity", engine: "codex", flow: "device-code", status: "pending",
+    }),
+  ];
+  const elements = loadPage(async (url, init = {}) => {
+    requests.push({ url, init });
+    return responses.shift();
+  });
+
+  elements.apiKey.value = "user-key-a";
+  await selectDeviceCode(elements);
+  await elements.createSession.onclick({ target: elements.createSession });
+  elements.apiKey.value = "user-key-b";
+  await elements.pollSession.onclick();
+
+  assert.equal(requests[0].init.headers["X-CLI-Proxy-User-Key"], "user-key-a");
+  assert.equal(requests[2].init.headers["X-CLI-Proxy-User-Key"], "user-key-a");
 });
 
 test("a stale terminal poll cannot clear a replacement device-code session", async () => {

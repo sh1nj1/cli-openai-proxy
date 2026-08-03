@@ -8,6 +8,7 @@ BASE_URL="http://127.0.0.1:3456"
 KEY_A="itest-key-user-a-0123456789abcdef"
 KEY_B="itest-key-user-b-0123456789abcdef"
 KEY_UNMAPPED="itest-key-unmapped-0123456789abcd"
+ADMIN_KEY="itest-admin-0123456789abcdef01234567"
 USERS_DIR="/var/lib/cli-openai-proxy/users"
 SOCKET_DIR="/run/cli-openai-proxy/workers"
 
@@ -70,6 +71,7 @@ release_root="$(sed -n \
 step "Configuring per-user API keys and starting the gateway"
 cat > /etc/cli-openai-proxy/gateway.env <<EOF
 USER_API_KEYS='[{"key":"${KEY_A}","tenantId":"itest","userId":"user-a"},{"key":"${KEY_B}","tenantId":"itest","userId":"user-b"}]'
+AUTH_ADMIN_KEYS=${ADMIN_KEY}
 EOF
 chown root:cli-openai-proxy /etc/cli-openai-proxy/gateway.env
 chmod 0640 /etc/cli-openai-proxy/gateway.env
@@ -88,6 +90,7 @@ gw_user="$(unit_user cli-openai-proxy-gateway.service)"
 
 step "Auth boundary: /health open, everything else fails closed"
 curl_expect 200 "${BASE_URL}/health"
+curl_expect 200 "${BASE_URL}/auth"
 curl_expect 401 "${BASE_URL}/v1/usage"
 curl_expect 401 -H "Authorization: Bearer ${KEY_UNMAPPED}" "${BASE_URL}/v1/usage"
 [[ -z "$(cap_accounts)" ]] || fail "cap_ account exists before any authenticated request"
@@ -113,6 +116,12 @@ home_a="${USERS_DIR}/${CAP_A}"
   || fail "user A HOME has wrong owner/mode: $(stat -c '%U %a' "${home_a}")"
 [[ "$(stat -c '%U %a' "${SOCKET_DIR}/${CAP_A}.sock")" == "cli-openai-proxy 600" ]] \
   || fail "worker A socket has wrong owner/mode: $(stat -c '%U %a' "${SOCKET_DIR}/${CAP_A}.sock")"
+
+step "Auth UI requests require and accept the mapped user identity"
+curl_expect 401 -H "Authorization: Bearer ${ADMIN_KEY}" "${BASE_URL}/v1/auth/engines"
+curl_expect 200 -H "Authorization: Bearer ${ADMIN_KEY}" \
+  -H "X-CLI-Proxy-User-Key: ${KEY_A}" "${BASE_URL}/v1/auth/engines"
+grep -q '"object":"list"' "${BODY}" || fail "auth engine response is invalid: $(cat "${BODY}")"
 
 step "User B gets a different account; user A's mapping is stable"
 curl_expect 200 -H "Authorization: Bearer ${KEY_B}" "${BASE_URL}/v1/usage"
