@@ -50,8 +50,10 @@ cleanup() {
       || printf '[install] WARNING: unable to remove transient build account\n' >&2
   fi
   if [[ "$EUID" -eq 0 && "$BUILD_GROUP_CREATED" == "1" ]]; then
-    groupdel "$BUILD_ACCOUNT" 2>/dev/null \
+    if getent group "$BUILD_ACCOUNT" >/dev/null; then
+      groupdel "$BUILD_ACCOUNT" 2>/dev/null \
       || printf '[install] WARNING: unable to remove transient build group\n' >&2
+    fi
   fi
 }
 trap cleanup EXIT
@@ -182,7 +184,9 @@ retire_build_account() {
   terminate_build_processes
   userdel "$BUILD_ACCOUNT" || die "Unable to remove transient build account"
   BUILD_ACCOUNT_CREATED=0
-  groupdel "$BUILD_ACCOUNT" || die "Unable to remove transient build group"
+  if getent group "$BUILD_ACCOUNT" >/dev/null; then
+    groupdel "$BUILD_ACCOUNT" || die "Unable to remove transient build group"
+  fi
   BUILD_GROUP_CREATED=0
 }
 

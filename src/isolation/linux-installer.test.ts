@@ -218,13 +218,18 @@ useradd() {
 }
 usermod() { [[ "\${*: -1}" == "$selected" ]]; }
 kill_build_processes() { return 0; }
-userdel() { [[ "$1" == "$selected" ]]; user_created=0; user_retired=1; }
+userdel() {
+  [[ "$1" == "$selected" ]]
+  user_created=0
+  group_created=0
+  user_retired=1
+}
 groupdel() { [[ "$1" == "$selected" ]]; group_created=0; group_retired=1; }
 
 ensure_build_account
 [[ "$BUILD_ACCOUNT" == "$selected" && "$BUILD_ACCOUNT" != "$existing" ]]
 retire_build_account
-[[ "$user_retired" == 1 && "$group_retired" == 1 ]]
+[[ "$user_retired" == 1 && "$group_retired" == 0 ]]
 [[ "$BUILD_ACCOUNT_CREATED" == 0 && "$BUILD_GROUP_CREATED" == 0 ]]
   `, "bash", scriptPath], { stdio: "pipe" });
 
