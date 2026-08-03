@@ -400,17 +400,90 @@ install_units() {
 health_check() {
   "$RUNTIME_NODE" -e '
     const http = require("node:http");
-    const request = http.get({ hostname: "127.0.0.1", port: 3456, path: "/health", timeout: 1000 }, (response) => {
+    const request = http.get({
+      hostname: process.argv[1],
+      port: Number(process.argv[2]),
+      path: "/health",
+      timeout: 1000,
+    }, (response) => {
       response.resume();
       response.on("end", () => process.exit(response.statusCode >= 200 && response.statusCode < 300 ? 0 : 1));
     });
     request.on("timeout", () => request.destroy());
     request.on("error", () => process.exit(1));
-  '
+  ' "$1" "$2"
+}
+
+listener_belongs_to_pid() {
+  "$RUNTIME_NODE" -e '
+    const fs = require("node:fs");
+    const pid = process.argv[1];
+    const expectedPort = Number(process.argv[2]);
+
+    try {
+      const socketInodes = new Set();
+      for (const fd of fs.readdirSync(`/proc/${pid}/fd`)) {
+	let target;
+	try {
+	  target = fs.readlinkSync(`/proc/${pid}/fd/${fd}`);
+	} catch {
+	  continue;
+	}
+	const match = /^socket:\[(\d+)\]$/.exec(target);
+	if (match) socketInodes.add(match[1]);
+      }
+
+      for (const table of [`/proc/${pid}/net/tcp`, `/proc/${pid}/net/tcp6`]) {
+	let rows;
+	try {
+	  rows = fs.readFileSync(table, "utf8").trim().split("\n").slice(1);
+	} catch {
+	  continue;
+	}
+	for (const row of rows) {
+	  const fields = row.trim().split(/\s+/);
+	  if (fields.length < 10 || fields[3] !== "0A") continue;
+	  const separator = fields[1].lastIndexOf(":");
+	  const port = Number.parseInt(fields[1].slice(separator + 1), 16);
+	  if (port === expectedPort && socketInodes.has(fields[9])) {
+	    process.exit(0);
+	  }
+	}
+      }
+    } catch {
+      // The unit may be between restart attempts; let the caller retry.
+    }
+    process.exit(1);
+  ' "$1" "$2"
+}
+
+read_effective_listener() {
+  local pid="$1"
+  local env_entry value
+
+  [[ -r "/proc/$pid/environ" ]] || return 1
+  EFFECTIVE_HOST="127.0.0.1"
+  EFFECTIVE_PORT="3456"
+  while IFS= read -r -d '' env_entry; do
+    case "$env_entry" in
+    HOST=*)
+      value="${env_entry#HOST=}"
+      [[ -z "$value" ]] || EFFECTIVE_HOST="$value"
+      ;;
+    PORT=*)
+      value="${env_entry#PORT=}"
+      [[ -z "$value" ]] || EFFECTIVE_PORT="$value"
+      ;;
+    esac
+  done < "/proc/$pid/environ"
+
+  [[ -n "$EFFECTIVE_HOST" ]]
+  [[ "$EFFECTIVE_PORT" =~ ^[0-9]+$ ]] \
+    && ((EFFECTIVE_PORT >= 1 && EFFECTIVE_PORT <= 65535))
 }
 
 start_and_verify_services() {
-  local ready=0 deadline worker_unit
+  local ready=0 deadline worker_unit main_pid current_main_pid probe_host
 
   systemd-tmpfiles --create "$TMPFILES_TARGET/cli-openai-proxy.conf"
   systemctl daemon-reload
@@ -433,9 +506,28 @@ start_and_verify_services() {
   deadline=$((SECONDS + READINESS_TIMEOUT))
   log "Waiting up to ${READINESS_TIMEOUT}s for the gateway health endpoint"
   while ((SECONDS < deadline)); do
-    if systemctl is-active --quiet cli-openai-proxy-gateway.service && health_check; then
-      ready=1
-      break
+    main_pid="$(systemctl show cli-openai-proxy-gateway.service \
+      --property=MainPID --value 2>/dev/null || true)"
+    if systemctl is-active --quiet cli-openai-proxy-gateway.service \
+      && [[ "$main_pid" =~ ^[1-9][0-9]*$ ]] \
+      && read_effective_listener "$main_pid"; then
+      probe_host="$EFFECTIVE_HOST"
+      case "$probe_host" in
+	0.0.0.0) probe_host="127.0.0.1" ;;
+	:: | "[::]") probe_host="::1" ;;
+      esac
+
+      current_main_pid=""
+      if listener_belongs_to_pid "$main_pid" "$EFFECTIVE_PORT" \
+	&& health_check "$probe_host" "$EFFECTIVE_PORT"; then
+	current_main_pid="$(systemctl show cli-openai-proxy-gateway.service \
+	  --property=MainPID --value 2>/dev/null || true)"
+      fi
+      if [[ "$current_main_pid" == "$main_pid" ]] \
+	&& listener_belongs_to_pid "$main_pid" "$EFFECTIVE_PORT"; then
+	ready=1
+	break
+      fi
     fi
     sleep 1
   done

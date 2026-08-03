@@ -126,8 +126,20 @@ test("Multi-user conversion disables the conflicting Single service and verifies
   assert.match(script, /disable --now "\$SINGLE_SERVICE_NAME\.service"/);
   assert.ok(stopSingle >= 0 && stopSingle < installUnits && installUnits < startServices);
   assert.match(script, /systemctl is-active --quiet cli-openai-proxy-provisioner\.service/);
-  assert.match(script, /systemctl is-active --quiet cli-openai-proxy-gateway\.service && health_check/);
+  assert.match(script, /systemctl is-active --quiet cli-openai-proxy-gateway\.service/);
+  assert.match(script, /health_check "\$probe_host" "\$EFFECTIVE_PORT"/);
   assert.match(script, /Run Codex device login and agent provisioning again for each mapped user/);
+});
+
+test("Multi-user readiness probes the effective gateway listener", async () => {
+  const script = await readScript("install-linux-user-workers.sh");
+
+  assert.match(script, /read_effective_listener\(\)[\s\S]*\/proc\/\$pid\/environ/);
+  assert.match(script, /HOST=\*\)[\s\S]*EFFECTIVE_HOST/);
+  assert.match(script, /PORT=\*\)[\s\S]*EFFECTIVE_PORT/);
+  assert.match(script, /health_check "\$probe_host" "\$EFFECTIVE_PORT"/);
+  assert.match(script, /listener_belongs_to_pid "\$main_pid" "\$EFFECTIVE_PORT"/);
+  assert.doesNotMatch(script, /http\.get\(\{ hostname: "127\.0\.0\.1", port: 3456/);
 });
 
 test("container first-boot restarts a previously active gateway without a seed", async () => {

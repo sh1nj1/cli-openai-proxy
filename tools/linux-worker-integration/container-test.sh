@@ -100,6 +100,16 @@ NODE
 [[ "${generated_config[2]}" == "default/default" ]] \
   || fail "installer did not create the default tenant/user mapping"
 
+step "Reinstall probes the preserved nondefault gateway listener"
+sed -i 's/^HOST=.*/HOST=127.0.0.1/' /etc/cli-openai-proxy/gateway.env
+sed -i 's/^PORT=.*/PORT=3457/' /etc/cli-openai-proxy/gateway.env
+rm -f /etc/systemd/system/cli-openai-proxy-gateway.service.d/docker-bind.conf
+INSTALL_USE_PREBUILT=1 \
+INSTALL_PRINT_KEYS=0 \
+INSTALL_READINESS_TIMEOUT=30 \
+  /opt/app/scripts/install-linux-user-workers.sh
+curl_expect 200 "http://127.0.0.1:3457/health"
+
 step "Configuring per-user API keys and starting the gateway"
 cat > /etc/cli-openai-proxy/gateway.env <<EOF
 USER_API_KEYS='[{"key":"${KEY_A}","tenantId":"itest","userId":"user-a"},{"key":"${KEY_B}","tenantId":"itest","userId":"user-b"}]'
@@ -107,7 +117,7 @@ AUTH_ADMIN_KEYS=${ADMIN_KEY}
 EOF
 chown root:cli-openai-proxy /etc/cli-openai-proxy/gateway.env
 chmod 0640 /etc/cli-openai-proxy/gateway.env
-systemctl start cli-openai-proxy-gateway.service
+systemctl restart cli-openai-proxy-gateway.service
 
 timeout 30 bash -c \
   "until curl -fsS ${BASE_URL}/health >/dev/null 2>&1; do
