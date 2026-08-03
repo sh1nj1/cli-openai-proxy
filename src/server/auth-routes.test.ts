@@ -181,13 +181,13 @@ describe("auth-routes", () => {
   test("GET engines advertises each engine's flows so the caller can branch its UI", () => {
     const res = fakeRes();
     handleAuthEngines(fakeReq(), res);
-    const data = (res.payload as { data: Array<{ engine: string; flow: string; flows: string[] }> }).data;
-    // `flow` stays the default so a caller written against single-flow engines keeps working.
+    const data = (res.payload as { data: Array<{ engine: string; flows: string[] }> }).data;
+    // Order is the contract: the first flow is the default a caller naming none gets.
     assert.deepEqual(data.find((e) => e.engine === "claude"), {
-      engine: "claude", flow: "paste-code", flows: ["paste-code", "api-key"],
+      engine: "claude", flows: ["paste-code", "api-key"],
     });
     assert.deepEqual(data.find((e) => e.engine === "codex"), {
-      engine: "codex", flow: "api-key", flows: ["api-key", "device-code"],
+      engine: "codex", flows: ["api-key", "device-code"],
     });
   });
 
@@ -514,7 +514,7 @@ describe("auth-routes", () => {
     const res = fakeRes();
     await handleAuthStatus(fakeReq({ params: { engine: "fake" } as any }), res);
     assert.deepEqual(res.payload, {
-      engine: "fake", flow: "paste-code", flows: ["paste-code"], state: "authenticated", source: "provisioned",
+      engine: "fake", flows: ["paste-code"], state: "authenticated", source: "provisioned",
     });
   });
 
