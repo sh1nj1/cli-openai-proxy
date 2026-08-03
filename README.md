@@ -295,6 +295,7 @@ See [docs/cli-auth-provisioning.md](docs/cli-auth-provisioning.md).
 | `/v1/usage` | GET | Usage stats |
 | `/v1/usage/recent` | GET | Recent request log |
 | `/v1/auth/engines` | GET | Auth flow per engine (needs `AUTH_ADMIN_KEYS`) |
+| `/auth` | GET | Browser UI for CLI authentication (available when `AUTH_ADMIN_KEYS` is set) |
 | `/v1/auth/{engine}/status` | GET | Whether that CLI is authenticated |
 | `/v1/auth/{engine}/sessions` | POST | Start a login flow |
 | `/v1/auth/{engine}/sessions/{id}` | GET / POST / DELETE | Poll / submit / abandon |

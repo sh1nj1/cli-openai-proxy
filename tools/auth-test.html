@@ -3,22 +3,61 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>cli-openai-proxy — auth flow test</title>
+<title>cli-openai-proxy — CLI authentication</title>
 <style>
-  body { font-family: system-ui, sans-serif; max-width: 640px; margin: 2rem auto; padding: 0 1rem; line-height: 1.5; }
-  fieldset { margin-bottom: 1rem; border: 1px solid #ccc; }
-  label { display: block; margin: 0.5rem 0 0.125rem; }
-  input, select { width: 100%; box-sizing: border-box; padding: 0.375rem; font: inherit; }
-  button { margin: 0.5rem 0.25rem 0 0; padding: 0.375rem 0.75rem; font: inherit; }
-  pre { background: #f4f4f4; padding: 0.75rem; overflow-x: auto; white-space: pre-wrap; word-break: break-all; }
+  :root {
+    --bg: #0a0a0b;
+    --surface: #111113;
+    --surface-2: #19191d;
+    --border: #2a2a30;
+    --text: #e8e6e3;
+    --text-dim: #8a8a8e;
+    --accent: #d4ff2b;
+    --red: #ff4d4d;
+    --green: #2bff6e;
+    --space-1: 0.25rem;
+    --space-2: 0.5rem;
+    --space-3: 0.75rem;
+    --space-4: 1rem;
+    --space-8: 2rem;
+    --control-radius: 0.25rem;
+    --content-width: 640px;
+  }
+  body {
+    background: var(--bg); color: var(--text); font-family: system-ui, sans-serif;
+    max-width: var(--content-width); margin: var(--space-8) auto;
+    padding: 0 var(--space-4); line-height: 1.5;
+  }
+  fieldset {
+    background: var(--surface); border: 1px solid var(--border);
+    margin-bottom: var(--space-4); padding: var(--space-3) var(--space-4);
+  }
+  legend { color: var(--accent); padding: 0 var(--space-1); }
+  label { color: var(--text-dim); display: block; margin: var(--space-2) 0 var(--space-1); }
+  input, select {
+    background: var(--surface-2); border: 1px solid var(--border);
+    border-radius: var(--control-radius); color: var(--text); width: 100%;
+    box-sizing: border-box; padding: var(--space-2); font: inherit;
+  }
+  button {
+    background: var(--accent); border: 0; border-radius: var(--control-radius);
+    color: var(--bg); cursor: pointer; font: inherit; font-weight: 600;
+    margin: var(--space-2) var(--space-1) 0 0; padding: var(--space-2) var(--space-3);
+  }
+  button:disabled { cursor: wait; opacity: 0.5; }
+  a { color: var(--accent); }
+  pre {
+    background: var(--surface-2); border: 1px solid var(--border);
+    padding: var(--space-3); overflow-x: auto; white-space: pre-wrap; word-break: break-all;
+  }
   [hidden] { display: none; }
-  .error { color: #b00020; }
-  .ok { color: #087443; }
+  .error { color: var(--red); }
+  .ok { color: var(--green); }
 </style>
 </head>
 <body>
-<h1>Auth flow test</h1>
-<p>Local test page for the <code>/v1/auth</code> provisioning API. Open this file directly in a browser (the server sends <code>Access-Control-Allow-Origin: *</code>).</p>
+<h1>CLI authentication</h1>
+<p>Authenticate the CLI engines used by this proxy. The admin key stays in this page and is sent only as an Authorization header.</p>
 
 <fieldset>
   <legend>Connection</legend>
@@ -26,6 +65,8 @@
   <input id="baseUrl" value="http://localhost:3456">
   <label for="adminKey">Admin key (AUTH_ADMIN_KEYS)</label>
   <input id="adminKey" type="password" autocomplete="off">
+  <label for="apiKey">Completion / user key (API_KEYS or USER_API_KEYS)</label>
+  <input id="apiKey" type="password" autocomplete="off">
 </fieldset>
 
 <fieldset>
@@ -55,8 +96,6 @@
 
 <fieldset>
   <legend>Completion test</legend>
-  <label for="apiKey">API key (API_KEYS)</label>
-  <input id="apiKey" type="password" autocomplete="off">
   <label for="model">Model</label>
   <input id="model" value="paperclip/claude_local">
   <button id="testCompletion">Send test completion</button>
@@ -74,6 +113,11 @@ const $ = (id) => document.getElementById(id);
 // change (or reset on reload) afterwards.
 let session = null;
 let engines = [];
+const requestedEngine = new URLSearchParams(window.location.search).get("engine");
+
+if (window.location.protocol !== "file:") {
+  $("baseUrl").value = window.location.origin;
+}
 
 function show(status, body) {
   const el = $("resultStatus");
@@ -84,9 +128,17 @@ function show(status, body) {
 
 const currentBase = () => $("baseUrl").value.replace(/\/+$/, "");
 
-async function call(method, path, { body, key, base, okStatus } = {}) {
+function authHeaders(key, userKey) {
+  const headers = { Authorization: `Bearer ${key}` };
+  if (userKey) headers["X-CLI-Proxy-User-Key"] = userKey;
+  return headers;
+}
+
+async function call(method, path, { body, key, userKey, base, okStatus } = {}) {
   base = base ?? currentBase();
-  const headers = { Authorization: `Bearer ${key ?? $("adminKey").value}` };
+  key = key ?? $("adminKey").value;
+  userKey = userKey ?? $("apiKey").value;
+  const headers = authHeaders(key, userKey);
   if (body) headers["Content-Type"] = "application/json";
   show("…", `${method} ${path}`);
   try {
@@ -130,7 +182,8 @@ $("loadEngines").onclick = async () => {
   const selectedEngine = engine();
   engines = list.data;
   $("engine").replaceChildren(...engines.map(({ engine }) => new Option(engine, engine)));
-  if (engines.some(({ engine }) => engine === selectedEngine)) $("engine").value = selectedEngine;
+  const preferredEngine = requestedEngine ?? selectedEngine;
+  if (engines.some(({ engine }) => engine === preferredEngine)) $("engine").value = preferredEngine;
   syncEngine();
 };
 
@@ -150,20 +203,23 @@ $("createSession").onclick = async (e) => {
     if (!target || !targetFlow) return show("!", "Load engines and select a login flow first.");
     const base = currentBase();
     const key = $("adminKey").value;
+    const userKey = $("apiKey").value;
     // The server supersedes only same-engine sessions on the same server; a
     // pending session for a different engine — or on a different server — would
     // keep its CLI child alive until TTL, so cancel it where it was created,
     // with the key it was created under. 404 means it is already gone; on any
     // other failure keep the session tracked so cancellation can be retried.
-    if (session && (session.engine !== target || session.base !== base)) {
+    if (session && (
+      session.engine !== target || session.base !== base || session.userKey !== userKey
+    )) {
       const gone = await call("DELETE", `/v1/auth/${session.engine}/sessions/${session.id}`,
-        { base: session.base, key: session.key, okStatus: 404 });
+	{ base: session.base, key: session.key, userKey: session.userKey, okStatus: 404 });
       if (!gone) return;
       session = null;
       clearSessionInfo();
     }
     const created = await call("POST", `/v1/auth/${target}/sessions`, {
-      body: { flow: targetFlow }, base, key,
+      body: { flow: targetFlow }, base, key, userKey,
     });
     if (!created) {
       // A same-engine recreation disposes the tracked session server-side
@@ -174,8 +230,9 @@ $("createSession").onclick = async (e) => {
       // error on screen) and drop the record only on a confirmed 404.
       if (session && session.engine === target && session.base === base) {
         const probe = session;
+	const headers = authHeaders(probe.key, probe.userKey);
         const gone = await fetch(`${probe.base}/v1/auth/${probe.engine}/sessions/${probe.id}`, {
-          headers: { Authorization: `Bearer ${probe.key}` },
+	  headers,
         }).then((r) => r.status === 404, () => false);
         if (gone && session && session.id === probe.id && session.base === probe.base) {
           session = null;
@@ -188,7 +245,7 @@ $("createSession").onclick = async (e) => {
     clearSessionInfo();
     session = {
       id: created.sessionId, engine: created.engine ?? target,
-      flow: created.flow ?? targetFlow, base, key,
+      flow: created.flow ?? targetFlow, base, key, userKey,
     };
     syncFlowControls();
     const info = $("sessionInfo");
@@ -220,7 +277,8 @@ $("submitCode").onclick = async (e) => {
   e.target.disabled = true;
   try {
     const done = await call("POST", `/v1/auth/${submitted.engine}/sessions/${submitted.id}`,
-      { body: { value }, base: submitted.base, key: submitted.key, okStatus: 404 });
+      { body: { value }, base: submitted.base, key: submitted.key,
+	userKey: submitted.userKey, okStatus: 404 });
     if (!done) return;
     // A 404 (error envelope, not a session view) confirms the session no longer
     // exists server-side — expired or the server restarted — so drop the dead
@@ -258,7 +316,7 @@ $("pollSession").onclick = async () => {
   if (!session) return show("!", "Create a session first.");
   const polled = session;
   const res = await call("GET", `/v1/auth/${polled.engine}/sessions/${polled.id}`,
-    { base: polled.base, key: polled.key, okStatus: 404 });
+    { base: polled.base, key: polled.key, userKey: polled.userKey, okStatus: 404 });
   // A terminal device-code result needs no submit or cancel; a 404 also means
   // the server already forgot the session. Drop either locally so a later
   // Create never depends on reaching this server just to clean up stale state.
@@ -277,7 +335,7 @@ $("cancelSession").onclick = async () => {
   // it again at a server that may no longer be reachable and refuse to proceed.
   // Skip if Create already replaced the record while the DELETE was in flight.
   const done = await call("DELETE", `/v1/auth/${cancelled.engine}/sessions/${cancelled.id}`,
-    { base: cancelled.base, key: cancelled.key, okStatus: 404 });
+    { base: cancelled.base, key: cancelled.key, userKey: cancelled.userKey, okStatus: 404 });
   if (!done) return;
   if (session && session.id === cancelled.id && session.base === cancelled.base) {
     session = null;

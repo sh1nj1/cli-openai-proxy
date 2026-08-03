@@ -59,3 +59,13 @@ test("Linux installer protects the privileged Node executable path", async () =>
   assert.match(script, /s\|@NODE@\|\$\{RUNTIME_NODE\}\|g/);
   assert.doesNotMatch(script, /s\|@NODE@\|\$\{NODE_PATH\}\|g/);
 });
+
+test("Linux immutable releases include the auth UI runtime asset", async () => {
+  const script = await readFile(new URL("../../scripts/install-linux-user-workers.sh", import.meta.url), "utf8");
+  assert.match(script, /if \[\[ ! -f "\$\{SOURCE_ROOT\}\/tools\/auth-test\.html" \]\]/);
+  assert.match(script, /install -d -o root -g root -m 0755 "\$\{RUNTIME_ROOT\}\/tools"/);
+  assert.match(
+    script,
+    /install -o root -g root -m 0644 \\\s+"\$\{SOURCE_ROOT\}\/tools\/auth-test\.html" \\\s+"\$\{RUNTIME_ROOT\}\/tools\/auth-test\.html"/,
+  );
+});

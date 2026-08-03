@@ -71,6 +71,7 @@ COPY --from=build /opt/app/dist dist
 COPY --from=build /opt/app/node_modules node_modules
 COPY package.json package-lock.json ./
 COPY scripts scripts
+COPY tools/auth-test.html tools/auth-test.html
 COPY deploy/linux deploy/linux
 COPY deploy/docker/first-boot-install.sh /usr/local/lib/cli-openai-proxy/first-boot-install.sh
 COPY deploy/docker/cli-openai-proxy-first-boot.service /etc/systemd/system/cli-openai-proxy-first-boot.service

@@ -21,8 +21,8 @@ docker run -d --name "${CONTAINER}" \
   --tmpfs /run --tmpfs /run/lock \
   "${IMAGE}" >/dev/null
 
-# The production image must ship no CLI or test assets; prove it, then inject
-# the stub CLI and the assertion script into the running container. Stage at
+# The production image must ship no CLI or integration-test assets; prove it,
+# then inject the stub CLI and the assertion script into the running container. Stage at
 # /root, not /tmp: Ubuntu's tmp.conf clears /tmp during early boot
 # (systemd-tmpfiles-setup.service runs `D /tmp ...`), which races docker cp
 # into /tmp. No tmpfiles.d directive touches /root, so this sidesteps the

@@ -8,14 +8,18 @@ shell access to the host.
 
 The intended loop:
 
-1. A completion fails with `401 engine_unauthenticated` naming the engine.
-2. The client opens that engine's flow (`POST /v1/auth/{engine}/sessions`).
+1. A completion fails with `401 engine_unauthenticated`, naming the engine and
+   offering a relative `auth_url` when the UI is enabled.
+2. The client opens `auth_url`, or drives that engine's flow directly
+   (`POST /v1/auth/{engine}/sessions`).
 3. The user completes it (opens a URL, or pastes a key).
 4. The client submits the result; the next completion works.
 
-To walk the whole loop by hand, open [`tools/auth-test.html`](../tools/auth-test.html)
-in a browser — a dependency-free page that drives every endpoint below against
-any base URL.
+With `AUTH_ADMIN_KEYS` set, open `/auth` on the proxy. It serves the bundled,
+dependency-free client and `?engine=codex` preselects an engine only after it
+matches the server's engine list. The source file remains available at
+[`tools/auth-test.html`](../tools/auth-test.html) for direct local testing against
+another base URL.
 
 ## Enabling it
 
@@ -30,8 +34,18 @@ cli-openai-proxy
 ```
 
 With it unset, every `/v1/auth/*` route answers `404 auth_provisioning_disabled`
-— upgrading the proxy never exposes a login endpoint by itself. A completion key
-is not accepted here, and an admin key is not accepted for completions.
+and `/auth` answers a generic 404 — upgrading the proxy never exposes a login
+surface by itself. A completion key is not accepted here, and an admin key is not
+accepted for completions.
+
+The UI itself is intentionally loadable without either key because a browser
+navigation cannot attach the admin Authorization header. It contains no secret;
+the user enters the admin key in a password field, and the page sends it only as
+a Bearer header to same-origin `/v1/auth/*` requests. The response is non-cacheable
+and uses a nonce CSP, `frame-ancestors 'none'`, and `X-Frame-Options: DENY`.
+In per-user worker mode, enter the affected caller's `USER_API_KEYS` key in the
+completion/user-key field as well; the page sends it as `X-CLI-Proxy-User-Key`
+while keeping the admin key in `Authorization`.
 
 Both key sets are read into memory at startup and **removed from the process
 environment**, so neither is inherited by the CLI children a completion spawns.

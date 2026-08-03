@@ -9,6 +9,7 @@ set -euo pipefail
 DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT="cli-openai-proxy-smoke-$$"
 KEY="smoke-key-0123456789abcdef01234567"
+ADMIN_KEY="smoke-admin-0123456789abcdef012345"
 BASE_URL="http://127.0.0.1:3457"
 # Force /tmp: Docker Desktop on macOS does not share the default $TMPDIR
 # (/var/folders/...), which would silently break the bind mount.
@@ -17,14 +18,16 @@ ENV_FILE="$(mktemp /tmp/cli-openai-proxy-smoke.XXXXXX)"
 write_seed() {
   local path="$1"
   local key="$2"
+  local admin_key="$3"
   # HOST/PORT deliberately conflict with the container endpoint. The
   # container-only network env must win after this shared gateway env loads.
-  printf 'USER_API_KEYS=%s\nHOST=127.0.0.1\nPORT=9999\n' \
+  printf 'USER_API_KEYS=%s\nAUTH_ADMIN_KEYS=%s\nHOST=127.0.0.1\nPORT=9999\n' \
     "'[{\"key\":\"${key}\",\"tenantId\":\"smoke\",\"userId\":\"user-a\"}]'" \
+    "${admin_key}" \
     > "${path}"
 }
 
-write_seed "${ENV_FILE}" "${KEY}"
+write_seed "${ENV_FILE}" "${KEY}" "${ADMIN_KEY}"
 
 compose() {
   HOST_PORT=3457 GATEWAY_ENV_FILE="${ENV_FILE}" INSTALL_CLIS="" \
@@ -66,6 +69,12 @@ unit_state() {
 
 expect 401 "${BASE_URL}/v1/usage"
 expect 200 -H "Authorization: Bearer ${KEY}" "${BASE_URL}/v1/usage"
+expect 200 "${BASE_URL}/auth"
+curl -fsS "${BASE_URL}/auth" | grep -q "CLI authentication" \
+  || { compose logs; echo "FAIL: auth UI asset is missing" >&2; exit 1; }
+curl -fsS -D - -o /dev/null "${BASE_URL}/auth" | tr -d '\r' \
+  | grep -qi "^content-security-policy: .*frame-ancestors 'none'" \
+  || { compose logs; echo "FAIL: auth UI CSP is missing" >&2; exit 1; }
 
 # Key rotation across a restart: the gateway is ordered after the first-boot
 # oneshot, so the rotated seed must be live before the gateway ever answers —
@@ -75,7 +84,7 @@ expect 200 -H "Authorization: Bearer ${KEY}" "${BASE_URL}/v1/usage"
 # container runs, and this asserts stop/start re-resolves the source path.
 echo "==> rotating key and restarting"
 ROTATED_KEY="smoke-key-rotated-89abcdef0123456789abcdef"
-write_seed "${ENV_FILE}.next" "${ROTATED_KEY}"
+write_seed "${ENV_FILE}.next" "${ROTATED_KEY}" "${ADMIN_KEY}"
 mv "${ENV_FILE}.next" "${ENV_FILE}"
 compose restart --timeout 30
 
@@ -112,7 +121,7 @@ expect 000 -H "Authorization: Bearer ${ROTATED_KEY}" "${BASE_URL}/v1/usage"
 
 # Recovery: repopulating the seed brings the gateway back on the next boot.
 echo "==> restoring seed and restarting"
-write_seed "${ENV_FILE}.next" "${ROTATED_KEY}"
+write_seed "${ENV_FILE}.next" "${ROTATED_KEY}" "${ADMIN_KEY}"
 mv "${ENV_FILE}.next" "${ENV_FILE}"
 compose restart --timeout 30
 

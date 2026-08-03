@@ -8,6 +8,7 @@ import { handleChatCompletions } from "./routes.js";
 import { runnerFactory } from "../adapter/paperclip-registry.js";
 import { usageTracker } from "../usage/tracker.js";
 import { PaperclipRunner, type AdapterExecute } from "../adapter/paperclip-runner.js";
+import { AUTH_UI_AVAILABLE_HEADER } from "../isolation/worker-protocol.js";
 
 // NOTE on seam: the task-4 brief's plan reassigns the namespace-import binding
 // `registry.createRunner` directly. In real ESM (this repo builds to ESM
@@ -209,8 +210,12 @@ test("an unauthenticated CLI returns 401 engine_unauthenticated naming the engin
       : orig(model);
 
   try {
-    const req = { body: { model: "paperclip/codex_local", stream: false,
-      messages: [{ role: "user", content: "hi" }] } } as unknown as Request;
+    const req = {
+      app: { locals: { cliProxyRole: "gateway", authUiEnabled: true } },
+      headers: { host: "attacker.example" },
+      body: { model: "paperclip/codex_local", stream: false,
+	messages: [{ role: "user", content: "hi" }] },
+    } as unknown as Request;
     const res = fakeRes();
     let statusCode = 0;
     res.status = (code: number) => { statusCode = code; return res; };
@@ -218,10 +223,53 @@ test("an unauthenticated CLI returns 401 engine_unauthenticated naming the engin
     await handleChatCompletions(req, res);
 
     assert.equal(statusCode, 401, "unauthenticated CLI -> HTTP 401");
-    const payload = JSON.parse(res.body) as { error: { code: string; engine: string; message: string } };
+    const payload = JSON.parse(res.body) as {
+      error: { code: string; engine: string; message: string; auth_url: string };
+    };
     assert.equal(payload.error.code, "engine_unauthenticated");
     assert.equal(payload.error.engine, "codex", "names which login flow to open");
+    assert.equal(payload.error.auth_url, "/auth?engine=codex", "offers a relative, Host-safe UI link");
     assert.equal(payload.error.message, authMsg, "verbatim CLI message");
+
+    const spoofedReq = {
+      app: { locals: { cliProxyRole: "gateway", authUiEnabled: false } },
+      headers: { [AUTH_UI_AVAILABLE_HEADER]: "1" },
+      body: req.body,
+    } as unknown as Request;
+    const spoofedRes = fakeRes();
+    await handleChatCompletions(spoofedReq, spoofedRes);
+    const spoofedPayload = JSON.parse(spoofedRes.body) as { error: { auth_url?: string } };
+    assert.equal(spoofedPayload.error.auth_url, undefined, "gateway callers cannot spoof UI availability");
+  } finally {
+    runnerFactory.create = orig;
+  }
+});
+
+test("a streaming auth error carries the same relative auth UI link in-band", async () => {
+  const authExecute: AdapterExecute = async () => ({
+    exitCode: 1, signal: null, timedOut: false,
+    errorMessage: "Please authenticate.", errorCode: "claude_auth_required",
+  });
+  const orig = runnerFactory.create;
+  runnerFactory.create = () => new PaperclipRunner(
+    authExecute,
+    { engine: "cli" },
+    { engine: "claude" },
+  );
+
+  try {
+    const req = {
+      app: { locals: { cliProxyRole: "gateway", authUiEnabled: true } },
+      headers: {},
+      body: { model: "paperclip/claude_local", stream: true,
+	messages: [{ role: "user", content: "hi" }] },
+    } as unknown as Request;
+    const res = fakeRes();
+
+    await handleChatCompletions(req, res);
+
+    assert.match(res.body, /"code":"engine_unauthenticated"/);
+    assert.match(res.body, /"auth_url":"\/auth\?engine=claude"/);
   } finally {
     runnerFactory.create = orig;
   }

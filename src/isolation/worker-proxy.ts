@@ -12,6 +12,7 @@ import type { WorkerProvisioner, WorkerTarget } from "./types.js";
 import { WorkerIsolationError } from "./types.js";
 import {
   AUTHORIZED_PROVISIONING_HEADER,
+  AUTH_UI_AVAILABLE_HEADER,
   PROVISIONING_GENERATION_HEADER,
   PROVISIONING_SESSION_TTL_HEADER,
   SUPERSEDED_PROVISIONING_GENERATION_HEADER,
@@ -41,6 +42,7 @@ const PRIVATE_HEADERS = new Set([
   PROVISIONING_GENERATION_HEADER,
   PROVISIONING_SESSION_TTL_HEADER,
   SUPERSEDED_PROVISIONING_GENERATION_HEADER,
+  AUTH_UI_AVAILABLE_HEADER,
 ]);
 
 const REGENERATED_BODY_HEADERS = new Set(["content-encoding", "content-length"]);
@@ -205,6 +207,7 @@ function outgoingHeaders(
   body: Buffer,
   provisioningGeneration?: string,
   provisioningSessionTtlMs?: number,
+  authUiAvailable = false,
 ): IncomingHttpHeaders {
   const result: IncomingHttpHeaders = {};
   for (const [name, value] of Object.entries(headers)) {
@@ -224,6 +227,7 @@ function outgoingHeaders(
   if (provisioningSessionTtlMs !== undefined) {
     result[PROVISIONING_SESSION_TTL_HEADER] = String(provisioningSessionTtlMs);
   }
+  if (authUiAvailable) result[AUTH_UI_AVAILABLE_HEADER] = "1";
   return result;
 }
 
@@ -265,6 +269,7 @@ export class UserWorkerProxy {
     req: Request,
     res: Response,
     onAuthorizedProvisioningUrl?: (url: string) => void | Promise<void>,
+    authUiAvailable = false,
   ): Promise<void> {
     let upstream: http.ClientRequest | undefined;
     let clientClosed = false;
@@ -327,6 +332,7 @@ export class UserWorkerProxy {
 	    body,
 	    provisioningGeneration,
 	    issuedBinding ? getAuthSessionTtlMs() : undefined,
+	    authUiAvailable,
 	  ),
         },
 	(workerResponse) => {

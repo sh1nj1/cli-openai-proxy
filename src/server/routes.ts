@@ -22,6 +22,16 @@ import type { ClaudeCliResult, ClaudeCliStreamEvent } from "../types/claude-cli.
 import { usageTracker, displayCostUsd } from "../usage/tracker.js";
 import { isAuthEnabled } from "./auth.js";
 import { PKG_VERSION, getTimeoutMs, KEEPALIVE_INTERVAL_MS } from "../config.js";
+import { AUTH_UI_AVAILABLE_HEADER } from "../isolation/worker-protocol.js";
+import { AUTH_UI_PATH } from "./auth-ui.js";
+
+function authUiPath(req: Request, engine: string | undefined): string | undefined {
+  if (!engine) return undefined;
+  const role = req.app?.locals.cliProxyRole;
+  const available = (role === "gateway" && req.app.locals.authUiEnabled === true)
+    || (role === "worker" && req.headers[AUTH_UI_AVAILABLE_HEADER] === "1");
+  return available ? `${AUTH_UI_PATH}?engine=${encodeURIComponent(engine)}` : undefined;
+}
 
 /**
  * Handle POST /v1/chat/completions
@@ -63,7 +73,7 @@ export async function handleChatCompletions(
       if (stream) {
         await handleStreamingResponse(req, res, subprocess, cliInput, requestId, requestedModel, startTime, cliInput.jsonMode, body.stream_options?.include_usage === true);
       } else {
-        await handleNonStreamingResponse(res, subprocess, cliInput, requestId, requestedModel, startTime, cliInput.jsonMode);
+	await handleNonStreamingResponse(req, res, subprocess, cliInput, requestId, requestedModel, startTime, cliInput.jsonMode);
       }
     } finally {
       await cleanup();
@@ -292,10 +302,17 @@ async function handleStreamingResponse(
       // change — deliver the classified error in-band with the verbatim message so an
       // OpenAI client parses type/code (e.g. insufficient_quota) from the SSE stream.
       const { type, code, message, engine } = openaiErrorFromError(error);
+      const authUrl = authUiPath(req, engine);
       if (!res.writableEnded) {
         res.write(
           `data: ${JSON.stringify({
-            error: { message, type, code, ...(engine ? { engine } : {}) },
+	    error: {
+	      message,
+	      type,
+	      code,
+	      ...(engine ? { engine } : {}),
+	      ...(authUrl ? { auth_url: authUrl } : {}),
+	    },
           })}\n\n`
         );
         res.end();
@@ -335,6 +352,7 @@ async function handleStreamingResponse(
  * Handle non-streaming response
  */
 async function handleNonStreamingResponse(
+  req: Request,
   res: Response,
   subprocess: AgentRunner,
   cliInput: ReturnType<typeof openaiToCli>,
@@ -378,9 +396,18 @@ async function handleNonStreamingResponse(
       // OpenAI status + type + code; a plain Error is an internal 500. Either way the
       // verbatim message is passed through unchanged.
       const { status, type, code, message, retryAfterSeconds, engine } = openaiErrorFromError(error);
+      const authUrl = authUiPath(req, engine);
       if (res.writable) {
         if (retryAfterSeconds != null) res.setHeader("Retry-After", String(retryAfterSeconds));
-        res.status(status).json({ error: { message, type, code, ...(engine ? { engine } : {}) } });
+	res.status(status).json({
+	  error: {
+	    message,
+	    type,
+	    code,
+	    ...(engine ? { engine } : {}),
+	    ...(authUrl ? { auth_url: authUrl } : {}),
+	  },
+	});
       }
       resolve();
     });

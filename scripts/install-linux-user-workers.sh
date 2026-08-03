@@ -53,6 +53,10 @@ if [[ ! -d "${SOURCE_ROOT}/node_modules" ]]; then
   echo "Dependencies are missing. Run npm ci first." >&2
   exit 1
 fi
+if [[ ! -f "${SOURCE_ROOT}/tools/auth-test.html" ]]; then
+  echo "Auth UI asset is missing: tools/auth-test.html" >&2
+  exit 1
+fi
 
 validate_privileged_path "${NODE_PATH}"
 
@@ -80,7 +84,11 @@ chmod 0600 "${CONFIG_DIR}/provisioner-identity.key"
 
 install -d -o root -g root -m 0755 "${RUNTIME_ROOT}"
 install -d -o root -g root -m 0755 "${RUNTIME_ROOT}/bin"
+install -d -o root -g root -m 0755 "${RUNTIME_ROOT}/tools"
 install -o root -g root -m 0755 "${NODE_PATH}" "${RUNTIME_NODE}"
+install -o root -g root -m 0644 \
+  "${SOURCE_ROOT}/tools/auth-test.html" \
+  "${RUNTIME_ROOT}/tools/auth-test.html"
 cp -a \
   "${SOURCE_ROOT}/dist" \
   "${SOURCE_ROOT}/node_modules" \
