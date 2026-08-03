@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { createHash, randomUUID } from "node:crypto";
+import { createHash, createHmac, randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
 import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import http from "node:http";
@@ -1217,6 +1217,59 @@ test("shared API key cannot select a worker or force JSON parsing without signed
     assert.equal(provisioned, false);
   } finally {
     await new Promise<void>((resolve) => gateway.close(() => resolve()));
+  }
+});
+
+test("gateway does not advertise the auth UI to signed-header-only callers", async () => {
+  const socketPath = `/tmp/cap-worker-${randomUUID().slice(0, 8)}.sock`;
+  let seenAuthUiHeader: string | string[] | undefined;
+  const worker = http.createServer((request, response) => {
+    seenAuthUiHeader = request.headers[AUTH_UI_AVAILABLE_HEADER];
+    response.writeHead(200, { "content-type": "application/json" });
+    response.end("{}");
+  });
+  await new Promise<void>((resolve) => worker.listen(socketPath, resolve));
+
+  const provisioner: WorkerProvisioner = {
+    async ensureWorker() {
+      return {
+	accountName: "cap_0123456789abcdef0123",
+	endpoint: { kind: "unix", address: socketPath },
+      };
+    },
+  };
+  const identitySecret = "identity-secret-that-is-long-enough";
+  process.env.API_KEYS = "shared-key";
+  process.env.AUTH_ADMIN_KEYS = "admin-key-123456";
+  process.env.USER_IDENTITY_HMAC_SECRET = identitySecret;
+  const gateway = createApp({ userWorkerProxy: new UserWorkerProxy(provisioner) }).listen(0);
+  await new Promise<void>((resolve) => gateway.once("listening", resolve));
+  try {
+    const port = (gateway.address() as AddressInfo).port;
+    const authUiResponse = await fetch(`http://127.0.0.1:${port}/auth`);
+    assert.equal(authUiResponse.status, 200, "the UI must be enabled for this regression test");
+    const timestamp = String(Math.floor(Date.now() / 1000));
+    const signature = createHmac("sha256", identitySecret)
+      .update(["v1", "POST", "/v1/chat/completions", timestamp, "tenant-a", "user-a"].join("\n"))
+      .digest("hex");
+    const response = await fetch(`http://127.0.0.1:${port}/v1/chat/completions`, {
+      method: "POST",
+      headers: {
+	authorization: "Bearer shared-key",
+	"content-type": "application/json",
+	"x-cli-proxy-tenant-id": "tenant-a",
+	"x-cli-proxy-user-id": "user-a",
+	"x-cli-proxy-identity-timestamp": timestamp,
+	"x-cli-proxy-identity-signature": signature,
+      },
+      body: JSON.stringify({ messages: [{ role: "user", content: "hi" }] }),
+    });
+    assert.equal(response.status, 200);
+    assert.equal(seenAuthUiHeader, undefined);
+  } finally {
+    await new Promise<void>((resolve) => gateway.close(() => resolve()));
+    await new Promise<void>((resolve) => worker.close(() => resolve()));
+    await rm(socketPath, { force: true });
   }
 });
 

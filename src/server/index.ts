@@ -32,7 +32,11 @@ import {
 import { getTimeoutMs } from "../config.js";
 import { resetSessions } from "../auth/session-manager.js";
 import { handleAuthorizedSession, initProvisioning, shutdownProvisioning } from "../provision/sync.js";
-import { initRequestIdentity, requireRequestIdentity } from "../isolation/request-identity.js";
+import {
+  initRequestIdentity,
+  requestUsesMappedIdentity,
+  requireRequestIdentity,
+} from "../isolation/request-identity.js";
 import type { UserWorkerProxy } from "../isolation/worker-proxy.js";
 import { AUTH_UI_PATH, handleAuthUi } from "./auth-ui.js";
 
@@ -198,7 +202,8 @@ export function createApp(config: AppConfig = {}): Express {
     if (!userWorkerProxy) return [handler];
     return [
       (req, res) => {
-	void userWorkerProxy.forward(req, res, onAuthorizedProvisioningUrl, app.locals.authUiEnabled === true);
+	const authUiAvailable = app.locals.authUiEnabled === true && requestUsesMappedIdentity(req);
+	void userWorkerProxy.forward(req, res, onAuthorizedProvisioningUrl, authUiAvailable);
       },
     ];
   };

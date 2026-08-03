@@ -91,6 +91,11 @@ function bearerToken(req: Request): string {
   return (req.headers.authorization ?? "").replace(/^Bearer\s+/i, "").trim();
 }
 
+export function requestUsesMappedIdentity(req: Request): boolean {
+  const userKey = header(req, "x-cli-proxy-user-key") || bearerToken(req);
+  return keyIdentities.has(userKey);
+}
+
 export function resolveRequestIdentity(req: Request): UserIdentity | null {
   const userKey = header(req, "x-cli-proxy-user-key") || bearerToken(req);
   const mapped = keyIdentities.get(userKey);
