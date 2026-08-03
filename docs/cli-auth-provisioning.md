@@ -46,6 +46,9 @@ and uses a nonce CSP, `frame-ancestors 'none'`, and `X-Frame-Options: DENY`.
 In per-user worker mode, enter the affected caller's `USER_API_KEYS` key in the
 completion/user-key field as well; the page sends it as `X-CLI-Proxy-User-Key`
 while keeping the admin key in `Authorization`.
+Workers advertise `auth_url` only for requests authenticated by such a mapped
+key. Signed-header-only callers do not receive the link because browser requests
+cannot recreate the path-bound HMAC identity.
 
 Both key sets are read into memory at startup and **removed from the process
 environment**, so neither is inherited by the CLI children a completion spawns.

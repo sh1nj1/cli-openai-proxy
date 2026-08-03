@@ -7,6 +7,7 @@ import {
   initRequestIdentity,
   mappedCompletionKeys,
   requestIdentity,
+  requestUsesMappedIdentity,
   resolveRequestIdentity,
   requireRequestIdentity,
   resetRequestIdentityForTests,
@@ -173,6 +174,8 @@ describe("request identity", () => {
     ]);
     initRequestIdentity();
     assert.deepEqual(mappedCompletionKeys(), ["user-key-12345678"]);
+    assert.equal(requestUsesMappedIdentity(fakeRequest({ authorization: "Bearer user-key-12345678" })), true);
+    assert.equal(requestUsesMappedIdentity(fakeRequest({ authorization: "Bearer another-key" })), false);
     assert.throws(() => requestIdentity(fakeRequest({})), /middleware did not run/);
   });
 });
