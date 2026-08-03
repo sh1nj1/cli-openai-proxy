@@ -486,12 +486,14 @@ async function prepareGitSource(
   if (tree.split("\n").some((entry) => entry.startsWith("160000 commit "))) {
     throw new ProvisionError("Git source contains a submodule", "git_source_rejected");
   }
+  // Inspect only the tree the archive extracts; walking the commit would also
+  // flag filtered-out blobs that exist solely in ancestor commits once the
+  // historical-pin fallback has deepened the clone.
   const missing = await runGit([
     "rev-list",
     "--objects",
     "--missing=print",
-    revision,
-    ...(source.path ? ["--", source.path] : []),
+    source.path ? treeish : `${revision}^{tree}`,
   ], {
     cwd: repository,
     maxBuffer: MAX_GIT_METADATA_BYTES,

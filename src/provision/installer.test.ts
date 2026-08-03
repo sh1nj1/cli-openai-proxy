@@ -94,10 +94,17 @@ async function serveGitRepository(
     addGitlink?: boolean;
     allowFilter?: boolean;
     objectFormat?: "sha1" | "sha256";
+    intermediateFiles?: Record<string, string>;
     tipFiles?: Record<string, string>;
     advanceAfterFirstAdvertisement?: Record<string, string>;
   } = {},
-): Promise<{ url: string; rev: string; historicalRev: string; close: () => Promise<void> }> {
+): Promise<{
+  url: string;
+  rev: string;
+  historicalRev: string;
+  intermediateRev?: string;
+  close: () => Promise<void>;
+}> {
   const root = mkdtempSync(path.join(tmpdir(), "provision-git-test-"));
   const source = path.join(root, "source");
   const bare = path.join(root, "skill.git");
@@ -134,6 +141,9 @@ async function serveGitRepository(
       "commit", "--quiet", "-m", "gitlink fixture",
     ], { cwd: source });
   }
+  const intermediateRev = opts.intermediateFiles
+    ? commitFiles(opts.intermediateFiles, "intermediate fixture")
+    : undefined;
   if (opts.tipFiles) commitFiles(opts.tipFiles, "tip fixture");
   const rev = execFileSync("git", ["rev-parse", "HEAD"], { cwd: source, encoding: "utf8" }).trim();
   execFileSync("git", ["clone", "--quiet", "--bare", source, bare]);
@@ -196,6 +206,7 @@ async function serveGitRepository(
     url: `http://127.0.0.1:${address.port}/skill.git`,
     rev,
     historicalRev,
+    intermediateRev,
     close: async () => {
       repositoryServer.closeAllConnections?.();
       await new Promise<void>((resolve, reject) => repositoryServer.close((err) => err ? reject(err) : resolve()));
@@ -504,6 +515,27 @@ describe("provision installer", () => {
 	git: { url: repository.url, rev: repository.rev, path: "skills/demo" },
       }, { skillsDir })), "audit_failed");
       assert.equal(existsSync(path.join(skillsDir, "demo")), false);
+    } finally {
+      await repository.close();
+    }
+  });
+
+  test("a historical pin ignores oversized blobs deleted before it", async () => {
+    const repository = await serveGitRepository({
+      "SKILL.md": "First revision.",
+      "big.bin": "x".repeat(1024 * 1024 + 1),
+    }, {
+      allowFilter: true,
+      intermediateFiles: { "SKILL.md": "Pinned revision.", "big.bin": "small" },
+      tipFiles: { "extra.txt": "tip" },
+    });
+    try {
+      const result = await installSkill({
+	name: "demo",
+	git: { url: repository.url, rev: repository.intermediateRev! },
+      }, { skillsDir });
+      assert.deepEqual(result.files.sort(), ["SKILL.md", "big.bin"]);
+      assert.equal(readFileSync(path.join(skillsDir, "demo", "SKILL.md"), "utf8"), "Pinned revision.");
     } finally {
       await repository.close();
     }
