@@ -43,6 +43,11 @@ describe("provision state", () => {
     assert.equal(loadRegisteredManifestUrl(["another-key", "admin-secret"]), url);
   });
 
+  test("a corrupt registered manifest file loads as absent", () => {
+    writeFileSync(registeredManifestFilePath(), "{ not json");
+    assert.equal(loadRegisteredManifestUrl(["admin-secret"]), null);
+  });
+
   test("saved state round-trips", () => {
     const state = {
       version: 1 as const,
