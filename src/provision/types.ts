@@ -12,10 +12,20 @@
 export interface ProvisionItem {
   type: string;
   name: string;
-  /** Artifact download URL. Required for supported types, opaque for others. */
+  /** Archive download URL. Exactly one of archive fields or `git` is required. */
   url?: string;
-  /** Hex sha256 of the artifact. Required for supported types. */
+  /** Hex sha256 of the archive. Required with `url`. */
   sha256?: string;
+  /** Public git repository at an immutable commit or named branch. */
+  git?: GitProvisionSource;
+}
+
+export interface GitProvisionSource {
+  url: string;
+  /** Full SHA-1/SHA-256 commit object ID or branch name; tags are refused. */
+  rev: string;
+  /** Repository-relative directory. Omitted means the repository root. */
+  path?: string;
 }
 
 export interface ProvisionManifest {
@@ -41,7 +51,13 @@ export const SUPPORTED_PROVISION_TYPES: ReadonlySet<string> = new Set(["skill"])
 
 /** One filesystem snapshot owned by the proxy. */
 export interface InstalledSnapshot {
+  /**
+   * Desired-source fingerprint. For archives this is the artifact sha256; git
+   * sources use a sha256 of their canonical URL, revision, and subpath.
+   */
   sha256: string;
+  /** Non-secret source metadata used to render status after a restart. */
+  source?: { type: "git"; ref: string; rev: string; path?: string };
   /** Paths relative to the item's install dir — what removal may delete. */
   files: string[];
   /** Archive-owned directories, including empty ones, that removal may clean up. */

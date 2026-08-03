@@ -10,9 +10,15 @@
 import {
   ProvisionError,
   SUPPORTED_PROVISION_TYPES,
+  type GitProvisionSource,
   type ProvisionItem,
   type ProvisionManifest,
 } from "./types.js";
+import {
+  isCanonicalGitPath,
+  isValidGitRevision,
+  parseGitHubTreeUrl,
+} from "./git-source.js";
 
 export const MANIFEST_SCHEMA = "agent-provisioning/v1";
 
@@ -29,6 +35,37 @@ export function isValidItemName(name: string): boolean {
 }
 
 const SHA256_PATTERN = /^[0-9a-f]{64}$/i;
+function parseGitSource(value: unknown, index: number): GitProvisionSource {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw invalidItem(index, "`git` must be an object");
+  }
+  const git = value as Record<string, unknown>;
+  if (typeof git.url !== "string" || !git.url.trim()) {
+    throw invalidItem(index, "`git.url` is required");
+  }
+  const browserSource = parseGitHubTreeUrl(git.url.trim());
+  if (browserSource && (git.rev !== undefined || git.path !== undefined)) {
+    throw invalidItem(index, "a GitHub tree URL cannot be combined with `git.rev` or `git.path`");
+  }
+  const url = browserSource?.url ?? git.url.trim();
+  const rev = browserSource?.rev ?? git.rev;
+  const rawPath = browserSource?.path ?? git.path;
+  if (!isValidGitRevision(rev)) {
+    throw invalidItem(index, "`git.rev` must be a full commit SHA or valid branch name");
+  }
+  let subpath: string | undefined;
+  if (rawPath !== undefined) {
+    if (!isCanonicalGitPath(rawPath)) {
+      throw invalidItem(index, "`git.path` must be a canonical repository-relative directory");
+    }
+    subpath = rawPath;
+  }
+  return {
+    url,
+    rev: /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i.test(rev) ? rev.toLowerCase() : rev,
+    ...(subpath !== undefined ? { path: subpath } : {}),
+  };
+}
 
 function invalidItem(index: number, reason: string): ProvisionError {
   return new ProvisionError(`items[${index}]: ${reason}`, "invalid_item");
@@ -69,18 +106,29 @@ export function parseManifest(raw: unknown): ProvisionManifest {
     // may carry a shape this version cannot judge, and it only ever reports
     // `unsupported` — it never reaches a download.
     if (SUPPORTED_PROVISION_TYPES.has(item.type)) {
-      if (typeof item.url !== "string" || !item.url.trim()) {
-        throw invalidItem(index, "missing `url`");
+      const carriesArchive = item.url !== undefined || item.sha256 !== undefined;
+      const carriesGit = item.git !== undefined;
+      if (carriesArchive === carriesGit) {
+	throw invalidItem(index, "must carry exactly one source: `url` + `sha256`, or `git`");
       }
-      if (typeof item.sha256 !== "string" || !SHA256_PATTERN.test(item.sha256)) {
-        throw invalidItem(index, "`sha256` must be 64 hex chars");
+      if (carriesArchive) {
+	if (typeof item.url !== "string" || !item.url.trim()) {
+	  throw invalidItem(index, "missing `url`");
+	}
+	if (typeof item.sha256 !== "string" || !SHA256_PATTERN.test(item.sha256)) {
+	  throw invalidItem(index, "`sha256` must be 64 hex chars");
+	}
       }
     }
+    const git = SUPPORTED_PROVISION_TYPES.has(item.type) && item.git !== undefined
+      ? parseGitSource(item.git, index)
+      : undefined;
     return {
       type: item.type,
       name: item.name,
       url: typeof item.url === "string" ? item.url : undefined,
       sha256: typeof item.sha256 === "string" ? item.sha256.toLowerCase() : undefined,
+      ...(git ? { git } : {}),
     };
   });
 

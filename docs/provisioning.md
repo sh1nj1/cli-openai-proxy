@@ -3,15 +3,15 @@
 The [auth provisioning API](cli-auth-provisioning.md) logs an engine in over
 HTTP. This surface handles the step after login: giving the agent its
 capabilities. An external app (e.g. Collavre) publishes **one JSON manifest**;
-the proxy pulls it, verifies every artifact, and installs it into a
+the proxy pulls it, verifies every source, and installs it into a
 type-specific sandbox on the host. The external side needs no orchestration, no
-callbacks, no signing infrastructure — a statically hosted JSON file plus the
-artifacts it names is a complete integration.
+callbacks, or signing infrastructure. Items may keep using pinned `.tar.gz`
+artifacts or point at a public git repository commit, branch, or GitHub tree URL.
 
 ```
 [external app]                          [cli-openai-proxy]
-  provision.json + artifacts    ←pull─   fetch → verify → diff → install
-  (static hosting is enough)             lockfile ownership, TOFU approval
+  provision.json + sources      ←pull─   fetch → verify → diff → install
+					  lockfile ownership, TOFU approval
 ```
 
 ## Enabling it
@@ -23,6 +23,11 @@ ignored — upgrading the proxy never exposes an install channel by itself.
 The routes are gated by the same `AUTH_ADMIN_KEYS` as the auth provisioning
 API: installing prompt-loaded instructions is at least as sensitive as mutating
 credentials, and a completion key is not accepted.
+
+Git-backed items require a `git` executable on the service's `PATH`. The
+official Docker image includes it. Bare-metal hosts that use only `.tar.gz`
+sources do not need git; install the operating system's git package before
+enabling a manifest that contains `git` sources.
 
 | Env | Meaning |
 | --- | --- |
@@ -85,6 +90,22 @@ the same reason.
       "name": "pr-monitor",
       "url": "https://collavre.com/registry/pr-monitor-1.4.2.tar.gz",
       "sha256": "9f2c…"
+    },
+    {
+      "type": "skill",
+      "name": "review-helper",
+      "git": {
+	"url": "https://github.com/example/agent-bundles.git",
+	"rev": "main",
+	"path": "skills/review-helper"
+      }
+    },
+    {
+      "type": "skill",
+      "name": "collavre",
+      "git": {
+	"url": "https://github.com/sh1nj1/plan42/tree/main/skills/collavre"
+      }
     }
   ]
 }
@@ -97,15 +118,27 @@ the same reason.
 - `name` must match `[a-z0-9][a-z0-9_-]{0,63}` — uppercase is rejected so
   names remain unique on case-insensitive filesystems; the name becomes a
   directory segment.
-- `sha256` pins the artifact. A mismatch refuses the install.
+- Each supported item carries exactly one source:
+  - `url` + `sha256` downloads the existing `.tar.gz` format. The digest pins
+    the artifact bytes; a mismatch refuses the install.
+  - `git` fetches a public repository. `rev` may be a full 40- or 64-character
+    commit SHA reachable from an advertised branch or tag, or a branch name;
+    tags are not accepted as `rev` values. `path` optionally selects one
+    repository-relative directory, and omission installs the repository root.
+    A GitHub `/tree/{branch}/{path}` browser URL may instead be supplied as
+    `git.url`; it is normalized to those three fields automatically.
+    Slash-containing branch names use the explicit `url` + `rev` + `path` form
+    because GitHub tree URLs do not delimit the branch from the path.
 - **The manifest never chooses paths.** Each type maps to a hardcoded sandbox
-  (`skill` → `~/.claude/skills/{name}`); there is no `path` field by design,
-  so the channel cannot become an arbitrary remote file write.
+  (`skill` → `~/.claude/skills/{name}`). `git.path` selects source content only;
+  it never affects the destination, so the channel cannot become an arbitrary
+  remote file write.
 
-Artifacts are `.tar.gz`, either files at the archive root or everything under
-one top-level directory. Removing an item from the manifest uninstalls it on
-the next sync; an **empty `items` array removes everything managed** (distinct
-from having no manifest registered, which syncs nothing).
+Archive sources may put files at the archive root or under one top-level
+directory. Git sources reject submodules and install only the selected tree.
+Removing an item from the manifest uninstalls it on the next sync; an **empty
+`items` array removes everything managed** (distinct from having no manifest
+registered, which syncs nothing).
 
 ## How the manifest URL arrives
 
@@ -129,8 +162,16 @@ Three ways, all equivalent once registered:
    `PROVISION_REFETCH_MS` (default 1h). Updating the JSON is all an external
    app does to roll out changes; a failed sync retries on the next tick.
 
-Manifest and artifact URLs may use signed query parameters, but embedded
-`https://user:password@host/` credentials are rejected before any request.
+Manifest and archive URLs may use signed query parameters, but embedded
+`https://user:password@host/` credentials are rejected before any request. Git
+URLs cannot contain credentials, query parameters, or fragments; v1 supports
+public repositories only.
+
+When the manifest and git repository use different hosts, both must appear in
+the explicit allowlist. For example, a Collavre-hosted manifest using the
+GitHub tree URL above needs
+`PROVISION_ALLOWLIST=collavre.example,github.com` (with the real manifest host
+in place of `collavre.example`).
 
 ## Endpoints
 
@@ -140,7 +181,10 @@ All under the admin key (`Authorization: Bearer <admin-key>`).
 
 Status of every item from the last sync (or the lockfile before one):
 `installed | pending_approval | unsupported | removed | failed` (+ `error`),
-plus `manifest_url`, `last_sync_at`, `last_error`.
+plus `manifest_url`, `last_sync_at`, `last_error`. Archive items report
+`sha256`; git items report the requested `git.rev`, its `git.resolved_rev`
+commit after resolution, and optional `git.path` without echoing the repository
+URL.
 
 ### `POST /v1/provision/sync` → status view
 
@@ -151,7 +195,7 @@ itself cannot be fetched or parsed.
 
 Lift the trust-on-first-use stop for one item and sync. Only items present in
 the current manifest can be approved. Once a name is approved, later upgrades
-(new sha256) apply without another stop.
+(new archive sha256, git revision, or branch head) apply without another stop.
 
 ### `DELETE /v1/provision/items/{type}/{name}`
 
@@ -169,19 +213,31 @@ The tombstone clears after the item leaves the manifest.
   `PROVISION_ALLOWLIST`, artifacts must come from the manifest's own host —
   registering a manifest is the trust decision, and it must not fan out to
   arbitrary origins by default.
-- **Integrity.** Artifact sha256 is mandatory and idempotency is judged on
-  content hash, not version strings — a registry that re-publishes different
-  bytes under the same name re-installs (and a tampered one fails).
-- **Bounded transfer and expansion.** The manifest is capped at 1 MiB and each
-  artifact at 10 MiB while their bodies stream (an oversized or never-ending
-  response is cut off at the limit, under an overall timeout). The archive's
-  decompressed size is bounded *before* extraction — a small gzip bomb never
-  reaches the filesystem.
-- **Redirects re-checked.** `fetch` is never allowed to follow a redirect on
+- **Integrity.** Archives require sha256. A git commit is used directly; a
+  branch is resolved through `refs/heads/*` on every sync, then that exact
+  commit is fetched and recorded in the lockfile. Git verifies fetched objects
+  before the selected tree is staged. Idempotency uses the archive digest or a
+  fingerprint of the git URL/requested ref/resolved commit/path, not version
+  strings. A moved branch therefore upgrades, while an unchanged branch does
+  not reinstall.
+- **Bounded content and archive transfer.** The manifest is capped at 1 MiB and
+  each archive at 10 MiB while their bodies stream (an oversized or
+  never-ending response is cut off at the limit, under an overall timeout).
+  Archive decompression is bounded *before* extraction. Git fetches are shallow,
+  time-bounded, and request a blob-size filter, though a server may ignore that
+  filter; the fetch subprocess is terminated if its temporary repository grows
+  beyond 16 MiB. The selected tree is always subject to the same 1 MiB file and
+  10 MiB total-content audit before installation.
+- **Redirects re-checked.** HTTP `fetch` is never allowed to follow a redirect on
   its own: every hop of a manifest or artifact fetch is validated against the
   same host policy, so an allowed host cannot bounce the request to a
   forbidden one.
-- **Install = file placement only.** Nothing from an archive is executed. Link
+- **Hardened git subprocess.** Git sources disable system/global config,
+  credential helpers, hooks, redirects, lazy fetching, and all protocols except
+  HTTPS (loopback HTTP is accepted for tests). Only branch refs are resolved;
+  tags, submodules, URL credentials, and interactive authentication are
+  refused.
+- **Install = file placement only.** Nothing from either source is executed. Link
   entries, traversal names, binaries, files over 1 MiB, and text matching
   pipe-download-into-shell patterns are refused. Extraction stages next to the
   target and publishes with the platform's atomic no-replace rename; a failed

@@ -60,6 +60,12 @@ step "Production image ships no devDependencies"
 [[ ! -e /opt/app/node_modules/typescript ]] \
   || fail "devDependencies leaked into the runtime image"
 
+step "Production image supports git-backed provisioning"
+command -v git >/dev/null \
+  || fail "git is missing from the production runtime image"
+git --version >/dev/null \
+  || fail "git in the production runtime image is not executable"
+
 step "Immutable release includes the auth UI runtime asset"
 release_root="$(sed -n \
   's|^ExecStart=[^ ]* \([^ ]*\)/dist/server/standalone\.js$|\1|p' \

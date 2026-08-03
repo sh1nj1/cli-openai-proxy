@@ -1,5 +1,6 @@
 import { test, describe, before, after, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
+import { execFileSync, spawn } from "child_process";
 import { createHash } from "crypto";
 import {
   existsSync,
@@ -57,6 +58,86 @@ function skillArchive(content: string, fileName = "SKILL.md"): Buffer {
 }
 
 const sha = (buf: Buffer) => createHash("sha256").update(buf).digest("hex");
+
+async function serveMutableGitRepository(): Promise<{
+  url: string;
+  revision: string;
+  update: (contents: string) => string;
+  close: () => Promise<void>;
+}> {
+  const root = mkdtempSync(path.join(tmpdir(), "provision-sync-git-"));
+  const source = path.join(root, "source");
+  const bare = path.join(root, "skill.git");
+  mkdirSync(source);
+  execFileSync("git", ["init", "--quiet"], { cwd: source });
+  const commit = (contents: string, message: string): string => {
+    writeFileSync(path.join(source, "SKILL.md"), contents);
+    execFileSync("git", ["add", "SKILL.md"], { cwd: source });
+    execFileSync("git", [
+      "-c", "user.name=Provision Test",
+      "-c", "user.email=provision@example.invalid",
+      "commit", "--quiet", "-m", message,
+    ], { cwd: source });
+    return execFileSync("git", ["rev-parse", "HEAD"], { cwd: source, encoding: "utf8" }).trim();
+  };
+  let revision = commit("branch v1", "v1");
+  execFileSync("git", ["branch", "-M", "main"], { cwd: source });
+  execFileSync("git", ["clone", "--quiet", "--bare", source, bare]);
+
+  const repositoryServer = createServer((req, res) => {
+    const requestUrl = new URL(req.url ?? "/", "http://127.0.0.1");
+    const backend = spawn("git", ["http-backend"], {
+      env: {
+	...process.env,
+	GIT_PROJECT_ROOT: root,
+	GIT_HTTP_EXPORT_ALL: "1",
+	PATH_INFO: requestUrl.pathname,
+	QUERY_STRING: requestUrl.search.slice(1),
+	REQUEST_METHOD: req.method ?? "GET",
+	CONTENT_TYPE: req.headers["content-type"] ?? "",
+	CONTENT_LENGTH: req.headers["content-length"] ?? "",
+      },
+      stdio: ["pipe", "pipe", "ignore"],
+    });
+    const chunks: Buffer[] = [];
+    backend.stdout.on("data", (chunk: Buffer) => chunks.push(chunk));
+    backend.on("close", () => {
+      const response = Buffer.concat(chunks);
+      const boundary = response.indexOf("\r\n\r\n");
+      if (boundary < 0) {
+	res.statusCode = 500;
+	res.end();
+	return;
+      }
+      for (const header of response.subarray(0, boundary).toString("utf8").split("\r\n")) {
+	const separator = header.indexOf(":");
+	if (separator < 0) continue;
+	const name = header.slice(0, separator);
+	const value = header.slice(separator + 1).trim();
+	if (name.toLowerCase() === "status") res.statusCode = Number.parseInt(value, 10);
+	else res.setHeader(name, value);
+      }
+      res.end(response.subarray(boundary + 4));
+    });
+    req.pipe(backend.stdin);
+  });
+  await new Promise<void>((resolve) => repositoryServer.listen(0, "127.0.0.1", resolve));
+  const address = repositoryServer.address() as { port: number };
+  return {
+    url: `http://127.0.0.1:${address.port}/skill.git`,
+    revision,
+    update: (contents: string) => {
+      revision = commit(contents, "update");
+      execFileSync("git", ["push", "--quiet", bare, "main"], { cwd: source });
+      return revision;
+    },
+    close: async () => {
+      repositoryServer.closeAllConnections?.();
+      await new Promise<void>((resolve, reject) => repositoryServer.close((err) => err ? reject(err) : resolve()));
+      rmSync(root, { recursive: true, force: true });
+    },
+  };
+}
 
 const SAVED_VARS = [
   "PROVISION_SYNC",
@@ -213,6 +294,62 @@ describe("provision sync", () => {
     const view = await syncNow();
     assert.equal(statusOf(view, "pr-monitor"), "pending_approval");
     assert.equal(existsSync(path.join(skillsDir, "pr-monitor")), false);
+  });
+
+  test("a pending git item reports its revision and subpath without exposing the URL", async () => {
+    registerManifestUrl(serveManifest([{
+      type: "skill",
+      name: "git-skill",
+      git: {
+	url: `${baseUrl}/public-skill.git`,
+	rev: "a".repeat(40),
+	path: "skills/demo",
+      },
+    }]));
+
+    const view = await syncNow();
+    assert.deepEqual(view.data[0], {
+      type: "skill",
+      name: "git-skill",
+      status: "pending_approval",
+      git: { rev: "a".repeat(40), path: "skills/demo" },
+    });
+  });
+
+  test("a branch is locked to its resolved commit and upgrades only when it moves", async () => {
+    const repository = await serveMutableGitRepository();
+    try {
+      process.env.PROVISION_AUTOAPPLY = "auto";
+      initProvisioning();
+      registerManifestUrl(serveManifest([{
+	type: "skill",
+	name: "branch-skill",
+	git: { url: repository.url, rev: "main" },
+      }]));
+
+      const first = await syncNow();
+      assert.equal(statusOf(first, "branch-skill"), "installed");
+      assert.equal(first.data[0]!.git?.resolved_rev, repository.revision);
+      assert.equal(readFileSync(path.join(skillsDir, "branch-skill", "SKILL.md"), "utf8"), "branch v1");
+      const firstInode = lstatSync(path.join(skillsDir, "branch-skill"), { bigint: true }).ino;
+
+      const unchanged = await syncNow();
+      assert.equal(unchanged.data[0]!.git?.resolved_rev, repository.revision);
+      assert.equal(lstatSync(path.join(skillsDir, "branch-skill"), { bigint: true }).ino, firstInode);
+
+      const nextRevision = repository.update("branch v2");
+      const upgraded = await syncNow();
+      assert.equal(upgraded.data[0]!.git?.resolved_rev, nextRevision);
+      assert.equal(readFileSync(path.join(skillsDir, "branch-skill", "SKILL.md"), "utf8"), "branch v2");
+      const state = JSON.parse(readFileSync(path.join(stateDir, "provision.lock.json"), "utf8"));
+      assert.deepEqual(state.installed["skill/branch-skill"].source, {
+	type: "git",
+	ref: "main",
+	rev: nextRevision,
+      });
+    } finally {
+      await repository.close();
+    }
   });
 
   test("approving a pending item installs it and future upgrades apply on their own", async () => {
@@ -473,6 +610,25 @@ describe("provision sync", () => {
     assert.equal(statusOf(view, "good"), "installed");
     assert.equal(statusOf(view, "foreign"), "failed");
     assert.match(view.data.find((item) => item.name === "foreign")?.error ?? "", /PROVISION_ALLOWLIST/);
+  });
+
+  test("a git repository on another host requires an explicit allowlist", async () => {
+    process.env.PROVISION_AUTOAPPLY = "auto";
+    initProvisioning();
+    registerManifestUrl(serveManifest([{
+      type: "skill",
+      name: "foreign-git",
+      git: {
+	url: "https://github.com/example/skill.git",
+	rev: "a".repeat(40),
+      },
+    }]));
+
+    const view = await syncNow();
+
+    assert.equal(statusOf(view, "foreign-git"), "failed");
+    assert.match(view.data[0]!.error ?? "", /differs from the manifest host/i);
+    assert.equal(existsSync(path.join(skillsDir, "foreign-git")), false);
   });
 
   test("a manifest that redirects to a foreign host is refused", async () => {
@@ -1650,6 +1806,39 @@ describe("provision sync", () => {
     assert.equal(statusOf(getStatus(), "startup-preclaim"), undefined);
     const state = JSON.parse(readFileSync(path.join(stateDir, "provision.lock.json"), "utf8"));
     assert.equal(state.installed[key].uncommitted, true);
+  });
+
+  test("startup status restores git source metadata from the lockfile", () => {
+    const key = "skill/startup-git";
+    writeFileSync(path.join(stateDir, "provision.lock.json"), JSON.stringify({
+      version: 1,
+      approved: [key],
+      revoked: [],
+      installed: {
+	[key]: {
+	  sha256: "f".repeat(64),
+	  source: {
+	    type: "git",
+	    ref: "main",
+	    rev: "a".repeat(40),
+	    path: "skills/demo",
+	  },
+	  files: ["SKILL.md"],
+	  directories: [],
+	  fileHashes: { "SKILL.md": sha(Buffer.from("git skill")) },
+	  installedAt: new Date().toISOString(),
+	},
+      },
+    }));
+
+    initProvisioning();
+
+    assert.deepEqual(getStatus().data.find((item) => item.name === "startup-git"), {
+      type: "skill",
+      name: "startup-git",
+      status: "installed",
+      git: { rev: "main", resolved_rev: "a".repeat(40), path: "skills/demo" },
+    });
   });
 
   test("startup status omits an unresolved upgrade journal", () => {

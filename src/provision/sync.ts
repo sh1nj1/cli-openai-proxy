@@ -41,6 +41,7 @@ import {
   installSkill,
   isolateRejectedCandidate,
   removeSkill,
+  resolveGitRevision,
 } from "./installer.js";
 import {
   loadRegisteredManifestUrl,
@@ -53,6 +54,7 @@ import {
   ProvisionError,
   SUPPORTED_PROVISION_TYPES,
   type ProvisionItemStatus,
+  type ProvisionItem,
   type InstalledRecord,
   type InstalledDirectoryIdentity,
   type InstalledSnapshot,
@@ -65,6 +67,7 @@ export interface ProvisionItemView {
   name: string;
   status: ProvisionItemStatus;
   sha256?: string;
+  git?: { rev: string; resolved_rev?: string; path?: string };
   error?: string;
 }
 
@@ -81,6 +84,45 @@ export interface ProvisionStatusView {
 const DEFAULT_REFETCH_MS = 60 * 60_000;
 const MANIFEST_FETCH_TIMEOUT_MS = 30_000;
 const MAX_MANIFEST_BYTES = 1024 * 1024;
+
+function itemFingerprint(item: ProvisionItem, resolvedGitRevision?: string): string {
+  if (!item.git) return item.sha256!;
+  if (!resolvedGitRevision) {
+    throw new ProvisionError("Git source has no resolved commit", "git_revision_mismatch");
+  }
+  return createHash("sha256")
+    .update(`git\0${item.git.url}\0${item.git.rev}\0${resolvedGitRevision}\0${item.git.path ?? ""}`)
+    .digest("hex");
+}
+
+function itemSourceView(
+  item: ProvisionItem,
+  resolvedGitRevision?: string,
+): Pick<ProvisionItemView, "sha256" | "git"> {
+  return item.git
+    ? {
+	git: {
+	  rev: item.git.rev,
+	  ...(resolvedGitRevision ? { resolved_rev: resolvedGitRevision } : {}),
+	  ...(item.git.path ? { path: item.git.path } : {}),
+	},
+      }
+    : { sha256: item.sha256 };
+}
+
+function installedSource(
+  item: ProvisionItem,
+  resolvedGitRevision?: string,
+): InstalledSnapshot["source"] {
+  return item.git
+    ? {
+	type: "git",
+	ref: item.git.rev,
+	rev: resolvedGitRevision!,
+	...(item.git.path ? { path: item.git.path } : {}),
+      }
+    : undefined;
+}
 
 let enabled = false;
 let autoApply: "auto" | "approve" = "approve";
@@ -185,7 +227,20 @@ export function initProvisioning(hooks: {
       .filter(([, record]) => !record.uncommitted && !record.pending && !record.removalRecoveryId)
       .map(([key, record]) => {
 	const [type, ...rest] = canonicalStateKey(key).split("/");
-	return { type: type ?? "skill", name: rest.join("/"), status: "installed" as const, sha256: record.sha256 };
+	return {
+	  type: type ?? "skill",
+	  name: rest.join("/"),
+	  status: "installed" as const,
+	  ...(record.source?.type === "git"
+	    ? {
+		git: {
+		  rev: record.source.ref,
+		  resolved_rev: record.source.rev,
+		  ...(record.source.path ? { path: record.source.path } : {}),
+		},
+	      }
+	    : { sha256: record.sha256 }),
+	};
       });
     const startupManifestUrl = fixed || loadRegisteredManifestUrl(manifestPersistenceKeys);
     if (startupManifestUrl) {
@@ -755,7 +810,7 @@ async function runSync(generation: number): Promise<ProvisionStatusView> {
 	type: item.type,
 	name: item.name,
 	status: "failed",
-	sha256: item.sha256,
+	...itemSourceView(item),
 	error: migrationFailure,
       });
       continue;
@@ -769,7 +824,7 @@ async function runSync(generation: number): Promise<ProvisionStatusView> {
 	  type: item.type,
 	  name: item.name,
 	  status: "failed",
-	  sha256: item.sha256,
+	  ...itemSourceView(item),
 	  error: `Cannot upgrade "${item.name}" until its interrupted upgrade journal is resolved`,
 	});
 	continue;
@@ -781,23 +836,12 @@ async function runSync(generation: number): Promise<ProvisionStatusView> {
     const approved = !state.revoked.includes(key)
       && (autoApply === "auto" || state.approved.includes(key) || key in state.installed);
     if (!approved) {
-      views.push({ type: item.type, name: item.name, status: "pending_approval", sha256: item.sha256 });
-      continue;
-    }
-
-    // Idempotency is judged on content hash, not version strings: a registry
-    // that re-publishes different bytes under the same name re-installs.
-    if (state.installed[key]?.sha256 === item.sha256
-      && !state.installed[key]!.installMarker
-      && installedRecordIntact(item.name, state.installed[key]!)) {
-      if (state.installed[key]!.removalRecoveryId) {
-	delete state.installed[key]!.removalRecoveryId;
-	finalizeRemovalRecoveries(state);
-	// Persist reconciliation before reporting the intact target as installed.
-	// Otherwise a second crash leaves startup status hiding a healthy item.
-	saveState(state);
-      }
-      views.push({ type: item.type, name: item.name, status: "installed", sha256: item.sha256 });
+      views.push({
+	type: item.type,
+	name: item.name,
+	status: "pending_approval",
+	...itemSourceView(item),
+      });
       continue;
     }
 
@@ -808,15 +852,42 @@ async function runSync(generation: number): Promise<ProvisionStatusView> {
         type: item.type,
         name: item.name,
         status: "failed",
-        sha256: item.sha256,
+	...itemSourceView(item),
         error: `Refusing to replace untracked directory "${item.name}" in ${skillsDir()}`,
       });
       continue;
     }
 
     const checkUrl = (hop: string) => checkUrlAllowed(hop, { manifestUrl: url, allowlist });
+    let resolvedGitRevision: string | undefined;
     try {
-      checkUrl(item.url!);
+      if (item.git) resolvedGitRevision = await resolveGitRevision(item.git, checkUrl);
+      else checkUrl(item.url!);
+
+      // Branches are resolved on every sync. The resolved commit participates
+      // in idempotency, so a moved branch upgrades while an unchanged one does
+      // not reinstall.
+      const fingerprint = itemFingerprint(item, resolvedGitRevision);
+      const source = installedSource(item, resolvedGitRevision);
+      if (state.installed[key]?.sha256 === fingerprint
+	&& !state.installed[key]!.installMarker
+	&& installedRecordIntact(item.name, state.installed[key]!)) {
+	if (state.installed[key]!.removalRecoveryId) {
+	  delete state.installed[key]!.removalRecoveryId;
+	  finalizeRemovalRecoveries(state);
+	  // Persist reconciliation before reporting the intact target as installed.
+	  // Otherwise a second crash leaves startup status hiding a healthy item.
+	  saveState(state);
+	}
+	views.push({
+	  type: item.type,
+	  name: item.name,
+	  status: "installed",
+	  ...itemSourceView(item, resolvedGitRevision),
+	});
+	continue;
+      }
+
       const previousRecord = state.installed[key];
       const managedFiles = previousRecord
 	? [...new Set([...previousRecord.files, ...(previousRecord.pending?.files ?? [])])]
@@ -849,7 +920,9 @@ async function runSync(generation: number): Promise<ProvisionStatusView> {
       let result: Awaited<ReturnType<typeof installSkill>>;
       try {
 	result = await installSkill(
-	  { name: item.name, url: item.url!, sha256: item.sha256! },
+	  item.git
+	    ? { name: item.name, git: item.git, resolvedGitRevision }
+	    : { name: item.name, url: item.url!, sha256: item.sha256! },
 	  {
 	    skillsDir: skillsDir(),
 	    checkUrl,
@@ -864,7 +937,8 @@ async function runSync(generation: number): Promise<ProvisionStatusView> {
 	    afterFirstInstallMove,
 	    beforeCommit: (candidate, candidateIdentity) => {
 	      const candidateRecord: InstalledSnapshot = {
-		sha256: item.sha256!,
+		sha256: fingerprint,
+		...(source ? { source } : {}),
 		files: candidate.files,
 		directories: candidate.directories,
 		fileHashes: candidate.fileHashes,
@@ -908,14 +982,20 @@ async function runSync(generation: number): Promise<ProvisionStatusView> {
       // Finalizing drops the upgrade journal. If this save later fails, the
       // persisted stable+pending pair lets the next sync recognize either side.
       state.installed[key] = {
-	sha256: item.sha256!,
+	sha256: fingerprint,
+	...(source ? { source } : {}),
 	files: result.files,
 	directories: result.directories,
 	fileHashes: result.fileHashes,
 	installedAt: new Date().toISOString(),
       };
       if (!state.approved.includes(key)) state.approved.push(key);
-      views.push({ type: item.type, name: item.name, status: "installed", sha256: item.sha256 });
+      views.push({
+	type: item.type,
+	name: item.name,
+	status: "installed",
+	...itemSourceView(item, resolvedGitRevision),
+      });
     } catch (err) {
       if (err instanceof SupersededSyncError) throw err;
       const journal = state.installed[key];
@@ -923,7 +1003,13 @@ async function runSync(generation: number): Promise<ProvisionStatusView> {
 	state.installed[key] = reconcileUpgradeJournal(item.name, journal);
       }
       const message = err instanceof Error ? err.message : String(err);
-      views.push({ type: item.type, name: item.name, status: "failed", sha256: item.sha256, error: message });
+      views.push({
+	type: item.type,
+	name: item.name,
+	status: "failed",
+	...itemSourceView(item, resolvedGitRevision),
+	error: message,
+      });
     }
   }
 
