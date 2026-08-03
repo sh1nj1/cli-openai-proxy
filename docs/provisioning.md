@@ -122,10 +122,11 @@ the same reason.
   - `url` + `sha256` downloads the existing `.tar.gz` format. The digest pins
     the artifact bytes; a mismatch refuses the install.
   - `git` fetches a public repository. `rev` may be a full 40- or 64-character
-    commit SHA or branch name; tags are not resolved. `path` optionally selects
-    one repository-relative directory, and omission installs the repository
-    root. A GitHub `/tree/{branch}/{path}` browser URL may instead be supplied
-    as `git.url`; it is normalized to those three fields automatically.
+    commit SHA reachable from an advertised branch or tag, or a branch name;
+    tags are not accepted as `rev` values. `path` optionally selects one
+    repository-relative directory, and omission installs the repository root.
+    A GitHub `/tree/{branch}/{path}` browser URL may instead be supplied as
+    `git.url`; it is normalized to those three fields automatically.
     Slash-containing branch names use the explicit `url` + `rev` + `path` form
     because GitHub tree URLs do not delimit the branch from the path.
 - **The manifest never chooses paths.** Each type maps to a hardcoded sandbox

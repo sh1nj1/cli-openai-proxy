@@ -412,18 +412,59 @@ async function prepareGitSource(
     ...(revision.length === 64 ? ["--object-format=sha256"] : []),
     repository,
   ]);
+  const fetchRefspecs = isGitObjectId(source.rev)
+    ? [
+	"+refs/heads/*:refs/provision/heads/*",
+	"+refs/tags/*:refs/provision/tags/*",
+      ]
+    : [
+	`+refs/heads/${source.rev}:refs/provision/heads/${source.rev}`,
+      ];
   await runBoundedGitFetch([
     "fetch",
     "--depth=1",
     "--filter=blob:limit=1048577",
     "--no-tags",
     source.url,
-    revision,
+    ...fetchRefspecs,
   ], repository);
 
-  const fetched = (await runGit(["rev-parse", "FETCH_HEAD"], { cwd: repository })).trim().toLowerCase();
-  const objectType = (await runGit(["cat-file", "-t", revision], { cwd: repository })).trim();
-  if (fetched !== revision.toLowerCase() || objectType !== "commit") {
+  const gitObjectType = async (): Promise<string | undefined> => {
+    try {
+      return (await runGit(["cat-file", "-t", revision], { cwd: repository })).trim();
+    } catch {
+      return undefined;
+    }
+  };
+  let objectType = await gitObjectType();
+  if (objectType === undefined) {
+    // A pin may be older than every advertised tip, or a branch may advance
+    // after resolution. Deepen through the advertised refs; ordinary servers
+    // reject requesting the now-unadvertised commit object directly.
+    await runBoundedGitFetch([
+      "fetch",
+      "--unshallow",
+      "--filter=blob:limit=1048577",
+      "--no-tags",
+      source.url,
+      ...fetchRefspecs,
+    ], repository);
+    objectType = await gitObjectType();
+  }
+  if (objectType === undefined) {
+    throw new ProvisionError("Git source did not contain the expected commit", "git_revision_mismatch");
+  }
+  if (objectType !== "commit") {
+    throw new ProvisionError("Git source did not resolve to a commit", "git_revision_mismatch");
+  }
+  const containingRef = (await runGit([
+    "for-each-ref",
+    "--count=1",
+    "--format=%(refname)",
+    `--contains=${revision}`,
+    "refs/provision",
+  ], { cwd: repository })).trim();
+  if (containingRef.length === 0) {
     throw new ProvisionError("Git source did not resolve to the expected commit", "git_revision_mismatch");
   }
 

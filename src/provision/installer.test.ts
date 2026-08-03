@@ -90,8 +90,14 @@ const sha = (buf: Buffer) => createHash("sha256").update(buf).digest("hex");
 
 async function serveGitRepository(
   files: Record<string, string>,
-  opts: { addGitlink?: boolean; allowFilter?: boolean; objectFormat?: "sha1" | "sha256" } = {},
-): Promise<{ url: string; rev: string; close: () => Promise<void> }> {
+  opts: {
+    addGitlink?: boolean;
+    allowFilter?: boolean;
+    objectFormat?: "sha1" | "sha256";
+    tipFiles?: Record<string, string>;
+    advanceAfterFirstAdvertisement?: Record<string, string>;
+  } = {},
+): Promise<{ url: string; rev: string; historicalRev: string; close: () => Promise<void> }> {
   const root = mkdtempSync(path.join(tmpdir(), "provision-git-test-"));
   const source = path.join(root, "source");
   const bare = path.join(root, "skill.git");
@@ -101,17 +107,21 @@ async function serveGitRepository(
     "--quiet",
     ...(opts.objectFormat === "sha256" ? ["--object-format=sha256"] : []),
   ], { cwd: source });
-  for (const [relative, contents] of Object.entries(files)) {
-    const destination = path.join(source, ...relative.split("/"));
-    mkdirSync(path.dirname(destination), { recursive: true });
-    writeFileSync(destination, contents);
-  }
-  execFileSync("git", ["add", "."], { cwd: source });
-  execFileSync("git", [
-    "-c", "user.name=Provision Test",
-    "-c", "user.email=provision@example.invalid",
-    "commit", "--quiet", "-m", "fixture",
-  ], { cwd: source });
+  const commitFiles = (nextFiles: Record<string, string>, message: string): string => {
+    for (const [relative, contents] of Object.entries(nextFiles)) {
+      const destination = path.join(source, ...relative.split("/"));
+      mkdirSync(path.dirname(destination), { recursive: true });
+      writeFileSync(destination, contents);
+    }
+    execFileSync("git", ["add", "."], { cwd: source });
+    execFileSync("git", [
+      "-c", "user.name=Provision Test",
+      "-c", "user.email=provision@example.invalid",
+      "commit", "--quiet", "-m", message,
+    ], { cwd: source });
+    return execFileSync("git", ["rev-parse", "HEAD"], { cwd: source, encoding: "utf8" }).trim();
+  };
+  const historicalRev = commitFiles(files, "fixture");
   execFileSync("git", ["branch", "-M", "main"], { cwd: source });
   if (opts.addGitlink) {
     const childRev = execFileSync("git", ["rev-parse", "HEAD"], { cwd: source, encoding: "utf8" }).trim();
@@ -124,12 +134,17 @@ async function serveGitRepository(
       "commit", "--quiet", "-m", "gitlink fixture",
     ], { cwd: source });
   }
+  if (opts.tipFiles) commitFiles(opts.tipFiles, "tip fixture");
   const rev = execFileSync("git", ["rev-parse", "HEAD"], { cwd: source, encoding: "utf8" }).trim();
   execFileSync("git", ["clone", "--quiet", "--bare", source, bare]);
+  if (opts.advanceAfterFirstAdvertisement) {
+    commitFiles(opts.advanceAfterFirstAdvertisement, "post-advertisement fixture");
+  }
   execFileSync("git", [
     "--git-dir", bare, "config", "uploadpack.allowFilter", opts.allowFilter ? "true" : "false",
   ]);
 
+  let advanced = false;
   const repositoryServer = createServer((req, res) => {
     const requestUrl = new URL(req.url ?? "/", "http://127.0.0.1");
     const backend = spawn("git", ["http-backend"], {
@@ -163,6 +178,14 @@ async function serveGitRepository(
 	if (name.toLowerCase() === "status") res.statusCode = Number.parseInt(value, 10);
 	else res.setHeader(name, value);
       }
+      if (!advanced
+	  && opts.advanceAfterFirstAdvertisement
+	  && requestUrl.pathname.endsWith("/info/refs")) {
+	advanced = true;
+	res.once("finish", () => {
+	  execFileSync("git", ["push", "--quiet", bare, "main"], { cwd: source });
+	});
+      }
       res.end(response.subarray(boundary + 4));
     });
     req.pipe(backend.stdin);
@@ -172,6 +195,7 @@ async function serveGitRepository(
   return {
     url: `http://127.0.0.1:${address.port}/skill.git`,
     rev,
+    historicalRev,
     close: async () => {
       repositoryServer.closeAllConnections?.();
       await new Promise<void>((resolve, reject) => repositoryServer.close((err) => err ? reject(err) : resolve()));
@@ -291,6 +315,24 @@ describe("provision installer", () => {
     }
   });
 
+  test("installs a historical commit reachable from an advertised branch", async () => {
+    const repository = await serveGitRepository(
+      { "SKILL.md": "Historical git skill." },
+      { tipFiles: { "SKILL.md": "Current git skill." } },
+    );
+    try {
+      assert.notEqual(repository.historicalRev, repository.rev);
+      const result = await installSkill({
+	name: "demo",
+	git: { url: repository.url, rev: repository.historicalRev },
+      }, { skillsDir });
+      assert.deepEqual(result.files, ["SKILL.md"]);
+      assert.equal(readFileSync(path.join(skillsDir, "demo", "SKILL.md"), "utf8"), "Historical git skill.");
+    } finally {
+      await repository.close();
+    }
+  });
+
   test("installs a pinned SHA-256 git repository", async () => {
     const repository = await serveGitRepository(
       { "SKILL.md": "SHA-256 git skill." },
@@ -318,6 +360,23 @@ describe("provision installer", () => {
       }, { skillsDir });
       assert.deepEqual(result.files, ["SKILL.md"]);
       assert.equal(readFileSync(path.join(skillsDir, "demo", "SKILL.md"), "utf8"), "Branch git skill.");
+    } finally {
+      await repository.close();
+    }
+  });
+
+  test("installs the resolved commit when a branch advances before fetch", async () => {
+    const repository = await serveGitRepository(
+      { "SKILL.md": "Resolved branch skill." },
+      { advanceAfterFirstAdvertisement: { "SKILL.md": "Advanced branch skill." } },
+    );
+    try {
+      const result = await installSkill({
+	name: "demo",
+	git: { url: repository.url, rev: "main" },
+      }, { skillsDir });
+      assert.deepEqual(result.files, ["SKILL.md"]);
+      assert.equal(readFileSync(path.join(skillsDir, "demo", "SKILL.md"), "utf8"), "Resolved branch skill.");
     } finally {
       await repository.close();
     }
