@@ -314,18 +314,25 @@ promote_release() {
 
 gateway_env_has() {
   local name="$1"
-  grep -q "^${name}=" "$GATEWAY_ENV" 2>/dev/null
+  grep -Eq "^[[:space:]]*${name}=" "$GATEWAY_ENV" 2>/dev/null
+}
+
+gateway_env_line_is_assignment() {
+  local line="$1"
+  local name="$2"
+  [[ "$line" =~ ^[[:space:]]*${name}= ]]
 }
 
 rotate_user_mappings() {
   "$NODE_BIN" --input-type=commonjs -e '
     const { randomBytes } = require("node:crypto");
     const { readFileSync } = require("node:fs");
-    const line = readFileSync(process.argv[1], "utf8")
+    const assignments = readFileSync(process.argv[1], "utf8")
       .split(/\r?\n/)
-      .find((candidate) => candidate.startsWith("USER_API_KEYS="));
+      .filter((candidate) => /^\s*USER_API_KEYS=/.test(candidate));
+    const line = assignments.at(-1);
     if (!line) process.exit(2);
-    let value = line.slice("USER_API_KEYS=".length).trim();
+    let value = line.replace(/^\s*USER_API_KEYS=/, "").trim();
     if (value.startsWith("\u0027") && value.endsWith("\u0027")) {
       value = value.slice(1, -1);
     } else if (value.startsWith("\u0022") && value.endsWith("\u0022")) {
@@ -383,10 +390,12 @@ prepare_gateway_config() {
   if ((replace_user || replace_admin || add_port || add_host)); then
     temp="$(mktemp "$CONFIG_DIR/.gateway.env.XXXXXX")"
     while IFS= read -r line || [[ -n "$line" ]]; do
-      if [[ "$replace_user" == "1" && "$line" == USER_API_KEYS=* ]]; then
+      if [[ "$replace_user" == "1" ]] \
+	  && gateway_env_line_is_assignment "$line" USER_API_KEYS; then
 	continue
       fi
-      if [[ "$replace_admin" == "1" && "$line" == AUTH_ADMIN_KEYS=* ]]; then
+      if [[ "$replace_admin" == "1" ]] \
+	  && gateway_env_line_is_assignment "$line" AUTH_ADMIN_KEYS; then
 	continue
       fi
       printf '%s\n' "$line"

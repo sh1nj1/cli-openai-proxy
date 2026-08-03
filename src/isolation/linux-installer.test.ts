@@ -299,6 +299,76 @@ test("USER_API_KEYS rotation preserves every tenant/user mapping", async () => {
   }
 });
 
+test("gateway config recognizes indentation and rotates the last effective mapping", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "linux-installer-env-"));
+  const environmentFile = join(directory, "gateway.env");
+  const scriptPath = fileURLToPath(
+    new URL("../../scripts/install-linux-user-workers.sh", import.meta.url),
+  );
+  const stale = [{ key: "stale-key", tenantId: "stale-tenant", userId: "stale-user" }];
+  const active = [{ key: "active-key", tenantId: "active-tenant", userId: "active-user" }];
+  const original = [
+    `  USER_API_KEYS='${JSON.stringify(stale)}'`,
+    `\tUSER_API_KEYS='${JSON.stringify(active)}'`,
+    "  AUTH_ADMIN_KEYS=old-admin-key",
+    "\tPORT=3457",
+    "  HOST=127.0.0.1",
+    "",
+  ].join("\n");
+  await writeFile(environmentFile, original);
+
+  try {
+    const preserved = execFileSync("bash", ["-c", `
+      source "$1"
+      NODE_BIN="$2"
+      CONFIG_DIR="$3"
+      GATEWAY_ENV="$4"
+      SERVICE_ACCOUNT=test-service
+      ROTATE_KEYS=0
+      stat() { [[ "$2" == %u ]] && printf '0\\n' || printf '640\\n'; }
+      chown() { :; }
+      chmod() { :; }
+      prepare_gateway_config >/dev/null
+      cat "$GATEWAY_ENV"
+    `, "bash", scriptPath, process.execPath, directory, environmentFile], { encoding: "utf8" });
+    assert.equal(preserved, original);
+
+    execFileSync("bash", ["-c", `
+      source "$1"
+      NODE_BIN="$2"
+      CONFIG_DIR="$3"
+      GATEWAY_ENV="$4"
+      SERVICE_ACCOUNT=test-service
+      ROTATE_KEYS=1
+      stat() { [[ "$2" == %u ]] && printf '0\\n' || printf '640\\n'; }
+      install() {
+	local source="" destination="" current=""
+	for current in "$@"; do source="$destination"; destination="$current"; done
+	cp "$source" "$destination"
+      }
+      chown() { :; }
+      chmod() { :; }
+      prepare_gateway_config >/dev/null
+    `, "bash", scriptPath, process.execPath, directory, environmentFile], { stdio: "pipe" });
+
+    const rotatedLines = (await readFile(environmentFile, "utf8")).trim().split(/\r?\n/);
+    const userAssignments = rotatedLines.filter((line) => /^\s*USER_API_KEYS=/.test(line));
+    const adminAssignments = rotatedLines.filter((line) => /^\s*AUTH_ADMIN_KEYS=/.test(line));
+    assert.equal(userAssignments.length, 1);
+    assert.equal(adminAssignments.length, 1);
+    assert.equal(rotatedLines.filter((line) => /^\s*PORT=/.test(line)).length, 1);
+    assert.equal(rotatedLines.filter((line) => /^\s*HOST=/.test(line)).length, 1);
+    const rotated = JSON.parse(userAssignments[0].slice("USER_API_KEYS=".length + 1, -1)) as typeof active;
+    assert.deepEqual(
+      rotated.map(({ tenantId, userId }) => ({ tenantId, userId })),
+      active.map(({ tenantId, userId }) => ({ tenantId, userId })),
+    );
+    assert.match(rotated[0].key, /^cop_user_[0-9a-f]{64}$/);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 test("Multi-user conversion disables the conflicting Single service and verifies both services", async () => {
   const script = await readScript("install-linux-user-workers.sh");
   const stopSingle = script.lastIndexOf("stop_single_user_service\n");
