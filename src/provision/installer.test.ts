@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { execFileSync, spawn } from "child_process";
 import { createHash, randomBytes } from "crypto";
 import {
+  chmodSync,
   closeSync,
   existsSync,
   ftruncateSync,
@@ -403,7 +404,7 @@ describe("provision installer", () => {
     }, { skillsDir })), "url_not_allowed");
   });
 
-  test("invalid, credentialed, and non-HTTPS git repository URLs are refused", async () => {
+  test("invalid, credentialed, ambiguous, and non-HTTPS git repository URLs are refused", async () => {
     for (const [url, code] of [
       ["not a url", "invalid_url"],
       ["https://user:secret@github.com/example/skill.git", "url_not_allowed"],
@@ -412,7 +413,82 @@ describe("provision installer", () => {
       assert.equal(await codeOf(() => installSkill({
 	name: "demo",
 	git: { url, rev: "a".repeat(40) },
-      }, { skillsDir })), code, `url=${url}`);
+	}, { skillsDir })), code, `url=${url}`);
+    }
+
+    const ambiguousUrl = "https://allowed.example\\@evil.example/repo.git";
+    const revision = "a".repeat(40);
+    for (const item of [
+      { name: "demo", git: { url: ambiguousUrl, rev: revision } },
+      { name: "demo", git: { url: ambiguousUrl, rev: "main" } },
+      { name: "demo", git: { url: ambiguousUrl, rev: "main" }, resolvedGitRevision: revision },
+    ]) {
+      assert.equal(
+	await codeOf(() => installSkill(item, { skillsDir })),
+	"url_not_allowed",
+	`rev=${item.git.rev}, resolved=${item.resolvedGitRevision ?? "none"}`,
+      );
+    }
+  });
+
+  test("URL policy and Git commands receive only the canonical repository URL", async () => {
+    const repository = await serveGitRepository({ "SKILL.md": "Canonical URL skill." });
+    const wrapperDir = mkdtempSync(path.join(tmpdir(), "provision-git-wrapper-"));
+    const wrapperPath = path.join(wrapperDir, "git");
+    const logPath = path.join(wrapperDir, "args.jsonl");
+    const originalPath = process.env.PATH;
+    const originalLogPath = process.env.PROVISION_TEST_GIT_LOG;
+    const originalRealGit = process.env.PROVISION_TEST_REAL_GIT;
+    const realGit = execFileSync("which", ["git"], { encoding: "utf8" }).trim();
+    writeFileSync(wrapperPath, `#!/usr/bin/env node
+const { appendFileSync } = require("node:fs");
+const { spawnSync } = require("node:child_process");
+appendFileSync(process.env.PROVISION_TEST_GIT_LOG, JSON.stringify(process.argv.slice(2)) + "\\n");
+const result = spawnSync(process.env.PROVISION_TEST_REAL_GIT, process.argv.slice(2), {
+  env: process.env,
+  stdio: "inherit",
+});
+if (result.error) throw result.error;
+if (result.signal) process.kill(process.pid, result.signal);
+process.exit(result.status ?? 1);
+`);
+    chmodSync(wrapperPath, 0o755);
+
+    const rawUrl = repository.url.replace("/skill.git", "/discarded/../skill.git");
+    const canonicalUrl = new URL(rawUrl).href;
+    assert.equal(canonicalUrl, repository.url);
+    const checkedUrls: string[] = [];
+    process.env.PATH = `${wrapperDir}${path.delimiter}${originalPath ?? ""}`;
+    process.env.PROVISION_TEST_GIT_LOG = logPath;
+    process.env.PROVISION_TEST_REAL_GIT = realGit;
+    try {
+      await installSkill({
+	name: "branch-demo",
+	git: { url: rawUrl, rev: "main" },
+      }, { skillsDir, checkUrl: (url) => checkedUrls.push(url) });
+      await installSkill({
+	name: "resolved-demo",
+	git: { url: rawUrl, rev: "main" },
+	resolvedGitRevision: repository.rev,
+      }, { skillsDir, checkUrl: (url) => checkedUrls.push(url) });
+
+      assert.deepEqual(checkedUrls, [canonicalUrl, canonicalUrl]);
+      const calls = readFileSync(logPath, "utf8").trim().split("\n")
+	.map((line) => JSON.parse(line) as string[]);
+      const networkCalls = calls.filter((args) => args.includes("ls-remote") || args.includes("fetch"));
+      assert.ok(networkCalls.some((args) => args.includes("ls-remote")));
+      assert.ok(networkCalls.some((args) => args.includes("fetch")));
+      assert.ok(networkCalls.every((args) => args.includes(canonicalUrl)));
+      assert.ok(networkCalls.every((args) => !args.includes(rawUrl)));
+    } finally {
+      if (originalPath === undefined) delete process.env.PATH;
+      else process.env.PATH = originalPath;
+      if (originalLogPath === undefined) delete process.env.PROVISION_TEST_GIT_LOG;
+      else process.env.PROVISION_TEST_GIT_LOG = originalLogPath;
+      if (originalRealGit === undefined) delete process.env.PROVISION_TEST_REAL_GIT;
+      else process.env.PROVISION_TEST_REAL_GIT = originalRealGit;
+      rmSync(wrapperDir, { recursive: true, force: true });
+      await repository.close();
     }
   });
 

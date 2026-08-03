@@ -349,8 +349,13 @@ async function runBoundedGitFetch(args: string[], cwd: string): Promise<void> {
   });
 }
 
-function validateGitRepositoryUrl(url: string, checkUrl?: (url: string) => void): void {
-  checkUrl?.(url);
+function validateGitRepositoryUrl(url: string, checkUrl?: (url: string) => void): string {
+  // WHATWG treats backslashes as path separators for special URLs, while
+  // Git/libcurl may interpret a backslash before `@` as userinfo. Refuse the
+  // ambiguous spelling and only pass the canonical WHATWG URL to Git.
+  if (url.includes("\\")) {
+    throw new ProvisionError("Git repository URL contains an invalid backslash", "url_not_allowed");
+  }
   let parsed: URL;
   try {
     parsed = new URL(url);
@@ -368,6 +373,9 @@ function validateGitRepositoryUrl(url: string, checkUrl?: (url: string) => void)
   if (parsed.search || parsed.hash) {
     throw new ProvisionError("Git repository URLs cannot contain a query or fragment", "url_not_allowed");
   }
+  const canonicalUrl = parsed.href;
+  checkUrl?.(canonicalUrl);
+  return canonicalUrl;
 }
 
 /** Resolve a mutable branch to the commit that this sync will install. */
@@ -375,11 +383,11 @@ export async function resolveGitRevision(
   source: GitProvisionSource,
   checkUrl?: (url: string) => void,
 ): Promise<string> {
-  validateGitRepositoryUrl(source.url, checkUrl);
+  const repositoryUrl = validateGitRepositoryUrl(source.url, checkUrl);
   if (isGitObjectId(source.rev)) return source.rev.toLowerCase();
 
   const fullRef = `refs/heads/${source.rev}`;
-  const output = await runGit(["ls-remote", "--refs", source.url, fullRef]);
+  const output = await runGit(["ls-remote", "--refs", repositoryUrl, fullRef]);
   const matches = output.trim().split("\n").filter(Boolean);
   if (matches.length !== 1) {
     throw new ProvisionError("Git branch did not resolve to one commit", "git_revision_not_found");
@@ -397,14 +405,11 @@ async function prepareGitSource(
   temporary: string,
   checkUrl?: (url: string) => void,
 ): Promise<PreparedSource> {
-  const revision = resolvedRevision ?? await resolveGitRevision(source, checkUrl);
+  const repositoryUrl = validateGitRepositoryUrl(source.url, checkUrl);
+  const revision = resolvedRevision ?? await resolveGitRevision({ ...source, url: repositoryUrl });
   if (!isGitObjectId(revision)) {
     throw new ProvisionError("Resolved git revision must be a full commit SHA", "git_revision_mismatch");
   }
-  // A pre-resolved revision came from the sync engine; still enforce URL policy
-  // here so direct installer callers cannot bypass it.
-  if (resolvedRevision !== undefined) validateGitRepositoryUrl(source.url, checkUrl);
-
   const repository = path.join(temporary, "repository.git");
   await runGit([
     "init",
@@ -425,7 +430,7 @@ async function prepareGitSource(
     "--depth=1",
     "--filter=blob:limit=1048577",
     "--no-tags",
-    source.url,
+    repositoryUrl,
     ...fetchRefspecs,
   ], repository);
 
@@ -446,7 +451,7 @@ async function prepareGitSource(
       "--unshallow",
       "--filter=blob:limit=1048577",
       "--no-tags",
-      source.url,
+      repositoryUrl,
       ...fetchRefspecs,
     ], repository);
     objectType = await gitObjectType();
