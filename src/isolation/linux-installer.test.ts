@@ -38,6 +38,108 @@ test("Node runtime preparation propagates an installation validation failure", (
   `, "bash", runtimePath], { stdio: "pipe" }));
 });
 
+test("Node runtime preparation reuses an installer-managed runtime", () => {
+  const runtimePath = fileURLToPath(
+    new URL("../../scripts/linux-node-runtime.sh", import.meta.url),
+  );
+  const selected = execFileSync("bash", ["-c", `
+    set -e
+    source "$1"
+    runtime_root="$(mktemp -d)"
+    trap 'rm -rf -- "$runtime_root"' EXIT
+    mkdir -p "$runtime_root/v22.13.0/bin"
+    printf '#!/usr/bin/env bash\\nexit 0\\n' > "$runtime_root/v22.13.0/bin/node"
+    printf '#!/usr/bin/env bash\\nexit 0\\n' > "$runtime_root/v22.13.0/bin/npm"
+    chmod 0755 "$runtime_root/v22.13.0/bin/node" "$runtime_root/v22.13.0/bin/npm"
+
+    LINUX_NODE_RUNTIME_INSTALL_ROOT="$runtime_root"
+    LINUX_NODE_RUNTIME_READLINK_BIN="$(command -v readlink)"
+    LINUX_NODE_RUNTIME_DIRNAME_BIN="$(command -v dirname)"
+    resolved_root="$(readlink -f -- "$runtime_root")"
+    linux_node_runtime_path_is_trusted() {
+      [[ "$2" == root ]] && { [[ "$1" == "$runtime_root"/* ]] || [[ "$1" == "$resolved_root"/* ]]; }
+    }
+    linux_node_runtime_version_supported() { return 0; }
+
+    linux_node_runtime_find_existing 22.13.0 service
+    printf '%s\\n%s\\n' "$LINUX_NODE_BIN" "$LINUX_NPM_BIN"
+  `, "bash", runtimePath], { encoding: "utf8" });
+
+  assert.match(selected, /\/v22\.13\.0\/bin\/node\n.*\/v22\.13\.0\/bin\/npm\n$/s);
+});
+
+test("Node runtime installation never promotes failed extraction or staging", () => {
+  const runtimePath = fileURLToPath(
+    new URL("../../scripts/linux-node-runtime.sh", import.meta.url),
+  );
+  execFileSync("bash", ["-c", `
+    source "$1"
+    scratch="$(mktemp -d)"
+    trap 'rm -rf -- "$scratch"' EXIT
+    runtime_root="$scratch/runtime"
+    marker="$scratch/mv-called"
+    printf '#!/usr/bin/env bash\\nprintf x86_64\\n' > "$scratch/uname"
+    printf '#!/usr/bin/env bash\\n[[ "$FAIL_EXTRACT" == 1 ]] && exit 1\\nexit 0\\n' > "$scratch/tar"
+    chmod 0755 "$scratch/uname" "$scratch/tar"
+
+    LINUX_NODE_RUNTIME_INSTALL_ROOT="$runtime_root"
+    LINUX_NODE_RUNTIME_UNAME_BIN="$scratch/uname"
+    LINUX_NODE_RUNTIME_MKDIR_BIN="$(command -v mkdir)"
+    LINUX_NODE_RUNTIME_AWK_BIN="$(command -v awk)"
+    LINUX_NODE_RUNTIME_INSTALL_BIN="$(command -v install)"
+    LINUX_NODE_RUNTIME_CP_BIN="$(command -v cp)"
+    LINUX_NODE_RUNTIME_CHOWN_BIN="$(command -v chown)"
+    LINUX_NODE_RUNTIME_CHMOD_BIN="$(command -v chmod)"
+    LINUX_NODE_RUNTIME_MV_BIN="$(command -v mv)"
+    LINUX_NODE_RUNTIME_READLINK_BIN="$(command -v readlink)"
+
+    linux_node_runtime_ensure_download_tools() { return 0; }
+    linux_node_runtime_command() {
+      case "$1" in
+      tar) printf '%s\\n' "$scratch/tar" ;;
+      *) command -v "$1" ;;
+      esac
+    }
+    linux_node_runtime_download() {
+      if [[ "$1" == */SHASUMS256.txt ]]; then
+      checksum="$(printf archive | sha256sum | awk '{ print $1 }')"
+      printf '%s  node-v22.13.0-linux-x64.tar.xz\\n' "$checksum" > "$2"
+      else
+      printf archive > "$2"
+      fi
+    }
+    linux_node_runtime_as_root() {
+      command_path="$1"
+      shift
+      if [[ "$command_path" == "$LINUX_NODE_RUNTIME_INSTALL_BIN" ]]; then
+      for argument in "$@"; do
+      [[ "$argument" == "$runtime_root"* ]] && mkdir -p "$argument"
+      done
+      return 0
+      fi
+      if [[ "$command_path" == "$LINUX_NODE_RUNTIME_CP_BIN" ]]; then
+      return 1
+      fi
+      if [[ "$command_path" == "$LINUX_NODE_RUNTIME_MV_BIN" ]]; then
+      touch "$marker"
+      fi
+      "$command_path" "$@"
+    }
+
+    if FAIL_EXTRACT=1 linux_node_runtime_install 22.13.0; then
+      exit 9
+    fi
+    [[ ! -e "$marker" ]]
+    [[ ! -e "$runtime_root/v22.13.0" ]]
+
+    if linux_node_runtime_install 22.13.0; then
+      exit 10
+    fi
+    [[ ! -e "$marker" ]]
+    [[ ! -e "$runtime_root/v22.13.0" ]]
+  `, "bash", runtimePath], { stdio: "pipe" });
+});
+
 test("Multi-user install builds as an unprivileged account before promotion", async () => {
   const script = await readScript("install-linux-user-workers.sh");
   const installDependencies = script.indexOf("run_npm_as_service ci");

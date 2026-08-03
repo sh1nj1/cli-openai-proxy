@@ -132,6 +132,18 @@ linux_node_runtime_find_existing() {
     LINUX_NPM_BIN="$npm_bin"
     return 0
   done
+
+  # Installer-managed runtimes are shared by both service modes, but must
+  # always satisfy the stricter root trust boundary.
+  for candidate in "$LINUX_NODE_RUNTIME_INSTALL_ROOT"/v*/bin/node; do
+    linux_node_runtime_path_is_trusted "$candidate" root || continue
+    resolved="$("$LINUX_NODE_RUNTIME_READLINK_BIN" -f -- "$candidate")"
+    linux_node_runtime_version_supported "$resolved" "$minimum" || continue
+    npm_bin="$(linux_node_runtime_find_npm "$resolved" root)" || continue
+    LINUX_NODE_BIN="$resolved"
+    LINUX_NPM_BIN="$npm_bin"
+    return 0
+  done
   return 1
 }
 
@@ -190,7 +202,7 @@ linux_node_runtime_ensure_download_tools() {
 linux_node_runtime_install() {
   local minimum="$1"
   local major version architecture archive_name base_url temp_dir archive sums expected actual
-  local extract_dir final_dir staging_dir
+  local extract_dir final_dir staging_dir staging_error
   local sha_bin tar_bin mktemp_bin rm_bin
 
   linux_node_runtime_ensure_download_tools || return 1
@@ -219,7 +231,11 @@ linux_node_runtime_install() {
   temp_dir="$($mktemp_bin -d /tmp/cli-openai-proxy-node.XXXXXX)" || return 1
   sums="$temp_dir/SHASUMS256.txt"
   extract_dir="$temp_dir/extract"
-  "$LINUX_NODE_RUNTIME_MKDIR_BIN" -m 0700 "$extract_dir"
+  if ! "$LINUX_NODE_RUNTIME_MKDIR_BIN" -m 0700 "$extract_dir"; then
+    linux_node_runtime_error "Failed to create the Node.js extraction directory"
+    "$rm_bin" -rf -- "$temp_dir"
+    return 1
+  fi
 
   linux_node_runtime_log "Discovering the latest supported Node.js ${major}.x runtime"
   if ! linux_node_runtime_download "$base_url/SHASUMS256.txt" "$sums"; then
@@ -252,17 +268,35 @@ linux_node_runtime_install() {
     "$rm_bin" -rf -- "$temp_dir"
     return 1
   fi
-  "$tar_bin" -xJf "$archive" -C "$extract_dir" --strip-components=1
+  if ! "$tar_bin" -xJf "$archive" -C "$extract_dir" --strip-components=1; then
+    linux_node_runtime_error "Failed to extract the Node.js archive"
+    "$rm_bin" -rf -- "$temp_dir"
+    return 1
+  fi
 
   final_dir="$LINUX_NODE_RUNTIME_INSTALL_ROOT/v${version}"
   staging_dir="$LINUX_NODE_RUNTIME_INSTALL_ROOT/.v${version}.install.$$"
   if [[ ! -e "$final_dir" ]]; then
-    linux_node_runtime_as_root "$LINUX_NODE_RUNTIME_INSTALL_BIN" -d -o root -g root -m 0755 \
-      "$LINUX_NODE_RUNTIME_INSTALL_ROOT" "$staging_dir"
-    linux_node_runtime_as_root "$LINUX_NODE_RUNTIME_CP_BIN" -a "$extract_dir/." "$staging_dir/"
-    linux_node_runtime_as_root "$LINUX_NODE_RUNTIME_CHOWN_BIN" -R root:root "$staging_dir"
-    linux_node_runtime_as_root "$LINUX_NODE_RUNTIME_CHMOD_BIN" -R go-w "$staging_dir"
-    linux_node_runtime_as_root "$LINUX_NODE_RUNTIME_MV_BIN" "$staging_dir" "$final_dir"
+    staging_error=""
+    if ! linux_node_runtime_as_root "$LINUX_NODE_RUNTIME_INSTALL_BIN" -d -o root -g root -m 0755 \
+      "$LINUX_NODE_RUNTIME_INSTALL_ROOT" "$staging_dir"; then
+      staging_error="create the Node.js staging directory"
+    elif ! linux_node_runtime_as_root "$LINUX_NODE_RUNTIME_CP_BIN" -a \
+      "$extract_dir/." "$staging_dir/"; then
+      staging_error="copy the Node.js runtime into staging"
+    elif ! linux_node_runtime_as_root "$LINUX_NODE_RUNTIME_CHOWN_BIN" -R root:root "$staging_dir"; then
+      staging_error="set Node.js staging ownership"
+    elif ! linux_node_runtime_as_root "$LINUX_NODE_RUNTIME_CHMOD_BIN" -R go-w "$staging_dir"; then
+      staging_error="remove write access from the Node.js staging tree"
+    elif ! linux_node_runtime_as_root "$LINUX_NODE_RUNTIME_MV_BIN" "$staging_dir" "$final_dir"; then
+      staging_error="publish the Node.js runtime"
+    fi
+    if [[ -n "$staging_error" ]]; then
+      linux_node_runtime_error "Failed to $staging_error"
+      linux_node_runtime_as_root "$rm_bin" -rf -- "$staging_dir" >/dev/null 2>&1 || true
+      "$rm_bin" -rf -- "$temp_dir"
+      return 1
+    fi
   fi
   "$rm_bin" -rf -- "$temp_dir"
 
