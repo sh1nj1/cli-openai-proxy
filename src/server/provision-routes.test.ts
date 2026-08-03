@@ -286,24 +286,24 @@ describe("provision-routes", () => {
       process.env.PROVISION_SYNC = "1";
       const { server, port } = await listen(createApp({ role: "worker" }));
       try {
-        const response = await fetch(`http://127.0.0.1:${port}${PROVISION_PREFIX}`);
-        assert.equal(response.status, 200);
-        const body = await response.json() as { enabled: boolean };
-        assert.equal(body.enabled, true);
+	const response = await fetch(`http://127.0.0.1:${port}${PROVISION_PREFIX}`);
+	assert.equal(response.status, 200);
+	const body = await response.json() as { enabled: boolean };
+	assert.equal(body.enabled, true);
       } finally {
-        await new Promise<void>((resolve, reject) => server.close((err) => err ? reject(err) : resolve()));
+	await new Promise<void>((resolve, reject) => server.close((err) => err ? reject(err) : resolve()));
       }
     });
 
     test("answers 404 provisioning_disabled when PROVISION_SYNC unset", async () => {
       const { server, port } = await listen(createApp({ role: "worker" }));
       try {
-        const response = await fetch(`http://127.0.0.1:${port}${PROVISION_PREFIX}`);
-        assert.equal(response.status, 404);
-        const body = await response.json() as { error: { code: string } };
-        assert.equal(body.error.code, "provisioning_disabled");
+	const response = await fetch(`http://127.0.0.1:${port}${PROVISION_PREFIX}`);
+	assert.equal(response.status, 404);
+	const body = await response.json() as { error: { code: string } };
+	assert.equal(body.error.code, "provisioning_disabled");
       } finally {
-        await new Promise<void>((resolve, reject) => server.close((err) => err ? reject(err) : resolve()));
+	await new Promise<void>((resolve, reject) => server.close((err) => err ? reject(err) : resolve()));
       }
     });
   });
