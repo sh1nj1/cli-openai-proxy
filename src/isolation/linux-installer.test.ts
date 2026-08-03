@@ -370,7 +370,13 @@ test("Multi-user releases are readable by service accounts after a private build
     chmod 0600 "$release/dist/server/standalone.js" "$outside"
     chmod 0700 "$release/node_modules/example/bin/tool"
     ln -s "$outside" "$release/node_modules/example/outside"
-    mode() { stat -f %Lp "$1" 2>/dev/null || stat -c %a "$1"; }
+    mode() {
+      if [[ "$(uname -s)" == Darwin ]]; then
+	stat -f %Lp "$1"
+      else
+	stat -c %a "$1"
+      fi
+    }
 
     normalize_release_permissions "$release"
 
