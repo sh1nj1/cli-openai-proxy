@@ -1,8 +1,7 @@
 import assert from "node:assert/strict";
-import { createHash } from "node:crypto";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { existsSync, mkdtempSync } from "node:fs";
-import { rm } from "node:fs/promises";
+import { readFile, rm } from "node:fs/promises";
 import http from "node:http";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
@@ -182,7 +181,13 @@ async function startManifestServer(): Promise<{ baseUrl: string; close: () => Pr
     res.statusCode = 404;
     res.end("not found");
   });
-  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  await new Promise<void>((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", () => {
+      server.off("error", reject);
+      resolve();
+    });
+  });
   const baseUrl = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
   manifest.items[0]!.url = `${baseUrl}/demo-skill.tgz`;
   return {
@@ -216,12 +221,21 @@ async function waitFor(predicate: () => boolean, timeoutMs = 5000): Promise<void
 }
 
 test("authorized login installs into the worker's own state dirs only", async () => {
-  // Full HTTP-driven form: a real worker-role app, driven through the same
+  // Full HTTP-driven form: real worker-role apps, driven through the same
   // /v1/auth session endpoints a Collavre client would call, with the fake
   // engine wired in the same way auth-routes.test.ts drives authorization.
+  //
+  // Two real engine instances run in this test, sequenced one after the
+  // other (the provisioning engine in src/provision/sync.ts is a process-wide
+  // singleton, so they cannot run concurrently): "worker-a" first, then a
+  // second engine scoped to what would otherwise be an inert control
+  // directory. Both directory sets are exercised by a real login so a
+  // scoping leak in either direction — worker-a writing into the second
+  // engine's dirs, or vice versa — would be caught by the assertions below.
   const workerAStateDir = mkdtempSync(path.join(tmpdir(), "worker-a-state-"));
   const workerASkillsDir = mkdtempSync(path.join(tmpdir(), "worker-a-skills-"));
   const gatewayStateDir = mkdtempSync(path.join(tmpdir(), "gateway-state-"));
+  const gatewaySkillsDir = mkdtempSync(path.join(tmpdir(), "gateway-skills-"));
 
   const savedEnv = new Map<string, string | undefined>();
   for (const name of [
@@ -233,13 +247,15 @@ test("authorized login installs into the worker's own state dirs only", async ()
 
   const realResolve = engineRegistry.resolve;
   const realIds = engineRegistry.ids;
-  engineRegistry.resolve = (engine) => (engine === "fake" ? fakeAuthDescriptor : realResolve(engine));
-  engineRegistry.ids = () => ["fake", ...realIds()];
 
-  const manifestServer = await startManifestServer();
+  let manifestServer: { baseUrl: string; close: () => Promise<void> } | undefined;
   let close: (() => Promise<void>) | undefined;
 
   try {
+    manifestServer = await startManifestServer();
+    engineRegistry.resolve = (engine) => (engine === "fake" ? fakeAuthDescriptor : realResolve(engine));
+    engineRegistry.ids = () => ["fake", ...realIds()];
+
     process.env.PROVISION_SYNC = "1";
     process.env.PROVISION_AUTOAPPLY = "auto";
     process.env.PROVISION_STATE_DIR = workerAStateDir;
@@ -278,11 +294,70 @@ test("authorized login installs into the worker's own state dirs only", async ()
     assert.ok(existsSync(path.join(workerASkillsDir, "demo-skill", "SKILL.md")));
     assert.ok(existsSync(path.join(workerAStateDir, "provision.lock.json")));
     assert.ok(existsSync(path.join(workerAStateDir, "manifest.key")));
-    // Nothing about this login touches the separate gateway-scoped dir.
+    // Nothing about this login has touched the second engine's dirs — at this
+    // point that's still an unproven negative (nothing has run against them
+    // yet), so it's re-checked for real below, after a second engine actually
+    // uses them.
     assert.ok(!existsSync(path.join(gatewayStateDir, "provision.lock.json")));
+
+    // Snapshot worker-a's artifacts before a second engine runs, so we can
+    // prove its activity doesn't perturb them (not just that they still
+    // exist, but that they're byte-identical to what worker-a produced).
+    const workerAManifestKeyBefore = await readFile(path.join(workerAStateDir, "manifest.key"), "utf8");
+    const workerASkillFileBefore = await readFile(path.join(workerASkillsDir, "demo-skill", "SKILL.md"), "utf8");
+
+    // Retire worker-a's app before starting the second engine: the
+    // provisioning module is a process-wide singleton, so a second
+    // createApp({ role: "worker" }) under a different env re-points that
+    // singleton at the second engine's dirs, and worker-a's server must not
+    // still be live to receive requests against the wrong state.
+    await close();
+    close = undefined;
+
+    process.env.PROVISION_STATE_DIR = gatewayStateDir;
+    process.env.PROVISION_SKILLS_DIR = gatewaySkillsDir;
+
+    const secondEngine = createApp({ role: "worker" }).listen(0);
+    await new Promise<void>((resolve) => secondEngine.once("listening", resolve));
+    const secondPort = (secondEngine.address() as AddressInfo).port;
+    close = () => new Promise<void>((resolve) => secondEngine.close(() => resolve()));
+
+    const createdSecond = await fetch(`http://127.0.0.1:${secondPort}/v1/auth/fake/sessions`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ provisioning_url: `${manifestServer.baseUrl}/provision.json` }),
+    });
+    assert.equal(createdSecond.status, 201);
+    const { sessionId: secondSessionId } = await createdSecond.json() as { sessionId: string };
+
+    const submittedSecond = await fetch(`http://127.0.0.1:${secondPort}/v1/auth/fake/sessions/${secondSessionId}`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ value: "code" }),
+    });
+    assert.equal(submittedSecond.status, 200);
+    const submittedSecondView = await submittedSecond.json() as { status: string };
+    assert.equal(submittedSecondView.status, "authorized");
+
+    await waitFor(() => existsSync(path.join(gatewaySkillsDir, "demo-skill", "SKILL.md")));
+
+    // The second engine really did write into its own dirs — this is what
+    // makes the earlier "gateway dir untouched" assertion non-vacuous:
+    // something is now demonstrably capable of writing there, and it wrote
+    // only there.
+    assert.ok(existsSync(path.join(gatewaySkillsDir, "demo-skill", "SKILL.md")));
+    assert.ok(existsSync(path.join(gatewayStateDir, "provision.lock.json")));
+    assert.ok(existsSync(path.join(gatewayStateDir, "manifest.key")));
+
+    // ...and worker-a's dirs are unaffected by the second engine's run:
+    // untouched files, byte-for-byte.
+    const workerAManifestKeyAfter = await readFile(path.join(workerAStateDir, "manifest.key"), "utf8");
+    const workerASkillFileAfter = await readFile(path.join(workerASkillsDir, "demo-skill", "SKILL.md"), "utf8");
+    assert.equal(workerAManifestKeyAfter, workerAManifestKeyBefore);
+    assert.equal(workerASkillFileAfter, workerASkillFileBefore);
   } finally {
     if (close) await close();
-    await manifestServer.close();
+    if (manifestServer) await manifestServer.close();
     resetSessions();
     resetProvisioning();
     engineRegistry.resolve = realResolve;
@@ -291,7 +366,7 @@ test("authorized login installs into the worker's own state dirs only", async ()
       if (value === undefined) delete process.env[name as string];
       else process.env[name as string] = value;
     }
-    await Promise.all([workerAStateDir, workerASkillsDir, gatewayStateDir].map((dir) =>
+    await Promise.all([workerAStateDir, workerASkillsDir, gatewayStateDir, gatewaySkillsDir].map((dir) =>
       rm(dir, { recursive: true, force: true })));
   }
 });
