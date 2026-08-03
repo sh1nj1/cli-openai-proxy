@@ -74,6 +74,32 @@ release_root="$(sed -n \
 [[ -f "${release_root}/tools/auth-test.html" ]] \
   || fail "auth UI asset is missing from immutable release: ${release_root}"
 
+step "First install generated separate user and administrator keys"
+mapfile -t generated_config < <(node --input-type=commonjs - <<'NODE'
+const { readFileSync } = require("node:fs");
+const lines = readFileSync("/etc/cli-openai-proxy/gateway.env", "utf8").split(/\r?\n/);
+const read = (name) => {
+  const line = lines.find((candidate) => candidate.startsWith(`${name}=`));
+  if (!line) process.exit(2);
+  let value = line.slice(name.length + 1).trim();
+  if ((value.startsWith("'") && value.endsWith("'"))
+      || (value.startsWith('"') && value.endsWith('"'))) value = value.slice(1, -1);
+  return value;
+};
+const mappings = JSON.parse(read("USER_API_KEYS"));
+if (!Array.isArray(mappings) || mappings.length !== 1) process.exit(3);
+console.log(mappings[0].key);
+console.log(read("AUTH_ADMIN_KEYS"));
+console.log(`${mappings[0].tenantId}/${mappings[0].userId}`);
+NODE
+)
+[[ "${generated_config[0]}" == cop_user_* && "${generated_config[1]}" == cop_admin_* ]] \
+  || fail "installer did not generate both key classes"
+[[ "${generated_config[0]}" != "${generated_config[1]}" ]] \
+  || fail "user and administrator keys must differ"
+[[ "${generated_config[2]}" == "default/default" ]] \
+  || fail "installer did not create the default tenant/user mapping"
+
 step "Configuring per-user API keys and starting the gateway"
 cat > /etc/cli-openai-proxy/gateway.env <<EOF
 USER_API_KEYS='[{"key":"${KEY_A}","tenantId":"itest","userId":"user-a"},{"key":"${KEY_B}","tenantId":"itest","userId":"user-b"}]'
