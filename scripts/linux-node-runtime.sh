@@ -94,29 +94,40 @@ linux_node_runtime_path_is_trusted() {
   done
 }
 
+linux_node_runtime_validate_install_directory() {
+  local directory="$1"
+  local metadata owner mode
+
+  if [[ -e "$directory" || -L "$directory" ]]; then
+    [[ -d "$directory" && ! -L "$directory" ]] || {
+      linux_node_runtime_error "Managed Node.js path is not a regular directory: $directory"
+      return 1
+    }
+    metadata="$(LC_ALL=C "$LINUX_NODE_RUNTIME_STAT_BIN" -Lc '%u %a' -- "$directory" 2>/dev/null)" \
+      || return 1
+    read -r owner mode <<<"$metadata"
+    [[ "$owner" == "0" && "$mode" =~ ^[0-7]+$ ]] \
+      && (( (8#$mode & 8#022) == 0 )) || {
+      linux_node_runtime_error "Managed Node.js path has untrusted ownership or permissions: $directory"
+      return 1
+    }
+  fi
+}
+
 linux_node_runtime_prepare_install_root() {
-  local install_parent directory metadata owner mode
+  local install_parent
 
   install_parent="$($LINUX_NODE_RUNTIME_DIRNAME_BIN -- "$LINUX_NODE_RUNTIME_INSTALL_ROOT")"
-  for directory in "$install_parent" "$LINUX_NODE_RUNTIME_INSTALL_ROOT"; do
-    if [[ -e "$directory" || -L "$directory" ]]; then
-      [[ -d "$directory" && ! -L "$directory" ]] || {
-	linux_node_runtime_error "Managed Node.js path is not a regular directory: $directory"
-	return 1
-      }
-      metadata="$(LC_ALL=C "$LINUX_NODE_RUNTIME_STAT_BIN" -Lc '%u %a' -- "$directory" 2>/dev/null)" \
-	|| return 1
-      read -r owner mode <<<"$metadata"
-      [[ "$owner" == "0" && "$mode" =~ ^[0-7]+$ ]] \
-	&& (( (8#$mode & 8#022) == 0 )) || {
-	linux_node_runtime_error "Managed Node.js path has untrusted ownership or permissions: $directory"
-	return 1
-      }
-    fi
-  done
+  linux_node_runtime_validate_install_directory "$install_parent" || return 1
 
+  # Make only the trusted parent traversable before inspecting a child that a
+  # previous private parent may have hidden from the invoking account.
   linux_node_runtime_as_root "$LINUX_NODE_RUNTIME_INSTALL_BIN" -d -o root -g root -m 0755 \
-    "$install_parent" "$LINUX_NODE_RUNTIME_INSTALL_ROOT"
+    "$install_parent" || return 1
+
+  linux_node_runtime_validate_install_directory "$LINUX_NODE_RUNTIME_INSTALL_ROOT" || return 1
+  linux_node_runtime_as_root "$LINUX_NODE_RUNTIME_INSTALL_BIN" -d -o root -g root -m 0755 \
+    "$LINUX_NODE_RUNTIME_INSTALL_ROOT"
 }
 
 linux_node_runtime_find_npm() {
@@ -369,11 +380,14 @@ linux_node_runtime_prepare() {
     linux_node_runtime_error "Trust mode must be 'service' or 'root'"
     return 1
   }
+  if [[ "$trust_mode" == "root" ]]; then
+    linux_node_runtime_prepare_install_root || return 1
+  fi
   if linux_node_runtime_find_existing "$minimum" "$trust_mode"; then
     linux_node_runtime_log "Using trusted Node.js $($LINUX_NODE_BIN --version): $LINUX_NODE_BIN"
     return 0
   fi
-  if [[ -e "$LINUX_NODE_RUNTIME_INSTALL_ROOT" || -L "$LINUX_NODE_RUNTIME_INSTALL_ROOT" ]]; then
+  if [[ "$trust_mode" == "service" ]]; then
     linux_node_runtime_prepare_install_root || return 1
     if linux_node_runtime_find_existing "$minimum" "$trust_mode"; then
       linux_node_runtime_log "Using trusted Node.js $($LINUX_NODE_BIN --version): $LINUX_NODE_BIN"

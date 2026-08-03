@@ -128,10 +128,15 @@ step "Reinstall probes the preserved nondefault gateway listener"
 sed -i 's/^HOST=.*/HOST=127.0.0.1/' /etc/cli-openai-proxy/gateway.env
 sed -i 's/^PORT=.*/PORT=3457/' /etc/cli-openai-proxy/gateway.env
 rm -f /etc/systemd/system/cli-openai-proxy-gateway.service.d/docker-bind.conf
+# An older install may have left this parent private; repair must still run
+# when the installer selects the trusted system Node.js runtime.
+chmod 0700 /opt/cli-openai-proxy
 INSTALL_USE_PREBUILT=1 \
 INSTALL_PRINT_KEYS=0 \
 INSTALL_READINESS_TIMEOUT=30 \
   /opt/app/scripts/install-linux-user-workers.sh
+[[ "$(stat -c '%U %a' /opt/cli-openai-proxy)" == "root 755" ]] \
+  || fail "reinstall did not repair the managed runtime parent"
 curl_expect 200 "http://127.0.0.1:3457/health"
 
 step "Configuring per-user API keys and starting the gateway"
