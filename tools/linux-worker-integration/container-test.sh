@@ -86,7 +86,9 @@ getent passwd cli-openai-proxy-build | grep -q ':/home/build:/bin/bash$' \
 getent passwd "${selected_build_account}" >/dev/null \
   && fail "transient build account survived retirement"
 userdel cli-openai-proxy-build
-groupdel cli-openai-proxy-build
+if getent group cli-openai-proxy-build >/dev/null; then
+  groupdel cli-openai-proxy-build
+fi
 
 step "Immutable release includes the auth UI runtime asset"
 release_root="$(sed -n \
