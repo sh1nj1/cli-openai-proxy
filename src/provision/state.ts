@@ -14,7 +14,7 @@ import {
   randomUUID,
   scryptSync,
 } from "crypto";
-import { linkSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "fs";
+import { mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "fs";
 import { homedir } from "os";
 import path from "path";
 import { managedPathParts } from "./path-policy.js";
@@ -54,20 +54,12 @@ export function loadOrCreateLocalManifestKey(): string {
   const temporary = `${file}.tmp-${process.pid}-${randomUUID()}`;
   try {
     writeFileSync(temporary, `${key}\n`, { encoding: "utf8", mode: 0o600, flag: "wx" });
-    try {
-      // Hard-link creation is atomic and never replaces a key another process won.
-      linkSync(temporary, file);
-      return key;
-    } catch (err) {
-      if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
-    }
+    renameSync(temporary, file);
   } finally {
     rmSync(temporary, { force: true });
   }
-  // Another process won creation; its valid file is the source of truth.
-  const winner = readFileSync(file, "utf8").trim();
-  if (/^[A-Za-z0-9_-]{43}$/.test(winner)) return winner;
-  throw new Error(`Invalid local manifest key: ${file}`);
+  // Another process may have won the rename race; the file is the truth.
+  return readFileSync(file, "utf8").trim();
 }
 
 const MAX_REGISTERED_MANIFEST_BYTES = 16 * 1024;

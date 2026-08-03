@@ -51,8 +51,8 @@ async function startGatewayWithFakeWorker(): Promise<{
   const provisioner: WorkerProvisioner = {
     async ensureWorker() {
       return {
-	accountName: "cap_0123456789abcdef0123",
-	endpoint: { kind: "unix", address: socketPath },
+        accountName: "cap_0123456789abcdef0123",
+        endpoint: { kind: "unix", address: socketPath },
       };
     },
   };
@@ -79,8 +79,8 @@ test("provision routes forward to the identity-selected worker", async () => {
   try {
     const response = await fetch(`http://127.0.0.1:${port}/v1/provision`, {
       headers: {
-	authorization: `Bearer ${ADMIN_KEY}`,
-	"x-cli-proxy-user-key": MAPPED_USER_KEY,
+        authorization: `Bearer ${ADMIN_KEY}`,
+        "x-cli-proxy-user-key": MAPPED_USER_KEY,
       },
     });
     assert.equal(workerSeenPaths.at(-1), "/v1/provision");
@@ -116,9 +116,9 @@ test("provision routes forward even when the gateway engine is disabled", async 
     const response = await fetch(`http://127.0.0.1:${port}/v1/provision/sync`, {
       method: "POST",
       headers: {
-	authorization: `Bearer ${ADMIN_KEY}`,
-	"x-cli-proxy-user-key": MAPPED_USER_KEY,
-	"content-type": "application/json",
+        authorization: `Bearer ${ADMIN_KEY}`,
+        "x-cli-proxy-user-key": MAPPED_USER_KEY,
+        "content-type": "application/json",
       },
     });
     await response.arrayBuffer();

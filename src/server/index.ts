@@ -109,8 +109,8 @@ export function createApp(config: AppConfig = {}): Express {
   }
 
   if (role === "worker") {
-    // Workers never receive AUTH_ADMIN_KEYS, so Task 1's local manifest-key
-    // persistence is what makes this call safe here.
+    // Workers never receive AUTH_ADMIN_KEYS; a per-state-dir key file
+    // substitutes for them when persisting the manifest URL.
     const provisionStatus = initProvisioning();
     if (provisionStatus.enabled) {
       console.log(`[Server] Per-user agent provisioning enabled (mode: ${provisionStatus.autoApply})`);
@@ -180,7 +180,7 @@ export function createApp(config: AppConfig = {}): Express {
         "/v1/usage",
         "/v1/usage/recent",
         AUTH_PROVISIONING_PREFIX,
-	PROVISION_PREFIX,
+        PROVISION_PREFIX,
       ],
       requireRequestIdentity,
     );

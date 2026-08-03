@@ -68,7 +68,8 @@ worker units also have it. A worker with its local engine enabled deliberately
 keeps authorized-login provisioning notifications local, so normal logins do
 not overwrite gateway state. Even so, a gateway-side engine would retain and
 periodically sync its own separate, process-global manifest. A mixed rollout
-also leaves disabled workers using the legacy upward relay. Keep
+also leaves any worker without `PROVISION_SYNC` set using the legacy upward
+relay. Keep
 `PROVISION_SYNC` on the gateway OFF in worker mode so there is one clear owner
 per user — the commented-out block in the worker unit file calls this out for
 the same reason.

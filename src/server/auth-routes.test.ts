@@ -332,18 +332,18 @@ describe("auth-routes", () => {
       const generation = "019865f4-50d6-7000-8000-000000000003";
       const created = fakeRes();
       await handleCreateAuthSession(fakeReq({
-	app: { locals: { cliProxyRole: "worker" } } as any,
-	headers: { [PROVISIONING_GENERATION_HEADER]: generation },
-	params: { engine: "fake" } as any,
-	body: { provisioning_url: manifestUrl },
+        app: { locals: { cliProxyRole: "worker" } } as any,
+        headers: { [PROVISIONING_GENERATION_HEADER]: generation },
+        params: { engine: "fake" } as any,
+        body: { provisioning_url: manifestUrl },
       }), created);
       const { sessionId } = created.payload as { sessionId: string };
 
       const res = fakeRes();
       await handleSubmitAuthSession(fakeReq({
-	app: { locals: { cliProxyRole: "worker" } } as any,
-	params: { engine: "fake", sessionId } as any,
-	body: { value: "code" },
+        app: { locals: { cliProxyRole: "worker" } } as any,
+        params: { engine: "fake", sessionId } as any,
+        body: { value: "code" },
       }), res);
 
       assert.equal((res.payload as { status: string }).status, "authorized");
