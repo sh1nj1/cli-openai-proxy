@@ -18,7 +18,10 @@ SINGLE_SERVICE_NAME="${INSTALL_SINGLE_SERVICE_NAME:-com.cli-openai-proxy}"
 SINGLE_USER="${INSTALL_SINGLE_USER:-${SUDO_USER:-}}"
 
 SERVICE_ACCOUNT="cli-openai-proxy"
-BUILD_ACCOUNT="cli-openai-proxy-build"
+BUILD_ACCOUNT_PREFIX="cli-openai-proxy-bld-"
+BUILD_ACCOUNT=""
+BUILD_ACCOUNT_CREATED=0
+BUILD_GROUP_CREATED=0
 CONFIG_DIR="/etc/cli-openai-proxy"
 STATE_DIR="/var/lib/cli-openai-proxy"
 RUNTIME_BASE="/opt/cli-openai-proxy/releases"
@@ -32,7 +35,8 @@ log() { printf '[install] %s\n' "$*"; }
 die() { printf '[install] ERROR: %s\n' "$*" >&2; exit 1; }
 
 cleanup() {
-  if [[ "$EUID" -eq 0 ]] && id "$BUILD_ACCOUNT" >/dev/null 2>&1; then
+  if [[ "$EUID" -eq 0 && -n "$BUILD_ACCOUNT" ]] \
+      && id "$BUILD_ACCOUNT" >/dev/null 2>&1; then
     kill_build_processes || printf '[install] WARNING: build-account processes survived cleanup\n' >&2
   fi
   case "$BUILD_ROOT" in
@@ -41,6 +45,14 @@ cleanup() {
   case "$RELEASE_STAGING" in
     /opt/cli-openai-proxy/releases/.install.*) rm -rf -- "$RELEASE_STAGING" ;;
   esac
+  if [[ "$EUID" -eq 0 && "$BUILD_ACCOUNT_CREATED" == "1" ]]; then
+    userdel "$BUILD_ACCOUNT" 2>/dev/null \
+      || printf '[install] WARNING: unable to remove transient build account\n' >&2
+  fi
+  if [[ "$EUID" -eq 0 && "$BUILD_GROUP_CREATED" == "1" ]]; then
+    groupdel "$BUILD_ACCOUNT" 2>/dev/null \
+      || printf '[install] WARNING: unable to remove transient build group\n' >&2
+  fi
 }
 trap cleanup EXIT
 
@@ -120,20 +132,58 @@ terminate_build_processes() {
 }
 
 ensure_build_account() {
-  local build_gid
+  local attempt build_gid build_uid candidate matching_uid_count passwd_entry
+  local shadow_entry build_home build_shell build_password random
 
-  if ! getent group "$BUILD_ACCOUNT" >/dev/null; then
-    groupadd --system "$BUILD_ACCOUNT"
-  fi
-  if ! id "$BUILD_ACCOUNT" >/dev/null 2>&1; then
-    useradd --system --gid "$BUILD_ACCOUNT" --home-dir /nonexistent \
-      --no-create-home --shell /usr/sbin/nologin "$BUILD_ACCOUNT"
-  fi
+  random="$(od -An -N6 -tx1 /dev/urandom | tr -d ' \n')"
+  [[ "$random" =~ ^[0-9a-f]{12}$ ]] \
+    || die "Unable to generate a transient build account name"
+  for attempt in 1 2 3 4 5; do
+    candidate="${BUILD_ACCOUNT_PREFIX}${random:0:8}-${attempt}"
+    if ! getent group "$candidate" >/dev/null \
+      && ! getent passwd "$candidate" >/dev/null; then
+      BUILD_ACCOUNT="$candidate"
+      break
+    fi
+  done
+  [[ -n "$BUILD_ACCOUNT" ]] || die "Unable to reserve a transient build account name"
+
+  groupadd --system "$BUILD_ACCOUNT" \
+    || die "Unable to create transient build group"
+  BUILD_GROUP_CREATED=1
+  useradd --system --gid "$BUILD_ACCOUNT" --home-dir /nonexistent \
+    --no-create-home --shell /usr/sbin/nologin "$BUILD_ACCOUNT" \
+    || die "Unable to create transient build account"
+  BUILD_ACCOUNT_CREATED=1
+  usermod --lock --home /nonexistent --shell /usr/sbin/nologin "$BUILD_ACCOUNT" \
+    || die "Unable to disable login for $BUILD_ACCOUNT"
+
   build_gid="$(getent group "$BUILD_ACCOUNT" | awk -F: '{print $3}')"
-  [[ "$(id -u "$BUILD_ACCOUNT")" != "0" \
+  build_uid="$(id -u "$BUILD_ACCOUNT")"
+  matching_uid_count="$(getent passwd \
+    | awk -F: -v uid="$build_uid" '$3 == uid { count++ } END { print count + 0 }')"
+  passwd_entry="$(getent passwd "$BUILD_ACCOUNT")" \
+    || die "Unable to read passwd entry for $BUILD_ACCOUNT"
+  shadow_entry="$(getent shadow "$BUILD_ACCOUNT")" \
+    || die "Unable to read shadow entry for $BUILD_ACCOUNT"
+  IFS=: read -r _ _ _ _ _ build_home build_shell <<<"$passwd_entry"
+  IFS=: read -r _ build_password _ <<<"$shadow_entry"
+  [[ "$build_uid" != "0" \
+      && "$matching_uid_count" == "1" \
       && "$(id -g "$BUILD_ACCOUNT")" == "$build_gid" \
-      && "$(id -G "$BUILD_ACCOUNT")" == "$build_gid" ]] \
-    || die "$BUILD_ACCOUNT must be an unprivileged account with no supplementary groups"
+      && "$(id -G "$BUILD_ACCOUNT")" == "$build_gid" \
+      && "$build_home" == "/nonexistent" \
+      && "$build_shell" == "/usr/sbin/nologin" \
+      && ( "$build_password" == '!'* || "$build_password" == '*'* ) ]] \
+    || die "$BUILD_ACCOUNT must be unprivileged, login-disabled, and have no supplementary groups"
+}
+
+retire_build_account() {
+  terminate_build_processes
+  userdel "$BUILD_ACCOUNT" || die "Unable to remove transient build account"
+  BUILD_ACCOUNT_CREATED=0
+  groupdel "$BUILD_ACCOUNT" || die "Unable to remove transient build group"
+  BUILD_GROUP_CREATED=0
 }
 
 install_native_build_tools() {
@@ -194,6 +244,7 @@ prepare_build() {
   terminate_build_processes
   chown -R root:root "$BUILD_ROOT"
   chmod -R go-w "$BUILD_ROOT"
+  retire_build_account
 }
 
 validate_build() {
@@ -540,6 +591,10 @@ start_and_verify_services() {
 main() {
 [[ "$(uname -s)" == "Linux" ]] || die "This installer supports Linux only"
 [[ "$EUID" -eq 0 ]] || die "Run as root: sudo $0"
+command -v flock >/dev/null 2>&1 || die "flock is required to serialize installation"
+exec 9>/run/cli-openai-proxy-install.lock \
+  || die "Unable to open the installation lock"
+flock --nonblock 9 || die "Another cli-openai-proxy installation is running"
 validate_boolean INSTALL_ROTATE_KEYS "$ROTATE_KEYS"
 validate_boolean INSTALL_USE_PREBUILT "$USE_PREBUILT"
 validate_boolean INSTALL_START_GATEWAY "$START_GATEWAY"

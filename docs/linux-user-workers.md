@@ -34,9 +34,12 @@ group/world-writable path is never accepted for Multi mode.
 
 Source is copied to a private staging directory, then `npm ci`, the TypeScript
 build, and production pruning run as the dedicated
-`cli-openai-proxy-build` account. That account has no gateway group membership,
-configuration access, or persistent HOME. Any remaining build-account process
-is killed before root freezes the result.
+invocation-scoped `cli-openai-proxy-bld-*` account. The installer never reuses
+a preexisting account or UID. The transient account has no gateway group
+membership, configuration access, persistent HOME, login shell, or usable
+password. Any remaining build-account process is killed before root freezes
+the result, then the account and group are removed. A global installer lock
+prevents concurrent invocations from sharing deployment state.
 Root freezes and validates the entrypoints and direct runtime dependencies
 (including `express`) before promoting the result into `/opt`. No
 administrator-owned NVM tree or caller-owned `node_modules` is used by the
@@ -45,7 +48,7 @@ system services.
 The installer creates:
 
 - low-privilege gateway account `cli-openai-proxy`
-- isolated build-only account `cli-openai-proxy-build`
+- transient, invocation-scoped build-only account `cli-openai-proxy-bld-*`
 - root provisioner socket `/run/cli-openai-proxy/provisioner.sock`
 - one socket-activated `cli-openai-proxy-worker@<account>` per user
 - persistent homes under `/var/lib/cli-openai-proxy/users`

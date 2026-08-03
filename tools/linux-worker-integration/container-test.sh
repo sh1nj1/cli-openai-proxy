@@ -66,6 +66,28 @@ command -v git >/dev/null \
 git --version >/dev/null \
   || fail "git in the production runtime image is not executable"
 
+step "Installer never reuses a preexisting build account"
+groupadd --system cli-openai-proxy-build
+useradd --system --gid cli-openai-proxy-build --home-dir /home/build \
+  --no-create-home --shell /bin/bash --password '$6$login-capable' \
+  cli-openai-proxy-build
+selected_build_account="$(bash -c '
+  source /opt/app/scripts/install-linux-user-workers.sh
+  ensure_build_account
+  printf "%s\n" "$BUILD_ACCOUNT"
+  retire_build_account
+')"
+[[ "${selected_build_account}" == cli-openai-proxy-bld-* ]] \
+  || fail "installer did not select an invocation-scoped build account"
+[[ "${selected_build_account}" != cli-openai-proxy-build ]] \
+  || fail "installer reused the preexisting build account"
+getent passwd cli-openai-proxy-build | grep -q ':/home/build:/bin/bash$' \
+  || fail "installer modified the unrelated preexisting account"
+getent passwd "${selected_build_account}" >/dev/null \
+  && fail "transient build account survived retirement"
+userdel cli-openai-proxy-build
+groupdel cli-openai-proxy-build
+
 step "Immutable release includes the auth UI runtime asset"
 release_root="$(sed -n \
   's|^ExecStart=[^ ]* \([^ ]*\)/dist/server/standalone\.js$|\1|p' \

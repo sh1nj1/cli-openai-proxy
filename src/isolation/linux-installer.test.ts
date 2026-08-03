@@ -160,6 +160,81 @@ test("Multi-user install builds as an unprivileged account before promotion", as
   assert.ok(validate >= 0 && validate < promote);
 });
 
+test("Multi-user install isolates and retires an invocation-scoped build account", () => {
+  const scriptPath = fileURLToPath(
+    new URL("../../scripts/install-linux-user-workers.sh", import.meta.url),
+  );
+  execFileSync("bash", ["-c", `
+source "$1"
+existing="\${BUILD_ACCOUNT_PREFIX}00112233-1"
+selected="\${BUILD_ACCOUNT_PREFIX}00112233-2"
+group_created=0
+user_created=0
+user_retired=0
+group_retired=0
+od() { printf ' 00 11 22 33 44 55\\n'; }
+getent() {
+  case "$1" in
+    group)
+      if [[ "$2" == "$existing" ]]; then
+      printf '%s:x:400:\\n' "$existing"
+      elif [[ "$2" == "$selected" && "$group_created" == 1 ]]; then
+      printf '%s:x:456:\\n' "$selected"
+      else
+      return 2
+      fi
+      ;;
+    passwd)
+      if [[ $# == 1 ]]; then
+      [[ "$user_created" == 0 ]] || printf '%s:x:123:456::/nonexistent:/usr/sbin/nologin\\n' "$selected"
+      printf 'unrelated:x:999:999::/nonexistent:/usr/sbin/nologin\\n'
+      elif [[ "$2" == "$selected" && "$user_created" == 1 ]]; then
+      printf '%s:x:123:456::/nonexistent:/usr/sbin/nologin\\n' "$selected"
+      else
+      return 2
+      fi
+      ;;
+    shadow)
+      [[ "$2" == "$selected" && "$user_created" == 1 ]] || return 2
+      printf '%s:!locked:1:0:99999:7::::\\n' "$selected"
+      ;;
+  esac
+}
+id() {
+  [[ "$user_created" == 1 && "\${*: -1}" == "$selected" ]] || return 1
+  case "$1" in
+    -u) printf '123\\n' ;;
+    -g|-G) printf '456\\n' ;;
+    *) return 0 ;;
+  esac
+}
+groupadd() {
+  [[ "\${*: -1}" == "$selected" ]]
+  group_created=1
+}
+useradd() {
+  [[ "\${*: -1}" == "$selected" ]]
+  user_created=1
+}
+usermod() { [[ "\${*: -1}" == "$selected" ]]; }
+kill_build_processes() { return 0; }
+userdel() { [[ "$1" == "$selected" ]]; user_created=0; user_retired=1; }
+groupdel() { [[ "$1" == "$selected" ]]; group_created=0; group_retired=1; }
+
+ensure_build_account
+[[ "$BUILD_ACCOUNT" == "$selected" && "$BUILD_ACCOUNT" != "$existing" ]]
+retire_build_account
+[[ "$user_retired" == 1 && "$group_retired" == 1 ]]
+[[ "$BUILD_ACCOUNT_CREATED" == 0 && "$BUILD_GROUP_CREATED" == 0 ]]
+  `, "bash", scriptPath], { stdio: "pipe" });
+
+  return readScript("install-linux-user-workers.sh").then((script) => {
+    assert.match(script, /flock --nonblock 9/);
+    assert.match(script, /matching_uid_count/);
+    assert.match(script, /retire_build_account/);
+  });
+});
+
 test("Multi-user runtime and services use only a root-owned Node copy", async () => {
   const script = await readScript("install-linux-user-workers.sh");
 
