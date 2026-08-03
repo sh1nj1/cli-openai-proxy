@@ -402,15 +402,18 @@ PROJECT_DIR="$(cd -- "$SCRIPT_DIR/.." && pwd -P)"
 [[ "$PROJECT_DIR" != *:* && "$PROJECT_DIR" != *$'\n'* && "$PROJECT_DIR" != *$'\r'* ]] \
   || die "Project path must not contain a colon or newline: $PROJECT_DIR"
 ENTRYPOINT="$PROJECT_DIR/dist/server/standalone.js"
+NODE_RUNTIME_SCRIPT="$PROJECT_DIR/scripts/linux-node-runtime.sh"
 CONFIG_HOME="${XDG_CONFIG_HOME:-$HOME/.config}"
 ENV_FILE="$CONFIG_HOME/cli-openai-proxy.env"
 SYSTEMD_USER_DIR="$CONFIG_HOME/systemd/user"
 SERVICE_FILE="$SYSTEMD_USER_DIR/$SERVICE_NAME.service"
 
 [[ -f "$PROJECT_DIR/package.json" ]] || die "package.json not found in $PROJECT_DIR"
+[[ -f "$NODE_RUNTIME_SCRIPT" ]] || die "Node.js runtime helper not found: $NODE_RUNTIME_SCRIPT"
 
-NODE_BIN="$(command_path node)"
-NPM_BIN="$(command_path npm)"
+# shellcheck source=linux-node-runtime.sh
+source "$NODE_RUNTIME_SCRIPT"
+
 SYSTEMCTL_BIN="$(trusted_command_path systemctl)"
 LOGINCTL_BIN="$(trusted_command_path loginctl)"
 SUDO_BIN="$(trusted_command_path sudo)"
@@ -425,8 +428,6 @@ DIRNAME_BIN="$(trusted_command_path dirname)"
 LN_BIN="$(trusted_command_path ln)"
 ENV_BIN="$(trusted_command_path env)"
 
-[[ -n "$NODE_BIN" ]] || die "Node.js $MIN_NODE_VERSION or newer is required"
-[[ -n "$NPM_BIN" ]] || die "npm is required"
 [[ -n "$SYSTEMCTL_BIN" ]] || die "systemctl is required (Ubuntu with systemd)"
 [[ -n "$LOGINCTL_BIN" ]] || die "loginctl is required (systemd-logind)"
 [[ -n "$ID_BIN" ]] || die "id is required"
@@ -439,6 +440,13 @@ ENV_BIN="$(trusted_command_path env)"
 [[ -n "$DIRNAME_BIN" ]] || die "dirname is required (GNU coreutils)"
 [[ -n "$LN_BIN" ]] || die "ln is required (GNU coreutils)"
 [[ -n "$ENV_BIN" ]] || die "env is required (GNU coreutils)"
+
+LINUX_NODE_RUNTIME_SUDO="$SUDO_BIN"
+linux_node_runtime_prepare service "$MIN_NODE_VERSION" \
+  || die "Unable to prepare Node.js $MIN_NODE_VERSION or newer"
+NODE_BIN="$LINUX_NODE_BIN"
+NPM_BIN="$LINUX_NPM_BIN"
+
 service_executable_is_trusted "$NODE_BIN" \
   || die "Refusing Node.js executable with untrusted ownership or permissions: $NODE_BIN"
 service_executable_is_trusted "$NPM_BIN" \
@@ -447,16 +455,6 @@ service_path_is_trusted "$PROJECT_DIR" \
   || die "Refusing project directory with untrusted ownership or permissions: $PROJECT_DIR"
 
 SERVICE_USER="$("$ID_BIN" -un)"
-
-"$NODE_BIN" -e '
-  const current = process.versions.node.split(".").map(Number);
-  const minimum = process.argv[1].split(".").map(Number);
-  for (let i = 0; i < 3; i += 1) {
-    if (current[i] > minimum[i]) process.exit(0);
-    if (current[i] < minimum[i]) process.exit(1);
-  }
-' "$MIN_NODE_VERSION" \
-  || die "Node.js $MIN_NODE_VERSION or newer is required (found $("$NODE_BIN" --version))"
 
 if [[ -z "$(trusted_command_path make)" || -z "$(trusted_command_path g++)" ]] \
   || [[ -z "$(trusted_command_path python3)" && -z "$(trusted_command_path python)" ]]; then

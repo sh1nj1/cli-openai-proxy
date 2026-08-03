@@ -437,8 +437,9 @@ cd cli-openai-proxy
 ./scripts/install-linux-single-user.sh
 ```
 
-The installer checks for Node.js 22.13.0 or newer, installs dependencies,
-builds the project, and enables the
+The installer reuses a trusted Node.js 22.13.0 or newer, or downloads and
+checksum-verifies the latest supported Node.js 22 runtime under `/opt` when none is
+available. It installs dependencies, builds the project, and enables the
 `com.cli-openai-proxy.service` systemd user service. It also enables
 systemd linger so the proxy starts at boot before login. On a minimal Ubuntu
 installation it also installs `build-essential` and Python 3, which are needed
@@ -472,9 +473,25 @@ For a shared gateway where each authenticated caller's CLI must run as a
 different Linux account, use the root provisioner + per-user worker installer:
 
 ```bash
-npm ci && npm run build
 sudo ./scripts/install-linux-user-workers.sh
 ```
+
+This is a one-shot install: it prepares a root-trusted Node.js runtime, runs
+`npm ci` and the build as a dedicated build-only non-login account, validates
+the production dependencies, and promotes only that frozen result into a
+root-owned release under `/opt`. It then installs and starts the provisioner,
+gateway, and worker systemd units and verifies the gateway health endpoint.
+
+On first install it writes separate random `USER_API_KEYS` and
+`AUTH_ADMIN_KEYS` values to `/etc/cli-openai-proxy/gateway.env`, creates a
+`default/default` user mapping, and prints the new keys once. Override that
+mapping with `INSTALL_TENANT_ID` and `INSTALL_USER_ID`. Reinstalls preserve the
+configuration and keys; use `INSTALL_ROTATE_KEYS=1` only when intentional.
+When converting from the Single installer, run via `sudo` from that service
+user (or set `INSTALL_SINGLE_USER`) so the conflicting user service is stopped
+and disabled before port 3456 moves to Multi mode. Per-user CLI credentials are
+not migrated: repeat Codex device login and agent provisioning for each mapped
+user after installation.
 
 The first request creates a locked, non-login Linux account and starts its
 systemd socket. The public gateway remains a dedicated low-privilege service

@@ -66,6 +66,30 @@ command -v git >/dev/null \
 git --version >/dev/null \
   || fail "git in the production runtime image is not executable"
 
+step "Installer never reuses a preexisting build account"
+groupadd --system cli-openai-proxy-build
+useradd --system --gid cli-openai-proxy-build --home-dir /home/build \
+  --no-create-home --shell /bin/bash --password '$6$login-capable' \
+  cli-openai-proxy-build
+selected_build_account="$(bash -c '
+  source /opt/app/scripts/install-linux-user-workers.sh
+  ensure_build_account
+  printf "%s\n" "$BUILD_ACCOUNT"
+  retire_build_account
+')"
+[[ "${selected_build_account}" == cli-openai-proxy-bld-* ]] \
+  || fail "installer did not select an invocation-scoped build account"
+[[ "${selected_build_account}" != cli-openai-proxy-build ]] \
+  || fail "installer reused the preexisting build account"
+getent passwd cli-openai-proxy-build | grep -q ':/home/build:/bin/bash$' \
+  || fail "installer modified the unrelated preexisting account"
+getent passwd "${selected_build_account}" >/dev/null \
+  && fail "transient build account survived retirement"
+userdel cli-openai-proxy-build
+if getent group cli-openai-proxy-build >/dev/null; then
+  groupdel cli-openai-proxy-build
+fi
+
 step "Immutable release includes the auth UI runtime asset"
 release_root="$(sed -n \
   's|^ExecStart=[^ ]* \([^ ]*\)/dist/server/standalone\.js$|\1|p' \
@@ -74,6 +98,42 @@ release_root="$(sed -n \
 [[ -f "${release_root}/tools/auth-test.html" ]] \
   || fail "auth UI asset is missing from immutable release: ${release_root}"
 
+step "First install generated separate user and administrator keys"
+mapfile -t generated_config < <(node --input-type=commonjs - <<'NODE'
+const { readFileSync } = require("node:fs");
+const lines = readFileSync("/etc/cli-openai-proxy/gateway.env", "utf8").split(/\r?\n/);
+const read = (name) => {
+  const line = lines.find((candidate) => candidate.startsWith(`${name}=`));
+  if (!line) process.exit(2);
+  let value = line.slice(name.length + 1).trim();
+  if ((value.startsWith("'") && value.endsWith("'"))
+      || (value.startsWith('"') && value.endsWith('"'))) value = value.slice(1, -1);
+  return value;
+};
+const mappings = JSON.parse(read("USER_API_KEYS"));
+if (!Array.isArray(mappings) || mappings.length !== 1) process.exit(3);
+console.log(mappings[0].key);
+console.log(read("AUTH_ADMIN_KEYS"));
+console.log(`${mappings[0].tenantId}/${mappings[0].userId}`);
+NODE
+)
+[[ "${generated_config[0]}" == cop_user_* && "${generated_config[1]}" == cop_admin_* ]] \
+  || fail "installer did not generate both key classes"
+[[ "${generated_config[0]}" != "${generated_config[1]}" ]] \
+  || fail "user and administrator keys must differ"
+[[ "${generated_config[2]}" == "default/default" ]] \
+  || fail "installer did not create the default tenant/user mapping"
+
+step "Reinstall probes the preserved nondefault gateway listener"
+sed -i 's/^HOST=.*/HOST=127.0.0.1/' /etc/cli-openai-proxy/gateway.env
+sed -i 's/^PORT=.*/PORT=3457/' /etc/cli-openai-proxy/gateway.env
+rm -f /etc/systemd/system/cli-openai-proxy-gateway.service.d/docker-bind.conf
+INSTALL_USE_PREBUILT=1 \
+INSTALL_PRINT_KEYS=0 \
+INSTALL_READINESS_TIMEOUT=30 \
+  /opt/app/scripts/install-linux-user-workers.sh
+curl_expect 200 "http://127.0.0.1:3457/health"
+
 step "Configuring per-user API keys and starting the gateway"
 cat > /etc/cli-openai-proxy/gateway.env <<EOF
 USER_API_KEYS='[{"key":"${KEY_A}","tenantId":"itest","userId":"user-a"},{"key":"${KEY_B}","tenantId":"itest","userId":"user-b"}]'
@@ -81,7 +141,7 @@ AUTH_ADMIN_KEYS=${ADMIN_KEY}
 EOF
 chown root:cli-openai-proxy /etc/cli-openai-proxy/gateway.env
 chmod 0640 /etc/cli-openai-proxy/gateway.env
-systemctl start cli-openai-proxy-gateway.service
+systemctl restart cli-openai-proxy-gateway.service
 
 timeout 30 bash -c \
   "until curl -fsS ${BASE_URL}/health >/dev/null 2>&1; do

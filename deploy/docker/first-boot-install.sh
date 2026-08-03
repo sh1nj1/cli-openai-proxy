@@ -38,17 +38,32 @@ if [[ -e "${SEED}" || -L "${SEED}" ]]; then
 fi
 systemctl daemon-reload
 
+GATEWAY_WAS_ACTIVE=0
+if systemctl is-active --quiet cli-openai-proxy-gateway.service; then
+  GATEWAY_WAS_ACTIVE=1
+fi
+
 # Compose always manages this path. If its host source is missing, Docker
 # materializes a directory here; symlinks and other special files are invalid
 # too. Do not let any of those cases fall through to the intentionally
 # unmanaged (absent-path) mode, which would reopen the gateway with a stale
 # persisted env on a later boot.
 if [[ -L "${SEED}" || ( -e "${SEED}" && ! -f "${SEED}" ) ]]; then
+  if [[ "${GATEWAY_WAS_ACTIVE}" == 1 ]]; then
+    systemctl stop cli-openai-proxy-gateway.service
+  fi
   echo "first-boot: seed gateway.env is not a regular file — gateway held down this boot" >&2
   exit 1
 fi
 
-/opt/app/scripts/install-linux-user-workers.sh
+# The image build already produced and pruned a root-owned runtime bundle. The
+# bare-metal installer builds as an isolated build-only account; containers reuse this
+# immutable image layer and let the boot unit apply the authoritative seed
+# before starting the gateway.
+INSTALL_USE_PREBUILT=1 \
+INSTALL_START_GATEWAY=0 \
+INSTALL_PRINT_KEYS=0 \
+  /opt/app/scripts/install-linux-user-workers.sh
 
 # The gateway defaults to HOST=127.0.0.1 (deploy/linux/cli-openai-proxy-gateway.service),
 # correct for the bare-metal install this unit is shared with. In a container,
@@ -92,4 +107,7 @@ else
   # No seed mounted (bare-metal-style in-container config management, or the
   # integration test): keep whatever is persisted and open the gate.
   touch "${CONFIG_OK_FLAG}"
+  if [[ "${GATEWAY_WAS_ACTIVE}" == 1 ]]; then
+    systemctl restart --no-block cli-openai-proxy-gateway.service
+  fi
 fi
