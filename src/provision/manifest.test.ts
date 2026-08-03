@@ -1,6 +1,7 @@
 import { test, describe, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
 import { parseManifest, checkUrlAllowed, fetchWithPolicy, getAllowlist, readResponseBody } from "./manifest.js";
+import { parseGitHubTreeUrl } from "./git-source.js";
 import { ProvisionError } from "./types.js";
 
 const valid = () => ({
@@ -81,6 +82,16 @@ describe("provision manifest", () => {
     });
   });
 
+  test("malformed GitHub tree URL shorthands are not normalized", () => {
+    for (const url of [
+      "not a url",
+      "https://github.com/example/skills/tree/main/%",
+      "https://github.com/example/skills/blob/main/SKILL.md",
+    ]) {
+      assert.equal(parseGitHubTreeUrl(url), null, `url=${url}`);
+    }
+  });
+
   test("a GitHub tree URL cannot conflict with explicit revision fields", () => {
     for (const extra of [{ rev: "main" }, { path: "skills/other" }]) {
       const raw = valid() as unknown as Record<string, unknown>;
@@ -146,6 +157,14 @@ describe("provision manifest", () => {
       rev: "a".repeat(40),
     };
     assert.equal(codeOf(() => parseManifest(manifest)), "invalid_item");
+  });
+
+  test("git sources must be objects with a non-empty URL", () => {
+    for (const git of [null, [], "github", {}, { url: "" }]) {
+      const raw = valid() as unknown as Record<string, unknown>;
+      raw.items = [{ type: "skill", name: "pr-monitor", git }];
+      assert.equal(codeOf(() => parseManifest(raw)), "invalid_item", `git=${JSON.stringify(git)}`);
+    }
   });
 
   test("git refs must be full commit SHAs or safe branch names", () => {

@@ -1808,6 +1808,39 @@ describe("provision sync", () => {
     assert.equal(state.installed[key].uncommitted, true);
   });
 
+  test("startup status restores git source metadata from the lockfile", () => {
+    const key = "skill/startup-git";
+    writeFileSync(path.join(stateDir, "provision.lock.json"), JSON.stringify({
+      version: 1,
+      approved: [key],
+      revoked: [],
+      installed: {
+	[key]: {
+	  sha256: "f".repeat(64),
+	  source: {
+	    type: "git",
+	    ref: "main",
+	    rev: "a".repeat(40),
+	    path: "skills/demo",
+	  },
+	  files: ["SKILL.md"],
+	  directories: [],
+	  fileHashes: { "SKILL.md": sha(Buffer.from("git skill")) },
+	  installedAt: new Date().toISOString(),
+	},
+      },
+    }));
+
+    initProvisioning();
+
+    assert.deepEqual(getStatus().data.find((item) => item.name === "startup-git"), {
+      type: "skill",
+      name: "startup-git",
+      status: "installed",
+      git: { rev: "main", resolved_rev: "a".repeat(40), path: "skills/demo" },
+    });
+  });
+
   test("startup status omits an unresolved upgrade journal", () => {
     const key = "skill/startup-upgrade";
     writeFileSync(path.join(stateDir, "provision.lock.json"), JSON.stringify({

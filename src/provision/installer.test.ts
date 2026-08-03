@@ -90,7 +90,7 @@ const sha = (buf: Buffer) => createHash("sha256").update(buf).digest("hex");
 
 async function serveGitRepository(
   files: Record<string, string>,
-  opts: { addGitlink?: boolean; objectFormat?: "sha1" | "sha256" } = {},
+  opts: { addGitlink?: boolean; allowFilter?: boolean; objectFormat?: "sha1" | "sha256" } = {},
 ): Promise<{ url: string; rev: string; close: () => Promise<void> }> {
   const root = mkdtempSync(path.join(tmpdir(), "provision-git-test-"));
   const source = path.join(root, "source");
@@ -126,7 +126,9 @@ async function serveGitRepository(
   }
   const rev = execFileSync("git", ["rev-parse", "HEAD"], { cwd: source, encoding: "utf8" }).trim();
   execFileSync("git", ["clone", "--quiet", "--bare", source, bare]);
-  execFileSync("git", ["--git-dir", bare, "config", "uploadpack.allowFilter", "false"]);
+  execFileSync("git", [
+    "--git-dir", bare, "config", "uploadpack.allowFilter", opts.allowFilter ? "true" : "false",
+  ]);
 
   const repositoryServer = createServer((req, res) => {
     const requestUrl = new URL(req.url ?? "/", "http://127.0.0.1");
@@ -331,6 +333,77 @@ describe("provision installer", () => {
     }, { skillsDir })), "url_not_allowed");
   });
 
+  test("invalid, credentialed, and non-HTTPS git repository URLs are refused", async () => {
+    for (const [url, code] of [
+      ["not a url", "invalid_url"],
+      ["https://user:secret@github.com/example/skill.git", "url_not_allowed"],
+      ["ssh://git@github.com/example/skill.git", "url_not_allowed"],
+    ]) {
+      assert.equal(await codeOf(() => installSkill({
+	name: "demo",
+	git: { url, rev: "a".repeat(40) },
+      }, { skillsDir })), code, `url=${url}`);
+    }
+  });
+
+  test("missing git branches and repository paths are reported precisely", async () => {
+    const pathRepository = await serveGitRepository({
+      "SKILL.md": "Root git skill.",
+      "skills/demo/SKILL.md": "Nested git skill.",
+    });
+    try {
+      assert.equal(await codeOf(() => installSkill({
+	name: "demo",
+	git: { url: pathRepository.url, rev: pathRepository.rev, path: "missing/path" },
+      }, { skillsDir })), "git_path_not_found");
+      assert.equal(await codeOf(() => installSkill({
+	name: "demo",
+	git: { url: pathRepository.url, rev: pathRepository.rev, path: "skills/*" },
+      }, { skillsDir })), "git_path_not_found", "git.path must not be interpreted as a pathspec glob");
+    } finally {
+      await pathRepository.close();
+    }
+
+    const branchRepository = await serveGitRepository({ "SKILL.md": "Root git skill." });
+    try {
+      assert.equal(await codeOf(() => installSkill({
+	name: "demo",
+	git: { url: branchRepository.url, rev: "missing-branch" },
+      }, { skillsDir })), "git_revision_not_found");
+    } finally {
+      await branchRepository.close();
+    }
+  });
+
+  test("a caller-provided resolved git revision must be a full object ID", async () => {
+    assert.equal(await codeOf(() => installSkill({
+      name: "demo",
+      git: { url: "https://github.com/example/skill.git", rev: "main" },
+      resolvedGitRevision: "main",
+    }, { skillsDir })), "git_revision_mismatch");
+  });
+
+  test("missing git and failed branch inspection have stable error codes", async () => {
+    const savedPath = process.env.PATH;
+    const emptyPath = mkdtempSync(path.join(tmpdir(), "provision-empty-path-"));
+    process.env.PATH = emptyPath;
+    try {
+      assert.equal(await codeOf(() => installSkill({
+	name: "demo",
+	git: { url: "https://github.com/example/skill.git", rev: "a".repeat(40) },
+      }, { skillsDir })), "git_unavailable");
+    } finally {
+      rmSync(emptyPath, { recursive: true, force: true });
+      if (savedPath === undefined) delete process.env.PATH;
+      else process.env.PATH = savedPath;
+    }
+
+    assert.equal(await codeOf(() => installSkill({
+      name: "demo",
+      git: { url: `${baseUrl}/missing.git`, rev: "main" },
+    }, { skillsDir })), "git_fetch_failed");
+  });
+
   test("git sources containing submodules are refused", async () => {
     const repository = await serveGitRepository({ "SKILL.md": "Root git skill." }, { addGitlink: true });
     try {
@@ -370,6 +443,21 @@ describe("provision installer", () => {
       assert.equal(await codeOf(() => installSkill({
 	name: "demo",
 	git: { url: repository.url, rev: repository.rev, path: "skills/demo" },
+      }, { skillsDir })), "audit_failed");
+      assert.equal(existsSync(path.join(skillsDir, "demo")), false);
+    } finally {
+      await repository.close();
+    }
+  });
+
+  test("a partial clone refuses selected blobs over the per-file limit", async () => {
+    const repository = await serveGitRepository({
+      "SKILL.md": "x".repeat(1024 * 1024 + 1),
+    }, { allowFilter: true });
+    try {
+      assert.equal(await codeOf(() => installSkill({
+	name: "demo",
+	git: { url: repository.url, rev: repository.rev },
       }, { skillsDir })), "audit_failed");
       assert.equal(existsSync(path.join(skillsDir, "demo")), false);
     } finally {

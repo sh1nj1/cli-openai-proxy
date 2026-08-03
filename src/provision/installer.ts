@@ -428,9 +428,15 @@ async function prepareGitSource(
   }
 
   const treeish = source.path ? `${revision}:${source.path}` : revision;
-  if (source.path
-    && (await runGit(["cat-file", "-t", treeish], { cwd: repository })).trim() !== "tree") {
-    throw new ProvisionError("Git source path is not a directory", "git_path_not_found");
+  if (source.path) {
+    const entries = (await runGit([
+      "--literal-pathspecs", "ls-tree", "-d", "-z", revision, "--", source.path,
+    ], { cwd: repository })).split("\0").filter(Boolean);
+    if (entries.length !== 1
+      || !entries[0]!.startsWith("040000 tree ")
+      || entries[0]!.split("\t")[1] !== source.path) {
+      throw new ProvisionError("Git source path is not a directory", "git_path_not_found");
+    }
   }
   const tree = await runGit(["ls-tree", "-r", treeish], {
     cwd: repository,
