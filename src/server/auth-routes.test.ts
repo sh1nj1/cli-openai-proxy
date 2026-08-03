@@ -1,5 +1,8 @@
 import { test, describe, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import path from "node:path";
 import type { Request, Response } from "express";
 import {
   authAdminMiddleware,
@@ -16,6 +19,7 @@ import { engineRegistry } from "../auth/registry.js";
 import { resetSessions } from "../auth/session-manager.js";
 import { clearAllCredentials, setCredential } from "../auth/token-store.js";
 import type { EngineAuthDescriptor, EngineAuthSession } from "../auth/types.js";
+import { initProvisioning, resetProvisioning } from "../provision/sync.js";
 import {
   AUTHORIZED_PROVISIONING_HEADER,
   PROVISIONING_GENERATION_HEADER,
@@ -305,6 +309,56 @@ describe("auth-routes", () => {
     }), polled);
     assert.equal((polled.payload as { status: string }).status, "authorized");
     assert.equal(decodeProvisioningUrl(polled.headers[AUTHORIZED_PROVISIONING_HEADER]), manifestUrl);
+  });
+
+  // A worker running its own provisioning engine already applies the URL locally
+  // (in this user's HOME); echoing it upward would additionally overwrite the
+  // gateway-global manifest, re-introducing the bug per-user provisioning fixes.
+  test("worker with local provisioning enabled does not echo the provisioning header", async () => {
+    const savedSync = process.env.PROVISION_SYNC;
+    const savedStateDir = process.env.PROVISION_STATE_DIR;
+    const savedAllowlist = process.env.PROVISION_ALLOWLIST;
+    const stateDir = mkdtempSync(path.join(tmpdir(), "auth-routes-provision-"));
+    process.env.PROVISION_SYNC = "1";
+    process.env.PROVISION_STATE_DIR = stateDir;
+    // Off the manifest's own host, so the worker's local apply (Task 2) rejects
+    // the URL before fetching it — this test only cares that the header stays
+    // suppressed, not that the local apply itself succeeds.
+    process.env.PROVISION_ALLOWLIST = "provisioning.example";
+    initProvisioning();
+
+    try {
+      const manifestUrl = "https://collavre.test/agents/vrex/provision.json?token=secret";
+      const generation = "019865f4-50d6-7000-8000-000000000003";
+      const created = fakeRes();
+      await handleCreateAuthSession(fakeReq({
+        app: { locals: { cliProxyRole: "worker" } } as any,
+        headers: { [PROVISIONING_GENERATION_HEADER]: generation },
+        params: { engine: "fake" } as any,
+        body: { provisioning_url: manifestUrl },
+      }), created);
+      const { sessionId } = created.payload as { sessionId: string };
+
+      const res = fakeRes();
+      await handleSubmitAuthSession(fakeReq({
+        app: { locals: { cliProxyRole: "worker" } } as any,
+        params: { engine: "fake", sessionId } as any,
+        body: { value: "code" },
+      }), res);
+
+      assert.equal((res.payload as { status: string }).status, "authorized");
+      assert.equal(res.headers[AUTHORIZED_PROVISIONING_HEADER], undefined);
+      assert.equal(res.headers[PROVISIONING_GENERATION_HEADER], undefined);
+    } finally {
+      resetProvisioning();
+      if (savedSync === undefined) delete process.env.PROVISION_SYNC;
+      else process.env.PROVISION_SYNC = savedSync;
+      if (savedStateDir === undefined) delete process.env.PROVISION_STATE_DIR;
+      else process.env.PROVISION_STATE_DIR = savedStateDir;
+      if (savedAllowlist === undefined) delete process.env.PROVISION_ALLOWLIST;
+      else process.env.PROVISION_ALLOWLIST = savedAllowlist;
+      rmSync(stateDir, { recursive: true, force: true });
+    }
   });
 
   test("worker provisioning sessions use the gateway-supplied TTL", async () => {
