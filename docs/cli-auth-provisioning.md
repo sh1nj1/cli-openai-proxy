@@ -52,10 +52,13 @@ restart still wins, which is how you rotate keys without a new process.
 
 ## A provisioned Claude credential is visible to completion callers
 
-`claude setup-token` prints its token instead of persisting it, so the proxy
-holds it and injects it into the CLI child of every completion. **That child's
-environment is readable by whoever wrote the prompt**, so a provisioned Claude
-token is recoverable by any caller who can reach `/v1/chat/completions`.
+Neither claude flow ends in a credential the CLI persists: `claude setup-token`
+prints its token instead of writing it anywhere, and the claude CLI has no
+api-key login command at all — it reads `ANTHROPIC_API_KEY` from its
+environment. So the proxy holds the credential and injects it into the CLI
+child of every completion. **That child's environment is readable by whoever
+wrote the prompt**, so a provisioned Claude credential is recoverable by any
+caller who can reach `/v1/chat/completions`.
 
 This is not something the proxy can filter away:
 
@@ -96,9 +99,17 @@ first is its default, and `POST …/sessions` picks one by name:
 | --- | --- | --- | --- |
 | `codex` | `api-key` (default) | `codex login --with-api-key` (key over stdin) | in `~/.codex`, written by the CLI |
 | `codex` | `device-code` | `codex login --device-auth` | in `~/.codex`, written by the CLI |
-| `claude` | `paste-code` | `claude setup-token` | in proxy memory, injected per run — requires `AUTH_TRUST_COMPLETION_CALLERS` |
+| `claude` | `paste-code` (default) | `claude setup-token` | in proxy memory, injected per run — requires `AUTH_TRUST_COMPLETION_CALLERS` |
+| `claude` | `api-key` | none — validated against the Anthropic API | in proxy memory, injected per run — requires `AUTH_TRUST_COMPLETION_CALLERS` |
 
-**`api-key`** — no verification URL. Submit the key; the CLI stores it itself.
+**`api-key`** — no verification URL. Submit the key. For codex the CLI stores
+it itself (`codex login --with-api-key`). The claude CLI has no such command —
+it reads `ANTHROPIC_API_KEY` from its environment — so the proxy validates the
+key with one authenticated request to the Anthropic API (`GET /v1/models`; the
+key travels in a header, never in the URL) and then holds it in memory like a
+`setup-token` credential. Only a definitive HTTP answer is a verdict: `401`/`403`
+fail the session with `invalid_api_key`, while an unreachable API fails it with
+`validation_unavailable` — never as a bad key.
 
 **`device-code`** — the ChatGPT *subscription* login for codex. Plain
 `codex login` cannot work remotely: its OAuth redirect targets localhost on the
@@ -141,7 +152,7 @@ All require `Authorization: Bearer <AUTH_ADMIN_KEYS entry>`.
 
 ```json
 { "object": "list", "data": [
-  { "engine": "claude", "flow": "paste-code", "flows": ["paste-code"] },
+  { "engine": "claude", "flow": "paste-code", "flows": ["paste-code", "api-key"] },
   { "engine": "codex",  "flow": "api-key",    "flows": ["api-key", "device-code"] }
 ] }
 ```

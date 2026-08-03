@@ -243,9 +243,9 @@ lanes is also driven by this resolved result.
 1. **Auth is the CLI's** (for ordinary local login): each CLI uses its own
    logged-in credential automatically and the proxy does not touch it. The
    exception is the remote [auth provisioning flow](docs/cli-auth-provisioning.md),
-   whose persistence model differs per engine: a Claude `setup-token`
-   credential captured through `/v1/auth` is held in proxy memory
-   (`token-store.ts`) and — only when the operator sets
+   whose persistence model differs per engine: a Claude credential captured
+   through `/v1/auth` (a `setup-token` OAuth token or an Anthropic API key) is
+   held in proxy memory (`token-store.ts`) and — only when the operator sets
    `AUTH_TRUST_COMPLETION_CALLERS=1` — injected into the completion subprocess
    environment; a Codex API key is instead forwarded to
    `codex login --with-api-key`, which persists it under `~/.codex` itself, so

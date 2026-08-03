@@ -6,6 +6,7 @@
 
 import { CodexApiKeySession, commandRunner } from "./adapters/codex-api-key.js";
 import { CodexDeviceAuthSession } from "./adapters/codex-device-auth.js";
+import { ClaudeApiKeySession } from "./adapters/claude-api-key.js";
 import { CLAUDE_OAUTH_TOKEN_ENV, ClaudeSetupTokenSession } from "./adapters/claude-setup-token.js";
 import { hasInjectableCredential } from "./token-store.js";
 import type { EngineAuthDescriptor, EngineAuthStatus } from "./types.js";
@@ -63,11 +64,20 @@ const REGISTRY: Record<string, EngineAuthDescriptor> = {
     engine: "claude",
     flows: [
       {
+        // paste-code stays first: it was this engine's only flow before api-key
+        // existed, and the default is what a caller naming no flow still gets.
         flow: "paste-code",
         // `claude setup-token` prints its token instead of persisting it, so the
         // proxy must hold it and inject it into every run.
         injectsCredential: true,
         createSession: () => new ClaudeSetupTokenSession(),
+      },
+      {
+        flow: "api-key",
+        // Same custody as paste-code: the claude CLI has no api-key login
+        // command, so the proxy holds the key and injects it as ANTHROPIC_API_KEY.
+        injectsCredential: true,
+        createSession: () => new ClaudeApiKeySession(),
       },
     ],
     checkStatus: claudeStatus,
