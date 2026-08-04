@@ -464,7 +464,7 @@ stop_single_user_service() {
 }
 
 install_units() {
-  local unit temp
+  local unit temp node_dir
   local -a units=(
     cli-openai-proxy-provisioner.service
     cli-openai-proxy-provisioner.socket
@@ -473,9 +473,14 @@ install_units() {
     cli-openai-proxy-gateway.service
   )
 
+  # The root-trusted runtime's bin directory, not the release copy: CLIs
+  # installed with its `npm -g` land here, so the service PATH must include it
+  # or every `spawn("codex")` fails with ENOENT.
+  node_dir="$(dirname -- "$NODE_BIN")"
   for unit in "${units[@]}"; do
     temp="$(mktemp "$UNIT_TARGET/.${unit}.XXXXXX")"
     sed -e "s|@NODE@|${RUNTIME_NODE}|g" -e "s|@APP_ROOT@|${RUNTIME_ROOT}|g" \
+      -e "s|@NODE_DIR@|${node_dir}|g" \
       "$UNIT_SOURCE/$unit" > "$temp"
     install -o root -g root -m 0644 "$temp" "$UNIT_TARGET/$unit"
     rm -f -- "$temp"

@@ -12,7 +12,8 @@ ExecStart=@NODE@ @APP_ROOT@/dist/server/standalone.js
 EnvironmentFile=-/etc/cli-openai-proxy/gateway.env
 Environment=USER_WORKER_MODE=enabled
 Environment=USER_WORKER_PROVISIONER_ENDPOINT=/run/cli-openai-proxy/provisioner.sock
-Environment=PATH=/usr/local/bin:/usr/bin:/bin
+# Same PATH as the worker units so both modes resolve the CLIs identically.
+Environment=PATH=@NODE_DIR@:/usr/local/bin:/usr/bin:/bin
 Restart=on-failure
 RestartSec=5
 NoNewPrivileges=yes

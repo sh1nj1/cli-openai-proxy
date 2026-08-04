@@ -9,6 +9,25 @@ import { test } from "node:test";
 const readScript = (name: string) =>
   readFile(new URL(`../../scripts/${name}`, import.meta.url), "utf8");
 
+const readUnit = (name: string) =>
+  readFile(new URL(`../../deploy/linux/${name}`, import.meta.url), "utf8");
+
+// The CLIs (claude/codex) are npm-global installs next to the trusted Node
+// runtime; a unit PATH without that directory makes every spawn fail ENOENT.
+test("Multi-mode units put the trusted Node runtime's bin directory on PATH", async () => {
+  const [multi, worker, gateway] = await Promise.all([
+    readScript("install-linux-user-workers.sh"),
+    readUnit("cli-openai-proxy-worker@.service"),
+    readUnit("cli-openai-proxy-gateway.service"),
+  ]);
+
+  const unitPath = /^Environment=PATH=@NODE_DIR@:\/usr\/local\/bin:\/usr\/bin:\/bin$/m;
+  assert.match(worker, unitPath);
+  assert.match(gateway, unitPath);
+  assert.match(multi, /node_dir="\$\(dirname -- "\$NODE_BIN"\)"/);
+  assert.match(multi, /s\|@NODE_DIR@\|\$\{node_dir\}\|g/);
+});
+
 test("Linux installers share one minimum Node.js runtime policy", async () => {
   const [runtime, single, multi] = await Promise.all([
     readScript("linux-node-runtime.sh"),

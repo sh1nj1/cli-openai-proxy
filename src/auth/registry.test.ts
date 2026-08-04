@@ -122,4 +122,11 @@ describe("codex auth status", () => {
     const status = await codexStatus();
     assert.strictEqual(status.state, "unknown");
   });
+
+  test("a missing CLI names the operator problem, not the spawn error", async () => {
+    stubRunner(new Error("spawn codex ENOENT"));
+    const status = await codexStatus();
+    assert.strictEqual(status.state, "unknown");
+    assert.strictEqual(status.detail, "codex CLI not found on the service PATH");
+  });
 });

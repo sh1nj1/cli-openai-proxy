@@ -88,7 +88,24 @@ system gateway. For a different account or unit name, set
 `INSTALL_SINGLE_USER` or `INSTALL_SINGLE_SERVICE_NAME`.
 
 Install the supported CLIs system-wide; dynamically created users cannot
-execute binaries hidden in an administrator's HOME. Each new installation creates an
+execute binaries hidden in an administrator's HOME (nvm trees, `~/.local`, and
+similar are invisible to workers). The worker and gateway units run with
+`PATH=<node bin dir>:/usr/local/bin:/usr/bin:/bin`, where `<node bin dir>` is
+the root-trusted Node runtime the installer selected. Installing with that
+runtime's own npm therefore makes the CLIs visible to every worker:
+
+```bash
+# Managed runtime (no root-trusted system Node existed at install time):
+sudo /opt/cli-openai-proxy/node/v<version>/bin/npm install -g @openai/codex @anthropic-ai/claude-code
+
+# System Node (e.g. /usr/bin/node): plain global installs already land on PATH.
+sudo npm install -g @openai/codex @anthropic-ai/claude-code
+```
+
+An adapter status of `"detail": "codex CLI not found on the service PATH"`
+means this step is missing or the CLI landed outside the service PATH.
+
+Each new installation creates an
 immutable release directory under `/opt`; old release directories may be
 removed manually after the new services are healthy.
 Re-running the installer stops an active gateway, restarts all active per-user
