@@ -394,16 +394,19 @@ install_cli_tools() {
   CLI_STAGING="$(dirname -- "$CLI_ROOT")/.clis.install.$$"
   rm -rf -- "$CLI_STAGING"
   mv "$BUILD_ROOT/clis" "$CLI_STAGING"
-  rm -rf -- "$CLI_ROOT"
-  mv "$CLI_STAGING" "$CLI_ROOT"
-  CLI_STAGING=""
 
+  # Validate before touching CLI_ROOT: a rejected tree must never replace the
+  # known-good one that active workers already have on PATH.
   while IFS= read -r -d '' link; do
     target="$(readlink -f -- "$link" 2>/dev/null)" \
       || die "Refusing a dangling CLI symlink: $link"
-    [[ "$target" == "$CLI_ROOT/"* ]] \
+    [[ "$target" == "$CLI_STAGING/"* ]] \
       || die "Refusing a CLI symlink outside the frozen tree: $link -> $target"
-  done < <(find "$CLI_ROOT" -type l -print0)
+  done < <(find "$CLI_STAGING" -type l -print0)
+
+  rm -rf -- "$CLI_ROOT"
+  mv "$CLI_STAGING" "$CLI_ROOT"
+  CLI_STAGING=""
 }
 
 gateway_env_has() {

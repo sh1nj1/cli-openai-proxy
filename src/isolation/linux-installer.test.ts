@@ -41,8 +41,14 @@ test("Multi-user install stages engine CLIs unprivileged and freezes them under 
     'run_npm_as_service install -g --prefix "$BUILD_ROOT/clis" $INSTALL_CLIS',
   );
   const freezeClis = multi.indexOf('chown -R root:root "$BUILD_ROOT/clis"');
+  const validateClis = multi.indexOf('find "$CLI_STAGING" -type l -print0');
+  const replaceClis = multi.indexOf('rm -rf -- "$CLI_ROOT"');
   const promoteClis = multi.indexOf('mv "$CLI_STAGING" "$CLI_ROOT"');
-  assert.ok(installClis >= 0 && installClis < freezeClis && freezeClis < promoteClis);
+  // A rejected staging tree must never replace the known-good CLI_ROOT that
+  // active workers already have on PATH: validate strictly before the swap.
+  assert.ok(installClis >= 0 && installClis < freezeClis);
+  assert.ok(validateClis >= 0 && freezeClis < validateClis);
+  assert.ok(replaceClis >= 0 && validateClis < replaceClis && replaceClis < promoteClis);
   assert.match(multi, /normalize_release_permissions "\$BUILD_ROOT\/clis"/);
   assert.match(multi, /Refusing a CLI symlink outside the frozen tree/);
   assert.match(multi, /cleanup\(\)[\s\S]*\.clis\.install\.\*\) rm -rf -- "\$CLI_STAGING"/);
