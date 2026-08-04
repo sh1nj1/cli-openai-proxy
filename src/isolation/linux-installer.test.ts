@@ -94,8 +94,10 @@ test("Staged tree symlink validation only accepts links that survive relocation"
   assert.throws(() => validate('ln -s "$root/lib/real" "$root/bin/abs"'), /absolute CLI symlink/);
   assert.throws(() => validate('ln -s /etc/passwd "$root/bin/escape"'), /absolute CLI symlink/);
   assert.throws(() => validate('ln -s ../.. "$root/bin/out"'), /outside the frozen tree/);
-  // readlink -f tolerates a missing final component; a missing intermediate
-  // directory is what makes resolution itself fail.
+  // readlink -f tolerates a missing final component, so the validator must
+  // reject dangling links via test -e: both the common missing-final-component
+  // case and a missing intermediate directory.
+  assert.throws(() => validate('ln -s ../lib/missing "$root/bin/dangling"'), /dangling CLI symlink/);
   assert.throws(() => validate('ln -s ../missing-dir/bin/x "$root/bin/gone"'), /dangling CLI symlink/);
 });
 

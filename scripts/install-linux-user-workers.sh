@@ -333,6 +333,10 @@ validate_relocatable_symlinks() {
   while IFS= read -r -d '' link; do
     [[ "$(readlink -- "$link")" != /* ]] \
       || die "Refusing an absolute $label symlink (dangles after promotion): $link"
+    # readlink -f tolerates a missing final component; test -e dereferences
+    # the whole chain, so it also catches that dangling case.
+    [[ -e "$link" ]] \
+      || die "Refusing a dangling $label symlink: $link"
     target="$(readlink -f -- "$link" 2>/dev/null)" \
       || die "Refusing a dangling $label symlink: $link"
     [[ "$target" == "$root/"* ]] \
