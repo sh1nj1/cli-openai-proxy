@@ -93,8 +93,10 @@ package names to change the set, or to an empty string to skip the step.
 Like the application build, the packages are installed by the transient
 unprivileged build account, frozen to root-owned read-only files, and promoted
 to `/opt/cli-openai-proxy/clis`. The worker and gateway units run with
-`PATH=<node bin dir>:/opt/cli-openai-proxy/clis/bin:/usr/local/bin:/usr/bin:/bin`,
+`PATH=<node bin dir>:/usr/local/bin:/opt/cli-openai-proxy/clis/bin:/usr/bin:/bin`,
 so the managed CLIs are visible to every dynamically created worker account.
+Root-managed global installs take precedence over the installer-frozen copies,
+so a manual install can update a CLI without rerunning the full installer.
 This system-wide location matters: workers cannot execute binaries hidden in
 an administrator's HOME (nvm trees, `~/.local`, and similar are invisible to
 them).

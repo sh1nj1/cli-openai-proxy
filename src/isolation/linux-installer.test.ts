@@ -12,8 +12,8 @@ const readScript = (name: string) =>
 const readUnit = (name: string) =>
   readFile(new URL(`../../deploy/linux/${name}`, import.meta.url), "utf8");
 
-// The CLIs (claude/codex) are npm-global installs next to the trusted Node
-// runtime; a unit PATH without that directory makes every spawn fail ENOENT.
+// Keep the trusted Node first for managed-runtime CLIs and npm shims, then let
+// root-managed /usr/local updates override the installer-frozen CLI fallback.
 test("Multi-mode units put the trusted Node runtime's bin directory on PATH", async () => {
   const [multi, worker, gateway] = await Promise.all([
     readScript("install-linux-user-workers.sh"),
@@ -21,7 +21,7 @@ test("Multi-mode units put the trusted Node runtime's bin directory on PATH", as
     readUnit("cli-openai-proxy-gateway.service"),
   ]);
 
-  const unitPath = /^Environment=PATH=@NODE_DIR@:@CLI_DIR@:\/usr\/local\/bin:\/usr\/bin:\/bin$/m;
+  const unitPath = /^Environment=PATH=@NODE_DIR@:\/usr\/local\/bin:@CLI_DIR@:\/usr\/bin:\/bin$/m;
   assert.match(worker, unitPath);
   assert.match(gateway, unitPath);
   assert.match(multi, /node_dir="\$\(dirname -- "\$NODE_BIN"\)"/);

@@ -556,9 +556,9 @@ install_units() {
     cli-openai-proxy-gateway.service
   )
 
-  # The root-trusted runtime's bin directory, not the release copy: CLIs
-  # installed with its `npm -g` land here, so the service PATH must include it
-  # or every `spawn("codex")` fails with ENOENT.
+  # Keep the root-trusted runtime's bin directory first. Besides exposing CLIs
+  # installed beside a managed Node, it makes /usr/local npm shims resolve the
+  # selected `node`; the unit templates then prefer those shims over CLI_ROOT.
   node_dir="$(dirname -- "$NODE_BIN")"
   for unit in "${units[@]}"; do
     temp="$(mktemp "$UNIT_TARGET/.${unit}.XXXXXX")"
