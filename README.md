@@ -440,7 +440,11 @@ cd cli-openai-proxy
 The installer reuses a trusted Node.js 22.13.0 or newer, or downloads and
 checksum-verifies the latest supported Node.js 22 runtime under `/opt` when none is
 available. It installs dependencies, builds the project, and enables the
-`com.cli-openai-proxy.service` systemd user service. It also enables
+`com.cli-openai-proxy.service` systemd user service. It also installs the
+engine CLIs (`INSTALL_CLIS`, default `@anthropic-ai/claude-code @openai/codex`)
+into a managed prefix under `${XDG_DATA_HOME:-$HOME/.local/share}` on the
+service PATH; CLIs already on your PATH take precedence, and `INSTALL_CLIS=""`
+skips the step. It also enables
 systemd linger so the proxy starts at boot before login. On a minimal Ubuntu
 installation it also installs `build-essential` and Python 3, which are needed
 to compile `node-pty`. `sudo` is used only for those OS prerequisites and the

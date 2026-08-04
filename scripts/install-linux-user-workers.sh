@@ -14,6 +14,8 @@ START_GATEWAY="${INSTALL_START_GATEWAY:-1}"
 PRINT_KEYS="${INSTALL_PRINT_KEYS:-1}"
 TENANT_ID="${INSTALL_TENANT_ID:-default}"
 USER_ID="${INSTALL_USER_ID:-default}"
+# `-` (not `:-`): an explicit INSTALL_CLIS="" opts out of CLI installation.
+INSTALL_CLIS="${INSTALL_CLIS-@anthropic-ai/claude-code @openai/codex}"
 SINGLE_SERVICE_NAME="${INSTALL_SINGLE_SERVICE_NAME:-com.cli-openai-proxy}"
 SINGLE_USER="${INSTALL_SINGLE_USER:-${SUDO_USER:-}}"
 
@@ -25,6 +27,8 @@ BUILD_GROUP_CREATED=0
 CONFIG_DIR="/etc/cli-openai-proxy"
 STATE_DIR="/var/lib/cli-openai-proxy"
 RUNTIME_BASE="/opt/cli-openai-proxy/releases"
+CLI_ROOT="/opt/cli-openai-proxy/clis"
+CLI_STAGING=""
 UNIT_TARGET="/etc/systemd/system"
 TMPFILES_TARGET="/etc/tmpfiles.d"
 GATEWAY_ENV="${CONFIG_DIR}/gateway.env"
@@ -45,6 +49,9 @@ cleanup() {
   case "$RELEASE_STAGING" in
     /opt/cli-openai-proxy/releases/.install.*) rm -rf -- "$RELEASE_STAGING" ;;
   esac
+  case "$CLI_STAGING" in
+    /opt/cli-openai-proxy/.clis.install.*) rm -rf -- "$CLI_STAGING" ;;
+  esac
   if [[ "$EUID" -eq 0 && "$BUILD_ACCOUNT_CREATED" == "1" ]]; then
     userdel "$BUILD_ACCOUNT" 2>/dev/null \
       || printf '[install] WARNING: unable to remove transient build account\n' >&2
@@ -62,6 +69,16 @@ validate_boolean() {
   local name="$1"
   local value="$2"
   [[ "$value" == "0" || "$value" == "1" ]] || die "$name must be 0 or 1"
+}
+
+# Anything not matching a bare npm package spec (optionally scoped/versioned)
+# could smuggle npm flags or paths into the privileged install.
+validate_cli_packages() {
+  local package
+  for package in "$@"; do
+    [[ "$package" =~ ^(@[a-z0-9][a-z0-9._-]*/)?[a-z0-9][a-z0-9._-]*(@[A-Za-z0-9][A-Za-z0-9._-]*)?$ ]] \
+      || die "INSTALL_CLIS entries must be plain npm package names: $package"
+  done
 }
 
 random_key() {
@@ -304,9 +321,30 @@ normalize_release_permissions() {
   done < <(find "$root" -xdev -print0)
 }
 
-promote_release() {
+# Staged trees are renamed into place with mv, which rewrites nothing inside
+# them: an absolute symlink target keeps pointing at the staging path and
+# dangles once cleanup removes it. Only relative in-tree links survive the
+# relocation, so absolute ones are rejected even when they currently resolve.
+validate_relocatable_symlinks() {
+  local root="$1"
+  local label="$2"
   local link target
 
+  while IFS= read -r -d '' link; do
+    [[ "$(readlink -- "$link")" != /* ]] \
+      || die "Refusing an absolute $label symlink (dangles after promotion): $link"
+    # readlink -f tolerates a missing final component; test -e dereferences
+    # the whole chain, so it also catches that dangling case.
+    [[ -e "$link" ]] \
+      || die "Refusing a dangling $label symlink: $link"
+    target="$(readlink -f -- "$link" 2>/dev/null)" \
+      || die "Refusing a dangling $label symlink: $link"
+    [[ "$target" == "$root/"* ]] \
+      || die "Refusing a $label symlink outside the frozen tree: $link -> $target"
+  done < <(find "$root" -type l -print0)
+}
+
+promote_release() {
   RUNTIME_ROOT="${RUNTIME_BASE}/$(date -u +%Y%m%dT%H%M%SZ)-$$"
   RELEASE_STAGING="${RUNTIME_BASE}/.install.$$"
   install -d -o root -g root -m 0755 "$RUNTIME_BASE" "$RELEASE_STAGING"
@@ -321,18 +359,63 @@ promote_release() {
   # service accounts need read access and directory traversal after promotion.
   normalize_release_permissions "$RELEASE_STAGING"
 
-  while IFS= read -r -d '' link; do
-    target="$(readlink -f -- "$link" 2>/dev/null)" \
-      || die "Refusing a dangling runtime symlink: $link"
-    [[ "$target" == "$RELEASE_STAGING/"* ]] \
-      || die "Refusing runtime symlink outside the immutable release: $link -> $target"
-  done < <(find "$RELEASE_STAGING" -type l -print0)
+  validate_relocatable_symlinks "$RELEASE_STAGING" "runtime"
   linux_node_runtime_path_is_trusted "$RELEASE_STAGING/bin/node" root \
     || die "Promoted Node.js runtime is not root trusted"
 
   mv "$RELEASE_STAGING" "$RUNTIME_ROOT"
   RELEASE_STAGING=""
   RUNTIME_NODE="$RUNTIME_ROOT/bin/node"
+}
+
+install_cli_tools() {
+  if [[ -z "$INSTALL_CLIS" ]]; then
+    log "Skipping engine CLI installation (INSTALL_CLIS is empty)"
+    return 0
+  fi
+
+  # The app build root is finished; free its slot so the CLI staging tree is
+  # covered by the same cleanup trap. The prebuilt bundle never matches.
+  case "$BUILD_ROOT" in
+    /var/tmp/cli-openai-proxy-build.*) rm -rf -- "$BUILD_ROOT" ;;
+  esac
+  ensure_build_account
+  terminate_build_processes
+  BUILD_ROOT="$(mktemp -d /var/tmp/cli-openai-proxy-build.XXXXXX)"
+  chown "$BUILD_ACCOUNT:$BUILD_ACCOUNT" "$BUILD_ROOT"
+  chmod 0700 "$BUILD_ROOT"
+  install -d -o "$BUILD_ACCOUNT" -g "$BUILD_ACCOUNT" -m 0700 \
+    "$BUILD_ROOT/home" "$BUILD_ROOT/clis"
+  install -o "$BUILD_ACCOUNT" -g "$BUILD_ACCOUNT" -m 0600 /dev/null \
+    "$BUILD_ROOT/.npmrc.user"
+  install -o "$BUILD_ACCOUNT" -g "$BUILD_ACCOUNT" -m 0600 /dev/null \
+    "$BUILD_ROOT/.npmrc.global"
+
+  log "Installing engine CLIs as $BUILD_ACCOUNT: $INSTALL_CLIS"
+  # shellcheck disable=SC2086 -- INSTALL_CLIS is a validated word list
+  (cd "$BUILD_ROOT" && run_npm_as_service install -g --prefix "$BUILD_ROOT/clis" $INSTALL_CLIS)
+
+  # Same freeze sequence as the app build: no build-account process may retain
+  # a writable handle on files root is about to trust.
+  terminate_build_processes
+  chown -R root:root "$BUILD_ROOT/clis"
+  chmod -R go-w "$BUILD_ROOT/clis"
+  retire_build_account
+  normalize_release_permissions "$BUILD_ROOT/clis"
+  find "$BUILD_ROOT/clis/bin" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null \
+    | grep -q . || die "Engine CLI installation produced no executables"
+
+  CLI_STAGING="$(dirname -- "$CLI_ROOT")/.clis.install.$$"
+  rm -rf -- "$CLI_STAGING"
+  mv "$BUILD_ROOT/clis" "$CLI_STAGING"
+
+  # Validate before touching CLI_ROOT: a rejected tree must never replace the
+  # known-good one that active workers already have on PATH.
+  validate_relocatable_symlinks "$CLI_STAGING" "CLI"
+
+  rm -rf -- "$CLI_ROOT"
+  mv "$CLI_STAGING" "$CLI_ROOT"
+  CLI_STAGING=""
 }
 
 gateway_env_has() {
@@ -464,7 +547,7 @@ stop_single_user_service() {
 }
 
 install_units() {
-  local unit temp
+  local unit temp node_dir
   local -a units=(
     cli-openai-proxy-provisioner.service
     cli-openai-proxy-provisioner.socket
@@ -473,9 +556,14 @@ install_units() {
     cli-openai-proxy-gateway.service
   )
 
+  # Keep the root-trusted runtime's bin directory first. Besides exposing CLIs
+  # installed beside a managed Node, it makes /usr/local npm shims resolve the
+  # selected `node`; the unit templates then prefer those shims over CLI_ROOT.
+  node_dir="$(dirname -- "$NODE_BIN")"
   for unit in "${units[@]}"; do
     temp="$(mktemp "$UNIT_TARGET/.${unit}.XXXXXX")"
     sed -e "s|@NODE@|${RUNTIME_NODE}|g" -e "s|@APP_ROOT@|${RUNTIME_ROOT}|g" \
+      -e "s|@NODE_DIR@|${node_dir}|g" -e "s|@CLI_DIR@|${CLI_ROOT}/bin|g" \
       "$UNIT_SOURCE/$unit" > "$temp"
     install -o root -g root -m 0644 "$temp" "$UNIT_TARGET/$unit"
     rm -f -- "$temp"
@@ -642,6 +730,8 @@ validate_boolean INSTALL_PRINT_KEYS "$PRINT_KEYS"
 [[ "$USER_ID" =~ ^[A-Za-z0-9._:@/-]{1,128}$ ]] || die "Invalid INSTALL_USER_ID"
 [[ "$SINGLE_SERVICE_NAME" =~ ^[A-Za-z0-9_.][A-Za-z0-9_.@-]*$ ]] \
   || die "Invalid INSTALL_SINGLE_SERVICE_NAME"
+# shellcheck disable=SC2086 -- INSTALL_CLIS is a space-separated word list
+validate_cli_packages $INSTALL_CLIS
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 SOURCE_ROOT="$(cd -- "$SCRIPT_DIR/.." && pwd)"
@@ -672,6 +762,7 @@ install -d -o "$SERVICE_ACCOUNT" -g "$SERVICE_ACCOUNT" -m 0700 "$STATE_DIR/gatew
 prepare_build
 validate_build
 promote_release
+install_cli_tools
 prepare_gateway_config
 
 if [[ ! -e "$CONFIG_DIR/provisioner-identity.key" ]]; then

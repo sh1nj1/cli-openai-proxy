@@ -55,7 +55,13 @@ async function codexStatus(): Promise<EngineAuthStatus> {
     }
     return { state: "unauthenticated", detail };
   } catch (err) {
-    return { state: "unknown", detail: err instanceof Error ? err.message : String(err) };
+    const message = err instanceof Error ? err.message : String(err);
+    return {
+      state: "unknown",
+      // A raw "spawn codex ENOENT" reads like a proxy bug; name the actual
+      // operator problem (the CLI is missing from the service PATH) instead.
+      detail: message.includes("ENOENT") ? "codex CLI not found on the service PATH" : message,
+    };
   }
 }
 

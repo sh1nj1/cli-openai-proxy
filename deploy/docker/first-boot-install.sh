@@ -60,9 +60,14 @@ fi
 # bare-metal installer builds as an isolated build-only account; containers reuse this
 # immutable image layer and let the boot unit apply the authoritative seed
 # before starting the gateway.
+# INSTALL_CLIS="": the image build already installed the engine CLIs into
+# /usr/local (Dockerfile INSTALL_CLIS build arg); boot must not require the
+# network, and the integration test injects a stub CLI that a boot-time
+# install would shadow.
 INSTALL_USE_PREBUILT=1 \
 INSTALL_START_GATEWAY=0 \
 INSTALL_PRINT_KEYS=0 \
+INSTALL_CLIS="" \
   /opt/app/scripts/install-linux-user-workers.sh
 
 # The gateway defaults to HOST=127.0.0.1 (deploy/linux/cli-openai-proxy-gateway.service),

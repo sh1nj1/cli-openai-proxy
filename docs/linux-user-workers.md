@@ -87,8 +87,39 @@ user. It disables and stops `com.cli-openai-proxy.service` before starting the
 system gateway. For a different account or unit name, set
 `INSTALL_SINGLE_USER` or `INSTALL_SINGLE_SERVICE_NAME`.
 
-Install the supported CLIs system-wide; dynamically created users cannot
-execute binaries hidden in an administrator's HOME. Each new installation creates an
+The installer also installs the engine CLIs. `INSTALL_CLIS` defaults to
+`@anthropic-ai/claude-code @openai/codex`; set it to other space-separated npm
+package names to change the set, or to an empty string to skip the step.
+Like the application build, the packages are installed by the transient
+unprivileged build account, frozen to root-owned read-only files, and promoted
+to `/opt/cli-openai-proxy/clis`. The worker and gateway units run with
+`PATH=<node bin dir>:/usr/local/bin:/opt/cli-openai-proxy/clis/bin:/usr/bin:/bin`,
+so the managed CLIs are visible to every dynamically created worker account.
+Root-managed global installs take precedence over the installer-frozen copies,
+so a manual install can update a CLI without rerunning the full installer.
+This system-wide location matters: workers cannot execute binaries hidden in
+an administrator's HOME (nvm trees, `~/.local`, and similar are invisible to
+them).
+
+To add or update CLIs without a full reinstall, a system-wide manual install
+also stays on the service PATH:
+
+```bash
+# Managed runtime (no root-trusted system Node existed at install time). The
+# managed npm is a `#!/usr/bin/env node` script and sudo's secure_path does not
+# include the versioned directory, so put its sibling node on PATH explicitly:
+sudo env PATH="/opt/cli-openai-proxy/node/v<version>/bin:$PATH" \
+  npm install -g @openai/codex @anthropic-ai/claude-code
+
+# System Node (e.g. /usr/bin/node): plain global installs already land on PATH.
+sudo npm install -g @openai/codex @anthropic-ai/claude-code
+```
+
+An adapter status of `"detail": "codex CLI not found on the service PATH"`
+means the CLI was skipped via `INSTALL_CLIS` or landed outside the service
+PATH.
+
+Each new installation creates an
 immutable release directory under `/opt`; old release directories may be
 removed manually after the new services are healthy.
 Re-running the installer stops an active gateway, restarts all active per-user

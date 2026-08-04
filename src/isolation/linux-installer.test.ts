@@ -9,6 +9,111 @@ import { test } from "node:test";
 const readScript = (name: string) =>
   readFile(new URL(`../../scripts/${name}`, import.meta.url), "utf8");
 
+const readUnit = (name: string) =>
+  readFile(new URL(`../../deploy/linux/${name}`, import.meta.url), "utf8");
+
+// Keep the trusted Node first for managed-runtime CLIs and npm shims, then let
+// root-managed /usr/local updates override the installer-frozen CLI fallback.
+test("Multi-mode units put the trusted Node runtime's bin directory on PATH", async () => {
+  const [multi, worker, gateway] = await Promise.all([
+    readScript("install-linux-user-workers.sh"),
+    readUnit("cli-openai-proxy-worker@.service"),
+    readUnit("cli-openai-proxy-gateway.service"),
+  ]);
+
+  const unitPath = /^Environment=PATH=@NODE_DIR@:\/usr\/local\/bin:@CLI_DIR@:\/usr\/bin:\/bin$/m;
+  assert.match(worker, unitPath);
+  assert.match(gateway, unitPath);
+  assert.match(multi, /node_dir="\$\(dirname -- "\$NODE_BIN"\)"/);
+  assert.match(multi, /s\|@NODE_DIR@\|\$\{node_dir\}\|g/);
+  assert.match(multi, /s\|@CLI_DIR@\|\$\{CLI_ROOT\}\/bin\|g/);
+});
+
+test("Multi-user install stages engine CLIs unprivileged and freezes them under /opt", async () => {
+  const [multi, firstBoot] = await Promise.all([
+    readScript("install-linux-user-workers.sh"),
+    readFile(new URL("../../deploy/docker/first-boot-install.sh", import.meta.url), "utf8"),
+  ]);
+
+  assert.match(multi, /INSTALL_CLIS="\$\{INSTALL_CLIS-@anthropic-ai\/claude-code @openai\/codex\}"/);
+  assert.match(multi, /CLI_ROOT="\/opt\/cli-openai-proxy\/clis"/);
+  const installClis = multi.indexOf(
+    'run_npm_as_service install -g --prefix "$BUILD_ROOT/clis" $INSTALL_CLIS',
+  );
+  const freezeClis = multi.indexOf('chown -R root:root "$BUILD_ROOT/clis"');
+  const validateClis = multi.indexOf('validate_relocatable_symlinks "$CLI_STAGING" "CLI"');
+  const replaceClis = multi.indexOf('rm -rf -- "$CLI_ROOT"');
+  const promoteClis = multi.indexOf('mv "$CLI_STAGING" "$CLI_ROOT"');
+  // A rejected staging tree must never replace the known-good CLI_ROOT that
+  // active workers already have on PATH: validate strictly before the swap.
+  assert.ok(installClis >= 0 && installClis < freezeClis);
+  assert.ok(validateClis >= 0 && freezeClis < validateClis);
+  assert.ok(replaceClis >= 0 && validateClis < replaceClis && replaceClis < promoteClis);
+  assert.match(multi, /normalize_release_permissions "\$BUILD_ROOT\/clis"/);
+  assert.match(multi, /validate_relocatable_symlinks "\$RELEASE_STAGING" "runtime"/);
+  assert.match(multi, /cleanup\(\)[\s\S]*\.clis\.install\.\*\) rm -rf -- "\$CLI_STAGING"/);
+  // Containers install CLIs at image build time; boot must stay offline-safe.
+  assert.match(firstBoot, /^INSTALL_CLIS="" \\$/m);
+});
+
+test("INSTALL_CLIS rejects anything that is not a bare npm package spec", () => {
+  const scriptPath = fileURLToPath(
+    new URL("../../scripts/install-linux-user-workers.sh", import.meta.url),
+  );
+  const validate = (packages: string) => execFileSync("bash", ["-c", `
+    source "$1"
+    validate_cli_packages $2
+  `, "bash", scriptPath, packages], { stdio: "pipe" });
+
+  validate("@anthropic-ai/claude-code @openai/codex");
+  validate("codex@0.42.0");
+  for (const invalid of ["--registry=https://evil.example", "-g", "../etc", "a;b", "@scope/"]) {
+    assert.throws(() => validate(invalid), Error, `accepted: ${invalid}`);
+  }
+});
+
+test("Staged tree symlink validation only accepts links that survive relocation", () => {
+  const scriptPath = fileURLToPath(
+    new URL("../../scripts/install-linux-user-workers.sh", import.meta.url),
+  );
+  const validate = (setup: string) => execFileSync("bash", ["-c", `
+    set -euo pipefail
+    source "$1"
+    # Canonicalize: on macOS mktemp returns a path under the /var symlink.
+    root="$(cd "$(mktemp -d)" && pwd -P)"
+    trap 'rm -rf -- "$root"' EXIT
+    mkdir -p "$root/bin" "$root/lib"
+    echo target > "$root/lib/real"
+    eval "$2"
+    validate_relocatable_symlinks "$root" "CLI"
+  `, "bash", scriptPath, setup], { stdio: "pipe" });
+
+  // Relative in-tree links relocate with the mv and stay valid.
+  validate('ln -s ../lib/real "$root/bin/ok"');
+  // Absolute links keep pointing at the deleted staging path after promotion.
+  assert.throws(() => validate('ln -s "$root/lib/real" "$root/bin/abs"'), /absolute CLI symlink/);
+  assert.throws(() => validate('ln -s /etc/passwd "$root/bin/escape"'), /absolute CLI symlink/);
+  assert.throws(() => validate('ln -s ../.. "$root/bin/out"'), /outside the frozen tree/);
+  // readlink -f tolerates a missing final component, so the validator must
+  // reject dangling links via test -e: both the common missing-final-component
+  // case and a missing intermediate directory.
+  assert.throws(() => validate('ln -s ../lib/missing "$root/bin/dangling"'), /dangling CLI symlink/);
+  assert.throws(() => validate('ln -s ../missing-dir/bin/x "$root/bin/gone"'), /dangling CLI symlink/);
+});
+
+test("Single-user install provisions engine CLIs into a managed prefix on the service PATH", async () => {
+  const single = await readScript("install-linux-single-user.sh");
+
+  assert.match(single, /INSTALL_CLIS="\$\{INSTALL_CLIS-@anthropic-ai\/claude-code @openai\/codex\}"/);
+  assert.match(single, /INSTALL_CLIS entries must be plain npm package names/);
+  const installClis = single.indexOf('run_npm install -g "--prefix=$CLI_PREFIX" $INSTALL_CLIS');
+  const appendPath = single.indexOf('append_service_path "$CLI_PREFIX/bin"');
+  const writeUnit = single.indexOf('"PATH=$SERVICE_PATH"');
+  assert.ok(installClis >= 0 && installClis < appendPath);
+  assert.ok(appendPath < single.indexOf("validate_service_cli_resolution claude"));
+  assert.ok(writeUnit >= 0 && appendPath < writeUnit);
+});
+
 test("Linux installers share one minimum Node.js runtime policy", async () => {
   const [runtime, single, multi] = await Promise.all([
     readScript("linux-node-runtime.sh"),

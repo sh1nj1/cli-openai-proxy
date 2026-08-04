@@ -14,7 +14,9 @@ WorkingDirectory=/var/lib/cli-openai-proxy/users/%i
 ExecStart=@NODE@ @APP_ROOT@/dist/server/worker-standalone.js
 Environment=HOME=/var/lib/cli-openai-proxy/users/%i
 Environment=WORKER_LISTEN_FD=3
-Environment=PATH=/usr/local/bin:/usr/bin:/bin
+# @NODE_DIR@ first so npm shims resolve the root-trusted `node`; root-managed
+# /usr/local overrides the installer-frozen fallback CLIs under @CLI_DIR@.
+Environment=PATH=@NODE_DIR@:/usr/local/bin:@CLI_DIR@:/usr/bin:/bin
 # The gateway guarantees that only this OS user's authenticated requests reach
 # this socket, so a credential provisioned here is exposed only to the same user.
 Environment=AUTH_TRUST_COMPLETION_CALLERS=true
