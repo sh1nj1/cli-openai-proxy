@@ -103,8 +103,11 @@ To add or update CLIs without a full reinstall, a system-wide manual install
 also stays on the service PATH:
 
 ```bash
-# Managed runtime (no root-trusted system Node existed at install time):
-sudo /opt/cli-openai-proxy/node/v<version>/bin/npm install -g @openai/codex @anthropic-ai/claude-code
+# Managed runtime (no root-trusted system Node existed at install time). The
+# managed npm is a `#!/usr/bin/env node` script and sudo's secure_path does not
+# include the versioned directory, so put its sibling node on PATH explicitly:
+sudo env PATH="/opt/cli-openai-proxy/node/v<version>/bin:$PATH" \
+  npm install -g @openai/codex @anthropic-ai/claude-code
 
 # System Node (e.g. /usr/bin/node): plain global installs already land on PATH.
 sudo npm install -g @openai/codex @anthropic-ai/claude-code

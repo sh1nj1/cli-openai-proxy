@@ -41,7 +41,7 @@ test("Multi-user install stages engine CLIs unprivileged and freezes them under 
     'run_npm_as_service install -g --prefix "$BUILD_ROOT/clis" $INSTALL_CLIS',
   );
   const freezeClis = multi.indexOf('chown -R root:root "$BUILD_ROOT/clis"');
-  const validateClis = multi.indexOf('find "$CLI_STAGING" -type l -print0');
+  const validateClis = multi.indexOf('validate_relocatable_symlinks "$CLI_STAGING" "CLI"');
   const replaceClis = multi.indexOf('rm -rf -- "$CLI_ROOT"');
   const promoteClis = multi.indexOf('mv "$CLI_STAGING" "$CLI_ROOT"');
   // A rejected staging tree must never replace the known-good CLI_ROOT that
@@ -50,7 +50,7 @@ test("Multi-user install stages engine CLIs unprivileged and freezes them under 
   assert.ok(validateClis >= 0 && freezeClis < validateClis);
   assert.ok(replaceClis >= 0 && validateClis < replaceClis && replaceClis < promoteClis);
   assert.match(multi, /normalize_release_permissions "\$BUILD_ROOT\/clis"/);
-  assert.match(multi, /Refusing a CLI symlink outside the frozen tree/);
+  assert.match(multi, /validate_relocatable_symlinks "\$RELEASE_STAGING" "runtime"/);
   assert.match(multi, /cleanup\(\)[\s\S]*\.clis\.install\.\*\) rm -rf -- "\$CLI_STAGING"/);
   // Containers install CLIs at image build time; boot must stay offline-safe.
   assert.match(firstBoot, /^INSTALL_CLIS="" \\$/m);
@@ -70,6 +70,33 @@ test("INSTALL_CLIS rejects anything that is not a bare npm package spec", () => 
   for (const invalid of ["--registry=https://evil.example", "-g", "../etc", "a;b", "@scope/"]) {
     assert.throws(() => validate(invalid), Error, `accepted: ${invalid}`);
   }
+});
+
+test("Staged tree symlink validation only accepts links that survive relocation", () => {
+  const scriptPath = fileURLToPath(
+    new URL("../../scripts/install-linux-user-workers.sh", import.meta.url),
+  );
+  const validate = (setup: string) => execFileSync("bash", ["-c", `
+    set -euo pipefail
+    source "$1"
+    # Canonicalize: on macOS mktemp returns a path under the /var symlink.
+    root="$(cd "$(mktemp -d)" && pwd -P)"
+    trap 'rm -rf -- "$root"' EXIT
+    mkdir -p "$root/bin" "$root/lib"
+    echo target > "$root/lib/real"
+    eval "$2"
+    validate_relocatable_symlinks "$root" "CLI"
+  `, "bash", scriptPath, setup], { stdio: "pipe" });
+
+  // Relative in-tree links relocate with the mv and stay valid.
+  validate('ln -s ../lib/real "$root/bin/ok"');
+  // Absolute links keep pointing at the deleted staging path after promotion.
+  assert.throws(() => validate('ln -s "$root/lib/real" "$root/bin/abs"'), /absolute CLI symlink/);
+  assert.throws(() => validate('ln -s /etc/passwd "$root/bin/escape"'), /absolute CLI symlink/);
+  assert.throws(() => validate('ln -s ../.. "$root/bin/out"'), /outside the frozen tree/);
+  // readlink -f tolerates a missing final component; a missing intermediate
+  // directory is what makes resolution itself fail.
+  assert.throws(() => validate('ln -s ../missing-dir/bin/x "$root/bin/gone"'), /dangling CLI symlink/);
 });
 
 test("Single-user install provisions engine CLIs into a managed prefix on the service PATH", async () => {

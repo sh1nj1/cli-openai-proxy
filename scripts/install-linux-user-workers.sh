@@ -321,9 +321,26 @@ normalize_release_permissions() {
   done < <(find "$root" -xdev -print0)
 }
 
-promote_release() {
+# Staged trees are renamed into place with mv, which rewrites nothing inside
+# them: an absolute symlink target keeps pointing at the staging path and
+# dangles once cleanup removes it. Only relative in-tree links survive the
+# relocation, so absolute ones are rejected even when they currently resolve.
+validate_relocatable_symlinks() {
+  local root="$1"
+  local label="$2"
   local link target
 
+  while IFS= read -r -d '' link; do
+    [[ "$(readlink -- "$link")" != /* ]] \
+      || die "Refusing an absolute $label symlink (dangles after promotion): $link"
+    target="$(readlink -f -- "$link" 2>/dev/null)" \
+      || die "Refusing a dangling $label symlink: $link"
+    [[ "$target" == "$root/"* ]] \
+      || die "Refusing a $label symlink outside the frozen tree: $link -> $target"
+  done < <(find "$root" -type l -print0)
+}
+
+promote_release() {
   RUNTIME_ROOT="${RUNTIME_BASE}/$(date -u +%Y%m%dT%H%M%SZ)-$$"
   RELEASE_STAGING="${RUNTIME_BASE}/.install.$$"
   install -d -o root -g root -m 0755 "$RUNTIME_BASE" "$RELEASE_STAGING"
@@ -338,12 +355,7 @@ promote_release() {
   # service accounts need read access and directory traversal after promotion.
   normalize_release_permissions "$RELEASE_STAGING"
 
-  while IFS= read -r -d '' link; do
-    target="$(readlink -f -- "$link" 2>/dev/null)" \
-      || die "Refusing a dangling runtime symlink: $link"
-    [[ "$target" == "$RELEASE_STAGING/"* ]] \
-      || die "Refusing runtime symlink outside the immutable release: $link -> $target"
-  done < <(find "$RELEASE_STAGING" -type l -print0)
+  validate_relocatable_symlinks "$RELEASE_STAGING" "runtime"
   linux_node_runtime_path_is_trusted "$RELEASE_STAGING/bin/node" root \
     || die "Promoted Node.js runtime is not root trusted"
 
@@ -353,8 +365,6 @@ promote_release() {
 }
 
 install_cli_tools() {
-  local link target
-
   if [[ -z "$INSTALL_CLIS" ]]; then
     log "Skipping engine CLI installation (INSTALL_CLIS is empty)"
     return 0
@@ -397,12 +407,7 @@ install_cli_tools() {
 
   # Validate before touching CLI_ROOT: a rejected tree must never replace the
   # known-good one that active workers already have on PATH.
-  while IFS= read -r -d '' link; do
-    target="$(readlink -f -- "$link" 2>/dev/null)" \
-      || die "Refusing a dangling CLI symlink: $link"
-    [[ "$target" == "$CLI_STAGING/"* ]] \
-      || die "Refusing a CLI symlink outside the frozen tree: $link -> $target"
-  done < <(find "$CLI_STAGING" -type l -print0)
+  validate_relocatable_symlinks "$CLI_STAGING" "CLI"
 
   rm -rf -- "$CLI_ROOT"
   mv "$CLI_STAGING" "$CLI_ROOT"
