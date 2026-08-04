@@ -8,6 +8,8 @@ PORT="${INSTALL_PORT:-3456}"
 HOST="${INSTALL_HOST:-127.0.0.1}"
 MIN_NODE_VERSION="22.13.0"
 READINESS_TIMEOUT="${INSTALL_READINESS_TIMEOUT:-30}"
+# `-` (not `:-`): an explicit INSTALL_CLIS="" opts out of CLI installation.
+INSTALL_CLIS="${INSTALL_CLIS-@anthropic-ai/claude-code @openai/codex}"
 USER_PATH="${PATH:-}"
 BUILD_BIN_DIR=""
 
@@ -395,6 +397,12 @@ read_effective_listener() {
   || die "INSTALL_READINESS_TIMEOUT must be an integer between 1 and 300 seconds"
 [[ "$HOST" != *$'\n'* && "$HOST" != *$'\r'* ]] \
   || die "HOST must not contain newlines"
+# Anything not matching a bare npm package spec (optionally scoped/versioned)
+# could smuggle npm flags or paths into the install.
+for cli_package in $INSTALL_CLIS; do
+  [[ "$cli_package" =~ ^(@[a-z0-9][a-z0-9._-]*/)?[a-z0-9][a-z0-9._-]*(@[A-Za-z0-9][A-Za-z0-9._-]*)?$ ]] \
+    || die "INSTALL_CLIS entries must be plain npm package names: $cli_package"
+done
 
 SCRIPT_DIR="${BASH_SOURCE[0]%/*}"
 [[ "$SCRIPT_DIR" != "${BASH_SOURCE[0]}" ]] || SCRIPT_DIR="."
@@ -572,6 +580,17 @@ else
   } >"$ENV_FILE"
   chmod 600 "$ENV_FILE"
   log "Created configuration: $ENV_FILE"
+fi
+
+if [[ -n "$INSTALL_CLIS" ]]; then
+  CLI_PREFIX="${XDG_DATA_HOME:-$HOME/.local/share}/cli-openai-proxy/clis"
+  prepare_trusted_directory "$CLI_PREFIX" "managed CLI directory"
+  log "Installing engine CLIs with the managed npm: $INSTALL_CLIS"
+  # shellcheck disable=SC2086 -- INSTALL_CLIS is a validated word list
+  run_npm install -g "--prefix=$CLI_PREFIX" $INSTALL_CLIS
+  # Appended after the discovered CLI directories, so an operator-installed
+  # claude/codex still wins over the managed copies.
+  append_service_path "$CLI_PREFIX/bin"
 fi
 
 NPM_PREFIX="$(run_npm prefix --global 2>/dev/null || true)"

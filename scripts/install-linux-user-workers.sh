@@ -14,6 +14,8 @@ START_GATEWAY="${INSTALL_START_GATEWAY:-1}"
 PRINT_KEYS="${INSTALL_PRINT_KEYS:-1}"
 TENANT_ID="${INSTALL_TENANT_ID:-default}"
 USER_ID="${INSTALL_USER_ID:-default}"
+# `-` (not `:-`): an explicit INSTALL_CLIS="" opts out of CLI installation.
+INSTALL_CLIS="${INSTALL_CLIS-@anthropic-ai/claude-code @openai/codex}"
 SINGLE_SERVICE_NAME="${INSTALL_SINGLE_SERVICE_NAME:-com.cli-openai-proxy}"
 SINGLE_USER="${INSTALL_SINGLE_USER:-${SUDO_USER:-}}"
 
@@ -25,6 +27,8 @@ BUILD_GROUP_CREATED=0
 CONFIG_DIR="/etc/cli-openai-proxy"
 STATE_DIR="/var/lib/cli-openai-proxy"
 RUNTIME_BASE="/opt/cli-openai-proxy/releases"
+CLI_ROOT="/opt/cli-openai-proxy/clis"
+CLI_STAGING=""
 UNIT_TARGET="/etc/systemd/system"
 TMPFILES_TARGET="/etc/tmpfiles.d"
 GATEWAY_ENV="${CONFIG_DIR}/gateway.env"
@@ -45,6 +49,9 @@ cleanup() {
   case "$RELEASE_STAGING" in
     /opt/cli-openai-proxy/releases/.install.*) rm -rf -- "$RELEASE_STAGING" ;;
   esac
+  case "$CLI_STAGING" in
+    /opt/cli-openai-proxy/.clis.install.*) rm -rf -- "$CLI_STAGING" ;;
+  esac
   if [[ "$EUID" -eq 0 && "$BUILD_ACCOUNT_CREATED" == "1" ]]; then
     userdel "$BUILD_ACCOUNT" 2>/dev/null \
       || printf '[install] WARNING: unable to remove transient build account\n' >&2
@@ -62,6 +69,16 @@ validate_boolean() {
   local name="$1"
   local value="$2"
   [[ "$value" == "0" || "$value" == "1" ]] || die "$name must be 0 or 1"
+}
+
+# Anything not matching a bare npm package spec (optionally scoped/versioned)
+# could smuggle npm flags or paths into the privileged install.
+validate_cli_packages() {
+  local package
+  for package in "$@"; do
+    [[ "$package" =~ ^(@[a-z0-9][a-z0-9._-]*/)?[a-z0-9][a-z0-9._-]*(@[A-Za-z0-9][A-Za-z0-9._-]*)?$ ]] \
+      || die "INSTALL_CLIS entries must be plain npm package names: $package"
+  done
 }
 
 random_key() {
@@ -335,6 +352,60 @@ promote_release() {
   RUNTIME_NODE="$RUNTIME_ROOT/bin/node"
 }
 
+install_cli_tools() {
+  local link target
+
+  if [[ -z "$INSTALL_CLIS" ]]; then
+    log "Skipping engine CLI installation (INSTALL_CLIS is empty)"
+    return 0
+  fi
+
+  # The app build root is finished; free its slot so the CLI staging tree is
+  # covered by the same cleanup trap. The prebuilt bundle never matches.
+  case "$BUILD_ROOT" in
+    /var/tmp/cli-openai-proxy-build.*) rm -rf -- "$BUILD_ROOT" ;;
+  esac
+  ensure_build_account
+  terminate_build_processes
+  BUILD_ROOT="$(mktemp -d /var/tmp/cli-openai-proxy-build.XXXXXX)"
+  chown "$BUILD_ACCOUNT:$BUILD_ACCOUNT" "$BUILD_ROOT"
+  chmod 0700 "$BUILD_ROOT"
+  install -d -o "$BUILD_ACCOUNT" -g "$BUILD_ACCOUNT" -m 0700 \
+    "$BUILD_ROOT/home" "$BUILD_ROOT/clis"
+  install -o "$BUILD_ACCOUNT" -g "$BUILD_ACCOUNT" -m 0600 /dev/null \
+    "$BUILD_ROOT/.npmrc.user"
+  install -o "$BUILD_ACCOUNT" -g "$BUILD_ACCOUNT" -m 0600 /dev/null \
+    "$BUILD_ROOT/.npmrc.global"
+
+  log "Installing engine CLIs as $BUILD_ACCOUNT: $INSTALL_CLIS"
+  # shellcheck disable=SC2086 -- INSTALL_CLIS is a validated word list
+  (cd "$BUILD_ROOT" && run_npm_as_service install -g --prefix "$BUILD_ROOT/clis" $INSTALL_CLIS)
+
+  # Same freeze sequence as the app build: no build-account process may retain
+  # a writable handle on files root is about to trust.
+  terminate_build_processes
+  chown -R root:root "$BUILD_ROOT/clis"
+  chmod -R go-w "$BUILD_ROOT/clis"
+  retire_build_account
+  normalize_release_permissions "$BUILD_ROOT/clis"
+  find "$BUILD_ROOT/clis/bin" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null \
+    | grep -q . || die "Engine CLI installation produced no executables"
+
+  CLI_STAGING="$(dirname -- "$CLI_ROOT")/.clis.install.$$"
+  rm -rf -- "$CLI_STAGING"
+  mv "$BUILD_ROOT/clis" "$CLI_STAGING"
+  rm -rf -- "$CLI_ROOT"
+  mv "$CLI_STAGING" "$CLI_ROOT"
+  CLI_STAGING=""
+
+  while IFS= read -r -d '' link; do
+    target="$(readlink -f -- "$link" 2>/dev/null)" \
+      || die "Refusing a dangling CLI symlink: $link"
+    [[ "$target" == "$CLI_ROOT/"* ]] \
+      || die "Refusing a CLI symlink outside the frozen tree: $link -> $target"
+  done < <(find "$CLI_ROOT" -type l -print0)
+}
+
 gateway_env_has() {
   local name="$1"
   grep -Eq "^[[:space:]]*${name}=" "$GATEWAY_ENV" 2>/dev/null
@@ -480,7 +551,7 @@ install_units() {
   for unit in "${units[@]}"; do
     temp="$(mktemp "$UNIT_TARGET/.${unit}.XXXXXX")"
     sed -e "s|@NODE@|${RUNTIME_NODE}|g" -e "s|@APP_ROOT@|${RUNTIME_ROOT}|g" \
-      -e "s|@NODE_DIR@|${node_dir}|g" \
+      -e "s|@NODE_DIR@|${node_dir}|g" -e "s|@CLI_DIR@|${CLI_ROOT}/bin|g" \
       "$UNIT_SOURCE/$unit" > "$temp"
     install -o root -g root -m 0644 "$temp" "$UNIT_TARGET/$unit"
     rm -f -- "$temp"
@@ -647,6 +718,8 @@ validate_boolean INSTALL_PRINT_KEYS "$PRINT_KEYS"
 [[ "$USER_ID" =~ ^[A-Za-z0-9._:@/-]{1,128}$ ]] || die "Invalid INSTALL_USER_ID"
 [[ "$SINGLE_SERVICE_NAME" =~ ^[A-Za-z0-9_.][A-Za-z0-9_.@-]*$ ]] \
   || die "Invalid INSTALL_SINGLE_SERVICE_NAME"
+# shellcheck disable=SC2086 -- INSTALL_CLIS is a space-separated word list
+validate_cli_packages $INSTALL_CLIS
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 SOURCE_ROOT="$(cd -- "$SCRIPT_DIR/.." && pwd)"
@@ -677,6 +750,7 @@ install -d -o "$SERVICE_ACCOUNT" -g "$SERVICE_ACCOUNT" -m 0700 "$STATE_DIR/gatew
 prepare_build
 validate_build
 promote_release
+install_cli_tools
 prepare_gateway_config
 
 if [[ ! -e "$CONFIG_DIR/provisioner-identity.key" ]]; then
