@@ -482,6 +482,65 @@ describe("provision sync", () => {
     assert.equal(lstatSync(path.join(actualRoot, "deduplicated")).isSymbolicLink(), true);
   });
 
+  test("rebinds a recorded discovery link through a configured root alias", async () => {
+    const actualRoot = path.join(stateDir, "rebound-discovery-root");
+    const aliasRoot = path.join(stateDir, "rebound-discovery-alias");
+    mkdirSync(actualRoot);
+    symlinkSync(actualRoot, aliasRoot, process.platform === "win32" ? "junction" : "dir");
+    process.env.PROVISION_SKILL_LINK_DIRS = aliasRoot;
+    process.env.PROVISION_AUTOAPPLY = "auto";
+    initProvisioning();
+    const skill = serveSkill("/rebound-link-root.tgz", "rebound link root");
+    const manifestUrl = serveManifest([{ type: "skill", name: "rebound", ...skill }]);
+    registerManifestUrl(manifestUrl);
+
+    assert.equal(statusOf(await syncNow(), "rebound"), "installed");
+    const aliasLink = path.join(aliasRoot, "rebound");
+    const actualLink = path.join(actualRoot, "rebound");
+    const linkIdentity = lstatSync(aliasLink, { bigint: true }).ino;
+
+    process.env.PROVISION_SKILL_LINK_DIRS = actualRoot;
+    initProvisioning();
+    registerManifestUrl(manifestUrl);
+    assert.equal(statusOf(await syncNow(), "rebound"), "installed");
+    assert.equal(lstatSync(actualLink, { bigint: true }).ino, linkIdentity);
+    assert.equal(statusOf(await syncNow(), "rebound"), "installed");
+    const state = JSON.parse(readFileSync(path.join(stateDir, "provision.lock.json"), "utf8"));
+    assert.deepEqual(
+      state.installed["skill/rebound"].skillLinks.map((link: { path: string }) => link.path),
+      [actualLink],
+    );
+  });
+
+  test("collapses stale exact ownership when recorded discovery roots become aliases", async () => {
+    const firstRoot = path.join(stateDir, "collapsed-discovery-first");
+    const secondRoot = path.join(stateDir, "collapsed-discovery-second");
+    process.env.PROVISION_SKILL_LINK_DIRS = `${firstRoot},${secondRoot}`;
+    process.env.PROVISION_AUTOAPPLY = "auto";
+    initProvisioning();
+    const skill = serveSkill("/collapsed-link-root.tgz", "collapsed link root");
+    const manifestUrl = serveManifest([{ type: "skill", name: "collapsed", ...skill }]);
+    registerManifestUrl(manifestUrl);
+
+    assert.equal(statusOf(await syncNow(), "collapsed"), "installed");
+    const secondLink = path.join(secondRoot, "collapsed");
+    const retainedIdentity = lstatSync(secondLink, { bigint: true }).ino;
+    rmSync(firstRoot, { recursive: true });
+    symlinkSync(secondRoot, firstRoot, process.platform === "win32" ? "junction" : "dir");
+
+    process.env.PROVISION_SKILL_LINK_DIRS = firstRoot;
+    initProvisioning();
+    registerManifestUrl(manifestUrl);
+    assert.equal(statusOf(await syncNow(), "collapsed"), "installed");
+    assert.equal(lstatSync(path.join(firstRoot, "collapsed"), { bigint: true }).ino, retainedIdentity);
+    assert.equal(statusOf(await syncNow(), "collapsed"), "installed");
+    const state = JSON.parse(readFileSync(path.join(stateDir, "provision.lock.json"), "utf8"));
+    assert.deepEqual(
+      state.installed["skill/collapsed"].skillLinks.map((link: { path: string }) => link.path),
+      [path.join(firstRoot, "collapsed")],
+    );
+  });
+
   test("deduplicates missing discovery roots beneath aliased parents", async () => {
     const actualParent = path.join(stateDir, "shared-discovery-parent");
     const aliasParent = path.join(stateDir, "shared-discovery-parent-alias");

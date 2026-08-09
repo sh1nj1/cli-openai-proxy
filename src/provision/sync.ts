@@ -889,13 +889,27 @@ function ensureSkillLinks(
     const stillDesired = desiredPaths.includes(interrupted.path) && interrupted.target === target;
     finishSkillLinkPublication(record, persist, stillDesired);
   }
-  const recorded = new Map((record.skillLinks ?? []).map((link) => [link.path, link]));
+  const recordedLinks = record.skillLinks ?? [];
+  const recorded = new Map(recordedLinks.map((link) => [link.path, link]));
+  const matchedRecordedLinks = new Set<InstalledSkillLink>();
+  const desiredOwnership = new Map<string, InstalledSkillLink>();
+  for (const linkPath of desiredPaths) {
+    const identityMatches = recordedLinks.filter((link) => sameSkillLinkIdentity(linkPath, link));
+    const exact = recorded.get(linkPath);
+    const owned = identityMatches[0] ?? exact;
+    if (owned) {
+      desiredOwnership.set(linkPath, owned);
+      matchedRecordedLinks.add(owned);
+    }
+    if (exact) matchedRecordedLinks.add(exact);
+    for (const match of identityMatches) matchedRecordedLinks.add(match);
+  }
 
   // Verify the whole destination set before changing any existing link. This
   // keeps the previous discovery fanout live when a newly configured root is
   // already occupied.
   for (const linkPath of desiredPaths) {
-    const owned = recorded.get(linkPath);
+    const owned = desiredOwnership.get(linkPath);
     if (owned && pathEntryExists(linkPath) && !sameSkillLinkIdentity(linkPath, owned)) {
       throw new ProvisionError(
 	`Refusing to replace changed skill link "${linkPath}"`,
@@ -909,8 +923,8 @@ function ensureSkillLinks(
       );
     }
   }
-  for (const link of record.skillLinks ?? []) {
-    if (desiredPaths.includes(link.path) || !pathEntryExists(link.path)) continue;
+  for (const link of recordedLinks) {
+    if (matchedRecordedLinks.has(link) || !pathEntryExists(link.path)) continue;
     if (!sameSkillLinkIdentity(link.path, link)) {
       throw new ProvisionError(
 	`Refusing to remove changed skill link "${link.path}"`,
@@ -923,7 +937,7 @@ function ensureSkillLinks(
   const created: InstalledSkillLink[] = [];
   try {
     for (const linkPath of desiredPaths) {
-      const owned = recorded.get(linkPath);
+      const owned = desiredOwnership.get(linkPath);
       if (owned) {
 	if (!pathEntryExists(linkPath)) {
 	  const replacement = publishSkillLink(linkPath, target, record, persist);
@@ -938,7 +952,7 @@ function ensureSkillLinks(
 	  );
 	}
 	if (owned.target === target) {
-	  result.push(owned);
+	  result.push(owned.path === linkPath ? owned : adoptPublishedSkillLink(linkPath, target));
 	  continue;
 	}
 	isolateRecordedSkillLink(owned);
@@ -958,8 +972,8 @@ function ensureSkillLinks(
       result.push(link);
       created.push(link);
     }
-    for (const link of record.skillLinks ?? []) {
-      if (desiredPaths.includes(link.path)) continue;
+    for (const link of recordedLinks) {
+      if (matchedRecordedLinks.has(link)) continue;
       isolateRecordedSkillLink(link);
     }
     return result;
