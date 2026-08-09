@@ -968,6 +968,44 @@ function moveDirectoryNoReplace(
   return renameDirectoryNoReplace(source, target);
 }
 
+/** Restore one exact preclaimed removal recovery without replacing a pathname. */
+export function restoreSkillRemovalRecovery(
+  name: string,
+  opts: {
+    skillsDir: string;
+    recoveryId: string;
+    recoveryIdentity: InstalledDirectoryIdentity;
+  },
+): boolean {
+  if (!LEGACY_NAME_PATTERN.test(name) || !RECOVERY_ID_PATTERN.test(opts.recoveryId)) {
+    throw new ProvisionError("Invalid skill recovery identity", "invalid_item");
+  }
+  const recovery = path.join(opts.skillsDir, `.provision-removed-${opts.recoveryId}`);
+  const target = path.join(opts.skillsDir, name);
+  const expected = {
+    dev: BigInt(opts.recoveryIdentity.dev),
+    ino: BigInt(opts.recoveryIdentity.ino),
+  };
+  if (sameDirectoryIdentity(directoryIdentity(target), expected)
+    && directoryIdentity(recovery) === null) return true;
+  if (!sameDirectoryIdentity(directoryIdentity(recovery), expected) || targetExists(target)) return false;
+  if (!moveDirectoryNoReplace(recovery, target, () => {
+    if (!sameDirectoryIdentity(directoryIdentity(recovery), expected)) {
+      throw new ProvisionError(
+	`Recovery for "${name}" changed identity before restoration`,
+	"untracked_content",
+      );
+    }
+  })) return false;
+  if (!sameDirectoryIdentity(directoryIdentity(target), expected)) {
+    throw new ProvisionError(
+      `Recovery for "${name}" changed identity during restoration`,
+      "untracked_content",
+    );
+  }
+  return true;
+}
+
 function targetExists(target: string): boolean {
   try {
     lstatSync(target);

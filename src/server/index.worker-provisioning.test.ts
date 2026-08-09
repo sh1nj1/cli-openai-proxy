@@ -270,7 +270,7 @@ test("authorized login installs into the worker's own state dirs only", async ()
   const savedEnv = new Map<string, string | undefined>();
   for (const name of [
     "PROVISION_SYNC", "PROVISION_AUTOAPPLY", "PROVISION_STATE_DIR",
-    "PROVISION_SKILLS_DIR", "PROVISION_CONFIG_DIR", "PROVISION_ALLOWLIST",
+    "PROVISION_SKILLS_DIR", "PROVISION_SKILL_LINK_DIRS", "PROVISION_CONFIG_DIR", "PROVISION_ALLOWLIST",
   ] as const) {
     savedEnv.set(name, process.env[name]);
   }
@@ -290,6 +290,7 @@ test("authorized login installs into the worker's own state dirs only", async ()
     process.env.PROVISION_AUTOAPPLY = "auto";
     process.env.PROVISION_STATE_DIR = workerAStateDir;
     process.env.PROVISION_SKILLS_DIR = workerASkillsDir;
+    process.env.PROVISION_SKILL_LINK_DIRS = "";
     process.env.PROVISION_CONFIG_DIR = workerAConfigDir;
     process.env.PROVISION_ALLOWLIST = "127.0.0.1";
 
@@ -351,6 +352,7 @@ test("authorized login installs into the worker's own state dirs only", async ()
 
     process.env.PROVISION_STATE_DIR = gatewayStateDir;
     process.env.PROVISION_SKILLS_DIR = gatewaySkillsDir;
+    process.env.PROVISION_SKILL_LINK_DIRS = "";
     process.env.PROVISION_CONFIG_DIR = gatewayConfigDir;
     manifestServer.setConfigToken("worker-b-token");
 

@@ -54,10 +54,12 @@ describe("provision state", () => {
       approved: ["skill/pr-monitor"],
       revoked: [],
       removalRecoveries: ["f".repeat(32)],
+      removalRecoveryRoots: { ["f".repeat(32)]: "/home/test/.agents/skills" },
       upgradeRecoveries: ["e".repeat(32)],
       installed: {
         "skill/pr-monitor": {
           sha256: "a".repeat(64),
+	  installRoot: "/home/test/.agents/skills",
 	  source: {
 	    type: "git" as const,
 	    ref: "main",
@@ -67,6 +69,16 @@ describe("provision state", () => {
           files: ["SKILL.md"],
 	  directories: ["examples", "examples/empty"],
           installedAt: "2026-08-02T00:00:00.000Z",
+	  skillLinks: [{
+	    path: "/home/test/.claude/skills/pr-monitor",
+	    target: "/home/test/.agents/skills/pr-monitor",
+	    dev: "12",
+	    ino: "34",
+	  }],
+	  skillLinkPublication: {
+	    path: "/home/test/.other-agent/skills/pr-monitor",
+	    target: "/home/test/.agents/skills/pr-monitor",
+	  },
 	  removalRecoveryId: "f".repeat(32),
         },
       },

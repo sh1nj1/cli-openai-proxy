@@ -15,6 +15,7 @@
 
 import { createHash, randomBytes } from "crypto";
 import {
+  accessSync,
   closeSync,
   constants as fsConstants,
   existsSync,
@@ -23,6 +24,11 @@ import {
   openSync,
   readdirSync,
   readFileSync,
+  readlinkSync,
+  realpathSync,
+  mkdirSync,
+  renameSync,
+  rmdirSync,
   unlinkSync,
 } from "fs";
 import { homedir } from "os";
@@ -41,6 +47,7 @@ import {
   installSkill,
   isolateRejectedCandidate,
   removeSkill,
+  restoreSkillRemovalRecovery,
   resolveGitRevision,
 } from "./installer.js";
 import {
@@ -49,6 +56,14 @@ import {
   installConfig,
   removeConfig,
 } from "./config-installer.js";
+import {
+  AnchoredPublicationAmbiguousError,
+  mkdirAt,
+  removeAtIdentity,
+  renameDirectoryNoReplace,
+  symlinkAt,
+  type AnchoredEntryIdentity,
+} from "./rename-no-replace.js";
 import {
   loadRegisteredManifestUrl,
   loadOrCreateLocalManifestKey,
@@ -64,6 +79,7 @@ import {
   type InstalledRecord,
   type InstalledDirectoryIdentity,
   type InstalledSnapshot,
+  type InstalledSkillLink,
   type ProvisionManifest,
   type ProvisionStateFile,
 } from "./types.js";
@@ -161,7 +177,10 @@ let fixedManifestUrl: string | null = null;
 let shuttingDown = false;
 let shutdownPromise: Promise<void> | null = null;
 let afterFirstInstallMove: ((target: string) => void) | undefined;
+let beforeSkillCandidateMove: ((target: string) => void) | undefined;
 let afterFirstInstallReconciliationIdentityCheck: ((target: string) => void) | undefined;
+let beforeSkillLinkPublication: ((linkPath: string) => void) | undefined;
+let afterSkillLinkPublication: ((linkPath: string) => void) | undefined;
 let afterRemovalAudit: ((target: string) => void) | undefined;
 let afterRemovalIsolation: ((target: string) => void) | undefined;
 let afterConfigRemoval: ((target: string) => void) | undefined;
@@ -213,18 +232,22 @@ function initializeRuntime(target: WorkspaceRuntime, legacy: boolean): void {
   if (!enabled || perUserWorkers) return;
   if (!legacy && !warnedNamedWorkspaceOverrides && [
     "PROVISION_SKILLS_DIR",
+    "PROVISION_SKILL_LINK_DIRS",
     "PROVISION_CONFIG_DIR",
     "PROVISION_STATE_DIR",
   ].some((name) => process.env[name]?.trim())) {
     warnedNamedWorkspaceOverrides = true;
     console.warn(
-      "[Provision] Named workspaces ignore PROVISION_SKILLS_DIR, PROVISION_CONFIG_DIR, and PROVISION_STATE_DIR",
+      "[Provision] Named workspaces ignore PROVISION_SKILLS_DIR, PROVISION_SKILL_LINK_DIRS, "
+	+ "PROVISION_CONFIG_DIR, and PROVISION_STATE_DIR",
     );
   }
   target.manifestPersistenceKeys = configuredManifestPersistenceKeys.length > 0
     ? [...configuredManifestPersistenceKeys]
     : [loadOrCreateLocalManifestKey()];
-  target.itemViews = Object.entries(loadState().installed)
+  target.itemViews = Object.entries(reconcileStartupProvisionState((message) => {
+    target.lastError = message;
+  }).installed)
     .filter(([, record]) => !record.uncommitted && !record.pending && !record.removalRecoveryId)
     .map(([key, record]) => {
       const [type, ...rest] = canonicalStateKey(key).split("/");
@@ -267,6 +290,17 @@ class SupersededSyncError extends Error {
   }
 }
 
+class SkillLinkRollbackError extends Error {
+  constructor(original: unknown, rollbackErrors: unknown[]) {
+    const originalMessage = original instanceof Error ? original.message : String(original);
+    const rollbackMessage = rollbackErrors
+      .map((error) => error instanceof Error ? error.message : String(error))
+      .join("; ");
+    super(`${originalMessage}; discovery-link rollback could not complete: ${rollbackMessage}`);
+    this.name = "SkillLinkRollbackError";
+  }
+}
+
 function assertCurrentGeneration(generation: number): void {
   if (generation !== runtime().manifestGeneration) throw new SupersededSyncError();
 }
@@ -292,7 +326,209 @@ function skillsDir(): string {
   const workspace = currentWorkspaceContext();
   return workspace?.scoped && workspace.skillsDir
     ? workspace.skillsDir
-    : process.env.PROVISION_SKILLS_DIR?.trim() || path.join(homedir(), ".claude", "skills");
+    : process.env.PROVISION_SKILLS_DIR?.trim() || path.join(homedir(), ".agents", "skills");
+}
+
+function existingRealPath(candidate: string): string | undefined {
+  try {
+    return realpathSync(candidate);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+    throw err;
+  }
+}
+
+function resolvedPathThroughExistingAncestor(candidate: string): string {
+  let ancestor = path.resolve(candidate);
+  const suffix: string[] = [];
+  while (true) {
+    const real = existingRealPath(ancestor);
+    if (real !== undefined) return path.resolve(real, ...suffix.reverse());
+    const parent = path.dirname(ancestor);
+    if (parent === ancestor) return path.resolve(candidate);
+    suffix.push(path.basename(ancestor));
+    ancestor = parent;
+  }
+}
+
+interface ExistingPathAnchor {
+  path: string;
+  suffix: string[];
+  dev: bigint;
+  ino: bigint;
+}
+
+function existingPathAnchor(candidate: string): ExistingPathAnchor {
+  let ancestor = path.resolve(candidate);
+  const suffix: string[] = [];
+  while (true) {
+    const real = existingRealPath(ancestor);
+    if (real !== undefined) {
+      const stat = lstatSync(real, { bigint: true });
+      return { path: real, suffix, dev: stat.dev, ino: stat.ino };
+    }
+    const parent = path.dirname(ancestor);
+    if (parent === ancestor) {
+      const stat = lstatSync(ancestor, { bigint: true });
+      return { path: ancestor, suffix, dev: stat.dev, ino: stat.ino };
+    }
+    suffix.unshift(path.basename(ancestor));
+    ancestor = parent;
+  }
+}
+
+function assertSkillLinkDirectoryWritable(directory: string): void {
+  let ancestor = path.resolve(directory);
+  while (!pathEntryExists(ancestor)) {
+    const parent = path.dirname(ancestor);
+    if (parent === ancestor) break;
+    ancestor = parent;
+  }
+  const real = realpathSync(ancestor);
+  if (!lstatSync(real).isDirectory()) {
+    throw new ProvisionError(`Skill link parent is not a directory: "${ancestor}"`, "untracked_content");
+  }
+  accessSync(real, fsConstants.W_OK | fsConstants.X_OK);
+}
+
+function sameAnchorIdentity(left: ExistingPathAnchor, right: ExistingPathAnchor): boolean {
+  return left.dev === right.dev && left.ino === right.ino;
+}
+
+function pathPartsMayOverlapByLookupSemantics(
+  leftParts: string[],
+  rightParts: string[],
+): boolean {
+  const shorter = leftParts.length <= rightParts.length ? leftParts : rightParts;
+  const longer = shorter === leftParts ? rightParts : leftParts;
+  const collator = new Intl.Collator("und", { usage: "search", sensitivity: "base" });
+  return shorter.every((part, index) => collator.compare(part, longer[index]!) === 0);
+}
+
+function exactPartsOverlap(leftParts: string[], rightParts: string[]): boolean {
+  const shorter = leftParts.length <= rightParts.length ? leftParts : rightParts;
+  const longer = shorter === leftParts ? rightParts : leftParts;
+  return shorter.every((part, index) => part === longer[index]);
+}
+
+function existingTreeContainsIdentity(
+  ancestor: ExistingPathAnchor,
+  descendant: ExistingPathAnchor,
+): boolean {
+  if (ancestor.suffix.length > 0) return false;
+  let cursor = descendant.path;
+  while (true) {
+    const stat = lstatSync(cursor, { bigint: true });
+    if (stat.dev === ancestor.dev && stat.ino === ancestor.ino) return true;
+    const parent = path.dirname(cursor);
+    if (parent === cursor) return false;
+    cursor = parent;
+  }
+}
+
+function anchoredSuffixesOverlapByFilesystemLookup(
+  anchor: ExistingPathAnchor,
+  leftSuffix: string[],
+  rightSuffix: string[],
+): boolean {
+  if (exactPartsOverlap(leftSuffix, rightSuffix)) return true;
+  if (!pathPartsMayOverlapByLookupSemantics(leftSuffix, rightSuffix)) return false;
+
+  const shorter = leftSuffix.length <= rightSuffix.length ? leftSuffix : rightSuffix;
+  const longer = shorter === leftSuffix ? rightSuffix : leftSuffix;
+  const probeRoot = path.join(
+    anchor.path,
+    `.provision-lookup-${randomBytes(16).toString("hex")}`,
+  );
+  const created = [probeRoot];
+  mkdirSync(probeRoot, { mode: 0o700 });
+  try {
+    let createdPath = probeRoot;
+    for (const component of shorter) {
+      createdPath = path.join(createdPath, component);
+      mkdirSync(createdPath, { mode: 0o700 });
+      created.push(createdPath);
+    }
+    const alternatePath = path.join(probeRoot, ...longer.slice(0, shorter.length));
+    try {
+      const createdStat = lstatSync(createdPath, { bigint: true });
+      const alternateStat = lstatSync(alternatePath, { bigint: true });
+      return createdStat.dev === alternateStat.dev && createdStat.ino === alternateStat.ino;
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === "ENOENT") return false;
+      throw err;
+    }
+  } finally {
+    for (const directory of created.reverse()) rmdirSync(directory);
+  }
+}
+
+function pathsOverlapByFilesystemLookup(left: string, right: string): boolean {
+  const leftAnchor = existingPathAnchor(left);
+  const rightAnchor = existingPathAnchor(right);
+  if (sameAnchorIdentity(leftAnchor, rightAnchor)) {
+    return anchoredSuffixesOverlapByFilesystemLookup(
+      leftAnchor,
+      leftAnchor.suffix,
+      rightAnchor.suffix,
+    );
+  }
+  // Bind mounts and other aliases need not collapse to the same realpath.
+  // Walk existing ancestors by inode before treating lexical roots as disjoint.
+  return existingTreeContainsIdentity(leftAnchor, rightAnchor)
+    || existingTreeContainsIdentity(rightAnchor, leftAnchor);
+}
+
+function pathsEqualByFilesystemLookup(left: string, right: string): boolean {
+  const leftAnchor = existingPathAnchor(left);
+  const rightAnchor = existingPathAnchor(right);
+  return sameAnchorIdentity(leftAnchor, rightAnchor)
+    && leftAnchor.suffix.length === rightAnchor.suffix.length
+    && anchoredSuffixesOverlapByFilesystemLookup(
+      leftAnchor,
+      leftAnchor.suffix,
+      rightAnchor.suffix,
+    );
+}
+
+function assertDiscoveryRootOutsideCanonical(
+  entry: string,
+  canonical: string,
+): void {
+  const resolved = resolvedPathThroughExistingAncestor(entry);
+  const resolvedCanonical = resolvedPathThroughExistingAncestor(canonical);
+  if (pathsOverlapByFilesystemLookup(resolved, resolvedCanonical)) {
+    throw new ProvisionError(
+      `Skill discovery root "${entry}" overlaps canonical skills directory "${canonical}"`,
+      "untracked_content",
+    );
+  }
+}
+
+function skillLinkDirs(): string[] {
+  const workspace = currentWorkspaceContext();
+  const configured = workspace?.scoped ? undefined : process.env.PROVISION_SKILL_LINK_DIRS;
+  const entries = configured === undefined
+    ? [path.join(workspace?.scoped && workspace.root ? workspace.root : homedir(), ".claude", "skills")]
+    : configured.split(",").map((entry) => entry.trim()).filter(Boolean);
+  const canonical = path.resolve(skillsDir());
+  const resolvedCanonical = resolvedPathThroughExistingAncestor(canonical);
+  const seenResolvedPaths = [resolvedCanonical];
+  return [...new Set(entries.map((entry) => path.resolve(entry)))].filter((entry) => {
+    if (entry === canonical) return false;
+    const resolved = resolvedPathThroughExistingAncestor(entry);
+    if (resolved === resolvedCanonical) return false;
+    assertDiscoveryRootOutsideCanonical(entry, canonical);
+    for (const seen of seenResolvedPaths) {
+      if (seen === resolved) return false;
+      const seenDepth = path.relative(path.parse(seen).root, seen).split(path.sep).filter(Boolean).length;
+      const resolvedDepth = path.relative(path.parse(resolved).root, resolved)
+	.split(path.sep).filter(Boolean).length;
+      if (seenDepth === resolvedDepth && pathsOverlapByFilesystemLookup(seen, resolved)) return false;
+    }
+    seenResolvedPaths.push(resolved);
+    return true;
+  });
 }
 
 function configDir(): string {
@@ -303,8 +539,27 @@ function configDir(): string {
     : process.env.PROVISION_CONFIG_DIR?.trim() || path.join(homedir(), ".config");
 }
 
+function reconcileStartupProvisionState(onError: (message: string) => void): ProvisionStateFile {
+  const state = loadState();
+  const migrationKeys = new Set(Object.entries(state.installed)
+    .filter(([, record]) => record.legacySkillMigration !== undefined)
+    .map(([key]) => key));
+  if (migrationKeys.size === 0) return state;
+  try {
+    reconcileFirstInstallJournals(state, migrationKeys);
+  } catch (err) {
+    onError(err instanceof Error ? err.message : String(err));
+    return state;
+  }
+  return state;
+}
+
 function itemRoot(type: string, name: string): string {
   return path.join(type === "config" ? configDir() : skillsDir(), name);
+}
+
+function skillInstallRoot(record: InstalledRecord): string {
+  return path.resolve(record.installRoot ?? skillsDir());
 }
 
 function refetchMs(): number {
@@ -319,8 +574,14 @@ export function initProvisioning(hooks: {
   perUserWorkers?: boolean;
   /** Test seam for a mutation immediately after a first install is exposed. */
   afterFirstInstallMove?: (target: string) => void;
+  /** Test seam for a target race after ownership is journaled but before exposure. */
+  beforeSkillCandidateMove?: (target: string) => void;
   /** Test seam for a namespace swap after restart reconciliation checks identity. */
   afterFirstInstallReconciliationIdentityCheck?: (target: string) => void;
+  /** Test seam for a discovery-path race after link preflight. */
+  beforeSkillLinkPublication?: (linkPath: string) => void;
+  /** Test seam for a state-save failure after a discovery link is exposed. */
+  afterSkillLinkPublication?: (linkPath: string) => void;
   /** Test seam for a namespace mutation after removal validates ownership. */
   afterRemovalAudit?: (target: string) => void;
   /** Test seam for a namespace mutation after removal isolates the owned root. */
@@ -335,7 +596,10 @@ export function initProvisioning(hooks: {
   resetProvisioning();
   perUserWorkers = hooks.perUserWorkers === true;
   afterFirstInstallMove = hooks.afterFirstInstallMove;
+  beforeSkillCandidateMove = hooks.beforeSkillCandidateMove;
   afterFirstInstallReconciliationIdentityCheck = hooks.afterFirstInstallReconciliationIdentityCheck;
+  beforeSkillLinkPublication = hooks.beforeSkillLinkPublication;
+  afterSkillLinkPublication = hooks.afterSkillLinkPublication;
   afterRemovalAudit = hooks.afterRemovalAudit;
   afterRemovalIsolation = hooks.afterRemovalIsolation;
   afterConfigRemoval = hooks.afterConfigRemoval;
@@ -474,7 +738,7 @@ function hasInterruptedRemovalForRecord(
   // tree to this record without making unrelated recoveries disable drift repair.
   const snapshots = [stableSnapshot(record), ...(record.pending ? [record.pending] : [])];
   return (state.removalRecoveries ?? []).some((recoveryId) => {
-    const recovery = path.join(skillsDir(), `.provision-removed-${recoveryId}`);
+    const recovery = path.join(skillInstallRoot(record), `.provision-removed-${recoveryId}`);
     return snapshots.some((snapshot) => installedSnapshotIntactAt(recovery, snapshot));
   });
 }
@@ -507,10 +771,6 @@ function installedSnapshotMatchesEntireTreeAt(root: string, record: InstalledSna
     return false;
   }
   return actual.size === expected.size && [...actual].every((entry) => expected.has(entry));
-}
-
-function installedRecordMatchesEntireTree(name: string, record: InstalledSnapshot): boolean {
-  return installedSnapshotMatchesEntireTreeAt(path.join(skillsDir(), name), record);
 }
 
 function configSnapshotComplete(
@@ -649,6 +909,7 @@ function removeOwnedConfig(
 
 function removeGatewayConfigState(): void {
   const state = loadState();
+  discoverLegacySkillInstallRoots(state);
   reconcileFirstInstallJournals(state);
   let changed = false;
   for (const [key, record] of Object.entries(state.installed)) {
@@ -669,25 +930,577 @@ function removeGatewayConfigState(): void {
 
 function stableSnapshot(record: InstalledRecord): InstalledSnapshot {
   const {
+    installRoot: _installRoot,
     pending: _pending,
     uncommitted: _uncommitted,
     candidateIdentity: _candidateIdentity,
     configCandidate: _configCandidate,
     installMarker: _installMarker,
+    legacySkillMigration: _legacySkillMigration,
     rejectionRecoveryId: _rejectionRecoveryId,
     removalRecoveryId: _removalRecoveryId,
+    skillLinks: _skillLinks,
+    skillLinkPublication: _skillLinkPublication,
     ...stable
   } = record;
   return stable;
 }
 
+function absoluteLinkTarget(linkPath: string): string {
+  const raw = readlinkSync(linkPath);
+  return path.resolve(path.dirname(linkPath), raw);
+}
+
+function sameSkillLinkIdentity(linkPath: string, expected: InstalledSkillLink): boolean {
+  try {
+    const stat = lstatSync(linkPath, { bigint: true });
+    return stat.isSymbolicLink()
+      && stat.dev.toString() === expected.dev
+      && stat.ino.toString() === expected.ino
+      && absoluteLinkTarget(linkPath) === expected.target;
+  } catch {
+    return false;
+  }
+}
+
+function pathEntryExists(candidate: string): boolean {
+  try {
+    lstatSync(candidate);
+    return true;
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") return false;
+    throw err;
+  }
+}
+
+function samePathEntryIdentity(left: string, right: string): boolean {
+  try {
+    const leftStat = lstatSync(left, { bigint: true });
+    const rightStat = lstatSync(right, { bigint: true });
+    return leftStat.dev === rightStat.dev && leftStat.ino === rightStat.ino;
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") return false;
+    throw err;
+  }
+}
+
+function retainRecordedSkillLink(link: InstalledSkillLink): string | undefined {
+  const quarantine = path.join(
+    path.dirname(link.path),
+    `.provision-link-${randomBytes(16).toString("hex")}`,
+  );
+  try {
+    const moved = process.platform === "win32"
+      ? (() => {
+	  try {
+	    renameSync(link.path, quarantine);
+	    return true;
+	  } catch (err) {
+	    if ((err as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+	    throw err;
+	  }
+	})()
+      : renameDirectoryNoReplace(link.path, quarantine);
+    if (moved === undefined) return undefined;
+    if (!moved) {
+      throw new ProvisionError(`Skill link recovery path already exists for "${link.path}"`, "untracked_content");
+    }
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+    throw err;
+  }
+
+  if (!sameSkillLinkIdentity(quarantine, link)) {
+    try {
+      if (process.platform === "win32") renameSync(quarantine, link.path);
+      else renameDirectoryNoReplace(quarantine, link.path);
+    } catch {
+      // Preserve the raced-in entry at its random recovery pathname.
+    }
+    throw new ProvisionError(
+      `Refusing to remove changed skill link "${link.path}"`,
+      "untracked_content",
+    );
+  }
+  return quarantine;
+}
+
+function restoreRetainedSkillLink(link: InstalledSkillLink, quarantine: string): void {
+  const restored = process.platform === "win32"
+    ? (() => {
+	try {
+	  renameSync(quarantine, link.path);
+	  return true;
+	} catch (err) {
+	  if ((err as NodeJS.ErrnoException).code === "EEXIST") return false;
+	  throw err;
+	}
+      })()
+    : renameDirectoryNoReplace(quarantine, link.path);
+  if (!restored || !sameSkillLinkIdentity(link.path, link)) {
+    throw new ProvisionError(
+      `Could not restore retained skill link "${link.path}"`,
+      "untracked_content",
+    );
+  }
+}
+
+function discardRetainedSkillLink(link: InstalledSkillLink, quarantine: string): void {
+  if (!sameSkillLinkIdentity(quarantine, link)) {
+    throw new ProvisionError(
+      `Retained skill link "${link.path}" changed before cleanup`,
+      "untracked_content",
+    );
+  }
+  unlinkSync(quarantine);
+}
+
+function isolateRecordedSkillLink(link: InstalledSkillLink): boolean {
+  const quarantine = retainRecordedSkillLink(link);
+  if (!quarantine) return false;
+  discardRetainedSkillLink(link, quarantine);
+  return true;
+}
+
+function openVerifiedDirectory(directory: string, allowAlias: boolean): number {
+  const fd = openSync(
+    directory,
+    fsConstants.O_RDONLY
+      | (fsConstants.O_DIRECTORY ?? 0)
+      | (allowAlias ? 0 : (fsConstants.O_NOFOLLOW ?? 0)),
+  );
+  try {
+    const opened = fstatSync(fd, { bigint: true });
+    const current = lstatSync(allowAlias ? realpathSync(directory) : directory, { bigint: true });
+    if (!opened.isDirectory() || !current.isDirectory()
+      || opened.dev !== current.dev || opened.ino !== current.ino) {
+      throw new ProvisionError(
+	`Skill link directory changed while it was opened at "${directory}"`,
+	"untracked_content",
+      );
+    }
+    return fd;
+  } catch (err) {
+    closeSync(fd);
+    throw err;
+  }
+}
+
+function createSkillLink(
+  linkPath: string,
+  target: string,
+  commit?: (link: InstalledSkillLink) => void,
+): InstalledSkillLink {
+  const directory = path.dirname(linkPath);
+  const canonical = path.resolve(skillsDir());
+  assertDiscoveryRootOutsideCanonical(directory, canonical);
+
+  const suffix: string[] = [];
+  let existing = directory;
+  while (!pathEntryExists(existing)) {
+    suffix.unshift(path.basename(existing));
+    const parent = path.dirname(existing);
+    if (parent === existing) break;
+    existing = parent;
+  }
+
+  const openFds: number[] = [];
+  const createdDirectories: Array<{
+    parentFd: number;
+    parentPath: string;
+    basename: string;
+    identity: AnchoredEntryIdentity;
+  }> = [];
+  let parentPath = existing;
+  let parentFd = openVerifiedDirectory(parentPath, true);
+  openFds.push(parentFd);
+  let published: InstalledSkillLink | undefined;
+  try {
+    assertDiscoveryRootOutsideCanonical(directory, canonical);
+    for (const basename of suffix) {
+      const identity = mkdirAt(parentFd, parentPath, basename);
+      const childPath = path.join(parentPath, basename);
+      const childFd = openVerifiedDirectory(childPath, false);
+      openFds.push(childFd);
+      const opened = fstatSync(childFd, { bigint: true });
+      if (identity && (opened.dev.toString() !== identity.dev || opened.ino.toString() !== identity.ino)) {
+	throw new ProvisionError(
+	  `Created skill link directory changed at "${childPath}"`,
+	  "untracked_content",
+	);
+      }
+      if (identity) {
+	createdDirectories.push({ parentFd, parentPath, basename, identity });
+      }
+      parentPath = childPath;
+      parentFd = childFd;
+      assertDiscoveryRootOutsideCanonical(directory, canonical);
+    }
+
+    assertDiscoveryRootOutsideCanonical(directory, canonical);
+    beforeSkillLinkPublication?.(linkPath);
+    const identity = symlinkAt(
+      parentFd,
+      parentPath,
+      target,
+      path.basename(linkPath),
+      process.platform === "win32" ? "junction" : "dir",
+    );
+    if (!identity) {
+      throw Object.assign(new Error("Skill link path already exists"), { code: "EEXIST" });
+    }
+    published = { path: linkPath, target, ...identity };
+    const opened = fstatSync(parentFd, { bigint: true });
+    const current = lstatSync(realpathSync(directory), { bigint: true });
+    if (opened.dev !== current.dev || opened.ino !== current.ino) {
+      throw new ProvisionError(
+	`Skill link directory changed during publication at "${directory}"`,
+	"untracked_content",
+      );
+    }
+    assertDiscoveryRootOutsideCanonical(directory, canonical);
+    if (!sameSkillLinkIdentity(linkPath, published)) {
+      throw new ProvisionError(
+	`Skill link changed during publication at "${linkPath}"`,
+	"untracked_content",
+      );
+    }
+    commit?.(published);
+    return published;
+  } catch (err) {
+    const rollbackErrors: unknown[] = [];
+    if (published) {
+      try {
+	if (!removeAtIdentity(
+	  parentFd,
+	  parentPath,
+	  path.basename(linkPath),
+	  false,
+	  published,
+	)) {
+	  rollbackErrors.push(new Error(`Published skill link changed at "${linkPath}"`));
+	}
+      } catch (rollbackError) {
+	rollbackErrors.push(rollbackError);
+      }
+    }
+    for (const created of createdDirectories.reverse()) {
+      try {
+	if (!removeAtIdentity(
+	  created.parentFd,
+	  created.parentPath,
+	  created.basename,
+	  true,
+	  created.identity,
+	)) {
+	  rollbackErrors.push(new Error(
+	    `Created skill link directory changed at "${path.join(created.parentPath, created.basename)}"`,
+	  ));
+	}
+      } catch (rollbackError) {
+	rollbackErrors.push(rollbackError);
+      }
+    }
+    if (err instanceof AnchoredPublicationAmbiguousError) {
+      throw new SkillLinkRollbackError(err, [
+	new Error("Durable discovery-link publication intent retained for recovery"),
+      ]);
+    }
+    if ((err as NodeJS.ErrnoException).code === "EEXIST") {
+      const collision = new ProvisionError(
+	`Refusing to replace untracked content at skill link "${linkPath}"`,
+	"untracked_content",
+      );
+      if (rollbackErrors.length > 0) throw new SkillLinkRollbackError(collision, rollbackErrors);
+      throw collision;
+    }
+    if (rollbackErrors.length > 0) throw new SkillLinkRollbackError(err, rollbackErrors);
+    throw err;
+  } finally {
+    for (const fd of openFds.reverse()) closeSync(fd);
+  }
+}
+
+function adoptPublishedSkillLink(linkPath: string, target: string): InstalledSkillLink {
+  const stat = lstatSync(linkPath, { bigint: true });
+  if (!stat.isSymbolicLink() || absoluteLinkTarget(linkPath) !== target) {
+    throw new ProvisionError(
+      `Refusing to adopt changed skill link publication at "${linkPath}"`,
+      "untracked_content",
+    );
+  }
+  return { path: linkPath, target, dev: stat.dev.toString(), ino: stat.ino.toString() };
+}
+
+function finishSkillLinkPublication(
+  record: InstalledRecord,
+  persist: () => void,
+  publishIfMissing: boolean,
+): InstalledSkillLink | undefined {
+  const publication = record.skillLinkPublication;
+  if (!publication) return undefined;
+  let link: InstalledSkillLink | undefined;
+  if (pathEntryExists(publication.path)) {
+    const retained = (record.skillLinks ?? []).find((entry) =>
+      sameSkillLinkIdentity(publication.path, entry));
+    if (retained && retained.target !== publication.target) {
+      // A failed retarget can durably preclaim the new target but restore the
+      // exact old link before its cleanup save fails. Withdraw only that stale
+      // intent; normal reconciliation below will safely retarget the owned inode.
+      delete record.skillLinkPublication;
+      persist();
+      return undefined;
+    }
+    link = adoptPublishedSkillLink(publication.path, publication.target);
+  } else if (publishIfMissing) {
+    link = createSkillLink(publication.path, publication.target);
+  }
+  if (link) {
+    const published = link;
+    record.skillLinks = [
+      ...(record.skillLinks ?? []).filter((entry) => entry.path !== published.path),
+      published,
+    ];
+  }
+  delete record.skillLinkPublication;
+  persist();
+  return link;
+}
+
+function publishSkillLink(
+  linkPath: string,
+  target: string,
+  record: InstalledRecord,
+  persist: () => void,
+): InstalledSkillLink {
+  if (record.skillLinkPublication) {
+    throw new ProvisionError("Another skill link publication is still pending", "untracked_content");
+  }
+  record.skillLinkPublication = { path: linkPath, target };
+  // The durable intent makes an exact link recoverable if publication or the
+  // following identity save is interrupted.
+  persist();
+  const previousLinks = record.skillLinks;
+  try {
+    return createSkillLink(linkPath, target, (link) => {
+      record.skillLinks = [
+	...(record.skillLinks ?? []).filter((entry) => entry.path !== linkPath),
+	link,
+      ];
+      delete record.skillLinkPublication;
+      try {
+	afterSkillLinkPublication?.(linkPath);
+	persist();
+      } catch (err) {
+	// Keep the in-memory journal aligned with the durable pre-publication save.
+	record.skillLinkPublication = { path: linkPath, target };
+	throw err;
+      }
+    });
+  } catch (err) {
+    if (!(err instanceof SkillLinkRollbackError)) {
+      record.skillLinks = previousLinks;
+      delete record.skillLinkPublication;
+    }
+    throw err;
+  }
+}
+
+function removeRecordedSkillLinks(
+  name: string,
+  record: InstalledRecord,
+  persist: () => void,
+): void {
+  finishSkillLinkPublication(record, persist, false);
+  for (const link of record.skillLinks ?? []) {
+    if (path.basename(link.path) !== name || path.basename(link.target) !== name) {
+      throw new ProvisionError(`Invalid recorded skill link for "${name}"`, "untracked_content");
+    }
+    isolateRecordedSkillLink(link);
+  }
+}
+
+function assertRecordedSkillLinksRemovable(name: string, record: InstalledRecord): void {
+  const publication = record.skillLinkPublication;
+  if (publication) {
+    if (path.basename(publication.path) !== name || path.basename(publication.target) !== name) {
+      throw new ProvisionError(`Invalid pending skill link for "${name}"`, "untracked_content");
+    }
+    if (pathEntryExists(publication.path)) {
+      adoptPublishedSkillLink(publication.path, publication.target);
+    }
+  }
+  for (const link of record.skillLinks ?? []) {
+    if (path.basename(link.path) !== name || path.basename(link.target) !== name) {
+      throw new ProvisionError(`Invalid recorded skill link for "${name}"`, "untracked_content");
+    }
+    if (pathEntryExists(link.path) && !sameSkillLinkIdentity(link.path, link)) {
+      throw new ProvisionError(
+	`Refusing to remove changed skill link "${link.path}"`,
+	"untracked_content",
+      );
+    }
+  }
+}
+
+function ensureSkillLinks(
+  name: string,
+  record: InstalledRecord,
+  persist: () => void,
+): InstalledSkillLink[] {
+  const target = path.resolve(skillsDir(), name);
+  const desiredPaths = skillLinkDirs().map((directory) => path.join(directory, name));
+  const interrupted = record.skillLinkPublication;
+  if (interrupted) {
+    const stillDesired = desiredPaths.includes(interrupted.path) && interrupted.target === target;
+    finishSkillLinkPublication(record, persist, stillDesired);
+  }
+  const recordedLinks = record.skillLinks ?? [];
+  const recorded = new Map(recordedLinks.map((link) => [link.path, link]));
+  const matchedRecordedLinks = new Set<InstalledSkillLink>();
+  const desiredOwnership = new Map<string, InstalledSkillLink>();
+  for (const linkPath of desiredPaths) {
+    const identityMatches = recordedLinks.filter((link) => sameSkillLinkIdentity(linkPath, link));
+    const exact = recorded.get(linkPath);
+    const owned = identityMatches[0] ?? exact;
+    if (owned) {
+      desiredOwnership.set(linkPath, owned);
+      matchedRecordedLinks.add(owned);
+    }
+    if (exact) matchedRecordedLinks.add(exact);
+    for (const match of identityMatches) matchedRecordedLinks.add(match);
+  }
+
+  // Verify the whole destination set before changing any existing link. This
+  // keeps the previous discovery fanout live when a newly configured root is
+  // already occupied.
+  for (const linkPath of desiredPaths) {
+    const owned = desiredOwnership.get(linkPath);
+    if (owned && pathEntryExists(linkPath) && !sameSkillLinkIdentity(linkPath, owned)) {
+      throw new ProvisionError(
+	`Refusing to replace changed skill link "${linkPath}"`,
+	"untracked_content",
+      );
+    }
+    if (!owned && pathEntryExists(linkPath)) {
+      throw new ProvisionError(
+	`Refusing to replace untracked content at skill link "${linkPath}"`,
+	"untracked_content",
+      );
+    }
+  }
+  for (const link of recordedLinks) {
+    if (matchedRecordedLinks.has(link) || !pathEntryExists(link.path)) continue;
+    if (!sameSkillLinkIdentity(link.path, link)) {
+      throw new ProvisionError(
+	`Refusing to remove changed skill link "${link.path}"`,
+	"untracked_content",
+      );
+    }
+  }
+
+  const result: InstalledSkillLink[] = [];
+  const created: InstalledSkillLink[] = [];
+  try {
+    for (const linkPath of desiredPaths) {
+      if (result.some((link) => samePathEntryIdentity(linkPath, link.path))) continue;
+      const owned = desiredOwnership.get(linkPath);
+      if (owned) {
+	if (!pathEntryExists(linkPath)) {
+	  const replacement = publishSkillLink(linkPath, target, record, persist);
+	  result.push(replacement);
+	  created.push(replacement);
+	  continue;
+	}
+	if (!sameSkillLinkIdentity(linkPath, owned)) {
+	  throw new ProvisionError(
+	    `Refusing to replace changed skill link "${linkPath}"`,
+	    "untracked_content",
+	  );
+	}
+	const sameTarget = owned.target === target
+	  || resolvedPathThroughExistingAncestor(owned.target)
+	    === resolvedPathThroughExistingAncestor(target);
+	if (sameTarget) {
+	  result.push(owned.path === linkPath
+	    ? owned
+	    : adoptPublishedSkillLink(linkPath, owned.target));
+	  continue;
+	}
+	const quarantine = retainRecordedSkillLink(owned);
+	try {
+	  const replacement = publishSkillLink(linkPath, target, record, persist);
+	  result.push(replacement);
+	  created.push(replacement);
+	  if (quarantine) discardRetainedSkillLink(owned, quarantine);
+	} catch (err) {
+	  if (quarantine) {
+	    try {
+	      const publication = record.skillLinkPublication;
+	      const replacementIsLive = err instanceof SkillLinkRollbackError
+		&& publication !== undefined
+		&& pathEntryExists(publication.path)
+		&& (() => {
+		  try {
+		    adoptPublishedSkillLink(publication.path, publication.target);
+		    return true;
+		  } catch {
+		    return false;
+		  }
+		})();
+	      if (replacementIsLive) discardRetainedSkillLink(owned, quarantine);
+	      else restoreRetainedSkillLink(owned, quarantine);
+	    } catch (rollbackError) {
+	      throw new SkillLinkRollbackError(err, [rollbackError]);
+	    }
+	  }
+	  throw err;
+	}
+	continue;
+      }
+
+      if (pathEntryExists(linkPath)) {
+	throw new ProvisionError(
+	  `Refusing to replace untracked content at skill link "${linkPath}"`,
+	  "untracked_content",
+	);
+      }
+      const link = publishSkillLink(linkPath, target, record, persist);
+      result.push(link);
+      created.push(link);
+    }
+    for (const link of recordedLinks) {
+      if (matchedRecordedLinks.has(link)) continue;
+      isolateRecordedSkillLink(link);
+    }
+    return result;
+  } catch (err) {
+    // createSkillLink already attempted its anchored rollback. If that rollback
+    // was incomplete, retain the durable publication intent for startup repair.
+    if (err instanceof SkillLinkRollbackError) throw err;
+    const interrupted = record.skillLinkPublication;
+    if (interrupted || created.length > 0) {
+      // Successful publications are already durable. Keep that partial commit
+      // instead of reopening lexical paths that may now identify another tree;
+      // startup/retry can finish the remaining desired fanout.
+      throw new SkillLinkRollbackError(err, [
+	new Error("Durable discovery-link publication retained for recovery"),
+      ]);
+    }
+    delete record.skillLinkPublication;
+    record.skillLinks = recordedLinks;
+    throw err;
+  }
+}
+
 function targetMatchesCandidateIdentity(
   name: string,
   expected: InstalledDirectoryIdentity | undefined,
+  installRoot = skillsDir(),
 ): boolean {
   if (expected === undefined) return false;
   try {
-    const stat = lstatSync(path.join(skillsDir(), name), { bigint: true });
+    const stat = lstatSync(path.join(installRoot, name), { bigint: true });
     return stat.isDirectory()
       && stat.dev.toString() === expected.dev
       && stat.ino.toString() === expected.ino;
@@ -721,18 +1534,23 @@ function directoryDescriptorPath(fd: number): string | undefined {
 function auditFirstInstallCandidate(
   name: string,
   record: InstalledRecord,
+  installRoot = skillInstallRoot(record),
 ): { contentsMatch: boolean; originalCandidateIsTarget: boolean } {
   if (!record.candidateIdentity) {
     return { contentsMatch: false, originalCandidateIsTarget: false };
   }
-  const target = path.join(skillsDir(), name);
+  const target = path.join(installRoot, name);
   if (process.platform === "win32") {
-    const originalCandidateWasTarget = targetMatchesCandidateIdentity(name, record.candidateIdentity);
+    const originalCandidateWasTarget = targetMatchesCandidateIdentity(
+      name,
+      record.candidateIdentity,
+      installRoot,
+    );
     if (originalCandidateWasTarget) afterFirstInstallReconciliationIdentityCheck?.(target);
     return {
       contentsMatch: originalCandidateWasTarget && firstInstallRecordMatchesEntireTreeAt(target, record),
       originalCandidateIsTarget: originalCandidateWasTarget
-	&& targetMatchesCandidateIdentity(name, record.candidateIdentity),
+	&& targetMatchesCandidateIdentity(name, record.candidateIdentity, installRoot),
     };
   }
   let fd: number;
@@ -762,7 +1580,11 @@ function auditFirstInstallCandidate(
     const contentsMatch = firstInstallRecordMatchesEntireTreeAt(auditRoot, record);
     return {
       contentsMatch,
-      originalCandidateIsTarget: targetMatchesCandidateIdentity(name, record.candidateIdentity),
+      originalCandidateIsTarget: targetMatchesCandidateIdentity(
+	name,
+	record.candidateIdentity,
+	installRoot,
+      ),
     };
   } finally {
     closeSync(fd);
@@ -772,8 +1594,9 @@ function auditFirstInstallCandidate(
 function firstInstallMarkerStatus(
   name: string,
   marker: string,
+  installRoot = skillsDir(),
 ): "matching" | "missing" | "modified" {
-  const file = firstInstallMarkerPath(path.join(skillsDir(), name), marker);
+  const file = firstInstallMarkerPath(path.join(installRoot, name), marker);
   try {
     if (!lstatSync(file).isFile()) return "modified";
     return readFileSync(file, "utf8") === marker ? "matching" : "modified";
@@ -784,10 +1607,14 @@ function firstInstallMarkerStatus(
 }
 
 /** Resolve every first-install journal before its target can be inspected. */
-function reconcileFirstInstallJournals(state: ProvisionStateFile): Set<string> {
+function reconcileFirstInstallJournals(
+  state: ProvisionStateFile,
+  onlyKeys?: ReadonlySet<string>,
+): Set<string> {
   let changed = false;
   const rejected = new Set<string>();
   for (const [key, record] of Object.entries(state.installed)) {
+    if (onlyKeys && !onlyKeys.has(key)) continue;
     if (!record.uncommitted) continue;
     if (key.startsWith("config/")) {
       const name = key.slice(key.indexOf("/") + 1);
@@ -809,9 +1636,49 @@ function reconcileFirstInstallJournals(state: ProvisionStateFile): Set<string> {
     }
     if (!key.startsWith("skill/")) continue;
     const name = key.slice(key.indexOf("/") + 1);
-    const target = path.join(skillsDir(), name);
+    const installRoot = skillInstallRoot(record);
+    const target = path.join(installRoot, name);
     const { originalCandidateIsTarget, contentsMatch } = auditFirstInstallCandidate(name, record);
     const exposed = originalCandidateIsTarget && contentsMatch;
+    if (record.legacySkillMigration) {
+      if (exposed) {
+	if (!targetMatchesCandidateIdentity(name, record.candidateIdentity, installRoot)) {
+	  throw new ProvisionError(
+	    `Canonical migration candidate for "${name}" changed identity during reconciliation`,
+	    "untracked_content",
+	  );
+	}
+	if (!pathsEqualByFilesystemLookup(installRoot, skillsDir())) {
+	  throw new ProvisionError(
+	    `Cannot reconcile canonical migration candidate for "${name}" after the skills root changed`,
+	    "untracked_content",
+	  );
+	}
+	record.skillLinks = ensureSkillLinks(name, record, () => saveState(state));
+	state.installed[key] = {
+	  ...stableSnapshot(record),
+	  installRoot,
+	  ...(record.skillLinks ? { skillLinks: record.skillLinks } : {}),
+	  ...(record.skillLinkPublication
+	    ? { skillLinkPublication: record.skillLinkPublication }
+	    : {}),
+	  ...(record.installMarker ? { installMarker: record.installMarker } : {}),
+	};
+      } else {
+	if (originalCandidateIsTarget && record.rejectionRecoveryId !== undefined) {
+	  isolateRejectedCandidate(
+	    target,
+	    name,
+	    installRoot,
+	    record.rejectionRecoveryId,
+	    record.candidateIdentity,
+	  );
+	}
+	restoreLegacySkillMigration(state, key, record);
+      }
+      changed = true;
+      continue;
+    }
     if (!exposed) {
       // A readable marker can be replayed by another same-UID process. Only the
       // original staged directory identity authorizes moving a rejected target.
@@ -819,7 +1686,7 @@ function reconcileFirstInstallJournals(state: ProvisionStateFile): Set<string> {
 	isolateRejectedCandidate(
 	  target,
 	  name,
-	  skillsDir(),
+	  installRoot,
 	  record.rejectionRecoveryId,
 	  record.candidateIdentity,
 	);
@@ -829,7 +1696,7 @@ function reconcileFirstInstallJournals(state: ProvisionStateFile): Set<string> {
     } else {
       // Keep the ownership decision adjacent to one final identity read. If the
       // namespace changed since the scan, preserve the replacement as unowned.
-      if (!targetMatchesCandidateIdentity(name, record.candidateIdentity)) {
+      if (!targetMatchesCandidateIdentity(name, record.candidateIdentity, installRoot)) {
 	delete state.installed[key];
 	rejected.add(key);
 	changed = true;
@@ -849,12 +1716,14 @@ function reconcileFirstInstallJournals(state: ProvisionStateFile): Set<string> {
 
   changed = false;
   for (const [key, record] of Object.entries(state.installed)) {
+    if (onlyKeys && !onlyKeys.has(key)) continue;
     if (!key.startsWith("skill/")) continue;
     if (record.uncommitted || !record.installMarker) continue;
     const name = key.slice(key.indexOf("/") + 1);
+    const installRoot = skillInstallRoot(record);
     const marker = record.installMarker;
-    const markerFile = firstInstallMarkerPath(path.join(skillsDir(), name), marker);
-    const markerStatus = firstInstallMarkerStatus(name, marker);
+    const markerFile = firstInstallMarkerPath(path.join(installRoot, name), marker);
+    const markerStatus = firstInstallMarkerStatus(name, marker, installRoot);
     const next = { ...record };
     let markerFinalized = markerStatus === "missing";
     if (markerStatus === "matching") {
@@ -865,7 +1734,7 @@ function reconcileFirstInstallJournals(state: ProvisionStateFile): Set<string> {
 	if (lstatSync(markerFile).isFile()) {
 	  const relative = path.basename(markerFile);
 	  const ownedHashes = next.fileHashes ?? Object.fromEntries(next.files.map((owned) => {
-	    const ownedFile = path.join(skillsDir(), name, ...owned.split("/"));
+	    const ownedFile = path.join(installRoot, name, ...owned.split("/"));
 	    if (!lstatSync(ownedFile).isFile()) throw new Error("Owned path is no longer a file");
 	    return [owned, createHash("sha256").update(readFileSync(ownedFile)).digest("hex")];
 	  }));
@@ -893,19 +1762,41 @@ function reconcileFirstInstallJournals(state: ProvisionStateFile): Set<string> {
 function prepareRemovalRecovery(state: ProvisionStateFile, key: string): {
   recoveryId: string;
 } {
-  const recoveryId = randomBytes(16).toString("hex");
-  state.removalRecoveries = [...(state.removalRecoveries ?? []), recoveryId];
   const record = state.installed[key];
-  if (record) record.removalRecoveryId = recoveryId;
+  const recoveryId = record?.removalRecoveryId ?? randomBytes(16).toString("hex");
+  state.removalRecoveries = [...new Set([...(state.removalRecoveries ?? []), recoveryId])];
+  if (record) {
+    record.removalRecoveryId = recoveryId;
+    state.removalRecoveryRoots = {
+      ...(state.removalRecoveryRoots ?? {}),
+      [recoveryId]: skillInstallRoot(record),
+    };
+  }
   // Persist the exact identity before its recovery directory can appear.
   saveState(state);
   return { recoveryId };
 }
 
 function finalizeRemovalRecoveries(state: ProvisionStateFile): void {
-  state.removalRecoveries = (state.removalRecoveries ?? []).filter((recoveryId) =>
-    existsSync(path.join(skillsDir(), `.provision-removed-${recoveryId}`))
-    || existsSync(path.join(skillsDir(), `.provision-removing-${recoveryId}`)));
+  const rootsById = state.removalRecoveryRoots ?? {};
+  const recordRoots = new Map<string, string>();
+  for (const record of Object.values(state.installed)) {
+    if (record.removalRecoveryId) {
+      recordRoots.set(record.removalRecoveryId, skillInstallRoot(record));
+    }
+  }
+  const retained = (state.removalRecoveries ?? []).filter((recoveryId) => {
+    const root = rootsById[recoveryId] ?? recordRoots.get(recoveryId) ?? skillsDir();
+    return existsSync(path.join(root, `.provision-removed-${recoveryId}`))
+      || existsSync(path.join(root, `.provision-removing-${recoveryId}`));
+  });
+  state.removalRecoveries = retained;
+  const retainedRoots = Object.fromEntries(retained.flatMap((recoveryId) => {
+    const root = rootsById[recoveryId] ?? recordRoots.get(recoveryId);
+    return root ? [[recoveryId, root]] : [];
+  }));
+  if (Object.keys(retainedRoots).length > 0) state.removalRecoveryRoots = retainedRoots;
+  else delete state.removalRecoveryRoots;
 }
 
 function prepareUpgradeRecovery(state: ProvisionStateFile): {
@@ -976,18 +1867,383 @@ function removalSnapshot(record: InstalledRecord): {
   };
 }
 
+/** Restore a legacy root from its exact migration recovery before dropping the journal. */
+function restoreLegacySkillMigration(
+  state: ProvisionStateFile,
+  key: string,
+  record: InstalledRecord,
+): void {
+  const migration = record.legacySkillMigration;
+  const snapshot = record.pending;
+  const recoveryId = record.removalRecoveryId;
+  if (!migration || !snapshot || !recoveryId) {
+    throw new ProvisionError("Legacy skill migration journal is incomplete", "untracked_content");
+  }
+  const name = migration.installedKey.slice(migration.installedKey.indexOf("/") + 1);
+  const target = path.join(migration.installRoot, name);
+  const targetIntact = installedSnapshotMatchesEntireTreeAt(target, snapshot);
+  const recovery = path.join(migration.installRoot, `.provision-removed-${recoveryId}`);
+  if ((!targetIntact && !installedSnapshotMatchesEntireTreeAt(recovery, snapshot))
+    || !restoreSkillRemovalRecovery(name, {
+      skillsDir: migration.installRoot,
+      recoveryId,
+      recoveryIdentity: migration.recoveryIdentity,
+    })) {
+    throw new ProvisionError(
+      `Cannot restore legacy skill "${name}" from its recorded migration recovery`,
+      "untracked_content",
+    );
+  }
+  if (!installedSnapshotMatchesEntireTreeAt(target, snapshot)) {
+    throw new ProvisionError(
+      `Restored legacy skill "${name}" no longer matches its ownership snapshot`,
+      "untracked_content",
+    );
+  }
+  delete state.installed[key];
+  state.installed[migration.installedKey] = {
+    ...snapshot,
+    installRoot: migration.installRoot,
+    ...(record.skillLinks ? { skillLinks: record.skillLinks } : {}),
+    ...(record.skillLinkPublication
+      ? { skillLinkPublication: record.skillLinkPublication }
+      : {}),
+  };
+  finalizeRemovalRecoveries(state);
+}
+
+/** Reject an exposed canonical candidate and restore its exact legacy migration tree. */
+function rollbackLegacySkillMigration(
+  state: ProvisionStateFile,
+  key: string,
+  record: InstalledRecord,
+): void {
+  const name = key.slice(key.indexOf("/") + 1);
+  const installRoot = skillInstallRoot(record);
+  if (targetMatchesCandidateIdentity(name, record.candidateIdentity, installRoot)) {
+    isolateRejectedCandidate(
+      path.join(installRoot, name),
+      name,
+      installRoot,
+      record.rejectionRecoveryId,
+      record.candidateIdentity,
+    );
+  }
+  delete record.skillLinkPublication;
+  restoreLegacySkillMigration(state, key, record);
+}
+
 function reconcileUpgradeJournal(name: string, record: InstalledRecord): InstalledRecord {
   if (!record.pending) return record;
   // A crash can leave either side of the swap visible. Whichever complete
   // snapshot is on disk becomes stable; if neither is intact, retain both
   // ownership sets so the next install/removal can recover safely.
-  if (installedRecordMatchesEntireTree(name, record.pending)) return { ...record.pending };
-  if (installedRecordMatchesEntireTree(name, record)) return { ...stableSnapshot(record) };
+  const skillLinks = record.skillLinks;
+  const skillLinkPublication = record.skillLinkPublication;
+  const installRoot = record.installRoot;
+  const target = path.join(skillInstallRoot(record), name);
+  if (installedSnapshotMatchesEntireTreeAt(target, record.pending)) {
+    return {
+      ...record.pending,
+      ...(installRoot ? { installRoot } : {}),
+      ...(skillLinks ? { skillLinks } : {}),
+      ...(skillLinkPublication ? { skillLinkPublication } : {}),
+    };
+  }
+  if (installedSnapshotMatchesEntireTreeAt(target, record)) {
+    return {
+      ...stableSnapshot(record),
+      ...(installRoot ? { installRoot } : {}),
+      ...(skillLinks ? { skillLinks } : {}),
+      ...(skillLinkPublication ? { skillLinkPublication } : {}),
+    };
+  }
   return record;
 }
 
 function canonicalStateKey(key: string): string {
   return key.toLowerCase();
+}
+
+/** Bind pre-Codex records to a proven root before either pathname is touched. */
+function discoverLegacySkillInstallRoots(state: ProvisionStateFile): Map<string, string> {
+  const failures = new Map<string, string>();
+  const workspace = currentWorkspaceContext();
+  const legacyBase = workspace?.scoped && workspace.root ? workspace.root : homedir();
+  const canonicalRoot = path.resolve(skillsDir());
+  const defaultCanonicalRoot = path.resolve(legacyBase, ".agents", "skills");
+  if (!pathsEqualByFilesystemLookup(canonicalRoot, defaultCanonicalRoot)) return failures;
+  const legacyRoot = path.resolve(legacyBase, ".claude", "skills");
+  if (legacyRoot === canonicalRoot) return failures;
+  const rootsAlias = pathsEqualByFilesystemLookup(canonicalRoot, legacyRoot);
+  let changed = false;
+  for (const [key, record] of Object.entries(state.installed)) {
+    if (!key.toLowerCase().startsWith("skill/") || record.installRoot) continue;
+    if (rootsAlias) {
+      record.installRoot = canonicalRoot;
+      changed = true;
+      continue;
+    }
+    const name = key.slice(key.indexOf("/") + 1);
+    const canonicalTarget = path.join(canonicalRoot, name.toLowerCase());
+    const legacyTarget = path.join(legacyRoot, name);
+    const ownershipSnapshots = [stableSnapshot(record), ...(record.pending ? [record.pending] : [])];
+    if (record.uncommitted) {
+      const canonicalCandidate = auditFirstInstallCandidate(name, record, canonicalRoot);
+      const legacyCandidate = canonicalCandidate.originalCandidateIsTarget
+	? { originalCandidateIsTarget: false, contentsMatch: false }
+	: auditFirstInstallCandidate(name, record, legacyRoot);
+      record.installRoot = canonicalCandidate.originalCandidateIsTarget
+	? canonicalRoot
+	: legacyCandidate.originalCandidateIsTarget
+	  ? legacyRoot
+	  // Rootless first-install journals predate the new default. If exposure
+	  // never happened, reconciling at the old root safely drops the preclaim.
+	  : legacyRoot;
+      changed = true;
+      continue;
+    }
+    const linkedToCanonical = (record.skillLinks ?? []).some((link) =>
+      link.target === canonicalTarget && sameSkillLinkIdentity(link.path, link));
+    if (linkedToCanonical
+	&& ownershipSnapshots.some((snapshot) => installedSnapshotIntactAt(canonicalTarget, snapshot))) {
+      record.installRoot = canonicalRoot;
+      changed = true;
+      continue;
+    }
+    if (ownershipSnapshots.some((snapshot) =>
+	installedSnapshotMatchesEntireTreeAt(legacyTarget, snapshot))) {
+      record.installRoot = legacyRoot;
+      changed = true;
+      continue;
+    }
+    if (!pathEntryExists(canonicalTarget) && !pathEntryExists(legacyTarget)) {
+      // A missing managed tree is repairable only while neither possible root
+      // has been claimed by new content. Preserve its historical root so the
+      // migration path reinstalls through the normal first-install boundary.
+      record.installRoot = legacyRoot;
+      changed = true;
+      continue;
+    }
+    failures.set(
+      canonicalStateKey(key),
+      `Cannot determine the legacy install root for skill "${name}"; refusing to touch either canonical path`,
+    );
+  }
+  if (changed) saveState(state);
+  return failures;
+}
+
+interface LegacySkillRootMigration {
+  installedKey: string;
+  canonicalKey: string;
+  name: string;
+  installRoot: string;
+}
+
+function recordedLegacyRecovery(
+  state: ProvisionStateFile,
+  record: InstalledRecord,
+  name: string,
+  installRoot: string,
+): { recoveryId: string; recoveryIdentity: InstalledDirectoryIdentity } | undefined {
+  const recoveryId = record.removalRecoveryId;
+  if (!recoveryId) return undefined;
+  const recoveryRoot = state.removalRecoveryRoots?.[recoveryId];
+  if (recoveryRoot === undefined || path.resolve(recoveryRoot) !== path.resolve(installRoot)) {
+    throw new ProvisionError(
+      `Cannot recover legacy skill "${name}": its recorded recovery root is unavailable`,
+      "untracked_content",
+    );
+  }
+  const recovery = path.join(recoveryRoot, `.provision-removed-${recoveryId}`);
+  const snapshots = [stableSnapshot(record), ...(record.pending ? [record.pending] : [])];
+  if (!snapshots.some((snapshot) => installedSnapshotMatchesEntireTreeAt(recovery, snapshot))) {
+    throw new ProvisionError(
+      `Cannot recover legacy skill "${name}": its recorded recovery is not intact`,
+      "untracked_content",
+    );
+  }
+  const stat = lstatSync(recovery, { bigint: true });
+  if (!stat.isDirectory()) {
+    throw new ProvisionError(
+      `Cannot recover legacy skill "${name}": its recovery identity is unavailable`,
+      "untracked_content",
+    );
+  }
+  return {
+    recoveryId,
+    recoveryIdentity: { dev: stat.dev.toString(), ino: stat.ino.toString() },
+  };
+}
+
+/** Keep the legacy skill live between an interrupted isolation and its retry. */
+function restorePreclaimedLegacyTarget(
+  state: ProvisionStateFile,
+  record: InstalledRecord,
+  name: string,
+  installRoot: string,
+): void {
+  const target = path.join(installRoot, name);
+  if (pathEntryExists(target)) return;
+  const recovery = recordedLegacyRecovery(state, record, name, installRoot);
+  if (!recovery) return;
+  const snapshots = [stableSnapshot(record), ...(record.pending ? [record.pending] : [])];
+  if (!restoreSkillRemovalRecovery(name, {
+    skillsDir: installRoot,
+    ...recovery,
+  }) || !snapshots.some((snapshot) => installedSnapshotMatchesEntireTreeAt(target, snapshot))) {
+    throw new ProvisionError(
+      `Cannot restore legacy skill "${name}" from its recorded recovery`,
+      "untracked_content",
+    );
+  }
+}
+
+/** Plan an old-root move without hiding the live skill before its replacement is ready. */
+function planLegacySkillRootMigrations(
+  state: ProvisionStateFile,
+  desired: Set<string>,
+): { failures: Map<string, string>; migrations: Map<string, LegacySkillRootMigration> } {
+  const failures = new Map<string, string>();
+  const migrations = new Map<string, LegacySkillRootMigration>();
+  const canonicalRoot = path.resolve(skillsDir());
+  const desiredRecords = new Map<string, string[]>();
+  for (const key of Object.keys(state.installed)) {
+    const canonicalKey = canonicalStateKey(key);
+    if (!key.toLowerCase().startsWith("skill/") || !desired.has(canonicalKey)) continue;
+    desiredRecords.set(canonicalKey, [...(desiredRecords.get(canonicalKey) ?? []), key]);
+  }
+  for (const [canonicalKey, keys] of desiredRecords) {
+    if (keys.length < 2) continue;
+    failures.set(
+      canonicalKey,
+      `Cannot migrate legacy skills ${keys.map((key) => `"${key}"`).join(", ")}: multiple installed records case-fold to the same key`,
+    );
+  }
+  for (const [key, record] of Object.entries(state.installed)) {
+    const canonicalKey = canonicalStateKey(key);
+    if (!key.toLowerCase().startsWith("skill/") || !desired.has(canonicalKey)) continue;
+    if (failures.has(canonicalKey)) continue;
+    const installRoot = skillInstallRoot(record);
+    if (pathsEqualByFilesystemLookup(installRoot, canonicalRoot)) continue;
+    const name = key.slice(key.indexOf("/") + 1);
+    const canonicalName = name.toLowerCase();
+    try {
+      restorePreclaimedLegacyTarget(state, record, name, installRoot);
+    } catch (err) {
+      failures.set(canonicalKey, err instanceof Error ? err.message : String(err));
+      continue;
+    }
+    if (pathEntryExists(path.join(canonicalRoot, canonicalName))) {
+      failures.set(
+	canonicalKey,
+	`Cannot migrate legacy skill "${name}": untracked canonical target already exists in ${canonicalRoot}`,
+      );
+      continue;
+    }
+    try {
+      assertRecordedSkillLinksRemovable(name, record);
+    } catch (err) {
+      failures.set(canonicalKey, err instanceof Error ? err.message : String(err));
+      continue;
+    }
+    migrations.set(canonicalKey, { installedKey: key, canonicalKey, name, installRoot });
+  }
+  return { failures, migrations };
+}
+
+/** Isolate a planned legacy tree only after the replacement candidate passed its full audit. */
+function executeLegacySkillRootMigration(
+  state: ProvisionStateFile,
+  migration: LegacySkillRootMigration,
+): { record: InstalledRecord; recoveryIdentity?: InstalledDirectoryIdentity } {
+  const record = state.installed[migration.installedKey];
+  if (!record || skillInstallRoot(record) !== migration.installRoot) {
+    throw new ProvisionError(
+      `Cannot migrate legacy skill "${migration.name}": its ownership record changed`,
+      "untracked_content",
+    );
+  }
+  const legacyTarget = path.join(migration.installRoot, migration.name);
+  const canonicalName = migration.canonicalKey.slice(migration.canonicalKey.indexOf("/") + 1);
+  for (const directory of skillLinkDirs()) {
+    const linkPath = path.join(directory, canonicalName);
+    let ownedPublication = false;
+    if (record.skillLinkPublication?.path === linkPath && pathEntryExists(linkPath)) {
+      adoptPublishedSkillLink(linkPath, record.skillLinkPublication.target);
+      ownedPublication = true;
+    }
+    const ownedLink = ownedPublication
+      || record.skillLinks?.some((link) => sameSkillLinkIdentity(linkPath, link));
+    if (pathEntryExists(linkPath) && !samePathEntryIdentity(linkPath, legacyTarget) && !ownedLink) {
+      throw new ProvisionError(
+	`Refusing to replace untracked content at skill link "${linkPath}" during root migration`,
+	"untracked_content",
+      );
+    }
+    // A migration must not hide the live legacy tree when its replacement link
+    // cannot even be created under the current filesystem permissions.
+    assertSkillLinkDirectoryWritable(directory);
+  }
+  const canonicalTarget = path.join(skillsDir(), migration.name.toLowerCase());
+  if (pathEntryExists(canonicalTarget)) {
+    throw new ProvisionError(
+      `Cannot migrate legacy skill "${migration.name}": untracked canonical target already exists in ${skillsDir()}`,
+      "untracked_content",
+    );
+  }
+  assertRecordedSkillLinksRemovable(migration.name, record);
+  if (!pathEntryExists(legacyTarget)) {
+    const recovery = recordedLegacyRecovery(
+      state,
+      record,
+      migration.name,
+      migration.installRoot,
+    );
+    return {
+      record,
+      ...(recovery ? { recoveryIdentity: recovery.recoveryIdentity } : {}),
+    };
+  }
+  const recovery = prepareRemovalRecovery(state, migration.installedKey);
+  let recoveryPath: string | undefined;
+  try {
+    recoveryPath = removeSkill(migration.name, {
+      skillsDir: migration.installRoot,
+      ...removalSnapshot(record),
+      ...recovery,
+      afterRootAudit: afterRemovalAudit,
+      afterRootIsolation: afterRemovalIsolation,
+    }).recoveryPath;
+  } finally {
+    finalizeRemovalRecoveries(state);
+  }
+  if (pathEntryExists(legacyTarget)) {
+    throw new ProvisionError(
+      `Cannot migrate legacy skill "${migration.name}" without verified ownership of its original target`,
+      "untracked_content",
+    );
+  }
+  recoveryPath ??= path.join(migration.installRoot, `.provision-removed-${recovery.recoveryId}`);
+  const recoveryStat = lstatSync(recoveryPath, { bigint: true });
+  if (!recoveryStat.isDirectory()) {
+    throw new ProvisionError(
+      `Cannot migrate legacy skill "${migration.name}": its recovery identity is unavailable`,
+      "untracked_content",
+    );
+  }
+  if (!state.revoked.includes(migration.canonicalKey)
+    && !state.approved.includes(migration.canonicalKey)) {
+    state.approved.push(migration.canonicalKey);
+  }
+  return {
+    record,
+    recoveryIdentity: {
+      dev: recoveryStat.dev.toString(),
+      ino: recoveryStat.ino.toString(),
+    },
+  };
 }
 
 /**
@@ -1001,11 +2257,21 @@ function canonicalStateKey(key: string): string {
 function migrateLegacyDesiredItems(
   state: ProvisionStateFile,
   desired: Set<string>,
+  blocked: ReadonlySet<string> = new Set(),
 ): Map<string, string> {
   const failures = new Map<string, string>();
   for (const [legacyKey, record] of Object.entries(state.installed)) {
     const canonicalKey = canonicalStateKey(legacyKey);
     if (legacyKey === canonicalKey || !desired.has(canonicalKey)) continue;
+    if (blocked.has(canonicalKey)) {
+      // The legacy ownership record is sufficient proof that this item passed
+      // its original approval gate, even while another migration stage owns it.
+      if (!state.revoked.includes(canonicalKey) && !state.approved.includes(canonicalKey)) {
+	state.approved.push(canonicalKey);
+      }
+      desired.add(legacyKey);
+      continue;
+    }
 
     // Two records that case-fold together may represent distinct trees on a
     // case-sensitive filesystem. Preserve both rather than guessing ownership.
@@ -1074,17 +2340,56 @@ async function runSync(generation: number): Promise<ProvisionStatusView> {
   workspace.lastManifest = manifest;
   workspace.lastManifestGeneration = generation;
 
+  let skillLinkConfigurationFailure: string | undefined;
+  try {
+    skillLinkDirs();
+  } catch (err) {
+    skillLinkConfigurationFailure = err instanceof Error ? err.message : String(err);
+  }
+
   const state = loadState();
+  const legacyRootDiscoveryFailures = discoverLegacySkillInstallRoots(state);
   reconcileFirstInstallJournals(state);
   const views: ProvisionItemView[] = [];
   const desired = new Set(manifest.items.map((item) => `${item.type}/${item.name}`));
-  const legacyMigrationFailures = migrateLegacyDesiredItems(state, desired);
+  const {
+    failures: legacyRootMigrationFailures,
+    migrations: legacyRootMigrations,
+  } = skillLinkConfigurationFailure
+    ? { failures: new Map<string, string>(), migrations: new Map<string, LegacySkillRootMigration>() }
+    : planLegacySkillRootMigrations(state, desired);
+  const legacyMigrationFailures = migrateLegacyDesiredItems(
+    state,
+    desired,
+    new Set([
+      ...legacyRootDiscoveryFailures.keys(),
+      ...legacyRootMigrationFailures.keys(),
+      ...legacyRootMigrations.keys(),
+      ...(skillLinkConfigurationFailure
+	? manifest.items
+	  .filter((item) => item.type === "skill")
+	  .map((item) => `${item.type}/${item.name}`)
+	: []),
+    ]),
+  );
 
   for (const item of manifest.items) {
     const key = `${item.type}/${item.name}`;
+    const legacyRootMigration = legacyRootMigrations.get(key);
 
     if (!SUPPORTED_PROVISION_TYPES.has(item.type)) {
       views.push({ type: item.type, name: item.name, status: "unsupported" });
+      continue;
+    }
+
+    if (item.type === "skill" && skillLinkConfigurationFailure) {
+      views.push({
+	type: item.type,
+	name: item.name,
+	status: "failed",
+	...itemSourceView(item),
+	error: skillLinkConfigurationFailure,
+      });
       continue;
     }
 
@@ -1118,7 +2423,9 @@ async function runSync(generation: number): Promise<ProvisionStatusView> {
       continue;
     }
 
-    const migrationFailure = legacyMigrationFailures.get(key);
+    const migrationFailure = legacyRootDiscoveryFailures.get(key)
+      ?? legacyMigrationFailures.get(key)
+      ?? legacyRootMigrationFailures.get(key);
     if (migrationFailure) {
       views.push({
 	type: item.type,
@@ -1206,10 +2513,20 @@ async function runSync(generation: number): Promise<ProvisionStatusView> {
       // not reinstall.
       const fingerprint = itemFingerprint(item, resolvedGitRevision);
       const source = installedSource(item, resolvedGitRevision);
-      if (state.installed[key]?.sha256 === fingerprint
+      if (!legacyRootMigration
+	&& state.installed[key]?.sha256 === fingerprint
 	&& !state.installed[key]!.pending
 	&& !state.installed[key]!.installMarker
 	&& installedRecordIntact(item.type, item.name, state.installed[key]!)) {
+	if (item.type === "skill") {
+	  const links = ensureSkillLinks(
+	    item.name,
+	    state.installed[key]!,
+	    () => saveState(state),
+	  );
+	  state.installed[key]!.skillLinks = links;
+	  saveState(state);
+	}
 	if (state.installed[key]!.removalRecoveryId) {
 	  delete state.installed[key]!.removalRecoveryId;
 	  finalizeRemovalRecoveries(state);
@@ -1226,7 +2543,7 @@ async function runSync(generation: number): Promise<ProvisionStatusView> {
 	continue;
       }
 
-      const previousRecord = state.installed[key];
+      const previousRecord = legacyRootMigration ? undefined : state.installed[key];
       const managedFiles = previousRecord
 	? [...new Set([...previousRecord.files, ...(previousRecord.pending?.files ?? [])])]
 	: undefined;
@@ -1324,7 +2641,25 @@ async function runSync(generation: number): Promise<ProvisionStatusView> {
 	    ...rejectedCandidateRecovery,
 	    firstInstallMarker,
 	    afterFirstInstallMove,
+	    beforeCandidateMove: beforeSkillCandidateMove,
 	    beforeCommit: (candidate, candidateIdentity) => {
+	      let migratedRecord: InstalledRecord | undefined;
+	      let migrationRecoveryIdentity: InstalledDirectoryIdentity | undefined;
+	      if (legacyRootMigration) {
+		const migration = executeLegacySkillRootMigration(state, legacyRootMigration);
+		migratedRecord = migration.record;
+		migrationRecoveryIdentity = migration.recoveryIdentity;
+	      }
+	      const restoreBeforePublication = () => {
+		if (migratedRecord && legacyRootMigration && migrationRecoveryIdentity) {
+		  restoreLegacySkillMigration(state, key, state.installed[key]!);
+		} else {
+		  delete state.installed[key];
+		  if (migratedRecord && legacyRootMigration) {
+		    state.installed[legacyRootMigration.installedKey] = migratedRecord;
+		  } else if (previousRecord) state.installed[key] = previousRecord;
+		}
+	      };
 	      const candidateRecord: InstalledSnapshot = {
 		sha256: fingerprint,
 		...(source ? { source } : {}),
@@ -1334,25 +2669,51 @@ async function runSync(generation: number): Promise<ProvisionStatusView> {
 		installedAt: new Date().toISOString(),
 	      };
 	      const nextRecord: InstalledRecord = previousRecord
-		? { ...stableSnapshot(previousRecord), pending: candidateRecord }
+		? {
+		    ...stableSnapshot(previousRecord),
+		    ...(previousRecord.installRoot ? { installRoot: previousRecord.installRoot } : {}),
+		    ...(previousRecord.skillLinks ? { skillLinks: previousRecord.skillLinks } : {}),
+		    ...(previousRecord.skillLinkPublication
+		      ? { skillLinkPublication: previousRecord.skillLinkPublication }
+		      : {}),
+		    pending: candidateRecord,
+		  }
 		: {
 		  ...candidateRecord,
+		  installRoot: path.resolve(skillsDir()),
 		  uncommitted: true,
 		  candidateIdentity,
 		  installMarker: firstInstallMarker,
 		  rejectionRecoveryId: rejectedCandidateRecovery.rejectionRecoveryId,
+		  ...(migratedRecord && legacyRootMigration && migrationRecoveryIdentity
+		    ? {
+			pending: stableSnapshot(migratedRecord),
+			legacySkillMigration: {
+			  installedKey: legacyRootMigration.installedKey,
+			  installRoot: legacyRootMigration.installRoot,
+			  recoveryIdentity: migrationRecoveryIdentity,
+			},
+			removalRecoveryId: migratedRecord.removalRecoveryId,
+		      }
+		    : {}),
+		  ...(migratedRecord?.skillLinks ? { skillLinks: migratedRecord.skillLinks } : {}),
+		  ...(migratedRecord?.skillLinkPublication
+		    ? { skillLinkPublication: migratedRecord.skillLinkPublication }
+		    : {}),
 		};
+	      if (legacyRootMigration && legacyRootMigration.installedKey !== key) {
+		delete state.installed[legacyRootMigration.installedKey];
+	      }
 	      state.installed[key] = nextRecord;
 	      try {
 		saveState(state);
 	      } catch (err) {
-		if (previousRecord) state.installed[key] = previousRecord;
-		else delete state.installed[key];
+		restoreBeforePublication();
 		throw err;
 	      }
 	      if (!previousRecord) {
 		return () => {
-		  delete state.installed[key];
+		  restoreBeforePublication();
 		  saveState(state);
 		};
 	      }
@@ -1366,19 +2727,48 @@ async function runSync(generation: number): Promise<ProvisionStatusView> {
 	  );
 	}
       } finally {
-	finalizeUpgradeRecoveries(state);
+	if (!state.installed[key]?.legacySkillMigration) finalizeUpgradeRecoveries(state);
       }
       }
       // Finalizing drops the upgrade journal. If this save later fails, the
       // persisted stable+pending pair lets the next sync recognize either side.
-      state.installed[key] = {
+      const linkOwnershipRecord = item.type === "skill" ? state.installed[key] : previousRecord;
+      const completedRecord: InstalledRecord = {
 	sha256: fingerprint,
 	...(source ? { source } : {}),
 	files: result.files,
 	directories: result.directories ?? [],
 	fileHashes: result.fileHashes,
 	installedAt: new Date().toISOString(),
+	...(item.type === "skill" ? { installRoot: path.resolve(skillsDir()) } : {}),
+	...(linkOwnershipRecord?.skillLinks ? { skillLinks: linkOwnershipRecord.skillLinks } : {}),
+	...(linkOwnershipRecord?.skillLinkPublication
+	  ? { skillLinkPublication: linkOwnershipRecord.skillLinkPublication }
+	  : {}),
       };
+
+      if (item.type === "skill") {
+	// Keep a root-migration journal durable until discovery fanout commits. A
+	// publication failure can then reject the candidate and restore the exact
+	// legacy tree instead of degrading into an ordinary upgrade journal.
+	const installedRecord = linkOwnershipRecord?.legacySkillMigration
+	  ? linkOwnershipRecord
+	  : completedRecord;
+	state.installed[key] = installedRecord;
+	const links = ensureSkillLinks(
+	  item.name,
+	  installedRecord,
+	  () => saveState(state),
+	);
+	completedRecord.skillLinks = links;
+	if (installedRecord.skillLinkPublication) {
+	  completedRecord.skillLinkPublication = installedRecord.skillLinkPublication;
+	} else {
+	  delete completedRecord.skillLinkPublication;
+	}
+      }
+      state.installed[key] = completedRecord;
+      if (item.type === "skill") finalizeUpgradeRecoveries(state);
       if (!state.approved.includes(key)) state.approved.push(key);
       views.push({
 	type: item.type,
@@ -1389,15 +2779,25 @@ async function runSync(generation: number): Promise<ProvisionStatusView> {
     } catch (err) {
       if (err instanceof SupersededSyncError) throw err;
       const journal = state.installed[key];
-      if (journal?.pending) {
+      let failure = err;
+      if (journal?.legacySkillMigration && !(failure instanceof SkillLinkRollbackError)) {
+	try {
+	  rollbackLegacySkillMigration(state, key, journal);
+	} catch (rollbackError) {
+	  failure = rollbackError;
+	}
+      } else if (journal?.pending) {
 	state.installed[key] = item.type === "config"
 	  ? reconcileConfigUpgradeJournal(item.name, journal)
 	  : reconcileUpgradeJournal(item.name, journal);
       }
+      if (item.type === "skill" && !state.installed[key]?.legacySkillMigration) {
+	finalizeUpgradeRecoveries(state);
+      }
       if (item.type === "config" && state.installed[key]?.uncommitted) {
 	reconcileFirstInstallJournals(state);
       }
-      const message = err instanceof Error ? err.message : String(err);
+      const message = failure instanceof Error ? failure.message : String(failure);
       views.push({
 	type: item.type,
 	name: item.name,
@@ -1418,13 +2818,16 @@ async function runSync(generation: number): Promise<ProvisionStatusView> {
     const canonicalType = type?.toLowerCase() ?? "skill";
     const canonicalName = name.toLowerCase();
     try {
+      const rootDiscoveryFailure = legacyRootDiscoveryFailures.get(canonicalStateKey(key));
+      if (rootDiscoveryFailure) throw new ProvisionError(rootDiscoveryFailure, "untracked_content");
       const record = state.installed[key]!;
       if (canonicalType === "skill") {
+	assertRecordedSkillLinksRemovable(name, record);
 	const recovery = prepareRemovalRecovery(state, key);
 	try {
 	  const snapshot = removalSnapshot(record);
 	  removeSkill(name, {
-	    skillsDir: skillsDir(),
+	    skillsDir: skillInstallRoot(record),
 	    ...snapshot,
 	    ...recovery,
 	    afterRootAudit: afterRemovalAudit,
@@ -1433,6 +2836,7 @@ async function runSync(generation: number): Promise<ProvisionStatusView> {
 	} finally {
 	  finalizeRemovalRecoveries(state);
 	}
+	removeRecordedSkillLinks(name, record, () => saveState(state));
       } else if (canonicalType === "config") {
 	removeOwnedConfig(canonicalName, state, key, record);
       }
@@ -1551,6 +2955,7 @@ export function deleteItem(type: string, name: string): Promise<{ removed: boole
   if (workspace.inFlight) workspace.syncRequested = true;
   return serialize(() => {
     const state = loadState();
+    const legacyRootDiscoveryFailures = discoverLegacySkillInstallRoots(state);
     reconcileFirstInstallJournals(state);
     const legacyMatches = Object.keys(state.installed)
       .filter((entry) => canonicalStateKey(entry) === key);
@@ -1560,12 +2965,17 @@ export function deleteItem(type: string, name: string): Promise<{ removed: boole
     const installed = installedKey !== undefined;
     const record = installedKey ? state.installed[installedKey] : undefined;
     if (record && type === "skill") {
+	const rootDiscoveryFailure = legacyRootDiscoveryFailures.get(canonicalStateKey(installedKey!));
+	if (rootDiscoveryFailure) {
+	  throw new ProvisionError(rootDiscoveryFailure, "untracked_content");
+	}
 	const installedName = installedKey!.slice(installedKey!.indexOf("/") + 1);
+      assertRecordedSkillLinksRemovable(installedName, record);
       const recovery = prepareRemovalRecovery(state, installedKey!);
       try {
 	const snapshot = removalSnapshot(record);
 	removeSkill(installedName, {
-	  skillsDir: skillsDir(),
+	  skillsDir: skillInstallRoot(record),
 	  ...snapshot,
 	  ...recovery,
 	  afterRootAudit: afterRemovalAudit,
@@ -1575,6 +2985,7 @@ export function deleteItem(type: string, name: string): Promise<{ removed: boole
 	finalizeRemovalRecoveries(state);
 	saveState(state);
       }
+      removeRecordedSkillLinks(installedName, record, () => saveState(state));
     } else if (record && type === "config") {
       removeOwnedConfig(name, state, installedKey!, record);
     }
@@ -1615,7 +3026,10 @@ function clearProvisioningState(): void {
   fixedManifestUrl = null;
   shuttingDown = false;
   afterFirstInstallMove = undefined;
+  beforeSkillCandidateMove = undefined;
   afterFirstInstallReconciliationIdentityCheck = undefined;
+  beforeSkillLinkPublication = undefined;
+  afterSkillLinkPublication = undefined;
   afterRemovalAudit = undefined;
   afterRemovalIsolation = undefined;
   afterConfigRemoval = undefined;

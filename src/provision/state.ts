@@ -22,8 +22,11 @@ import { managedPathParts } from "./path-policy.js";
 import { currentWorkspaceContext } from "./workspace-context.js";
 import type {
   InstalledFileIdentity,
+  InstalledLegacySkillMigration,
   InstalledRecord,
   InstalledSnapshot,
+  InstalledSkillLink,
+  InstalledSkillLinkPublication,
   ProvisionStateFile,
 } from "./types.js";
 
@@ -236,11 +239,84 @@ function installedSnapshot(value: unknown): InstalledSnapshot | null {
   };
 }
 
-function installedRecord(value: unknown): InstalledRecord | null {
+function installedSkillLinks(value: unknown, installedKey: string): InstalledSkillLink[] | null {
+  if (value === undefined) return [];
+  if (!Array.isArray(value)) return null;
+  const name = installedKey.slice(installedKey.indexOf("/") + 1);
+  const links: InstalledSkillLink[] = [];
+  for (const entry of value) {
+    if (typeof entry !== "object" || entry === null || Array.isArray(entry)) return null;
+    const record = entry as Record<string, unknown>;
+    if (typeof record.path !== "string" || !path.isAbsolute(record.path)
+      || path.basename(record.path) !== name
+      || typeof record.target !== "string" || !path.isAbsolute(record.target)
+      || path.basename(record.target) !== name
+      || typeof record.dev !== "string" || !FILESYSTEM_ID_PATTERN.test(record.dev)
+      || typeof record.ino !== "string" || !FILESYSTEM_ID_PATTERN.test(record.ino)) return null;
+    links.push({ path: path.normalize(record.path), target: path.normalize(record.target), dev: record.dev, ino: record.ino });
+  }
+  if (new Set(links.map((link) => link.path)).size !== links.length) return null;
+  return links;
+}
+
+function installedSkillLinkPublication(
+  value: unknown,
+  installedKey: string,
+): InstalledSkillLinkPublication | null | undefined {
+  if (value === undefined) return undefined;
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return null;
+  const name = installedKey.slice(installedKey.indexOf("/") + 1);
+  const record = value as Record<string, unknown>;
+  if (typeof record.path !== "string" || !path.isAbsolute(record.path)
+    || path.basename(record.path) !== name
+    || typeof record.target !== "string" || !path.isAbsolute(record.target)
+    || path.basename(record.target) !== name) return null;
+  return { path: path.normalize(record.path), target: path.normalize(record.target) };
+}
+
+function installedLegacySkillMigration(
+  value: unknown,
+  installedKey: string,
+): InstalledLegacySkillMigration | null | undefined {
+  if (value === undefined) return undefined;
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return null;
+  const record = value as Record<string, unknown>;
+  const identity = record.recoveryIdentity;
+  if (typeof record.installedKey !== "string" || !KEY_PATTERN.test(record.installedKey)
+    || !record.installedKey.toLowerCase().startsWith("skill/")
+    || record.installedKey.toLowerCase() !== installedKey.toLowerCase()
+    || typeof record.installRoot !== "string" || !path.isAbsolute(record.installRoot)
+    || typeof identity !== "object" || identity === null || Array.isArray(identity)
+    || typeof (identity as Record<string, unknown>).dev !== "string"
+    || !FILESYSTEM_ID_PATTERN.test((identity as Record<string, string>).dev)
+    || typeof (identity as Record<string, unknown>).ino !== "string"
+    || !FILESYSTEM_ID_PATTERN.test((identity as Record<string, string>).ino)) return null;
+  return {
+    installedKey: record.installedKey,
+    installRoot: path.normalize(record.installRoot),
+    recoveryIdentity: {
+      dev: (identity as Record<string, string>).dev,
+      ino: (identity as Record<string, string>).ino,
+    },
+  };
+}
+
+function installedRecord(value: unknown, installedKey: string): InstalledRecord | null {
   const stable = installedSnapshot(value);
   if (!stable) return null;
   const raw = value as Record<string, unknown>;
+  const installRoot = typeof raw.installRoot === "string" && path.isAbsolute(raw.installRoot)
+    ? path.normalize(raw.installRoot)
+    : undefined;
+  const skillLinks = installedSkillLinks(raw.skillLinks, installedKey);
+  if (skillLinks === null) return null;
+  const skillLinkPublication = installedSkillLinkPublication(raw.skillLinkPublication, installedKey);
+  if (skillLinkPublication === null) return null;
+  if (!installedKey.toLowerCase().startsWith("skill/")
+    && (skillLinks.length > 0 || skillLinkPublication !== undefined)) return null;
   const pending = raw.pending === undefined ? null : installedSnapshot(raw.pending);
+  const legacySkillMigration = installedLegacySkillMigration(raw.legacySkillMigration, installedKey);
+  if (legacySkillMigration === null) return null;
   const rawCandidateIdentity = raw.candidateIdentity;
   const candidateIdentity = typeof rawCandidateIdentity === "object"
     && rawCandidateIdentity !== null
@@ -271,9 +347,18 @@ function installedRecord(value: unknown): InstalledRecord | null {
 	  ino: (rawConfigCandidate as Record<string, string>).ino,
 	}
       : undefined;
+  const uncommitted = raw.uncommitted === true;
+  const removalRecoveryId = typeof raw.removalRecoveryId === "string"
+    && RECOVERY_ID_PATTERN.test(raw.removalRecoveryId)
+    ? raw.removalRecoveryId
+    : undefined;
+  if (legacySkillMigration && (!uncommitted || !pending || !removalRecoveryId)) return null;
   return {
     ...stable,
-    ...(raw.uncommitted === true ? { uncommitted: true as const } : {}),
+    ...(installedKey.toLowerCase().startsWith("skill/") && installRoot ? { installRoot } : {}),
+    ...(skillLinks.length > 0 ? { skillLinks } : {}),
+    ...(skillLinkPublication ? { skillLinkPublication } : {}),
+    ...(uncommitted ? { uncommitted: true as const } : {}),
     ...(candidateIdentity ? { candidateIdentity } : {}),
     ...(configCandidate ? { configCandidate } : {}),
     ...(typeof raw.installMarker === "string" && INSTALL_MARKER_PATTERN.test(raw.installMarker)
@@ -282,10 +367,9 @@ function installedRecord(value: unknown): InstalledRecord | null {
     ...(typeof raw.rejectionRecoveryId === "string" && RECOVERY_ID_PATTERN.test(raw.rejectionRecoveryId)
       ? { rejectionRecoveryId: raw.rejectionRecoveryId }
       : {}),
-    ...(typeof raw.removalRecoveryId === "string" && RECOVERY_ID_PATTERN.test(raw.removalRecoveryId)
-      ? { removalRecoveryId: raw.removalRecoveryId }
-      : {}),
+    ...(removalRecoveryId ? { removalRecoveryId } : {}),
     ...(pending ? { pending } : {}),
+    ...(legacySkillMigration ? { legacySkillMigration } : {}),
   };
 }
 
@@ -302,21 +386,31 @@ export function loadState(): ProvisionStateFile {
     const installed: Record<string, InstalledRecord> = {};
     if (typeof parsed.installed === "object" && parsed.installed !== null) {
       for (const [key, value] of Object.entries(parsed.installed)) {
-	const record = KEY_PATTERN.test(key) ? installedRecord(value) : null;
+	const record = KEY_PATTERN.test(key) ? installedRecord(value, key) : null;
 	if (record) installed[key] = record;
       }
     }
+    const removalRecoveries = Array.isArray(parsed.removalRecoveries)
+      ? [...new Set(parsed.removalRecoveries.filter(
+	(id): id is string => typeof id === "string" && RECOVERY_ID_PATTERN.test(id),
+      ))]
+      : undefined;
+    const rawRemovalRecoveryRoots = parsed.removalRecoveryRoots;
+    const removalRecoveryRoots = removalRecoveries && typeof rawRemovalRecoveryRoots === "object"
+      && rawRemovalRecoveryRoots !== null && !Array.isArray(rawRemovalRecoveryRoots)
+      ? Object.fromEntries(removalRecoveries.flatMap((id) => {
+	const root = (rawRemovalRecoveryRoots as Record<string, unknown>)[id];
+	return typeof root === "string" && path.isAbsolute(root) ? [[id, path.normalize(root)]] : [];
+      }))
+      : undefined;
     return {
       version: 1,
       approved: canonicalKeys(parsed.approved),
       revoked: canonicalKeys(parsed.revoked),
       ...(parsed.adopted !== undefined ? { adopted: canonicalKeys(parsed.adopted) } : {}),
-      ...(Array.isArray(parsed.removalRecoveries)
-	? {
-	  removalRecoveries: [...new Set(parsed.removalRecoveries.filter(
-	    (id): id is string => typeof id === "string" && RECOVERY_ID_PATTERN.test(id),
-	  ))],
-	}
+      ...(removalRecoveries ? { removalRecoveries } : {}),
+      ...(removalRecoveryRoots && Object.keys(removalRecoveryRoots).length > 0
+	? { removalRecoveryRoots }
 	: {}),
       ...(Array.isArray(parsed.upgradeRecoveries)
 	? {

@@ -37,7 +37,8 @@ enabling a manifest that contains `git` sources.
 | `PROVISION_AUTOAPPLY` | `approve` (default): first-seen items stop at `pending_approval`. `auto`: install immediately. |
 | `PROVISION_REFETCH_MS` | Drift-correction re-fetch interval. Default 3600000 (1h), `0` disables. |
 | `PROVISION_STATE_DIR` | Lockfile directory. Default `~/.cli-openai-proxy`. |
-| `PROVISION_SKILLS_DIR` | Install dir for `skill` items. Default `~/.claude/skills`. |
+| `PROVISION_SKILLS_DIR` | Canonical install dir for `skill` items. Default `~/.agents/skills` (read natively by Codex). |
+| `PROVISION_SKILL_LINK_DIRS` | Comma-separated discovery directories that receive managed links to canonical skills. Default `~/.claude/skills`; set to an empty string to disable link fanout. |
 | `PROVISION_CONFIG_DIR` | Install root for `config` items. Default `~/.config`; `XDG_CONFIG_HOME` is intentionally ignored because consuming CLIs read `~/.config` directly. |
 | `PROVISION_WORKSPACE_ROOT` | Named workspace parent. Default `<worker HOME>/workspaces`. |
 | `PROVISION_MAX_WORKSPACES_PER_USER` | Maximum named workspaces per worker/user. Default `32`; existing on-disk workspaces count toward the limit. |
@@ -47,12 +48,16 @@ enabling a manifest that contains `git` sources.
 Where the engine runs depends on deployment mode, not on any new flag:
 
 - **Solo gateway** (no per-user workers) — one process-local engine, running
-  in the gateway's own HOME (`~/.claude/skills`, `~/.cli-openai-proxy`).
+  in the gateway's own HOME (`~/.agents/skills`, linked from
+  `~/.claude/skills`, plus `~/.cli-openai-proxy`).
 - **Per-user Linux workers** (`deploy/linux/cli-openai-proxy-worker@.service`)
   — `X-CLI-Proxy-User-ID` selects the worker and shared engine credentials.
   With signed v2 identity, `X-CLI-Proxy-Workspace-ID` selects
   `<worker HOME>/workspaces/<id>` for skills, config, and lockfiles. Requests
-  without that header retain the pre-v2 HOME paths exactly.
+  without that header retain the pre-v2 HOME paths exactly, including the
+  canonical `.agents/skills` tree and its `.claude/skills` discovery links.
+  `PROVISION_SYNC` on the worker unit remains the explicit opt-in; when unset,
+  `/v1/provision/*` answers `404 provisioning_disabled`.
 
 In worker mode `/v1/provision/*` still requires the admin key, and — like
 every other scoped route — also requires a user identity
@@ -145,7 +150,8 @@ workspace config.
     Slash-containing branch names use the explicit `url` + `rev` + `path` form
     because GitHub tree URLs do not delimit the branch from the path.
 - **The manifest never chooses paths.** Each type maps to a hardcoded sandbox
-  (`skill` → `~/.claude/skills/{name}`, `config` → `~/.config/{name}`).
+  (`skill` → `~/.agents/skills/{name}` with a managed
+  `~/.claude/skills/{name}` link, `config` → `~/.config/{name}`).
   `git.path` selects source content only;
   it never affects the destination, so the channel cannot become an arbitrary
   remote file write.
@@ -155,6 +161,24 @@ directory. Git sources reject submodules and install only the selected tree.
 Removing an item from the manifest uninstalls it on the next sync; an **empty
 `items` array removes everything managed** (distinct from having no manifest
 registered, which syncs nothing).
+
+Skill content has one canonical copy. Codex discovers the default
+`~/.agents/skills/{name}` directly, while Claude discovers the managed link at
+`~/.claude/skills/{name}`. Additional link roots can be configured with
+`PROVISION_SKILL_LINK_DIRS`. Link paths and filesystem identities are recorded
+in the lockfile; changed or untracked entries fail with `untracked_content`
+instead of being replaced or removed. On upgrade from the previous default,
+the lockfile first records the proven legacy install root. Migration proceeds
+only when the new canonical pathname is absent and after the replacement source
+has been downloaded, verified, extracted, and audited. An exact lockfile-owned
+`~/.claude/skills/{name}` tree is then retained in a hidden recovery directory
+and replaced by the discovery link. A source-preparation failure therefore
+leaves the legacy skill live. Canonical collisions and modified or ambiguous
+legacy trees are left untouched. The recovery identity and its install root are
+journaled before isolation so restart reuses the same recovery. During canonical
+publication, the legacy snapshot, original key/root, and isolated tree identity
+remain journaled until exposure succeeds; a failed no-replace publish or restart
+restores that exact tree to the legacy path without replacing another entry.
 
 ### `type: "config"`
 
@@ -300,7 +324,11 @@ the manifest.
   closed instead of falling back to racy path checks.
 - **Lockfile ownership.** `~/.cli-openai-proxy/provision.lock.json` records
   what the proxy installed, including archive-owned directories and per-file
-  hashes used to repair missing or modified content on the next sync. Upgrades
+  hashes used to repair missing or modified content on the next sync. Managed
+  discovery links are also recorded by path, target, and filesystem identity.
+  Their publication intent is journaled before the symlink becomes visible, so
+  an interrupted publication can be recovered or removed safely. Links are
+  isolated and rechecked before removal. Upgrades
   journal both the stable and candidate ownership snapshots before swapping
   directories, so an interrupted swap is recoverable. Removal records its
   recovery identity before inspecting the target, atomically moves an owned
@@ -311,7 +339,8 @@ the manifest.
   a manifest item whose name collides with an untracked directory fails with
   `Refusing to replace untracked directory` instead of replacing it. Hidden
   removal, upgrade, and failed candidate recoveries are retained for explicit
-  operator cleanup. They are never automatically unlinked because an already-open
+  operator cleanup. Failed link isolation can likewise retain a hidden
+  `.provision-link-*` entry. Recoveries are never automatically unlinked because an already-open
   descriptor can modify an inode after any integrity check.
 - **TOFU approval.** In the default `approve` mode a first-seen `(type, name)`
   stops at `pending_approval` until an admin approves it.
@@ -330,8 +359,9 @@ declaration that the manifest's publisher is inside your trust boundary.
 
 See [Per-user scope (worker mode)](#per-user-scope-worker-mode) above. With
 `PROVISION_SYNC=1` on worker units, v2 requests install skills and config below
-`~/workspaces/<workspace-id>`, while the CLI child receives that directory as
-`HOME`. `PAPERCLIP_HOME` remains `<worker HOME>/.paperclip`, and `CODEX_HOME` is
+`~/workspaces/<workspace-id>`; canonical skills are exposed to Claude through
+managed discovery links. The CLI child receives that directory as `HOME`.
+`PAPERCLIP_HOME` remains `<worker HOME>/.paperclip`, and `CODEX_HOME` is
 explicitly pinned to its user-scoped managed `codex-home`; the adapter seeds
 that home from the login CLI's `<worker HOME>/.codex`. Codex login is therefore
 shared by all of that user's agents without following the workspace `HOME`.

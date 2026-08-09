@@ -39,7 +39,7 @@ export function resolveWorkspaceContext(workspaceId: string): ProvisionWorkspace
     scoped: true,
     userHome,
     root,
-    skillsDir: path.join(root, ".claude", "skills"),
+    skillsDir: path.join(root, ".agents", "skills"),
     configDir: path.join(root, ".config"),
     stateDir: path.join(root, ".cli-openai-proxy"),
   };
@@ -88,9 +88,9 @@ export function ensureWorkspaceRoot(
   try {
     count = readdirSync(base).filter((name) => {
       try {
-        return lstatSync(path.join(base, name)).isDirectory();
+	return lstatSync(path.join(base, name)).isDirectory();
       } catch {
-        return false;
+	return false;
       }
     }).length;
   } catch {
@@ -113,8 +113,8 @@ export function runInWorkspace<T>(
   return workspaceId === undefined
     ? operation()
     : workspaceStorage.run(
-        scoped ? resolveWorkspaceContext(workspaceId) : legacyWorkspaceContext(workspaceId),
-        operation,
+	scoped ? resolveWorkspaceContext(workspaceId) : legacyWorkspaceContext(workspaceId),
+	operation,
       );
 }
 

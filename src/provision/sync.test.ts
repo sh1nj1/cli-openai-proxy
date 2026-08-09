@@ -11,9 +11,12 @@ import {
   mkdtempSync,
   readdirSync,
   readFileSync,
+  readlinkSync,
   renameSync,
   rmSync,
   statSync,
+  symlinkSync,
+  unlinkSync,
   writeFileSync,
 } from "fs";
 import { createServer, type Server } from "http";
@@ -149,11 +152,13 @@ const SAVED_VARS = [
   "PROVISION_ALLOWLIST",
   "PROVISION_STATE_DIR",
   "PROVISION_SKILLS_DIR",
+  "PROVISION_SKILL_LINK_DIRS",
   "PROVISION_CONFIG_DIR",
   "PROVISION_REFETCH_MS",
   "PROVISION_WORKSPACE_ROOT",
   "PROVISION_MAX_WORKSPACES_PER_USER",
   "AUTH_ADMIN_KEYS",
+  "HOME",
 ] as const;
 
 describe("provision sync", () => {
@@ -215,6 +220,7 @@ describe("provision sync", () => {
     workspaceRoot = mkdtempSync(path.join(tmpdir(), "provision-sync-workspaces-"));
     process.env.PROVISION_STATE_DIR = stateDir;
     process.env.PROVISION_SKILLS_DIR = skillsDir;
+    process.env.PROVISION_SKILL_LINK_DIRS = "";
     process.env.PROVISION_CONFIG_DIR = configDir;
     process.env.PROVISION_WORKSPACE_ROOT = workspaceRoot;
     process.env.PROVISION_SYNC = "1";
@@ -396,6 +402,1761 @@ describe("provision sync", () => {
     assert.equal(statusOf(view, "pr-monitor"), "installed");
   });
 
+  test("fans one canonical skill out through managed discovery links", async () => {
+    const linkDir = path.join(stateDir, "claude-skills");
+    process.env.PROVISION_SKILL_LINK_DIRS = linkDir;
+    process.env.PROVISION_AUTOAPPLY = "auto";
+    initProvisioning();
+    const skill = serveSkill("/linked.tgz", "linked skill");
+    registerManifestUrl(serveManifest([{ type: "skill", name: "linked", ...skill }]));
+
+    const installed = await syncNow();
+    const link = path.join(linkDir, "linked");
+    const target = path.join(skillsDir, "linked");
+    assert.equal(statusOf(installed, "linked"), "installed");
+    assert.equal(lstatSync(link).isSymbolicLink(), true);
+    assert.equal(path.resolve(path.dirname(link), readlinkSync(link)), target);
+    const state = JSON.parse(readFileSync(path.join(stateDir, "provision.lock.json"), "utf8"));
+    assert.equal(state.installed["skill/linked"].skillLinks[0].path, link);
+
+    const linkIdentity = lstatSync(link, { bigint: true }).ino;
+    const upgradedSkill = serveSkill("/linked-v2.tgz", "linked skill v2");
+    registerManifestUrl(serveManifest([{ type: "skill", name: "linked", ...upgradedSkill }]));
+    const upgraded = await syncNow();
+    assert.equal(statusOf(upgraded, "linked"), "installed");
+    assert.equal(lstatSync(link, { bigint: true }).ino, linkIdentity);
+    assert.equal(readFileSync(path.join(target, "SKILL.md"), "utf8"), "linked skill v2");
+
+    responses.set("/provision.json", { schema: "agent-provisioning/v1", items: [] });
+    const removed = await syncNow();
+    assert.equal(statusOf(removed, "linked"), "removed");
+    assert.equal(existsSync(link), false);
+    assert.equal(existsSync(target), false);
+  });
+
+  test("skips a discovery root that aliases the canonical skills directory", async () => {
+    const testHome = path.join(stateDir, "aliased-root-home");
+    const canonicalRoot = path.join(testHome, ".agents", "skills");
+    const aliasRoot = path.join(testHome, ".claude", "skills");
+    mkdirSync(canonicalRoot, { recursive: true });
+    mkdirSync(path.dirname(aliasRoot), { recursive: true });
+    symlinkSync(canonicalRoot, aliasRoot, process.platform === "win32" ? "junction" : "dir");
+    process.env.HOME = testHome;
+    delete process.env.PROVISION_SKILLS_DIR;
+    delete process.env.PROVISION_SKILL_LINK_DIRS;
+    process.env.PROVISION_AUTOAPPLY = "auto";
+    initProvisioning();
+    const skill = serveSkill("/aliased-root.tgz", "aliased root skill");
+    registerManifestUrl(serveManifest([{ type: "skill", name: "aliased", ...skill }]));
+
+    assert.equal(statusOf(await syncNow(), "aliased"), "installed");
+    const canonical = path.join(canonicalRoot, "aliased");
+    const alias = path.join(aliasRoot, "aliased");
+    assert.equal(readFileSync(path.join(alias, "SKILL.md"), "utf8"), "aliased root skill");
+    assert.equal(lstatSync(alias).isSymbolicLink(), false);
+    assert.equal(lstatSync(alias, { bigint: true }).ino, lstatSync(canonical, { bigint: true }).ino);
+    const statePath = path.join(stateDir, "provision.lock.json");
+    const state = JSON.parse(readFileSync(statePath, "utf8"));
+    assert.deepEqual(state.installed["skill/aliased"].skillLinks, []);
+    delete state.installed["skill/aliased"].installRoot;
+    writeFileSync(statePath, `${JSON.stringify(state, null, 2)}\n`);
+    initProvisioning();
+    registerManifestUrl(`${baseUrl}/provision.json`);
+    assert.equal(statusOf(await syncNow(), "aliased"), "installed");
+    const rebound = JSON.parse(readFileSync(statePath, "utf8"));
+    assert.equal(rebound.installed["skill/aliased"].installRoot, canonicalRoot);
+  });
+
+  test("deduplicates discovery roots that alias the same directory", async () => {
+    const actualRoot = path.join(stateDir, "shared-discovery-root");
+    const aliasRoot = path.join(stateDir, "shared-discovery-alias");
+    mkdirSync(actualRoot);
+    symlinkSync(actualRoot, aliasRoot, process.platform === "win32" ? "junction" : "dir");
+    process.env.PROVISION_SKILL_LINK_DIRS = `${aliasRoot},${actualRoot}`;
+    process.env.PROVISION_AUTOAPPLY = "auto";
+    initProvisioning();
+    const skill = serveSkill("/deduplicated-link-roots.tgz", "deduplicated link roots");
+    registerManifestUrl(serveManifest([{ type: "skill", name: "deduplicated", ...skill }]));
+
+    assert.equal(statusOf(await syncNow(), "deduplicated"), "installed");
+    assert.equal(statusOf(await syncNow(), "deduplicated"), "installed");
+    const state = JSON.parse(readFileSync(path.join(stateDir, "provision.lock.json"), "utf8"));
+    assert.equal(state.installed["skill/deduplicated"].skillLinks.length, 1);
+    assert.equal(
+      state.installed["skill/deduplicated"].skillLinks[0].path,
+      path.join(aliasRoot, "deduplicated"),
+    );
+    assert.equal(lstatSync(path.join(actualRoot, "deduplicated")).isSymbolicLink(), true);
+  });
+
+  test("rebinds a recorded discovery link through a configured root alias", async () => {
+    const actualRoot = path.join(stateDir, "rebound-discovery-root");
+    const aliasRoot = path.join(stateDir, "rebound-discovery-alias");
+    mkdirSync(actualRoot);
+    symlinkSync(actualRoot, aliasRoot, process.platform === "win32" ? "junction" : "dir");
+    process.env.PROVISION_SKILL_LINK_DIRS = aliasRoot;
+    process.env.PROVISION_AUTOAPPLY = "auto";
+    initProvisioning();
+    const skill = serveSkill("/rebound-link-root.tgz", "rebound link root");
+    const manifestUrl = serveManifest([{ type: "skill", name: "rebound", ...skill }]);
+    registerManifestUrl(manifestUrl);
+
+    assert.equal(statusOf(await syncNow(), "rebound"), "installed");
+    const aliasLink = path.join(aliasRoot, "rebound");
+    const actualLink = path.join(actualRoot, "rebound");
+    const linkIdentity = lstatSync(aliasLink, { bigint: true }).ino;
+
+    process.env.PROVISION_SKILL_LINK_DIRS = actualRoot;
+    initProvisioning();
+    registerManifestUrl(manifestUrl);
+    assert.equal(statusOf(await syncNow(), "rebound"), "installed");
+    assert.equal(lstatSync(actualLink, { bigint: true }).ino, linkIdentity);
+    assert.equal(statusOf(await syncNow(), "rebound"), "installed");
+    const state = JSON.parse(readFileSync(path.join(stateDir, "provision.lock.json"), "utf8"));
+    assert.deepEqual(
+      state.installed["skill/rebound"].skillLinks.map((link: { path: string }) => link.path),
+      [actualLink],
+    );
+  });
+
+  test("collapses stale exact ownership when recorded discovery roots become aliases", async () => {
+    const firstRoot = path.join(stateDir, "collapsed-discovery-first");
+    const secondRoot = path.join(stateDir, "collapsed-discovery-second");
+    process.env.PROVISION_SKILL_LINK_DIRS = `${firstRoot},${secondRoot}`;
+    process.env.PROVISION_AUTOAPPLY = "auto";
+    initProvisioning();
+    const skill = serveSkill("/collapsed-link-root.tgz", "collapsed link root");
+    const manifestUrl = serveManifest([{ type: "skill", name: "collapsed", ...skill }]);
+    registerManifestUrl(manifestUrl);
+
+    assert.equal(statusOf(await syncNow(), "collapsed"), "installed");
+    const secondLink = path.join(secondRoot, "collapsed");
+    const retainedIdentity = lstatSync(secondLink, { bigint: true }).ino;
+    rmSync(firstRoot, { recursive: true });
+    symlinkSync(secondRoot, firstRoot, process.platform === "win32" ? "junction" : "dir");
+
+    process.env.PROVISION_SKILL_LINK_DIRS = firstRoot;
+    initProvisioning();
+    registerManifestUrl(manifestUrl);
+    assert.equal(statusOf(await syncNow(), "collapsed"), "installed");
+    assert.equal(lstatSync(path.join(firstRoot, "collapsed"), { bigint: true }).ino, retainedIdentity);
+    assert.equal(statusOf(await syncNow(), "collapsed"), "installed");
+    const state = JSON.parse(readFileSync(path.join(stateDir, "provision.lock.json"), "utf8"));
+    assert.deepEqual(
+      state.installed["skill/collapsed"].skillLinks.map((link: { path: string }) => link.path),
+      [path.join(firstRoot, "collapsed")],
+    );
+  });
+
+  test("deduplicates missing discovery roots beneath aliased parents", async () => {
+    const actualParent = path.join(stateDir, "shared-discovery-parent");
+    const aliasParent = path.join(stateDir, "shared-discovery-parent-alias");
+    mkdirSync(actualParent);
+    symlinkSync(actualParent, aliasParent, process.platform === "win32" ? "junction" : "dir");
+    const aliasRoot = path.join(aliasParent, "new-skills");
+    const actualRoot = path.join(actualParent, "new-skills");
+    process.env.PROVISION_SKILL_LINK_DIRS = `${aliasRoot},${actualRoot}`;
+    process.env.PROVISION_AUTOAPPLY = "auto";
+    initProvisioning();
+    const skill = serveSkill("/deduplicated-missing-roots.tgz", "deduplicated missing roots");
+    registerManifestUrl(serveManifest([{ type: "skill", name: "deduplicated", ...skill }]));
+
+    assert.equal(statusOf(await syncNow(), "deduplicated"), "installed");
+    assert.equal(statusOf(await syncNow(), "deduplicated"), "installed");
+    const state = JSON.parse(readFileSync(path.join(stateDir, "provision.lock.json"), "utf8"));
+    assert.equal(state.installed["skill/deduplicated"].skillLinks.length, 1);
+    assert.equal(
+      state.installed["skill/deduplicated"].skillLinks[0].path,
+      path.join(aliasRoot, "deduplicated"),
+    );
+    assert.equal(lstatSync(path.join(actualRoot, "deduplicated")).isSymbolicLink(), true);
+  });
+
+  test("handles missing discovery-root suffix case using actual filesystem identity", async () => {
+    const parent = path.join(stateDir, "case-folded-discovery-parent");
+    mkdirSync(parent);
+    const probe = path.join(parent, "Case-Probe");
+    mkdirSync(probe);
+    const caseInsensitive = existsSync(path.join(parent, "case-probe"));
+    rmSync(probe, { recursive: true });
+    const firstRoot = path.join(parent, "New-Skills");
+    const secondRoot = path.join(parent, "new-skills");
+    process.env.PROVISION_SKILL_LINK_DIRS = `${firstRoot},${secondRoot}`;
+    process.env.PROVISION_AUTOAPPLY = "auto";
+    initProvisioning();
+    const skill = serveSkill("/case-folded-missing-roots.tgz", "case-folded missing roots");
+    registerManifestUrl(serveManifest([{ type: "skill", name: "deduplicated", ...skill }]));
+
+    assert.equal(statusOf(await syncNow(), "deduplicated"), "installed");
+    assert.equal(statusOf(await syncNow(), "deduplicated"), "installed");
+    const state = JSON.parse(readFileSync(path.join(stateDir, "provision.lock.json"), "utf8"));
+    assert.deepEqual(
+      state.installed["skill/deduplicated"].skillLinks.map((link: { path: string }) => link.path),
+      (caseInsensitive ? [firstRoot] : [firstRoot, secondRoot])
+	.map((root) => path.join(root, "deduplicated")),
+    );
+  });
+
+  test("rejects discovery roots overlapping the canonical namespace before install", async () => {
+    const canonicalRoot = path.join(stateDir, "Overlap-Canonical");
+    process.env.PROVISION_SKILLS_DIR = canonicalRoot;
+    process.env.PROVISION_AUTOAPPLY = "auto";
+    const skill = serveSkill("/overlapping-discovery-root.tgz", "must not install");
+    const manifestUrl = serveManifest([{ type: "skill", name: "linked", ...skill }]);
+    const probe = path.join(stateDir, "Overlap-Case-Probe");
+    mkdirSync(probe);
+    const caseInsensitive = existsSync(path.join(stateDir, "overlap-case-probe"));
+    rmSync(probe, { recursive: true });
+    const linkRoots = [path.join(canonicalRoot, "shared"), path.dirname(canonicalRoot)];
+    if (caseInsensitive) {
+      linkRoots.push(path.join(stateDir, "overlap-canonical", "shared"));
+    }
+
+    for (const linkRoot of linkRoots) {
+      process.env.PROVISION_SKILL_LINK_DIRS = linkRoot;
+      initProvisioning();
+      registerManifestUrl(manifestUrl);
+      const refused = await syncNow();
+      assert.equal(statusOf(refused, "linked"), "failed");
+      assert.match(refused.data[0]!.error!, /overlaps canonical skills directory/);
+      assert.equal(existsSync(path.join(canonicalRoot, "linked")), false);
+      assert.equal(existsSync(path.join(linkRoot, "linked")), false);
+    }
+  });
+
+  test("uses filesystem Unicode normalization when checking discovery-root overlap", async () => {
+    const probe = path.join(stateDir, "Normalization-Café");
+    mkdirSync(probe);
+    const normalizationInsensitive = existsSync(probe.normalize("NFD"));
+    rmSync(probe, { recursive: true });
+    const canonicalRoot = path.join(stateDir, "Canonical-Café");
+    const linkRoot = path.join(path.join(stateDir, "Canonical-Café").normalize("NFD"), "shared");
+    process.env.PROVISION_SKILLS_DIR = canonicalRoot;
+    process.env.PROVISION_SKILL_LINK_DIRS = linkRoot;
+    process.env.PROVISION_AUTOAPPLY = "auto";
+    initProvisioning();
+    const skill = serveSkill("/normalized-overlap.tgz", "normalization-aware overlap");
+    registerManifestUrl(serveManifest([{ type: "skill", name: "normalized", ...skill }]));
+
+    const result = await syncNow();
+
+    assert.equal(statusOf(result, "normalized"), normalizationInsensitive ? "failed" : "installed");
+    if (normalizationInsensitive) {
+      assert.match(result.data[0]!.error!, /overlaps canonical skills directory/);
+      assert.equal(existsSync(path.join(canonicalRoot, "normalized")), false);
+      assert.equal(existsSync(path.join(linkRoot, "normalized")), false);
+    } else {
+      assert.equal(lstatSync(path.join(linkRoot, "normalized")).isSymbolicLink(), true);
+    }
+  });
+
+  test("uses filesystem full Unicode case folding for discovery-root overlap", async () => {
+    const probe = path.join(stateDir, "Fold-Straße");
+    mkdirSync(probe);
+    const fullCaseFolded = existsSync(path.join(stateDir, "FOLD-STRASSE"));
+    rmSync(probe, { recursive: true });
+    const canonicalRoot = path.join(stateDir, "Canonical-Straße");
+    const linkRoot = path.join(stateDir, "CANONICAL-STRASSE", "shared");
+    process.env.PROVISION_SKILLS_DIR = canonicalRoot;
+    process.env.PROVISION_SKILL_LINK_DIRS = linkRoot;
+    process.env.PROVISION_AUTOAPPLY = "auto";
+    initProvisioning();
+    const skill = serveSkill("/full-case-fold-overlap.tgz", "full case-fold overlap");
+    registerManifestUrl(serveManifest([{ type: "skill", name: "folded", ...skill }]));
+
+    const result = await syncNow();
+
+    assert.equal(statusOf(result, "folded"), fullCaseFolded ? "failed" : "installed");
+    if (fullCaseFolded) {
+      assert.match(result.data[0]!.error!, /overlaps canonical skills directory/);
+      assert.equal(existsSync(path.join(canonicalRoot, "folded")), false);
+      assert.equal(existsSync(path.join(linkRoot, "folded")), false);
+    } else {
+      assert.equal(lstatSync(path.join(linkRoot, "folded")).isSymbolicLink(), true);
+    }
+  });
+
+  test("revalidates discovery-root overlap after the publication hook", async () => {
+    const canonicalRoot = path.join(stateDir, "publication-race-canonical");
+    const discoveryParent = path.join(stateDir, "publication-race-parent");
+    const linkRoot = path.join(discoveryParent, "links");
+    mkdirSync(discoveryParent);
+    process.env.PROVISION_SKILLS_DIR = canonicalRoot;
+    process.env.PROVISION_SKILL_LINK_DIRS = linkRoot;
+    process.env.PROVISION_AUTOAPPLY = "auto";
+    let raced = false;
+    initProvisioning({
+      beforeSkillLinkPublication: () => {
+	if (raced) return;
+	raced = true;
+	rmSync(discoveryParent, { recursive: true });
+	symlinkSync(canonicalRoot, discoveryParent, process.platform === "win32" ? "junction" : "dir");
+	mkdirSync(path.join(canonicalRoot, "links"));
+      },
+    });
+    const skill = serveSkill("/overlap-publication-race.tgz", "must not publish through race");
+    registerManifestUrl(serveManifest([{ type: "skill", name: "raced", ...skill }]));
+
+    const refused = await syncNow();
+
+    assert.equal(statusOf(refused, "raced"), "failed");
+    assert.match(refused.data[0]!.error!, /Skill link parent changed during publication/);
+    assert.equal(existsSync(path.join(canonicalRoot, "links", "raced")), false);
+  });
+
+  test("preserves uppercase legacy skills when discovery roots overlap canonical", async () => {
+    const canonicalRoot = path.join(stateDir, "overlap-uppercase-canonical");
+    const legacyTarget = path.join(canonicalRoot, "Demo");
+    mkdirSync(legacyTarget, { recursive: true });
+    writeFileSync(path.join(legacyTarget, "SKILL.md"), "trusted legacy contents");
+    writeFileSync(path.join(stateDir, "provision.lock.json"), JSON.stringify({
+      version: 1,
+      approved: [],
+      revoked: [],
+      installed: {
+	"skill/Demo": {
+	  sha256: "a".repeat(64),
+	  files: ["SKILL.md"],
+	  directories: [],
+	  fileHashes: { "SKILL.md": sha(Buffer.from("trusted legacy contents")) },
+	  installedAt: new Date().toISOString(),
+	  installRoot: canonicalRoot,
+	},
+      },
+    }));
+    process.env.PROVISION_SKILLS_DIR = canonicalRoot;
+    process.env.PROVISION_SKILL_LINK_DIRS = path.join(canonicalRoot, "shared");
+    process.env.PROVISION_AUTOAPPLY = "auto";
+    const legacyIdentity = lstatSync(legacyTarget, { bigint: true }).ino;
+    initProvisioning();
+    const replacement = serveSkill("/overlap-uppercase-migration.tgz", "replacement contents");
+    registerManifestUrl(serveManifest([{ type: "skill", name: "demo", ...replacement }]));
+
+    const refused = await syncNow();
+
+    assert.equal(statusOf(refused, "demo"), "failed");
+    assert.match(refused.data[0]!.error!, /overlaps canonical skills directory/);
+    assert.equal(
+	readFileSync(path.join(legacyTarget, "SKILL.md"), "utf8"),
+	"trusted legacy contents",
+    );
+    assert.equal(lstatSync(legacyTarget, { bigint: true }).ino, legacyIdentity);
+    assert.equal(
+	readdirSync(canonicalRoot).some((entry) => entry.startsWith(".provision-removed-")),
+	false,
+    );
+    const state = JSON.parse(readFileSync(path.join(stateDir, "provision.lock.json"), "utf8"));
+    assert.equal(state.installed["skill/Demo"].installRoot, canonicalRoot);
+    assert.equal(state.installed["skill/demo"], undefined);
+    assert.deepEqual(state.removalRecoveries ?? [], []);
+  });
+
+  test("does not probe unrelated read-only roots during idempotent link sync", {
+    skip: process.platform === "win32",
+  }, async () => {
+    const canonicalRoot = path.join(stateDir, "read-only-canonical");
+    const linkRoot = path.join(stateDir, "read-only-discovery");
+    process.env.PROVISION_SKILLS_DIR = canonicalRoot;
+    process.env.PROVISION_SKILL_LINK_DIRS = linkRoot;
+    process.env.PROVISION_AUTOAPPLY = "auto";
+    initProvisioning();
+    const skill = serveSkill("/read-only-roots.tgz", "read-only roots");
+    const manifestUrl = serveManifest([{ type: "skill", name: "linked", ...skill }]);
+    registerManifestUrl(manifestUrl);
+    assert.equal(statusOf(await syncNow(), "linked"), "installed");
+
+    chmodSync(canonicalRoot, 0o555);
+    chmodSync(linkRoot, 0o555);
+    try {
+      initProvisioning();
+      registerManifestUrl(manifestUrl);
+      assert.equal(statusOf(await syncNow(), "linked"), "installed");
+    } finally {
+      chmodSync(canonicalRoot, 0o755);
+      chmodSync(linkRoot, 0o755);
+    }
+  });
+
+  test("does not probe collator-equivalent existing roots below a read-only parent", {
+    skip: process.platform === "win32",
+  }, async () => {
+    const commonParent = path.join(stateDir, "read-only-accent-parent");
+    const canonicalRoot = path.join(commonParent, "Café");
+    const linkRoot = path.join(commonParent, "Cafe");
+    mkdirSync(canonicalRoot, { recursive: true });
+    mkdirSync(linkRoot, { recursive: true });
+    const canonicalIdentity = lstatSync(canonicalRoot, { bigint: true });
+    const linkIdentity = lstatSync(linkRoot, { bigint: true });
+    if (canonicalIdentity.dev === linkIdentity.dev && canonicalIdentity.ino === linkIdentity.ino) return;
+    process.env.PROVISION_SKILLS_DIR = canonicalRoot;
+    process.env.PROVISION_SKILL_LINK_DIRS = linkRoot;
+    process.env.PROVISION_AUTOAPPLY = "auto";
+    initProvisioning();
+    const skill = serveSkill("/read-only-accent-roots.tgz", "accent-distinct roots");
+    const manifestUrl = serveManifest([{ type: "skill", name: "linked", ...skill }]);
+    registerManifestUrl(manifestUrl);
+    assert.equal(statusOf(await syncNow(), "linked"), "installed");
+
+    chmodSync(commonParent, 0o555);
+    try {
+      initProvisioning();
+      registerManifestUrl(manifestUrl);
+      assert.equal(statusOf(await syncNow(), "linked"), "installed");
+    } finally {
+      chmodSync(commonParent, 0o755);
+    }
+  });
+
+  test("does not probe a read-only common parent when existing case variants are distinct", {
+    skip: process.platform === "win32",
+  }, async () => {
+    const commonParent = path.join(stateDir, "read-only-case-parent");
+    const canonicalRoot = path.join(commonParent, "Foo");
+    const discoveryParent = path.join(commonParent, "foo");
+    const linkRoot = path.join(discoveryParent, "missing-links");
+    mkdirSync(canonicalRoot, { recursive: true });
+    if (existsSync(discoveryParent)) return;
+    mkdirSync(discoveryParent);
+    const canonicalIdentity = lstatSync(canonicalRoot, { bigint: true });
+    const discoveryIdentity = lstatSync(discoveryParent, { bigint: true });
+    if (canonicalIdentity.dev === discoveryIdentity.dev
+      && canonicalIdentity.ino === discoveryIdentity.ino) return;
+    process.env.PROVISION_SKILLS_DIR = canonicalRoot;
+    process.env.PROVISION_SKILL_LINK_DIRS = linkRoot;
+    process.env.PROVISION_AUTOAPPLY = "auto";
+    const skill = serveSkill("/read-only-case-parent.tgz", "case-distinct roots");
+    const manifestUrl = serveManifest([{ type: "skill", name: "linked", ...skill }]);
+
+    chmodSync(commonParent, 0o555);
+    try {
+      initProvisioning();
+      registerManifestUrl(manifestUrl);
+      assert.equal(statusOf(await syncNow(), "linked"), "installed");
+      assert.equal(lstatSync(path.join(linkRoot, "linked")).isSymbolicLink(), true);
+    } finally {
+      chmodSync(commonParent, 0o755);
+    }
+  });
+
+  test("keeps a durable created link when a later root races onto canonical", async () => {
+    const canonicalRoot = path.join(stateDir, "partial-link-canonical");
+    const firstRoot = path.join(stateDir, "partial-link-first");
+    const displacedFirstRoot = path.join(stateDir, "partial-link-first-displaced");
+    const secondRoot = path.join(stateDir, "partial-link-second");
+    const firstLink = path.join(firstRoot, "linked");
+    const secondLink = path.join(secondRoot, "linked");
+    process.env.PROVISION_SKILLS_DIR = canonicalRoot;
+    process.env.PROVISION_SKILL_LINK_DIRS = `${firstRoot},${secondRoot}`;
+    process.env.PROVISION_AUTOAPPLY = "auto";
+    let raced = false;
+    initProvisioning({
+      beforeSkillLinkPublication: (linkPath) => {
+	if (raced || linkPath !== secondLink) return;
+	raced = true;
+	renameSync(firstRoot, displacedFirstRoot);
+	symlinkSync(canonicalRoot, firstRoot, process.platform === "win32" ? "junction" : "dir");
+	mkdirSync(secondLink, { recursive: true });
+      },
+    });
+    const skill = serveSkill("/partial-link-race.tgz", "canonical survives link rollback race");
+    registerManifestUrl(serveManifest([{ type: "skill", name: "linked", ...skill }]));
+
+    const failed = await syncNow();
+
+    assert.equal(statusOf(failed, "linked"), "failed");
+    assert.match(failed.data[0]!.error!, /discovery-link rollback could not complete/);
+    assert.equal(
+	readFileSync(path.join(canonicalRoot, "linked", "SKILL.md"), "utf8"),
+	"canonical survives link rollback race",
+    );
+    assert.equal(lstatSync(path.join(displacedFirstRoot, "linked")).isSymbolicLink(), true);
+    assert.equal(lstatSync(path.join(firstRoot, "linked")).isDirectory(), true);
+    assert.equal(lstatSync(secondLink).isDirectory(), true);
+  });
+
+  test("keeps old discovery links when a newly configured root collides", async () => {
+    const oldRoot = path.join(stateDir, "old-discovery-root");
+    const newRoot = path.join(stateDir, "new-discovery-root");
+    process.env.PROVISION_SKILL_LINK_DIRS = oldRoot;
+    process.env.PROVISION_AUTOAPPLY = "auto";
+    initProvisioning();
+    const skill = serveSkill("/changed-link-roots.tgz", "changed link roots");
+    const manifestUrl = serveManifest([{ type: "skill", name: "linked", ...skill }]);
+    registerManifestUrl(manifestUrl);
+    assert.equal(statusOf(await syncNow(), "linked"), "installed");
+    const oldLink = path.join(oldRoot, "linked");
+    const oldIdentity = lstatSync(oldLink, { bigint: true }).ino;
+
+    const collision = path.join(newRoot, "linked");
+    mkdirSync(collision, { recursive: true });
+    writeFileSync(path.join(collision, "USER.md"), "untracked collision");
+    process.env.PROVISION_SKILL_LINK_DIRS = newRoot;
+    initProvisioning();
+    registerManifestUrl(manifestUrl);
+
+    const refused = await syncNow();
+    assert.equal(statusOf(refused, "linked"), "failed");
+    assert.match(refused.data[0]!.error!, /untracked content at skill link/);
+    assert.equal(lstatSync(oldLink, { bigint: true }).ino, oldIdentity);
+    assert.equal(readFileSync(path.join(collision, "USER.md"), "utf8"), "untracked collision");
+    const state = JSON.parse(readFileSync(path.join(stateDir, "provision.lock.json"), "utf8"));
+    assert.equal(state.installed["skill/linked"].skillLinks[0].path, oldLink);
+  });
+
+  test("keeps every old discovery link when one obsolete link changed", async () => {
+    const firstRoot = path.join(stateDir, "first-old-discovery-root");
+    const secondRoot = path.join(stateDir, "second-old-discovery-root");
+    process.env.PROVISION_SKILL_LINK_DIRS = `${firstRoot},${secondRoot}`;
+    process.env.PROVISION_AUTOAPPLY = "auto";
+    initProvisioning();
+    const skill = serveSkill("/obsolete-link-roots.tgz", "obsolete link roots");
+    const manifestUrl = serveManifest([{ type: "skill", name: "linked", ...skill }]);
+    registerManifestUrl(manifestUrl);
+    assert.equal(statusOf(await syncNow(), "linked"), "installed");
+    const firstLink = path.join(firstRoot, "linked");
+    const secondLink = path.join(secondRoot, "linked");
+    const firstIdentity = lstatSync(firstLink, { bigint: true }).ino;
+    unlinkSync(secondLink);
+    mkdirSync(secondLink);
+    writeFileSync(path.join(secondLink, "USER.md"), "changed link content");
+
+    process.env.PROVISION_SKILL_LINK_DIRS = "";
+    initProvisioning();
+    registerManifestUrl(manifestUrl);
+    const refused = await syncNow();
+
+    assert.equal(statusOf(refused, "linked"), "failed");
+    assert.match(refused.data[0]!.error!, /remove changed skill link/);
+    assert.equal(lstatSync(firstLink, { bigint: true }).ino, firstIdentity);
+    assert.equal(readFileSync(path.join(secondLink, "USER.md"), "utf8"), "changed link content");
+    const state = JSON.parse(readFileSync(path.join(stateDir, "provision.lock.json"), "utf8"));
+    assert.deepEqual(
+      state.installed["skill/linked"].skillLinks.map((link: { path: string }) => link.path),
+      [firstLink, secondLink],
+    );
+  });
+
+  test("recovers a discovery link published after its ownership intent was saved", async () => {
+    const linkDir = path.join(stateDir, "claude-skills");
+    process.env.PROVISION_SKILL_LINK_DIRS = linkDir;
+    process.env.PROVISION_AUTOAPPLY = "auto";
+    initProvisioning();
+    const skill = serveSkill("/interrupted-link.tgz", "managed");
+    registerManifestUrl(serveManifest([{ type: "skill", name: "linked", ...skill }]));
+    await syncNow();
+
+    const statePath = path.join(stateDir, "provision.lock.json");
+    const state = JSON.parse(readFileSync(statePath, "utf8"));
+    const link = path.join(linkDir, "linked");
+    const target = path.join(skillsDir, "linked");
+    delete state.installed["skill/linked"].skillLinks;
+    state.installed["skill/linked"].skillLinkPublication = { path: link, target };
+    writeFileSync(statePath, `${JSON.stringify(state, null, 2)}\n`);
+
+    const recovered = await syncNow();
+    assert.equal(statusOf(recovered, "linked"), "installed");
+    const recoveredState = JSON.parse(readFileSync(statePath, "utf8"));
+    assert.equal(recoveredState.installed["skill/linked"].skillLinkPublication, undefined);
+    assert.equal(recoveredState.installed["skill/linked"].skillLinks[0].path, link);
+    assert.equal(
+      recoveredState.installed["skill/linked"].skillLinks[0].ino,
+      lstatSync(link, { bigint: true }).ino.toString(),
+    );
+  });
+
+  test("removes a discovery link left at the ownership-publication crash point", async () => {
+    const linkDir = path.join(stateDir, "claude-skills");
+    process.env.PROVISION_SKILL_LINK_DIRS = linkDir;
+    process.env.PROVISION_AUTOAPPLY = "auto";
+    initProvisioning();
+    const skill = serveSkill("/interrupted-link-removal.tgz", "managed");
+    registerManifestUrl(serveManifest([{ type: "skill", name: "linked", ...skill }]));
+    await syncNow();
+
+    const statePath = path.join(stateDir, "provision.lock.json");
+    const state = JSON.parse(readFileSync(statePath, "utf8"));
+    const link = path.join(linkDir, "linked");
+    const target = path.join(skillsDir, "linked");
+    delete state.installed["skill/linked"].skillLinks;
+    state.installed["skill/linked"].skillLinkPublication = { path: link, target };
+    writeFileSync(statePath, `${JSON.stringify(state, null, 2)}\n`);
+    responses.set("/provision.json", { schema: "agent-provisioning/v1", items: [] });
+
+    const removed = await syncNow();
+    assert.equal(statusOf(removed, "linked"), "removed");
+    assert.equal(existsSync(link), false);
+    assert.equal(existsSync(target), false);
+  });
+
+  test("migrates the previous Claude default into the shared Codex source", async () => {
+    const testHome = path.join(stateDir, "home");
+    const legacySkillsDir = path.join(testHome, ".claude", "skills");
+    process.env.HOME = testHome;
+    process.env.PROVISION_SKILLS_DIR = legacySkillsDir;
+    process.env.PROVISION_SKILL_LINK_DIRS = "";
+    process.env.PROVISION_AUTOAPPLY = "auto";
+    initProvisioning();
+    const skill = serveSkill("/legacy-default.tgz", "legacy managed skill");
+    registerManifestUrl(serveManifest([{ type: "skill", name: "legacy", ...skill }]));
+    await syncNow();
+    assert.equal(existsSync(path.join(legacySkillsDir, "legacy", "SKILL.md")), true);
+    const statePath = path.join(stateDir, "provision.lock.json");
+    const legacyState = JSON.parse(readFileSync(statePath, "utf8"));
+    delete legacyState.installed["skill/legacy"].installRoot;
+    writeFileSync(statePath, `${JSON.stringify(legacyState, null, 2)}\n`);
+
+    process.env.PROVISION_SKILLS_DIR = path.join(testHome, ".agents", "skills");
+    delete process.env.PROVISION_SKILL_LINK_DIRS;
+    initProvisioning();
+    registerManifestUrl(`${baseUrl}/provision.json`);
+    const migrated = await syncNow();
+    const canonical = path.join(testHome, ".agents", "skills", "legacy");
+    const link = path.join(legacySkillsDir, "legacy");
+    assert.equal(statusOf(migrated, "legacy"), "installed");
+    assert.equal(readFileSync(path.join(canonical, "SKILL.md"), "utf8"), "legacy managed skill");
+    assert.equal(lstatSync(link).isSymbolicLink(), true);
+    assert.equal(path.resolve(path.dirname(link), readlinkSync(link)), canonical);
+    assert.equal(
+      readdirSync(legacySkillsDir).some((entry) => entry.startsWith(".provision-removed-")),
+      true,
+    );
+  });
+
+  test("does not migrate an install root reached through a canonical alias", async () => {
+    const actualRoot = path.join(stateDir, "actual-canonical-root");
+    const aliasRoot = path.join(stateDir, "aliased-canonical-root");
+    process.env.PROVISION_SKILLS_DIR = actualRoot;
+    process.env.PROVISION_SKILL_LINK_DIRS = "";
+    process.env.PROVISION_AUTOAPPLY = "auto";
+    initProvisioning();
+    const skill = serveSkill("/aliased-canonical-install.tgz", "aliased canonical install");
+    const manifestUrl = serveManifest([{ type: "skill", name: "aliased", ...skill }]);
+    registerManifestUrl(manifestUrl);
+    assert.equal(statusOf(await syncNow(), "aliased"), "installed");
+    symlinkSync(actualRoot, aliasRoot, process.platform === "win32" ? "junction" : "dir");
+
+    process.env.PROVISION_SKILLS_DIR = aliasRoot;
+    initProvisioning();
+    registerManifestUrl(manifestUrl);
+    assert.equal(statusOf(await syncNow(), "aliased"), "installed");
+
+    const actualTarget = path.join(actualRoot, "aliased");
+    const aliasTarget = path.join(aliasRoot, "aliased");
+    assert.equal(lstatSync(actualTarget, { bigint: true }).ino, lstatSync(aliasTarget, { bigint: true }).ino);
+    assert.equal(
+      readdirSync(actualRoot).some((entry) => entry.startsWith(".provision-removed-")),
+      false,
+    );
+    const state = JSON.parse(readFileSync(path.join(stateDir, "provision.lock.json"), "utf8"));
+    assert.equal(state.installed["skill/aliased"].installRoot, actualRoot);
+  });
+
+  test("keeps a discovery link when its canonical target changes to an alias", async () => {
+    const actualRoot = path.join(stateDir, "linked-canonical-root");
+    const aliasRoot = path.join(stateDir, "linked-canonical-alias");
+    const linkRoot = path.join(stateDir, "linked-canonical-discovery");
+    process.env.PROVISION_SKILLS_DIR = actualRoot;
+    process.env.PROVISION_SKILL_LINK_DIRS = linkRoot;
+    process.env.PROVISION_AUTOAPPLY = "auto";
+    initProvisioning();
+    const skill = serveSkill("/linked-canonical-alias.tgz", "linked canonical alias");
+    const manifestUrl = serveManifest([{ type: "skill", name: "aliased", ...skill }]);
+    registerManifestUrl(manifestUrl);
+    assert.equal(statusOf(await syncNow(), "aliased"), "installed");
+    const link = path.join(linkRoot, "aliased");
+    const actualTarget = path.join(actualRoot, "aliased");
+    const linkIdentity = lstatSync(link, { bigint: true }).ino;
+    symlinkSync(actualRoot, aliasRoot, process.platform === "win32" ? "junction" : "dir");
+
+    process.env.PROVISION_SKILLS_DIR = aliasRoot;
+    initProvisioning();
+    registerManifestUrl(manifestUrl);
+    assert.equal(statusOf(await syncNow(), "aliased"), "installed");
+    assert.equal(lstatSync(link, { bigint: true }).ino, linkIdentity);
+    assert.equal(path.resolve(path.dirname(link), readlinkSync(link)), actualTarget);
+    assert.equal(statusOf(await syncNow(), "aliased"), "installed");
+    const state = JSON.parse(readFileSync(path.join(stateDir, "provision.lock.json"), "utf8"));
+    assert.equal(state.installed["skill/aliased"].skillLinks[0].target, actualTarget);
+  });
+
+  test("migrates an install root while retaining recorded discovery-link ownership", async () => {
+    const oldRoot = path.join(stateDir, "linked-migration-old");
+    const newRoot = path.join(stateDir, "linked-migration-new");
+    const linkRoot = path.join(stateDir, "linked-migration-discovery");
+    process.env.PROVISION_SKILLS_DIR = oldRoot;
+    process.env.PROVISION_SKILL_LINK_DIRS = linkRoot;
+    process.env.PROVISION_AUTOAPPLY = "auto";
+    initProvisioning();
+    const skill = serveSkill("/linked-root-migration.tgz", "linked root migration");
+    const manifestUrl = serveManifest([{ type: "skill", name: "migrated", ...skill }]);
+    registerManifestUrl(manifestUrl);
+    assert.equal(statusOf(await syncNow(), "migrated"), "installed");
+    const link = path.join(linkRoot, "migrated");
+    const oldTarget = path.join(oldRoot, "migrated");
+    assert.equal(path.resolve(path.dirname(link), readlinkSync(link)), oldTarget);
+    const before = JSON.parse(readFileSync(path.join(stateDir, "provision.lock.json"), "utf8"));
+    const beforeLink = before.installed["skill/migrated"].skillLinks[0];
+    const beforeStat = lstatSync(link, { bigint: true });
+    assert.equal(beforeLink.path, link);
+    assert.equal(beforeLink.target, oldTarget);
+    assert.equal(beforeLink.dev, beforeStat.dev.toString());
+    assert.equal(beforeLink.ino, beforeStat.ino.toString());
+
+    process.env.PROVISION_SKILLS_DIR = newRoot;
+    initProvisioning();
+    registerManifestUrl(manifestUrl);
+    const migrated = await syncNow();
+    assert.equal(statusOf(migrated, "migrated"), "installed", migrated.data[0]?.error);
+    const newTarget = path.join(newRoot, "migrated");
+    assert.equal(readFileSync(path.join(newTarget, "SKILL.md"), "utf8"), "linked root migration");
+    assert.equal(path.resolve(path.dirname(link), readlinkSync(link)), newTarget);
+    assert.equal(existsSync(oldTarget), false);
+    assert.equal(statusOf(await syncNow(), "migrated"), "installed");
+    const state = JSON.parse(readFileSync(path.join(stateDir, "provision.lock.json"), "utf8"));
+    assert.equal(state.installed["skill/migrated"].installRoot, newRoot);
+    assert.equal(state.installed["skill/migrated"].skillLinks[0].path, link);
+    assert.equal(state.installed["skill/migrated"].skillLinks[0].target, newTarget);
+  });
+
+  test("retains a root-migration journal when a link race blocks rollback", async () => {
+    const oldRoot = path.join(stateDir, "failed-linked-migration-old");
+    const newRoot = path.join(stateDir, "failed-linked-migration-new");
+    const linkRoot = path.join(stateDir, "failed-linked-migration-discovery");
+    process.env.PROVISION_SKILLS_DIR = oldRoot;
+    process.env.PROVISION_SKILL_LINK_DIRS = linkRoot;
+    process.env.PROVISION_AUTOAPPLY = "auto";
+    initProvisioning();
+    const skill = serveSkill("/failed-linked-root-migration.tgz", "live before link race");
+    const manifestUrl = serveManifest([{ type: "skill", name: "migrated", ...skill }]);
+    registerManifestUrl(manifestUrl);
+    assert.equal(statusOf(await syncNow(), "migrated"), "installed");
+
+    const link = path.join(linkRoot, "migrated");
+    const oldTarget = path.join(oldRoot, "migrated");
+    const newTarget = path.join(newRoot, "migrated");
+    process.env.PROVISION_SKILLS_DIR = newRoot;
+    let raced = false;
+    initProvisioning({
+      beforeSkillLinkPublication: (linkPath) => {
+	if (raced || linkPath !== link) return;
+	raced = true;
+	mkdirSync(linkPath);
+	writeFileSync(path.join(linkPath, "USER.md"), "link race winner");
+      },
+    });
+    registerManifestUrl(manifestUrl);
+
+    const failed = await syncNow();
+    assert.equal(statusOf(failed, "migrated"), "failed");
+    assert.match(failed.data[0]!.error!, /discovery-link rollback could not complete/);
+    assert.equal(existsSync(oldTarget), false);
+    assert.equal(readFileSync(path.join(link, "USER.md"), "utf8"), "link race winner");
+    assert.equal(readFileSync(path.join(newTarget, "SKILL.md"), "utf8"), "live before link race");
+    const state = JSON.parse(readFileSync(path.join(stateDir, "provision.lock.json"), "utf8"));
+    assert.equal(state.installed["skill/migrated"].installRoot, newRoot);
+    assert.notEqual(state.installed["skill/migrated"].legacySkillMigration, undefined);
+    assert.equal(state.installed["skill/migrated"].skillLinkPublication, undefined);
+    assert.equal(state.removalRecoveries.length, 1);
+    assert.equal(state.upgradeRecoveries.length, 1);
+
+    rmSync(link, { recursive: true });
+    initProvisioning();
+    registerManifestUrl(manifestUrl);
+    assert.equal(statusOf(await syncNow(), "migrated"), "installed");
+    assert.equal(path.resolve(path.dirname(link), readlinkSync(link)), newTarget);
+    const recovered = JSON.parse(readFileSync(path.join(stateDir, "provision.lock.json"), "utf8"));
+    assert.equal(recovered.installed["skill/migrated"].legacySkillMigration, undefined);
+  });
+
+  test("restores the old discovery link when migration publication fails", async () => {
+    const oldRoot = path.join(stateDir, "publication-failure-migration-old");
+    const newRoot = path.join(stateDir, "publication-failure-migration-new");
+    const linkRoot = path.join(stateDir, "publication-failure-migration-discovery");
+    process.env.PROVISION_SKILLS_DIR = oldRoot;
+    process.env.PROVISION_SKILL_LINK_DIRS = linkRoot;
+    process.env.PROVISION_AUTOAPPLY = "auto";
+    initProvisioning();
+    const skill = serveSkill("/publication-failure-migration.tgz", "live before publication failure");
+    const manifestUrl = serveManifest([{ type: "skill", name: "migrated", ...skill }]);
+    registerManifestUrl(manifestUrl);
+    assert.equal(statusOf(await syncNow(), "migrated"), "installed");
+
+    const link = path.join(linkRoot, "migrated");
+    const oldTarget = path.join(oldRoot, "migrated");
+    const oldLinkIdentity = lstatSync(link, { bigint: true }).ino;
+    process.env.PROVISION_SKILLS_DIR = newRoot;
+    initProvisioning({
+      afterSkillLinkPublication: (linkPath) => {
+	if (linkPath === link) throw Object.assign(new Error("simulated ENOSPC"), { code: "ENOSPC" });
+      },
+    });
+    registerManifestUrl(manifestUrl);
+
+    const failed = await syncNow();
+    assert.equal(statusOf(failed, "migrated"), "failed");
+    assert.match(failed.data[0]!.error!, /simulated ENOSPC/);
+    assert.equal(lstatSync(link, { bigint: true }).ino, oldLinkIdentity);
+    assert.equal(path.resolve(path.dirname(link), readlinkSync(link)), oldTarget);
+    assert.equal(
+      readFileSync(path.join(oldTarget, "SKILL.md"), "utf8"),
+      "live before publication failure",
+    );
+    const state = JSON.parse(readFileSync(path.join(stateDir, "provision.lock.json"), "utf8"));
+    assert.equal(state.installed["skill/migrated"].installRoot, oldRoot);
+    assert.equal(state.installed["skill/migrated"].legacySkillMigration, undefined);
+    assert.equal(state.installed["skill/migrated"].skillLinks[0].ino, oldLinkIdentity.toString());
+  });
+
+  test("retains the migration journal when discovery-link rollback cannot complete", {
+    skip: process.platform === "win32",
+  }, async () => {
+    const oldRoot = path.join(stateDir, "rollback-failure-migration-old");
+    const newRoot = path.join(stateDir, "rollback-failure-migration-new");
+    const linkRoot = path.join(stateDir, "rollback-failure-migration-discovery");
+    process.env.PROVISION_SKILLS_DIR = oldRoot;
+    process.env.PROVISION_SKILL_LINK_DIRS = linkRoot;
+    process.env.PROVISION_AUTOAPPLY = "auto";
+    initProvisioning();
+    const skill = serveSkill("/rollback-failure-migration.tgz", "migration journal retained");
+    const manifestUrl = serveManifest([{ type: "skill", name: "migrated", ...skill }]);
+    registerManifestUrl(manifestUrl);
+    assert.equal(statusOf(await syncNow(), "migrated"), "installed");
+
+    const link = path.join(linkRoot, "migrated");
+    const newTarget = path.join(newRoot, "migrated");
+    process.env.PROVISION_SKILLS_DIR = newRoot;
+    initProvisioning({
+      afterSkillLinkPublication: (linkPath) => {
+	if (linkPath !== link) return;
+	chmodSync(linkRoot, 0o500);
+	throw new Error("simulated post-publication failure");
+      },
+    });
+    registerManifestUrl(manifestUrl);
+
+    try {
+      const failed = await syncNow();
+      assert.equal(statusOf(failed, "migrated"), "failed");
+      assert.match(failed.data[0]!.error!, /discovery-link rollback could not complete/);
+      assert.equal(path.resolve(path.dirname(link), readlinkSync(link)), newTarget);
+      assert.equal(readFileSync(path.join(newTarget, "SKILL.md"), "utf8"), "migration journal retained");
+      const retained = JSON.parse(readFileSync(path.join(stateDir, "provision.lock.json"), "utf8"));
+      assert.notEqual(retained.installed["skill/migrated"].legacySkillMigration, undefined);
+      assert.equal(retained.removalRecoveries.length, 1);
+    } finally {
+      chmodSync(linkRoot, 0o700);
+    }
+
+    initProvisioning();
+    registerManifestUrl(manifestUrl);
+    assert.equal(statusOf(await syncNow(), "migrated"), "installed");
+    const recovered = JSON.parse(readFileSync(path.join(stateDir, "provision.lock.json"), "utf8"));
+    assert.equal(recovered.installed["skill/migrated"].legacySkillMigration, undefined);
+    assert.equal(path.resolve(path.dirname(link), readlinkSync(link)), newTarget);
+  });
+
+  test("repairs a missing legacy skill while migrating to the shared Codex source", async () => {
+    const testHome = path.join(stateDir, "missing-legacy-home");
+    const legacySkillsDir = path.join(testHome, ".claude", "skills");
+    process.env.HOME = testHome;
+    process.env.PROVISION_SKILLS_DIR = legacySkillsDir;
+    process.env.PROVISION_SKILL_LINK_DIRS = "";
+    process.env.PROVISION_AUTOAPPLY = "auto";
+    initProvisioning();
+    const skill = serveSkill("/missing-legacy-default.tgz", "repaired legacy skill");
+    const manifestUrl = serveManifest([{ type: "skill", name: "legacy", ...skill }]);
+    registerManifestUrl(manifestUrl);
+    await syncNow();
+
+    const statePath = path.join(stateDir, "provision.lock.json");
+    const legacyState = JSON.parse(readFileSync(statePath, "utf8"));
+    delete legacyState.installed["skill/legacy"].installRoot;
+    writeFileSync(statePath, `${JSON.stringify(legacyState, null, 2)}\n`);
+    rmSync(path.join(legacySkillsDir, "legacy"), { recursive: true });
+
+    delete process.env.PROVISION_SKILLS_DIR;
+    delete process.env.PROVISION_SKILL_LINK_DIRS;
+    initProvisioning();
+    registerManifestUrl(manifestUrl);
+
+    const repaired = await syncNow();
+    const canonical = path.join(testHome, ".agents", "skills", "legacy");
+    const link = path.join(legacySkillsDir, "legacy");
+    assert.equal(statusOf(repaired, "legacy"), "installed");
+    assert.equal(readFileSync(path.join(canonical, "SKILL.md"), "utf8"), "repaired legacy skill");
+    assert.equal(lstatSync(link).isSymbolicLink(), true);
+    assert.equal(path.resolve(path.dirname(link), readlinkSync(link)), canonical);
+    assert.equal(
+      readdirSync(legacySkillsDir).some((entry) => entry.startsWith(".provision-removed-")),
+      false,
+    );
+  });
+
+  test("keeps the legacy skill live when its migration artifact fails", async () => {
+    const testHome = path.join(stateDir, "failed-migration-home");
+    const legacySkillsDir = path.join(testHome, ".claude", "skills");
+    process.env.HOME = testHome;
+    process.env.PROVISION_SKILLS_DIR = legacySkillsDir;
+    process.env.PROVISION_SKILL_LINK_DIRS = "";
+    process.env.PROVISION_AUTOAPPLY = "auto";
+    initProvisioning();
+    const skill = serveSkill("/legacy-before-failed-migration.tgz", "live legacy skill");
+    registerManifestUrl(serveManifest([{ type: "skill", name: "legacy", ...skill }]));
+    await syncNow();
+
+    const statePath = path.join(stateDir, "provision.lock.json");
+    const legacyState = JSON.parse(readFileSync(statePath, "utf8"));
+    delete legacyState.installed["skill/legacy"].installRoot;
+    writeFileSync(statePath, `${JSON.stringify(legacyState, null, 2)}\n`);
+
+    delete process.env.PROVISION_SKILLS_DIR;
+    delete process.env.PROVISION_SKILL_LINK_DIRS;
+    initProvisioning();
+    registerManifestUrl(serveManifest([{
+      type: "skill",
+      name: "legacy",
+      url: `${baseUrl}/missing-migration-artifact.tgz`,
+      sha256: "a".repeat(64),
+    }]));
+
+    const failed = await syncNow();
+    const legacyTarget = path.join(legacySkillsDir, "legacy");
+    assert.equal(statusOf(failed, "legacy"), "failed");
+    assert.match(failed.data[0]!.error!, /Download failed: HTTP 404/);
+    assert.equal(readFileSync(path.join(legacyTarget, "SKILL.md"), "utf8"), "live legacy skill");
+    assert.equal(lstatSync(legacyTarget).isSymbolicLink(), false);
+    assert.equal(existsSync(path.join(testHome, ".agents", "skills", "legacy")), false);
+    assert.equal(
+      readdirSync(legacySkillsDir).some((entry) => entry.startsWith(".provision-removed-")),
+      false,
+    );
+    const state = JSON.parse(readFileSync(statePath, "utf8"));
+    assert.equal(state.installed["skill/legacy"].installRoot, legacySkillsDir);
+    assert.equal(state.installed["skill/legacy"].removalRecoveryId, undefined);
+  });
+
+  test("keeps the legacy skill live when its discovery root is not writable", {
+    skip: process.platform === "win32",
+  }, async () => {
+    const testHome = path.join(stateDir, "unwritable-link-migration-home");
+    const legacySkillsDir = path.join(testHome, ".claude", "skills");
+    process.env.HOME = testHome;
+    process.env.PROVISION_SKILLS_DIR = legacySkillsDir;
+    process.env.PROVISION_SKILL_LINK_DIRS = "";
+    process.env.PROVISION_AUTOAPPLY = "auto";
+    initProvisioning();
+    const skill = serveSkill("/legacy-before-link-permission.tgz", "live legacy skill");
+    const manifestUrl = serveManifest([{ type: "skill", name: "legacy", ...skill }]);
+    registerManifestUrl(manifestUrl);
+    await syncNow();
+
+    const statePath = path.join(stateDir, "provision.lock.json");
+    const legacyState = JSON.parse(readFileSync(statePath, "utf8"));
+    delete legacyState.installed["skill/legacy"].installRoot;
+    writeFileSync(statePath, `${JSON.stringify(legacyState, null, 2)}\n`);
+    chmodSync(legacySkillsDir, 0o500);
+    try {
+      delete process.env.PROVISION_SKILLS_DIR;
+      delete process.env.PROVISION_SKILL_LINK_DIRS;
+      initProvisioning();
+      registerManifestUrl(manifestUrl);
+
+      const refused = await syncNow();
+      const legacyTarget = path.join(legacySkillsDir, "legacy");
+      assert.equal(statusOf(refused, "legacy"), "failed");
+      assert.match(refused.data[0]!.error!, /EACCES|permission denied/i);
+      assert.equal(readFileSync(path.join(legacyTarget, "SKILL.md"), "utf8"), "live legacy skill");
+      assert.equal(lstatSync(legacyTarget).isSymbolicLink(), false);
+      assert.equal(existsSync(path.join(testHome, ".agents", "skills", "legacy")), false);
+      assert.equal(
+	readdirSync(legacySkillsDir).some((entry) => entry.startsWith(".provision-removed-")),
+	false,
+      );
+    } finally {
+      chmodSync(legacySkillsDir, 0o700);
+    }
+  });
+
+  test("keeps the legacy skill live when another discovery root has a collision", async () => {
+    const testHome = path.join(stateDir, "migration-link-collision-home");
+    const legacySkillsDir = path.join(testHome, ".claude", "skills");
+    process.env.HOME = testHome;
+    process.env.PROVISION_SKILLS_DIR = legacySkillsDir;
+    process.env.PROVISION_SKILL_LINK_DIRS = "";
+    process.env.PROVISION_AUTOAPPLY = "auto";
+    initProvisioning();
+    const skill = serveSkill("/legacy-before-link-collision.tgz", "live legacy skill");
+    const manifestUrl = serveManifest([{ type: "skill", name: "legacy", ...skill }]);
+    registerManifestUrl(manifestUrl);
+    await syncNow();
+
+    const statePath = path.join(stateDir, "provision.lock.json");
+    const legacyState = JSON.parse(readFileSync(statePath, "utf8"));
+    delete legacyState.installed["skill/legacy"].installRoot;
+    writeFileSync(statePath, `${JSON.stringify(legacyState, null, 2)}\n`);
+    const otherLinkRoot = path.join(testHome, "other-skills");
+    const collision = path.join(otherLinkRoot, "legacy");
+    mkdirSync(collision, { recursive: true });
+    writeFileSync(path.join(collision, "USER.md"), "untracked collision");
+
+    delete process.env.PROVISION_SKILLS_DIR;
+    process.env.PROVISION_SKILL_LINK_DIRS = `${legacySkillsDir},${otherLinkRoot}`;
+    initProvisioning();
+    registerManifestUrl(manifestUrl);
+
+    const refused = await syncNow();
+    const legacyTarget = path.join(legacySkillsDir, "legacy");
+    assert.equal(statusOf(refused, "legacy"), "failed");
+    assert.match(refused.data[0]!.error!, /untracked content at skill link/);
+    assert.equal(readFileSync(path.join(legacyTarget, "SKILL.md"), "utf8"), "live legacy skill");
+    assert.equal(lstatSync(legacyTarget).isSymbolicLink(), false);
+    assert.equal(readFileSync(path.join(collision, "USER.md"), "utf8"), "untracked collision");
+    assert.equal(existsSync(path.join(testHome, ".agents", "skills", "legacy")), false);
+    assert.equal(
+      readdirSync(legacySkillsDir).some((entry) => entry.startsWith(".provision-removed-")),
+      false,
+    );
+    const state = JSON.parse(readFileSync(statePath, "utf8"));
+    assert.equal(state.installed["skill/legacy"].installRoot, legacySkillsDir);
+  });
+
+  test("restores the legacy skill when canonical publication loses a race", async () => {
+    const testHome = path.join(stateDir, "migration-race-home");
+    const legacySkillsDir = path.join(testHome, ".claude", "skills");
+    process.env.HOME = testHome;
+    process.env.PROVISION_SKILLS_DIR = legacySkillsDir;
+    process.env.PROVISION_SKILL_LINK_DIRS = "";
+    process.env.PROVISION_AUTOAPPLY = "auto";
+    initProvisioning();
+    const original = serveSkill("/legacy-before-race.tgz", "live legacy skill");
+    registerManifestUrl(serveManifest([{ type: "skill", name: "legacy", ...original }]));
+    await syncNow();
+
+    const statePath = path.join(stateDir, "provision.lock.json");
+    const legacyState = JSON.parse(readFileSync(statePath, "utf8"));
+    delete legacyState.installed["skill/legacy"].installRoot;
+    writeFileSync(statePath, `${JSON.stringify(legacyState, null, 2)}\n`);
+
+    delete process.env.PROVISION_SKILLS_DIR;
+    delete process.env.PROVISION_SKILL_LINK_DIRS;
+    const canonical = path.join(testHome, ".agents", "skills", "legacy");
+    initProvisioning({
+      beforeSkillCandidateMove: (target) => {
+	assert.equal(target, canonical);
+	mkdirSync(target);
+	writeFileSync(path.join(target, "USER.md"), "race winner");
+      },
+    });
+    const replacement = serveSkill("/legacy-race-replacement.tgz", "replacement");
+    registerManifestUrl(serveManifest([{ type: "skill", name: "legacy", ...replacement }]));
+
+    const failed = await syncNow();
+    const legacyTarget = path.join(legacySkillsDir, "legacy");
+    assert.equal(statusOf(failed, "legacy"), "failed");
+    assert.match(failed.data[0]!.error!, /target appeared during installation/);
+    assert.equal(readFileSync(path.join(legacyTarget, "SKILL.md"), "utf8"), "live legacy skill");
+    assert.equal(lstatSync(legacyTarget).isSymbolicLink(), false);
+    assert.equal(readFileSync(path.join(canonical, "USER.md"), "utf8"), "race winner");
+    assert.equal(
+      readdirSync(legacySkillsDir).some((entry) => entry.startsWith(".provision-removed-")),
+      false,
+    );
+    const state = JSON.parse(readFileSync(statePath, "utf8"));
+    assert.equal(state.installed["skill/legacy"].installRoot, legacySkillsDir);
+    assert.equal(state.installed["skill/legacy"].legacySkillMigration, undefined);
+    assert.equal(state.installed["skill/legacy"].removalRecoveryId, undefined);
+  });
+
+  test("restores legacy ownership after a crash before canonical publication", async () => {
+    const testHome = path.join(stateDir, "migration-crash-home");
+    const legacySkillsDir = path.join(testHome, ".claude", "skills");
+    const linkRoot = path.join(testHome, "discovery-skills");
+    process.env.HOME = testHome;
+    process.env.PROVISION_SKILLS_DIR = legacySkillsDir;
+    process.env.PROVISION_SKILL_LINK_DIRS = linkRoot;
+    process.env.PROVISION_AUTOAPPLY = "auto";
+    initProvisioning();
+    const original = serveSkill("/legacy-before-crash.tgz", "live legacy skill");
+    registerManifestUrl(serveManifest([{ type: "skill", name: "legacy", ...original }]));
+    await syncNow();
+
+    const statePath = path.join(stateDir, "provision.lock.json");
+    const state = JSON.parse(readFileSync(statePath, "utf8"));
+    const legacyRecord = state.installed["skill/legacy"];
+    delete legacyRecord.installRoot;
+    const legacySnapshot = {
+      sha256: legacyRecord.sha256,
+      files: legacyRecord.files,
+      directories: legacyRecord.directories,
+      fileHashes: legacyRecord.fileHashes,
+      installedAt: legacyRecord.installedAt,
+    };
+    const recoveryId = "a".repeat(32);
+    const legacyTarget = path.join(legacySkillsDir, "legacy");
+    const recovery = path.join(legacySkillsDir, `.provision-removed-${recoveryId}`);
+    renameSync(legacyTarget, recovery);
+    const recoveryStat = lstatSync(recovery, { bigint: true });
+    const canonicalRoot = path.join(testHome, ".agents", "skills");
+    state.installed["skill/legacy"] = {
+      sha256: "b".repeat(64),
+      files: ["SKILL.md"],
+      directories: [],
+      fileHashes: { "SKILL.md": sha(Buffer.from("replacement")) },
+      installedAt: new Date().toISOString(),
+      installRoot: canonicalRoot,
+      uncommitted: true,
+      candidateIdentity: {
+	dev: recoveryStat.dev.toString(),
+	ino: recoveryStat.ino.toString(),
+      },
+      pending: legacySnapshot,
+      skillLinks: legacyRecord.skillLinks,
+      legacySkillMigration: {
+	installedKey: "skill/legacy",
+	installRoot: legacySkillsDir,
+	recoveryIdentity: {
+	  dev: recoveryStat.dev.toString(),
+	  ino: recoveryStat.ino.toString(),
+	},
+      },
+      removalRecoveryId: recoveryId,
+    };
+    state.removalRecoveries = [recoveryId];
+    state.removalRecoveryRoots = { [recoveryId]: legacySkillsDir };
+    writeFileSync(statePath, `${JSON.stringify(state, null, 2)}\n`);
+
+    delete process.env.PROVISION_SKILLS_DIR;
+    process.env.PROVISION_SKILL_LINK_DIRS = linkRoot;
+    initProvisioning();
+    registerManifestUrl(serveManifest([{
+      type: "skill",
+      name: "legacy",
+      url: `${baseUrl}/missing-after-migration-crash.tgz`,
+      sha256: "c".repeat(64),
+    }]));
+
+    const failed = await syncNow();
+    assert.equal(statusOf(failed, "legacy"), "failed");
+    assert.equal(readFileSync(path.join(legacyTarget, "SKILL.md"), "utf8"), "live legacy skill");
+    assert.equal(existsSync(recovery), false);
+    const restored = JSON.parse(readFileSync(statePath, "utf8"));
+    assert.equal(restored.installed["skill/legacy"].installRoot, legacySkillsDir);
+    assert.equal(restored.installed["skill/legacy"].skillLinks[0].path, path.join(linkRoot, "legacy"));
+    assert.equal(
+      path.resolve(path.dirname(path.join(linkRoot, "legacy")), readlinkSync(path.join(linkRoot, "legacy"))),
+      legacyTarget,
+    );
+    assert.equal(restored.installed["skill/legacy"].legacySkillMigration, undefined);
+    assert.deepEqual(restored.removalRecoveries, []);
+
+    initProvisioning();
+    registerManifestUrl(serveManifest([{ type: "skill", name: "legacy", ...original }]));
+    assert.equal(statusOf(await syncNow(), "legacy"), "installed");
+    const canonical = path.join(canonicalRoot, "legacy");
+    assert.equal(
+      path.resolve(path.dirname(path.join(linkRoot, "legacy")), readlinkSync(path.join(linkRoot, "legacy"))),
+      canonical,
+    );
+  });
+
+  test("drops migration metadata after recovering an exposed canonical candidate", async () => {
+    const testHome = path.join(stateDir, "published-migration-crash-home");
+    const legacySkillsDir = path.join(testHome, ".claude", "skills");
+    const canonicalRoot = path.join(testHome, ".agents", "skills");
+    const canonical = path.join(canonicalRoot, "legacy");
+    const legacyTarget = path.join(legacySkillsDir, "legacy");
+    const linkRoot = path.join(testHome, "discovery-skills");
+    const link = path.join(linkRoot, "legacy");
+    const recoveryId = "a".repeat(32);
+    const recovery = path.join(legacySkillsDir, `.provision-removed-${recoveryId}`);
+    mkdirSync(recovery, { recursive: true });
+    writeFileSync(path.join(recovery, "SKILL.md"), "legacy contents");
+    mkdirSync(canonical, { recursive: true });
+    writeFileSync(path.join(canonical, "SKILL.md"), "canonical contents");
+    mkdirSync(linkRoot, { recursive: true });
+    symlinkSync(legacyTarget, link, process.platform === "win32" ? "junction" : "dir");
+    const recoveryStat = lstatSync(recovery, { bigint: true });
+    const canonicalStat = lstatSync(canonical, { bigint: true });
+    const linkStat = lstatSync(link, { bigint: true });
+    const canonicalArtifact = serveSkill("/published-migration.tgz", "canonical contents");
+    writeFileSync(path.join(stateDir, "provision.lock.json"), JSON.stringify({
+      version: 1,
+      approved: ["skill/legacy"],
+      revoked: [],
+      removalRecoveries: [recoveryId],
+      removalRecoveryRoots: { [recoveryId]: legacySkillsDir },
+      installed: {
+	"skill/legacy": {
+	  sha256: canonicalArtifact.sha256,
+	  files: ["SKILL.md"],
+	  directories: [],
+	  fileHashes: { "SKILL.md": sha(Buffer.from("canonical contents")) },
+	  installedAt: new Date().toISOString(),
+	  installRoot: canonicalRoot,
+	  uncommitted: true,
+	  candidateIdentity: {
+	    dev: canonicalStat.dev.toString(),
+	    ino: canonicalStat.ino.toString(),
+	  },
+	  pending: {
+	    sha256: "b".repeat(64),
+	    files: ["SKILL.md"],
+	    directories: [],
+	    fileHashes: { "SKILL.md": sha(Buffer.from("legacy contents")) },
+	    installedAt: new Date().toISOString(),
+	  },
+	  legacySkillMigration: {
+	    installedKey: "skill/legacy",
+	    installRoot: legacySkillsDir,
+	    recoveryIdentity: {
+	      dev: recoveryStat.dev.toString(),
+	      ino: recoveryStat.ino.toString(),
+	    },
+	  },
+	  removalRecoveryId: recoveryId,
+	  skillLinks: [{
+	    path: link,
+	    target: legacyTarget,
+	    dev: linkStat.dev.toString(),
+	    ino: linkStat.ino.toString(),
+	  }],
+	  skillLinkPublication: {
+	    path: link,
+	    target: canonical,
+	  },
+	},
+      },
+    }));
+    process.env.HOME = testHome;
+    process.env.PROVISION_SKILLS_DIR = path.join(testHome, "different-canonical-root");
+    process.env.PROVISION_SKILL_LINK_DIRS = linkRoot;
+    process.env.PROVISION_AUTOAPPLY = "auto";
+    initProvisioning();
+    let recovered = JSON.parse(readFileSync(path.join(stateDir, "provision.lock.json"), "utf8"));
+    assert.notEqual(recovered.installed["skill/legacy"].legacySkillMigration, undefined);
+    assert.equal(path.resolve(path.dirname(link), readlinkSync(link)), legacyTarget);
+
+    delete process.env.PROVISION_SKILLS_DIR;
+    initProvisioning();
+    recovered = JSON.parse(readFileSync(path.join(stateDir, "provision.lock.json"), "utf8"));
+    assert.equal(recovered.installed["skill/legacy"].legacySkillMigration, undefined);
+    assert.equal(path.resolve(path.dirname(link), readlinkSync(link)), canonical);
+
+    registerManifestUrl(`${baseUrl}/missing-after-exposed-migration-crash.json`);
+    await assert.rejects(syncNow(), /Manifest fetch failed: HTTP 404/);
+    assert.equal(path.resolve(path.dirname(link), readlinkSync(link)), canonical);
+
+    const manifestUrl = serveManifest([{
+      type: "skill",
+      name: "legacy",
+      ...canonicalArtifact,
+    }]);
+    registerManifestUrl(manifestUrl);
+
+    assert.equal(statusOf(await syncNow(), "legacy"), "installed");
+    recovered = JSON.parse(readFileSync(path.join(stateDir, "provision.lock.json"), "utf8"));
+    assert.equal(recovered.installed["skill/legacy"].legacySkillMigration, undefined);
+
+    await shutdownProvisioning();
+    initProvisioning();
+    registerManifestUrl(manifestUrl);
+    assert.equal(statusOf(await syncNow(), "legacy"), "installed");
+    recovered = JSON.parse(readFileSync(path.join(stateDir, "provision.lock.json"), "utf8"));
+    assert.equal(recovered.installed["skill/legacy"].legacySkillMigration, undefined);
+    assert.equal(readFileSync(path.join(canonical, "SKILL.md"), "utf8"), "canonical contents");
+  });
+
+  test("migrates a legacy root whose interrupted upgrade published the pending snapshot", async () => {
+    const testHome = path.join(stateDir, "pending-migration-home");
+    const legacySkillsDir = path.join(testHome, ".claude", "skills");
+    process.env.HOME = testHome;
+    process.env.PROVISION_SKILLS_DIR = legacySkillsDir;
+    process.env.PROVISION_SKILL_LINK_DIRS = "";
+    process.env.PROVISION_AUTOAPPLY = "auto";
+    initProvisioning();
+    const stable = serveSkill("/legacy-pending-v1.tgz", "stable contents");
+    registerManifestUrl(serveManifest([{ type: "skill", name: "legacy-pending", ...stable }]));
+    await syncNow();
+
+    const statePath = path.join(stateDir, "provision.lock.json");
+    const legacyState = JSON.parse(readFileSync(statePath, "utf8"));
+    const record = legacyState.installed["skill/legacy-pending"];
+    const pending = serveSkill("/legacy-pending-v2.tgz", "pending contents");
+    delete record.installRoot;
+    record.pending = {
+	sha256: pending.sha256,
+	files: ["SKILL.md"],
+	directories: [],
+	fileHashes: { "SKILL.md": sha(Buffer.from("pending contents")) },
+	installedAt: new Date().toISOString(),
+    };
+    writeFileSync(
+      path.join(legacySkillsDir, "legacy-pending", "SKILL.md"),
+      "pending contents",
+    );
+    writeFileSync(statePath, `${JSON.stringify(legacyState, null, 2)}\n`);
+
+    delete process.env.PROVISION_SKILLS_DIR;
+    delete process.env.PROVISION_SKILL_LINK_DIRS;
+    initProvisioning();
+    registerManifestUrl(serveManifest([{ type: "skill", name: "legacy-pending", ...pending }]));
+
+    const migrated = await syncNow();
+    const canonical = path.join(testHome, ".agents", "skills", "legacy-pending");
+    assert.equal(statusOf(migrated, "legacy-pending"), "installed");
+    assert.equal(readFileSync(path.join(canonical, "SKILL.md"), "utf8"), "pending contents");
+    assert.equal(lstatSync(path.join(legacySkillsDir, "legacy-pending")).isSymbolicLink(), true);
+    const migratedState = JSON.parse(readFileSync(statePath, "utf8"));
+    assert.equal(migratedState.installed["skill/legacy-pending"].pending, undefined);
+    assert.equal(
+      migratedState.installed["skill/legacy-pending"].installRoot,
+      path.join(testHome, ".agents", "skills"),
+    );
+  });
+
+  test("preserves case-fold-colliding records during legacy root migration", async () => {
+    const testHome = path.join(stateDir, "case-fold-migration-home");
+    const legacySkillsDir = path.join(testHome, ".claude", "skills");
+    const records = {
+	"skill/demo": "managed contents",
+	"skill/Demo": "managed contents",
+    };
+    const installed: Record<string, object> = {};
+    for (const [key, contents] of Object.entries(records)) {
+	const name = key.slice(key.indexOf("/") + 1);
+	const target = path.join(legacySkillsDir, name);
+	mkdirSync(target, { recursive: true });
+	writeFileSync(path.join(target, "SKILL.md"), contents);
+	installed[key] = {
+	  sha256: "a".repeat(64),
+	  files: ["SKILL.md"],
+	  directories: [],
+	  fileHashes: { "SKILL.md": sha(Buffer.from(contents)) },
+	  installedAt: new Date().toISOString(),
+	};
+    }
+    writeFileSync(path.join(stateDir, "provision.lock.json"), JSON.stringify({
+	version: 1,
+	approved: [],
+	revoked: [],
+	installed,
+    }));
+    process.env.HOME = testHome;
+    delete process.env.PROVISION_SKILLS_DIR;
+    delete process.env.PROVISION_SKILL_LINK_DIRS;
+    process.env.PROVISION_AUTOAPPLY = "auto";
+    initProvisioning();
+    const replacement = serveSkill("/case-fold-root-migration.tgz", "canonical replacement");
+    registerManifestUrl(serveManifest([{ type: "skill", name: "demo", ...replacement }]));
+
+    const refused = await syncNow();
+
+    assert.equal(statusOf(refused, "demo"), "failed");
+    assert.match(refused.data[0]!.error!, /multiple installed records case-fold to the same key/);
+    assert.equal(
+	readFileSync(path.join(legacySkillsDir, "demo", "SKILL.md"), "utf8"),
+	"managed contents",
+    );
+    assert.equal(
+	readFileSync(path.join(legacySkillsDir, "Demo", "SKILL.md"), "utf8"),
+	"managed contents",
+    );
+    assert.equal(existsSync(path.join(testHome, ".agents", "skills", "demo")), false);
+    assert.equal(
+	readdirSync(legacySkillsDir).some((entry) => entry.startsWith(".provision-removed-")),
+	false,
+    );
+    const state = JSON.parse(readFileSync(path.join(stateDir, "provision.lock.json"), "utf8"));
+    assert.deepEqual(Object.keys(state.installed).sort(), ["skill/Demo", "skill/demo"]);
+  });
+
+  test("preserves approval while an uppercase legacy record moves to the Codex root", async () => {
+    const testHome = path.join(stateDir, "uppercase-root-migration-home");
+    const legacySkillsDir = path.join(testHome, ".claude", "skills");
+    const legacyTarget = path.join(legacySkillsDir, "Demo");
+    mkdirSync(legacyTarget, { recursive: true });
+    writeFileSync(path.join(legacyTarget, "SKILL.md"), "trusted legacy contents");
+    writeFileSync(path.join(stateDir, "provision.lock.json"), JSON.stringify({
+      version: 1,
+      approved: [],
+      revoked: [],
+      installed: {
+	"skill/Demo": {
+	  sha256: "a".repeat(64),
+	  files: ["SKILL.md"],
+	  directories: [],
+	  fileHashes: { "SKILL.md": sha(Buffer.from("trusted legacy contents")) },
+	  installedAt: new Date().toISOString(),
+	},
+      },
+    }));
+    process.env.HOME = testHome;
+    delete process.env.PROVISION_SKILLS_DIR;
+    delete process.env.PROVISION_SKILL_LINK_DIRS;
+    process.env.PROVISION_AUTOAPPLY = "approve";
+    initProvisioning();
+    const replacement = serveSkill("/uppercase-root-migration.tgz", "canonical contents");
+    registerManifestUrl(serveManifest([{ type: "skill", name: "demo", ...replacement }]));
+
+    const migrated = await syncNow();
+
+    assert.equal(statusOf(migrated, "demo"), "installed");
+    const canonical = path.join(testHome, ".agents", "skills", "demo");
+    assert.equal(readFileSync(path.join(canonical, "SKILL.md"), "utf8"), "canonical contents");
+    const state = JSON.parse(readFileSync(path.join(stateDir, "provision.lock.json"), "utf8"));
+    assert.equal(state.installed["skill/Demo"], undefined);
+    assert.equal(state.installed["skill/demo"].installRoot, path.dirname(canonical));
+    assert.deepEqual(state.approved, ["skill/demo"]);
+  });
+
+  test("reconciles a legacy first-install journal at its original root", async () => {
+    const testHome = path.join(stateDir, "journal-home");
+    const legacySkillsDir = path.join(testHome, ".claude", "skills");
+    const name = "legacy-journal";
+    const marker = "a".repeat(32);
+    const rejectionRecoveryId = "b".repeat(32);
+    const legacyTarget = path.join(legacySkillsDir, name);
+    mkdirSync(legacyTarget, { recursive: true });
+    writeFileSync(path.join(legacyTarget, "SKILL.md"), "legacy candidate");
+    writeFileSync(firstInstallMarkerPath(legacyTarget, marker), marker);
+    const targetStat = lstatSync(legacyTarget, { bigint: true });
+    writeFileSync(path.join(stateDir, "provision.lock.json"), JSON.stringify({
+      version: 1,
+      approved: [],
+      revoked: [],
+      upgradeRecoveries: [rejectionRecoveryId],
+      installed: {
+	[`skill/${name}`]: {
+	  sha256: "c".repeat(64),
+	  files: ["SKILL.md"],
+	  directories: [],
+	  fileHashes: { "SKILL.md": sha(Buffer.from("legacy candidate")) },
+	  installedAt: new Date().toISOString(),
+	  uncommitted: true,
+	  candidateIdentity: { dev: targetStat.dev.toString(), ino: targetStat.ino.toString() },
+	  installMarker: marker,
+	  rejectionRecoveryId,
+	},
+      },
+    }));
+    process.env.HOME = testHome;
+    delete process.env.PROVISION_SKILLS_DIR;
+    delete process.env.PROVISION_SKILL_LINK_DIRS;
+    process.env.PROVISION_AUTOAPPLY = "auto";
+    initProvisioning();
+    const replacement = serveSkill("/legacy-journal-v2.tgz", "canonical replacement");
+    registerManifestUrl(serveManifest([{ type: "skill", name, ...replacement }]));
+
+    const migrated = await syncNow();
+    const canonical = path.join(testHome, ".agents", "skills", name);
+    assert.equal(statusOf(migrated, name), "installed");
+    assert.equal(readFileSync(path.join(canonical, "SKILL.md"), "utf8"), "canonical replacement");
+    assert.equal(lstatSync(legacyTarget).isSymbolicLink(), true);
+    const recovery = readdirSync(legacySkillsDir)
+      .find((entry) => entry.startsWith(".provision-removed-"));
+    assert.notEqual(recovery, undefined);
+    assert.equal(
+      readFileSync(path.join(legacySkillsDir, recovery!, "SKILL.md"), "utf8"),
+      "legacy candidate",
+    );
+  });
+
+  test("recovers an interrupted legacy-root isolation from its preclaim", async () => {
+    const testHome = path.join(stateDir, "recovery-home");
+    const legacySkillsDir = path.join(testHome, ".claude", "skills");
+    process.env.HOME = testHome;
+    process.env.PROVISION_SKILLS_DIR = legacySkillsDir;
+    process.env.PROVISION_SKILL_LINK_DIRS = "";
+    process.env.PROVISION_AUTOAPPLY = "auto";
+    initProvisioning();
+    const skill = serveSkill("/legacy-recovery.tgz", "legacy managed skill");
+    const manifestUrl = serveManifest([{ type: "skill", name: "legacy", ...skill }]);
+    registerManifestUrl(manifestUrl);
+    await syncNow();
+    const statePath = path.join(stateDir, "provision.lock.json");
+    const legacyState = JSON.parse(readFileSync(statePath, "utf8"));
+    delete legacyState.installed["skill/legacy"].installRoot;
+    writeFileSync(statePath, `${JSON.stringify(legacyState, null, 2)}\n`);
+
+    delete process.env.PROVISION_SKILLS_DIR;
+    delete process.env.PROVISION_SKILL_LINK_DIRS;
+    initProvisioning({
+      afterRemovalIsolation: () => {
+	throw new Error("simulated legacy-root isolation interruption");
+      },
+    });
+    registerManifestUrl(manifestUrl);
+    const interrupted = await syncNow();
+    assert.equal(statusOf(interrupted, "legacy"), "failed");
+    assert.match(interrupted.data[0]!.error!, /isolation interruption/);
+    const interruptedState = JSON.parse(readFileSync(statePath, "utf8"));
+    const recoveryId = interruptedState.installed["skill/legacy"].removalRecoveryId;
+    assert.match(recoveryId, /^[a-f0-9]{32}$/);
+    assert.deepEqual(interruptedState.removalRecoveries, [recoveryId]);
+    assert.equal(interruptedState.removalRecoveryRoots[recoveryId], legacySkillsDir);
+    const recovery = path.join(legacySkillsDir, `.provision-removed-${recoveryId}`);
+    assert.equal(readFileSync(path.join(recovery, "SKILL.md"), "utf8"), "legacy managed skill");
+
+    initProvisioning();
+    registerManifestUrl(serveManifest([{
+      type: "skill",
+      name: "legacy",
+      url: `${baseUrl}/missing-after-root-isolation.tgz`,
+      sha256: "d".repeat(64),
+    }]));
+    const preparationFailed = await syncNow();
+    assert.equal(statusOf(preparationFailed, "legacy"), "failed");
+    assert.match(preparationFailed.data[0]!.error!, /Download failed: HTTP 404/);
+    assert.equal(
+      readFileSync(path.join(legacySkillsDir, "legacy", "SKILL.md"), "utf8"),
+      "legacy managed skill",
+    );
+    const restoredBeforeRetry = JSON.parse(readFileSync(statePath, "utf8"));
+    assert.equal(restoredBeforeRetry.installed["skill/legacy"].removalRecoveryId, recoveryId);
+
+    registerManifestUrl(serveManifest([{ type: "skill", name: "legacy", ...skill }]));
+    const recovered = await syncNow();
+    assert.equal(statusOf(recovered, "legacy"), "installed", JSON.stringify(recovered));
+    const recoveredState = JSON.parse(readFileSync(statePath, "utf8"));
+    assert.deepEqual(recoveredState.removalRecoveries, [recoveryId]);
+    assert.equal(recoveredState.removalRecoveryRoots[recoveryId], legacySkillsDir);
+    assert.equal(recoveredState.installed["skill/legacy"].removalRecoveryId, undefined);
+    assert.equal(
+      recoveredState.installed["skill/legacy"].installRoot,
+      path.join(testHome, ".agents", "skills"),
+    );
+    assert.equal(readFileSync(path.join(recovery, "SKILL.md"), "utf8"), "legacy managed skill");
+  });
+
+  test("restores a preclaimed legacy recovery when retry publication loses a race", async () => {
+    const testHome = path.join(stateDir, "recovery-race-home");
+    const legacySkillsDir = path.join(testHome, ".claude", "skills");
+    process.env.HOME = testHome;
+    process.env.PROVISION_SKILLS_DIR = legacySkillsDir;
+    process.env.PROVISION_SKILL_LINK_DIRS = "";
+    process.env.PROVISION_AUTOAPPLY = "auto";
+    initProvisioning();
+    const skill = serveSkill("/legacy-recovery-race.tgz", "legacy managed skill");
+    const manifestUrl = serveManifest([{ type: "skill", name: "legacy", ...skill }]);
+    registerManifestUrl(manifestUrl);
+    await syncNow();
+    const statePath = path.join(stateDir, "provision.lock.json");
+    const legacyState = JSON.parse(readFileSync(statePath, "utf8"));
+    delete legacyState.installed["skill/legacy"].installRoot;
+    writeFileSync(statePath, `${JSON.stringify(legacyState, null, 2)}\n`);
+
+    delete process.env.PROVISION_SKILLS_DIR;
+    delete process.env.PROVISION_SKILL_LINK_DIRS;
+    initProvisioning({
+      afterRemovalIsolation: () => {
+	throw new Error("simulated legacy-root isolation interruption");
+      },
+    });
+    registerManifestUrl(manifestUrl);
+    assert.equal(statusOf(await syncNow(), "legacy"), "failed");
+
+    const canonical = path.join(testHome, ".agents", "skills", "legacy");
+    initProvisioning({
+      beforeSkillCandidateMove: () => {
+	mkdirSync(canonical, { recursive: true });
+	writeFileSync(path.join(canonical, "USER.md"), "race winner");
+      },
+    });
+    registerManifestUrl(manifestUrl);
+    const refused = await syncNow();
+    const legacyTarget = path.join(legacySkillsDir, "legacy");
+    assert.equal(statusOf(refused, "legacy"), "failed");
+    assert.match(refused.data[0]!.error!, /target appeared during installation/);
+    assert.equal(readFileSync(path.join(legacyTarget, "SKILL.md"), "utf8"), "legacy managed skill");
+    assert.equal(readFileSync(path.join(canonical, "USER.md"), "utf8"), "race winner");
+    const restored = JSON.parse(readFileSync(statePath, "utf8"));
+    assert.equal(restored.installed["skill/legacy"].installRoot, legacySkillsDir);
+    assert.equal(restored.installed["skill/legacy"].removalRecoveryId, undefined);
+    assert.deepEqual(restored.removalRecoveries, []);
+  });
+
+  test("refuses a canonical collision while migrating the previous Claude default", async () => {
+    const testHome = path.join(stateDir, "home");
+    const legacySkillsDir = path.join(testHome, ".claude", "skills");
+    const canonicalSkillsDir = path.join(testHome, ".agents", "skills");
+    process.env.HOME = testHome;
+    process.env.PROVISION_SKILLS_DIR = legacySkillsDir;
+    process.env.PROVISION_SKILL_LINK_DIRS = "";
+    process.env.PROVISION_AUTOAPPLY = "auto";
+    initProvisioning();
+    const skill = serveSkill("/legacy-collision.tgz", "same contents");
+    registerManifestUrl(serveManifest([{ type: "skill", name: "legacy", ...skill }]));
+    await syncNow();
+    const statePath = path.join(stateDir, "provision.lock.json");
+    const legacyState = JSON.parse(readFileSync(statePath, "utf8"));
+    delete legacyState.installed["skill/legacy"].installRoot;
+    writeFileSync(statePath, `${JSON.stringify(legacyState, null, 2)}\n`);
+
+    const canonical = path.join(canonicalSkillsDir, "legacy");
+    mkdirSync(canonical, { recursive: true });
+    writeFileSync(path.join(canonical, "SKILL.md"), "same contents");
+    process.env.PROVISION_SKILLS_DIR = "   ";
+    delete process.env.PROVISION_SKILL_LINK_DIRS;
+    initProvisioning();
+    registerManifestUrl(`${baseUrl}/provision.json`);
+
+    const refused = await syncNow();
+    assert.equal(statusOf(refused, "legacy"), "failed");
+    assert.match(refused.data[0]!.error!, /untracked canonical target/);
+    assert.equal(readFileSync(path.join(canonical, "SKILL.md"), "utf8"), "same contents");
+    assert.equal(
+      readFileSync(path.join(legacySkillsDir, "legacy", "SKILL.md"), "utf8"),
+      "same contents",
+    );
+    const state = JSON.parse(readFileSync(statePath, "utf8"));
+    assert.equal(state.installed["skill/legacy"].installRoot, legacySkillsDir);
+
+    await deleteItem("skill", "legacy");
+    assert.equal(readFileSync(path.join(canonical, "SKILL.md"), "utf8"), "same contents");
+    assert.equal(existsSync(path.join(legacySkillsDir, "legacy")), false);
+  });
+
+  test("discovers legacy ownership through an aliased default canonical root", async () => {
+    const testHome = path.join(stateDir, "aliased-default-migration-home");
+    const legacySkillsDir = path.join(testHome, ".claude", "skills");
+    const canonicalSkillsDir = path.join(testHome, ".agents", "skills");
+    const canonicalAlias = path.join(testHome, "canonical-skills-alias");
+    process.env.HOME = testHome;
+    process.env.PROVISION_SKILLS_DIR = legacySkillsDir;
+    process.env.PROVISION_SKILL_LINK_DIRS = "";
+    process.env.PROVISION_AUTOAPPLY = "auto";
+    initProvisioning();
+    const skill = serveSkill("/aliased-default-migration.tgz", "same contents");
+    const manifestUrl = serveManifest([{ type: "skill", name: "legacy", ...skill }]);
+    registerManifestUrl(manifestUrl);
+    await syncNow();
+
+    const statePath = path.join(stateDir, "provision.lock.json");
+    const legacyState = JSON.parse(readFileSync(statePath, "utf8"));
+    delete legacyState.installed["skill/legacy"].installRoot;
+    writeFileSync(statePath, `${JSON.stringify(legacyState, null, 2)}\n`);
+    const canonical = path.join(canonicalSkillsDir, "legacy");
+    mkdirSync(canonical, { recursive: true });
+    writeFileSync(path.join(canonical, "SKILL.md"), "same contents");
+    symlinkSync(canonicalSkillsDir, canonicalAlias, process.platform === "win32" ? "junction" : "dir");
+
+    process.env.PROVISION_SKILLS_DIR = canonicalAlias;
+    delete process.env.PROVISION_SKILL_LINK_DIRS;
+    initProvisioning();
+    registerManifestUrl(manifestUrl);
+    const refused = await syncNow();
+
+    assert.equal(statusOf(refused, "legacy"), "failed");
+    assert.match(refused.data[0]!.error!, /untracked canonical target/);
+    assert.equal(readFileSync(path.join(canonical, "SKILL.md"), "utf8"), "same contents");
+    assert.equal(
+      readFileSync(path.join(legacySkillsDir, "legacy", "SKILL.md"), "utf8"),
+      "same contents",
+    );
+    const state = JSON.parse(readFileSync(statePath, "utf8"));
+    assert.equal(state.installed["skill/legacy"].installRoot, legacySkillsDir);
+  });
+
+  test("discovers legacy ownership through a missing case alias of the default root", async () => {
+    const testHome = path.join(stateDir, "case-aliased-default-migration-home");
+    mkdirSync(testHome);
+    const caseProbe = path.join(testHome, "Case-Probe");
+    mkdirSync(caseProbe);
+    const caseInsensitive = existsSync(path.join(testHome, "case-probe"));
+    rmSync(caseProbe, { recursive: true });
+    if (!caseInsensitive) return;
+
+    const legacySkillsDir = path.join(testHome, ".claude", "skills");
+    const canonicalAlias = path.join(testHome, ".Agents", "skills");
+    process.env.HOME = testHome;
+    process.env.PROVISION_SKILLS_DIR = legacySkillsDir;
+    process.env.PROVISION_SKILL_LINK_DIRS = "";
+    process.env.PROVISION_AUTOAPPLY = "auto";
+    initProvisioning();
+    const skill = serveSkill("/case-aliased-default-migration.tgz", "legacy contents");
+    const manifestUrl = serveManifest([{ type: "skill", name: "legacy", ...skill }]);
+    registerManifestUrl(manifestUrl);
+    assert.equal(statusOf(await syncNow(), "legacy"), "installed");
+
+    const statePath = path.join(stateDir, "provision.lock.json");
+    const legacyState = JSON.parse(readFileSync(statePath, "utf8"));
+    delete legacyState.installed["skill/legacy"].installRoot;
+    writeFileSync(statePath, `${JSON.stringify(legacyState, null, 2)}\n`);
+    process.env.PROVISION_SKILLS_DIR = canonicalAlias;
+    delete process.env.PROVISION_SKILL_LINK_DIRS;
+    initProvisioning();
+    registerManifestUrl(manifestUrl);
+
+    assert.equal(statusOf(await syncNow(), "legacy"), "installed");
+    assert.equal(
+      readFileSync(path.join(canonicalAlias, "legacy", "SKILL.md"), "utf8"),
+      "legacy contents",
+    );
+    assert.equal(lstatSync(path.join(legacySkillsDir, "legacy")).isSymbolicLink(), true);
+    const state = JSON.parse(readFileSync(statePath, "utf8"));
+    assert.equal(state.installed["skill/legacy"].installRoot, canonicalAlias);
+  });
+
+  test("never infers legacy ownership from a matching Claude skill", async () => {
+    const testHome = path.join(stateDir, "matching-claude-home");
+    const claudeSkill = path.join(testHome, ".claude", "skills", "matching");
+    process.env.HOME = testHome;
+    delete process.env.PROVISION_SKILLS_DIR;
+    delete process.env.PROVISION_SKILL_LINK_DIRS;
+    process.env.PROVISION_AUTOAPPLY = "auto";
+    mkdirSync(claudeSkill, { recursive: true });
+    writeFileSync(path.join(claudeSkill, "SKILL.md"), "identical contents");
+    initProvisioning();
+    const skill = serveSkill("/matching-claude.tgz", "identical contents");
+    registerManifestUrl(serveManifest([{ type: "skill", name: "matching", ...skill }]));
+
+    const refused = await syncNow();
+    assert.equal(statusOf(refused, "matching"), "failed");
+    assert.match(refused.data[0]!.error!, /untracked content at skill link/);
+    assert.equal(lstatSync(claudeSkill).isDirectory(), true);
+    assert.equal(readFileSync(path.join(claudeSkill, "SKILL.md"), "utf8"), "identical contents");
+  });
+
+  test("refuses an untracked discovery-path collision", async () => {
+    const linkDir = path.join(stateDir, "claude-skills");
+    const collision = path.join(linkDir, "linked");
+    mkdirSync(collision, { recursive: true });
+    writeFileSync(path.join(collision, "SKILL.md"), "user owned");
+    process.env.PROVISION_SKILL_LINK_DIRS = linkDir;
+    process.env.PROVISION_AUTOAPPLY = "auto";
+    initProvisioning();
+    const skill = serveSkill("/linked-collision.tgz", "managed");
+    registerManifestUrl(serveManifest([{ type: "skill", name: "linked", ...skill }]));
+
+    const status = await syncNow();
+    assert.equal(statusOf(status, "linked"), "failed");
+    assert.match(status.data[0]!.error!, /untracked content at skill link/);
+    assert.equal(readFileSync(path.join(collision, "SKILL.md"), "utf8"), "user owned");
+  });
+
+  test("preserves a changed managed link and refuses skill removal", async () => {
+    const linkDir = path.join(stateDir, "claude-skills");
+    process.env.PROVISION_SKILL_LINK_DIRS = linkDir;
+    process.env.PROVISION_AUTOAPPLY = "auto";
+    initProvisioning();
+    const skill = serveSkill("/changed-link.tgz", "managed");
+    registerManifestUrl(serveManifest([{ type: "skill", name: "linked", ...skill }]));
+    await syncNow();
+
+    const link = path.join(linkDir, "linked");
+    const replacement = path.join(stateDir, "replacement");
+    mkdirSync(replacement);
+    unlinkSync(link);
+    symlinkSync(replacement, link, process.platform === "win32" ? "junction" : "dir");
+    responses.set("/provision.json", { schema: "agent-provisioning/v1", items: [] });
+
+    const status = await syncNow();
+    assert.equal(statusOf(status, "linked"), "failed");
+    assert.match(status.data[0]!.error!, /changed skill link/);
+    assert.equal(path.resolve(path.dirname(link), readlinkSync(link)), replacement);
+    assert.equal(existsSync(path.join(skillsDir, "linked")), true);
+  });
+
   test("approval queued during an active sync survives its stale snapshot and installs", async () => {
     const first = serveSkill("/slow-v1.tgz", "v1");
     registerManifestUrl(serveManifest([{ type: "skill", name: "slow", ...first }]));
@@ -541,6 +2302,34 @@ describe("provision sync", () => {
     const view = await syncNow();
     assert.equal(statusOf(view, "aaa"), "removed");
     assert.equal(existsSync(path.join(skillsDir, "aaa")), false);
+  });
+
+  test("keeps discovery links when canonical removal fails before isolation", async () => {
+    const linkRoot = path.join(stateDir, "removal-failure-link-root");
+    process.env.PROVISION_SKILL_LINK_DIRS = linkRoot;
+    process.env.PROVISION_AUTOAPPLY = "auto";
+    initProvisioning();
+    const skill = serveSkill("/removal-failure-links.tgz", "still live");
+    registerManifestUrl(serveManifest([{ type: "skill", name: "linked", ...skill }]));
+    await syncNow();
+    const canonical = path.join(skillsDir, "linked");
+    const link = path.join(linkRoot, "linked");
+    const linkIdentity = lstatSync(link, { bigint: true }).ino;
+
+    initProvisioning({
+      afterRemovalAudit: () => {
+	throw new Error("simulated canonical removal failure");
+      },
+    });
+    registerManifestUrl(serveManifest([]));
+    const failed = await syncNow();
+
+    assert.equal(statusOf(failed, "linked"), "failed");
+    assert.match(failed.data[0]!.error!, /simulated canonical removal failure/);
+    assert.equal(readFileSync(path.join(canonical, "SKILL.md"), "utf8"), "still live");
+    assert.equal(lstatSync(link, { bigint: true }).ino, linkIdentity);
+    const state = JSON.parse(readFileSync(path.join(stateDir, "provision.lock.json"), "utf8"));
+    assert.equal(state.installed["skill/linked"].skillLinks[0].path, link);
   });
 
   test("removal cleans archive-owned empty directories so the item can be re-added", async () => {
@@ -2474,7 +4263,51 @@ describe("provision sync", () => {
       readFileSync(path.join(workspaceRoot, "agent-12", ".claude", "skills", "collavre", "SKILL.md"), "utf8"),
       "# agent b",
     );
+    assert.equal(
+      readFileSync(path.join(workspaceRoot, "agent-11", ".agents", "skills", "collavre", "SKILL.md"), "utf8"),
+      "# agent a",
+    );
+    assert.equal(
+      lstatSync(path.join(workspaceRoot, "agent-11", ".claude", "skills", "collavre")).isSymbolicLink(),
+      true,
+    );
     assert.equal(existsSync(path.join(configDir, "collavre")), false, "named config ignores legacy override");
+  });
+
+  test("named workspaces migrate pre-scoped skills from their Claude root", async () => {
+    process.env.PROVISION_AUTOAPPLY = "auto";
+    initProvisioning();
+    const skill = serveSkill("/named-legacy-skill.tar.gz", "# named legacy");
+    responses.set("/named-legacy.json", {
+      schema: "agent-provisioning/v1",
+      items: [{ type: "skill", name: "legacy", ...skill }],
+    });
+    const workspaceId = "agent-legacy";
+    await runInWorkspace(workspaceId, async () => {
+      registerManifestUrl(`${baseUrl}/named-legacy.json`, { persist: true });
+      await syncNow();
+    });
+
+    const root = path.join(workspaceRoot, workspaceId);
+    const canonicalTarget = path.join(root, ".agents", "skills", "legacy");
+    const legacyTarget = path.join(root, ".claude", "skills", "legacy");
+    unlinkSync(legacyTarget);
+    renameSync(canonicalTarget, legacyTarget);
+    const stateFile = path.join(root, ".cli-openai-proxy", "provision.lock.json");
+    const legacyState = JSON.parse(readFileSync(stateFile, "utf8"));
+    delete legacyState.installed["skill/legacy"].installRoot;
+    delete legacyState.installed["skill/legacy"].skillLinks;
+    delete legacyState.installed["skill/legacy"].skillLinkPublication;
+    writeFileSync(stateFile, JSON.stringify(legacyState));
+
+    const status = await runInWorkspace(workspaceId, () => syncNow());
+    assert.equal(statusOf(status, "legacy"), "installed");
+    assert.equal(readFileSync(path.join(canonicalTarget, "SKILL.md"), "utf8"), "# named legacy");
+    assert.equal(lstatSync(legacyTarget).isSymbolicLink(), true);
+    assert.equal(readFileSync(path.join(legacyTarget, "SKILL.md"), "utf8"), "# named legacy");
+    const migratedState = JSON.parse(readFileSync(stateFile, "utf8"));
+    assert.equal(migratedState.installed["skill/legacy"].installRoot, path.dirname(canonicalTarget));
+    assert.equal(migratedState.installed["skill/legacy"].skillLinks[0].path, legacyTarget);
   });
 
   test("enforces the named workspace count without affecting the legacy workspace", async () => {

@@ -55,6 +55,7 @@ const SAVED_VARS = [
   "PROVISION_SYNC",
   "PROVISION_STATE_DIR",
   "PROVISION_SKILLS_DIR",
+  "PROVISION_SKILL_LINK_DIRS",
   "PROVISION_WORKSPACE_ROOT",
   "AUTH_ADMIN_KEYS",
 ] as const;
@@ -71,6 +72,7 @@ describe("provision-routes", () => {
     stateDir = mkdtempSync(path.join(tmpdir(), "provision-routes-"));
     process.env.PROVISION_STATE_DIR = stateDir;
     process.env.PROVISION_SKILLS_DIR = path.join(stateDir, "skills");
+    process.env.PROVISION_SKILL_LINK_DIRS = "";
     process.env.PROVISION_WORKSPACE_ROOT = path.join(stateDir, "workspaces");
   });
 

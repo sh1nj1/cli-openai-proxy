@@ -81,8 +81,40 @@ export interface InstalledFileIdentity extends InstalledDirectoryIdentity {
   name: string;
 }
 
+/** One proxy-owned skill discovery link. */
+export interface InstalledSkillLink extends InstalledDirectoryIdentity {
+  /** Absolute link pathname. */
+  path: string;
+  /** Absolute canonical skill directory the link resolves to. */
+  target: string;
+}
+
+/** Durable intent written before a skill discovery link becomes visible. */
+export interface InstalledSkillLinkPublication {
+  /** Absolute link pathname reserved for publication. */
+  path: string;
+  /** Absolute canonical skill directory the link must resolve to. */
+  target: string;
+}
+
+/** Legacy owner retained while a replacement is journaled at the new canonical root. */
+export interface InstalledLegacySkillMigration {
+  /** Original lockfile key, including its legacy case. */
+  installedKey: string;
+  /** Absolute parent directory of the live legacy skill. */
+  installRoot: string;
+  /** Physical identity of the isolated legacy tree authorized for restoration. */
+  recoveryIdentity: InstalledDirectoryIdentity;
+}
+
 /** One installed artifact as the lockfile records it. */
 export interface InstalledRecord extends InstalledSnapshot {
+  /** Absolute parent directory that owns this skill's canonical tree. */
+  installRoot?: string;
+  /** Discovery links published for other supported agent CLIs. */
+  skillLinks?: InstalledSkillLink[];
+  /** In-flight publication that crash recovery may safely finish or remove. */
+  skillLinkPublication?: InstalledSkillLinkPublication;
   /**
    * First-install ownership written before exposure. Recovery accepts only the
    * original staged directory identity at the canonical target.
@@ -104,6 +136,8 @@ export interface InstalledRecord extends InstalledSnapshot {
    * retained alongside it so either side of an interrupted swap stays owned.
    */
   pending?: InstalledSnapshot;
+  /** Old-root ownership retained until a canonical first-install is exposed. */
+  legacySkillMigration?: InstalledLegacySkillMigration;
   /** Removal recovery preclaim persisted before the visible target is inspected. */
   removalRecoveryId?: string;
 }
@@ -122,6 +156,8 @@ export interface ProvisionStateFile {
   adopted?: string[];
   /** Exact random identities of retained removal recoveries. */
   removalRecoveries?: string[];
+  /** Install root for each retained removal recovery identity. */
+  removalRecoveryRoots?: Record<string, string>;
   /** Exact random identities of retained upgrade or rejected-candidate recovery trees. */
   upgradeRecoveries?: string[];
   installed: Record<string, InstalledRecord>;
