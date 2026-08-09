@@ -672,6 +672,83 @@ describe("provision sync", () => {
     assert.deepEqual(restored.removalRecoveries, []);
   });
 
+  test("drops migration metadata after recovering an exposed canonical candidate", async () => {
+    const testHome = path.join(stateDir, "published-migration-crash-home");
+    const legacySkillsDir = path.join(testHome, ".claude", "skills");
+    const canonicalRoot = path.join(testHome, ".agents", "skills");
+    const canonical = path.join(canonicalRoot, "legacy");
+    const recoveryId = "a".repeat(32);
+    const recovery = path.join(legacySkillsDir, `.provision-removed-${recoveryId}`);
+    mkdirSync(recovery, { recursive: true });
+    writeFileSync(path.join(recovery, "SKILL.md"), "legacy contents");
+    mkdirSync(canonical, { recursive: true });
+    writeFileSync(path.join(canonical, "SKILL.md"), "canonical contents");
+    const recoveryStat = lstatSync(recovery, { bigint: true });
+    const canonicalStat = lstatSync(canonical, { bigint: true });
+    const canonicalArtifact = serveSkill("/published-migration.tgz", "canonical contents");
+    writeFileSync(path.join(stateDir, "provision.lock.json"), JSON.stringify({
+      version: 1,
+      approved: ["skill/legacy"],
+      revoked: [],
+      removalRecoveries: [recoveryId],
+      removalRecoveryRoots: { [recoveryId]: legacySkillsDir },
+      installed: {
+	"skill/legacy": {
+	  sha256: canonicalArtifact.sha256,
+	  files: ["SKILL.md"],
+	  directories: [],
+	  fileHashes: { "SKILL.md": sha(Buffer.from("canonical contents")) },
+	  installedAt: new Date().toISOString(),
+	  installRoot: canonicalRoot,
+	  uncommitted: true,
+	  candidateIdentity: {
+	    dev: canonicalStat.dev.toString(),
+	    ino: canonicalStat.ino.toString(),
+	  },
+	  pending: {
+	    sha256: "b".repeat(64),
+	    files: ["SKILL.md"],
+	    directories: [],
+	    fileHashes: { "SKILL.md": sha(Buffer.from("legacy contents")) },
+	    installedAt: new Date().toISOString(),
+	  },
+	  legacySkillMigration: {
+	    installedKey: "skill/legacy",
+	    installRoot: legacySkillsDir,
+	    recoveryIdentity: {
+	      dev: recoveryStat.dev.toString(),
+	      ino: recoveryStat.ino.toString(),
+	    },
+	  },
+	  removalRecoveryId: recoveryId,
+	},
+      },
+    }));
+    process.env.HOME = testHome;
+    delete process.env.PROVISION_SKILLS_DIR;
+    delete process.env.PROVISION_SKILL_LINK_DIRS;
+    process.env.PROVISION_AUTOAPPLY = "auto";
+    initProvisioning();
+    const manifestUrl = serveManifest([{
+      type: "skill",
+      name: "legacy",
+      ...canonicalArtifact,
+    }]);
+    registerManifestUrl(manifestUrl);
+
+    assert.equal(statusOf(await syncNow(), "legacy"), "installed");
+    let recovered = JSON.parse(readFileSync(path.join(stateDir, "provision.lock.json"), "utf8"));
+    assert.equal(recovered.installed["skill/legacy"].legacySkillMigration, undefined);
+
+    await shutdownProvisioning();
+    initProvisioning();
+    registerManifestUrl(manifestUrl);
+    assert.equal(statusOf(await syncNow(), "legacy"), "installed");
+    recovered = JSON.parse(readFileSync(path.join(stateDir, "provision.lock.json"), "utf8"));
+    assert.equal(recovered.installed["skill/legacy"].legacySkillMigration, undefined);
+    assert.equal(readFileSync(path.join(canonical, "SKILL.md"), "utf8"), "canonical contents");
+  });
+
   test("migrates a legacy root whose interrupted upgrade published the pending snapshot", async () => {
     const testHome = path.join(stateDir, "pending-migration-home");
     const legacySkillsDir = path.join(testHome, ".claude", "skills");

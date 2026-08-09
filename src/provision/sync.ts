@@ -628,6 +628,7 @@ function stableSnapshot(record: InstalledRecord): InstalledSnapshot {
     candidateIdentity: _candidateIdentity,
     configCandidate: _configCandidate,
     installMarker: _installMarker,
+    legacySkillMigration: _legacySkillMigration,
     rejectionRecoveryId: _rejectionRecoveryId,
     removalRecoveryId: _removalRecoveryId,
     skillLinks: _skillLinks,
