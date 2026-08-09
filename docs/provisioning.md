@@ -173,7 +173,10 @@ has been downloaded, verified, extracted, and audited. An exact lockfile-owned
 and replaced by the discovery link. A source-preparation failure therefore
 leaves the legacy skill live. Canonical collisions and modified or ambiguous
 legacy trees are left untouched. The recovery identity and its install root are
-journaled before isolation so restart reuses the same recovery.
+journaled before isolation so restart reuses the same recovery. During canonical
+publication, the legacy snapshot, original key/root, and isolated tree identity
+remain journaled until exposure succeeds; a failed no-replace publish or restart
+restores that exact tree to the legacy path without replacing another entry.
 
 ### `type: "config"`
 

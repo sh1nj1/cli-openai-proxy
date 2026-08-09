@@ -45,6 +45,7 @@ import {
   installSkill,
   isolateRejectedCandidate,
   removeSkill,
+  restoreSkillRemovalRecovery,
   resolveGitRevision,
 } from "./installer.js";
 import {
@@ -154,6 +155,7 @@ let pendingOperations = 0;
 let shuttingDown = false;
 let shutdownPromise: Promise<void> | null = null;
 let afterFirstInstallMove: ((target: string) => void) | undefined;
+let beforeSkillCandidateMove: ((target: string) => void) | undefined;
 let afterFirstInstallReconciliationIdentityCheck: ((target: string) => void) | undefined;
 let afterRemovalAudit: ((target: string) => void) | undefined;
 let afterRemovalIsolation: ((target: string) => void) | undefined;
@@ -226,6 +228,8 @@ export function initProvisioning(hooks: {
   perUserWorkers?: boolean;
   /** Test seam for a mutation immediately after a first install is exposed. */
   afterFirstInstallMove?: (target: string) => void;
+  /** Test seam for a target race after ownership is journaled but before exposure. */
+  beforeSkillCandidateMove?: (target: string) => void;
   /** Test seam for a namespace swap after restart reconciliation checks identity. */
   afterFirstInstallReconciliationIdentityCheck?: (target: string) => void;
   /** Test seam for a namespace mutation after removal validates ownership. */
@@ -242,6 +246,7 @@ export function initProvisioning(hooks: {
   resetProvisioning();
   perUserWorkers = hooks.perUserWorkers === true;
   afterFirstInstallMove = hooks.afterFirstInstallMove;
+  beforeSkillCandidateMove = hooks.beforeSkillCandidateMove;
   afterFirstInstallReconciliationIdentityCheck = hooks.afterFirstInstallReconciliationIdentityCheck;
   afterRemovalAudit = hooks.afterRemovalAudit;
   afterRemovalIsolation = hooks.afterRemovalIsolation;
@@ -1009,6 +1014,34 @@ function reconcileFirstInstallJournals(state: ProvisionStateFile): Set<string> {
     const target = path.join(installRoot, name);
     const { originalCandidateIsTarget, contentsMatch } = auditFirstInstallCandidate(name, record);
     const exposed = originalCandidateIsTarget && contentsMatch;
+    if (record.legacySkillMigration) {
+      if (exposed) {
+	if (!targetMatchesCandidateIdentity(name, record.candidateIdentity, installRoot)) {
+	  throw new ProvisionError(
+	    `Canonical migration candidate for "${name}" changed identity during reconciliation`,
+	    "untracked_content",
+	  );
+	}
+	state.installed[key] = {
+	  ...stableSnapshot(record),
+	  installRoot,
+	  ...(record.installMarker ? { installMarker: record.installMarker } : {}),
+	};
+      } else {
+	if (originalCandidateIsTarget && record.rejectionRecoveryId !== undefined) {
+	  isolateRejectedCandidate(
+	    target,
+	    name,
+	    installRoot,
+	    record.rejectionRecoveryId,
+	    record.candidateIdentity,
+	  );
+	}
+	restoreLegacySkillMigration(state, key, record);
+      }
+      changed = true;
+      continue;
+    }
     if (!exposed) {
       // A readable marker can be replayed by another same-UID process. Only the
       // original staged directory identity authorizes moving a rejected target.
@@ -1196,6 +1229,47 @@ function removalSnapshot(record: InstalledRecord): {
   };
 }
 
+/** Restore a legacy root from its exact migration recovery before dropping the journal. */
+function restoreLegacySkillMigration(
+  state: ProvisionStateFile,
+  key: string,
+  record: InstalledRecord,
+): void {
+  const migration = record.legacySkillMigration;
+  const snapshot = record.pending;
+  const recoveryId = record.removalRecoveryId;
+  if (!migration || !snapshot || !recoveryId) {
+    throw new ProvisionError("Legacy skill migration journal is incomplete", "untracked_content");
+  }
+  const name = migration.installedKey.slice(migration.installedKey.indexOf("/") + 1);
+  const target = path.join(migration.installRoot, name);
+  const targetIntact = installedSnapshotMatchesEntireTreeAt(target, snapshot);
+  const recovery = path.join(migration.installRoot, `.provision-removed-${recoveryId}`);
+  if ((!targetIntact && !installedSnapshotMatchesEntireTreeAt(recovery, snapshot))
+    || !restoreSkillRemovalRecovery(name, {
+      skillsDir: migration.installRoot,
+      recoveryId,
+      recoveryIdentity: migration.recoveryIdentity,
+    })) {
+    throw new ProvisionError(
+      `Cannot restore legacy skill "${name}" from its recorded migration recovery`,
+      "untracked_content",
+    );
+  }
+  if (!installedSnapshotMatchesEntireTreeAt(target, snapshot)) {
+    throw new ProvisionError(
+      `Restored legacy skill "${name}" no longer matches its ownership snapshot`,
+      "untracked_content",
+    );
+  }
+  delete state.installed[key];
+  state.installed[migration.installedKey] = {
+    ...snapshot,
+    installRoot: migration.installRoot,
+  };
+  finalizeRemovalRecoveries(state);
+}
+
 function reconcileUpgradeJournal(name: string, record: InstalledRecord): InstalledRecord {
   if (!record.pending) return record;
   // A crash can leave either side of the swap visible. Whichever complete
@@ -1339,7 +1413,7 @@ function planLegacySkillRootMigrations(
 function executeLegacySkillRootMigration(
   state: ProvisionStateFile,
   migration: LegacySkillRootMigration,
-): InstalledRecord {
+): { record: InstalledRecord; recoveryIdentity: InstalledDirectoryIdentity } {
   const record = state.installed[migration.installedKey];
   if (!record || skillInstallRoot(record) !== migration.installRoot) {
     throw new ProvisionError(
@@ -1361,14 +1435,15 @@ function executeLegacySkillRootMigration(
     );
   }
   const recovery = prepareRemovalRecovery(state, migration.installedKey);
+  let recoveryPath: string | undefined;
   try {
-    removeSkill(migration.name, {
+    recoveryPath = removeSkill(migration.name, {
       skillsDir: migration.installRoot,
       ...removalSnapshot(record),
       ...recovery,
       afterRootAudit: afterRemovalAudit,
       afterRootIsolation: afterRemovalIsolation,
-    });
+    }).recoveryPath;
   } finally {
     finalizeRemovalRecoveries(state);
   }
@@ -1378,11 +1453,25 @@ function executeLegacySkillRootMigration(
       "untracked_content",
     );
   }
+  recoveryPath ??= path.join(migration.installRoot, `.provision-removed-${recovery.recoveryId}`);
+  const recoveryStat = lstatSync(recoveryPath, { bigint: true });
+  if (!recoveryStat.isDirectory()) {
+    throw new ProvisionError(
+      `Cannot migrate legacy skill "${migration.name}": its recovery identity is unavailable`,
+      "untracked_content",
+    );
+  }
   if (!state.revoked.includes(migration.canonicalKey)
     && !state.approved.includes(migration.canonicalKey)) {
     state.approved.push(migration.canonicalKey);
   }
-  return record;
+  return {
+    record,
+    recoveryIdentity: {
+      dev: recoveryStat.dev.toString(),
+      ino: recoveryStat.ino.toString(),
+    },
+  };
 }
 
 /**
@@ -1749,10 +1838,14 @@ async function runSync(generation: number): Promise<ProvisionStatusView> {
 	    ...rejectedCandidateRecovery,
 	    firstInstallMarker,
 	    afterFirstInstallMove,
+	    beforeCandidateMove: beforeSkillCandidateMove,
 	    beforeCommit: (candidate, candidateIdentity) => {
 	      let migratedRecord: InstalledRecord | undefined;
+	      let migrationRecoveryIdentity: InstalledDirectoryIdentity | undefined;
 	      if (legacyRootMigration) {
-		migratedRecord = executeLegacySkillRootMigration(state, legacyRootMigration);
+		const migration = executeLegacySkillRootMigration(state, legacyRootMigration);
+		migratedRecord = migration.record;
+		migrationRecoveryIdentity = migration.recoveryIdentity;
 	      }
 	      const candidateRecord: InstalledSnapshot = {
 		sha256: fingerprint,
@@ -1779,6 +1872,17 @@ async function runSync(generation: number): Promise<ProvisionStatusView> {
 		  candidateIdentity,
 		  installMarker: firstInstallMarker,
 		  rejectionRecoveryId: rejectedCandidateRecovery.rejectionRecoveryId,
+		  ...(migratedRecord && legacyRootMigration && migrationRecoveryIdentity
+		    ? {
+			pending: stableSnapshot(migratedRecord),
+			legacySkillMigration: {
+			  installedKey: legacyRootMigration.installedKey,
+			  installRoot: legacyRootMigration.installRoot,
+			  recoveryIdentity: migrationRecoveryIdentity,
+			},
+			removalRecoveryId: migratedRecord.removalRecoveryId,
+		      }
+		    : {}),
 		};
 	      if (legacyRootMigration && legacyRootMigration.installedKey !== key) {
 		delete state.installed[legacyRootMigration.installedKey];
@@ -1787,19 +1891,19 @@ async function runSync(generation: number): Promise<ProvisionStatusView> {
 	      try {
 		saveState(state);
 	      } catch (err) {
-		delete state.installed[key];
-		if (previousRecord) state.installed[key] = previousRecord;
-		else if (migratedRecord && legacyRootMigration) {
-		  state.installed[legacyRootMigration.installedKey] = migratedRecord;
+		if (migratedRecord && legacyRootMigration) {
+		  restoreLegacySkillMigration(state, key, state.installed[key]!);
+		} else {
+		  delete state.installed[key];
+		  if (previousRecord) state.installed[key] = previousRecord;
 		}
 		throw err;
 	      }
 	      if (!previousRecord) {
 		return () => {
-		  delete state.installed[key];
 		  if (migratedRecord && legacyRootMigration) {
-		    state.installed[legacyRootMigration.installedKey] = migratedRecord;
-		  }
+		    restoreLegacySkillMigration(state, key, state.installed[key]!);
+		  } else delete state.installed[key];
 		  saveState(state);
 		};
 	      }
@@ -2088,6 +2192,7 @@ function clearProvisioningState(): void {
   pendingOperations = 0;
   shuttingDown = false;
   afterFirstInstallMove = undefined;
+  beforeSkillCandidateMove = undefined;
   afterFirstInstallReconciliationIdentityCheck = undefined;
   afterRemovalAudit = undefined;
   afterRemovalIsolation = undefined;

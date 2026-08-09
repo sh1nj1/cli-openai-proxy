@@ -21,6 +21,7 @@ import { isCanonicalGitPath, isGitObjectId, isValidGitRevision } from "./git-sou
 import { managedPathParts } from "./path-policy.js";
 import type {
   InstalledFileIdentity,
+  InstalledLegacySkillMigration,
   InstalledRecord,
   InstalledSnapshot,
   InstalledSkillLink,
@@ -269,6 +270,33 @@ function installedSkillLinkPublication(
   return { path: path.normalize(record.path), target: path.normalize(record.target) };
 }
 
+function installedLegacySkillMigration(
+  value: unknown,
+  installedKey: string,
+): InstalledLegacySkillMigration | null | undefined {
+  if (value === undefined) return undefined;
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return null;
+  const record = value as Record<string, unknown>;
+  const identity = record.recoveryIdentity;
+  if (typeof record.installedKey !== "string" || !KEY_PATTERN.test(record.installedKey)
+    || !record.installedKey.toLowerCase().startsWith("skill/")
+    || record.installedKey.toLowerCase() !== installedKey.toLowerCase()
+    || typeof record.installRoot !== "string" || !path.isAbsolute(record.installRoot)
+    || typeof identity !== "object" || identity === null || Array.isArray(identity)
+    || typeof (identity as Record<string, unknown>).dev !== "string"
+    || !FILESYSTEM_ID_PATTERN.test((identity as Record<string, string>).dev)
+    || typeof (identity as Record<string, unknown>).ino !== "string"
+    || !FILESYSTEM_ID_PATTERN.test((identity as Record<string, string>).ino)) return null;
+  return {
+    installedKey: record.installedKey,
+    installRoot: path.normalize(record.installRoot),
+    recoveryIdentity: {
+      dev: (identity as Record<string, string>).dev,
+      ino: (identity as Record<string, string>).ino,
+    },
+  };
+}
+
 function installedRecord(value: unknown, installedKey: string): InstalledRecord | null {
   const stable = installedSnapshot(value);
   if (!stable) return null;
@@ -283,6 +311,8 @@ function installedRecord(value: unknown, installedKey: string): InstalledRecord 
   if (!installedKey.toLowerCase().startsWith("skill/")
     && (skillLinks.length > 0 || skillLinkPublication !== undefined)) return null;
   const pending = raw.pending === undefined ? null : installedSnapshot(raw.pending);
+  const legacySkillMigration = installedLegacySkillMigration(raw.legacySkillMigration, installedKey);
+  if (legacySkillMigration === null) return null;
   const rawCandidateIdentity = raw.candidateIdentity;
   const candidateIdentity = typeof rawCandidateIdentity === "object"
     && rawCandidateIdentity !== null
@@ -313,12 +343,18 @@ function installedRecord(value: unknown, installedKey: string): InstalledRecord 
 	  ino: (rawConfigCandidate as Record<string, string>).ino,
 	}
       : undefined;
+  const uncommitted = raw.uncommitted === true;
+  const removalRecoveryId = typeof raw.removalRecoveryId === "string"
+    && RECOVERY_ID_PATTERN.test(raw.removalRecoveryId)
+    ? raw.removalRecoveryId
+    : undefined;
+  if (legacySkillMigration && (!uncommitted || !pending || !removalRecoveryId)) return null;
   return {
     ...stable,
     ...(installedKey.toLowerCase().startsWith("skill/") && installRoot ? { installRoot } : {}),
     ...(skillLinks.length > 0 ? { skillLinks } : {}),
     ...(skillLinkPublication ? { skillLinkPublication } : {}),
-    ...(raw.uncommitted === true ? { uncommitted: true as const } : {}),
+    ...(uncommitted ? { uncommitted: true as const } : {}),
     ...(candidateIdentity ? { candidateIdentity } : {}),
     ...(configCandidate ? { configCandidate } : {}),
     ...(typeof raw.installMarker === "string" && INSTALL_MARKER_PATTERN.test(raw.installMarker)
@@ -327,10 +363,9 @@ function installedRecord(value: unknown, installedKey: string): InstalledRecord 
     ...(typeof raw.rejectionRecoveryId === "string" && RECOVERY_ID_PATTERN.test(raw.rejectionRecoveryId)
       ? { rejectionRecoveryId: raw.rejectionRecoveryId }
       : {}),
-    ...(typeof raw.removalRecoveryId === "string" && RECOVERY_ID_PATTERN.test(raw.removalRecoveryId)
-      ? { removalRecoveryId: raw.removalRecoveryId }
-      : {}),
+    ...(removalRecoveryId ? { removalRecoveryId } : {}),
     ...(pending ? { pending } : {}),
+    ...(legacySkillMigration ? { legacySkillMigration } : {}),
   };
 }
 

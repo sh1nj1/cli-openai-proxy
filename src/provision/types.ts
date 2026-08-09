@@ -97,6 +97,16 @@ export interface InstalledSkillLinkPublication {
   target: string;
 }
 
+/** Legacy owner retained while a replacement is journaled at the new canonical root. */
+export interface InstalledLegacySkillMigration {
+  /** Original lockfile key, including its legacy case. */
+  installedKey: string;
+  /** Absolute parent directory of the live legacy skill. */
+  installRoot: string;
+  /** Physical identity of the isolated legacy tree authorized for restoration. */
+  recoveryIdentity: InstalledDirectoryIdentity;
+}
+
 /** One installed artifact as the lockfile records it. */
 export interface InstalledRecord extends InstalledSnapshot {
   /** Absolute parent directory that owns this skill's canonical tree. */
@@ -126,6 +136,8 @@ export interface InstalledRecord extends InstalledSnapshot {
    * retained alongside it so either side of an interrupted swap stays owned.
    */
   pending?: InstalledSnapshot;
+  /** Old-root ownership retained until a canonical first-install is exposed. */
+  legacySkillMigration?: InstalledLegacySkillMigration;
   /** Removal recovery preclaim persisted before the visible target is inspected. */
   removalRecoveryId?: string;
 }

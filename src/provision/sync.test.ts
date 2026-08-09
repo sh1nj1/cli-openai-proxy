@@ -556,6 +556,122 @@ describe("provision sync", () => {
     assert.equal(state.installed["skill/legacy"].removalRecoveryId, undefined);
   });
 
+  test("restores the legacy skill when canonical publication loses a race", async () => {
+    const testHome = path.join(stateDir, "migration-race-home");
+    const legacySkillsDir = path.join(testHome, ".claude", "skills");
+    process.env.HOME = testHome;
+    process.env.PROVISION_SKILLS_DIR = legacySkillsDir;
+    process.env.PROVISION_SKILL_LINK_DIRS = "";
+    process.env.PROVISION_AUTOAPPLY = "auto";
+    initProvisioning();
+    const original = serveSkill("/legacy-before-race.tgz", "live legacy skill");
+    registerManifestUrl(serveManifest([{ type: "skill", name: "legacy", ...original }]));
+    await syncNow();
+
+    const statePath = path.join(stateDir, "provision.lock.json");
+    const legacyState = JSON.parse(readFileSync(statePath, "utf8"));
+    delete legacyState.installed["skill/legacy"].installRoot;
+    writeFileSync(statePath, `${JSON.stringify(legacyState, null, 2)}\n`);
+
+    delete process.env.PROVISION_SKILLS_DIR;
+    delete process.env.PROVISION_SKILL_LINK_DIRS;
+    const canonical = path.join(testHome, ".agents", "skills", "legacy");
+    initProvisioning({
+      beforeSkillCandidateMove: (target) => {
+	assert.equal(target, canonical);
+	mkdirSync(target);
+	writeFileSync(path.join(target, "USER.md"), "race winner");
+      },
+    });
+    const replacement = serveSkill("/legacy-race-replacement.tgz", "replacement");
+    registerManifestUrl(serveManifest([{ type: "skill", name: "legacy", ...replacement }]));
+
+    const failed = await syncNow();
+    const legacyTarget = path.join(legacySkillsDir, "legacy");
+    assert.equal(statusOf(failed, "legacy"), "failed");
+    assert.match(failed.data[0]!.error!, /target appeared during installation/);
+    assert.equal(readFileSync(path.join(legacyTarget, "SKILL.md"), "utf8"), "live legacy skill");
+    assert.equal(lstatSync(legacyTarget).isSymbolicLink(), false);
+    assert.equal(readFileSync(path.join(canonical, "USER.md"), "utf8"), "race winner");
+    assert.equal(
+      readdirSync(legacySkillsDir).some((entry) => entry.startsWith(".provision-removed-")),
+      false,
+    );
+    const state = JSON.parse(readFileSync(statePath, "utf8"));
+    assert.equal(state.installed["skill/legacy"].installRoot, legacySkillsDir);
+    assert.equal(state.installed["skill/legacy"].legacySkillMigration, undefined);
+    assert.equal(state.installed["skill/legacy"].removalRecoveryId, undefined);
+  });
+
+  test("restores legacy ownership after a crash before canonical publication", async () => {
+    const testHome = path.join(stateDir, "migration-crash-home");
+    const legacySkillsDir = path.join(testHome, ".claude", "skills");
+    process.env.HOME = testHome;
+    process.env.PROVISION_SKILLS_DIR = legacySkillsDir;
+    process.env.PROVISION_SKILL_LINK_DIRS = "";
+    process.env.PROVISION_AUTOAPPLY = "auto";
+    initProvisioning();
+    const original = serveSkill("/legacy-before-crash.tgz", "live legacy skill");
+    registerManifestUrl(serveManifest([{ type: "skill", name: "legacy", ...original }]));
+    await syncNow();
+
+    const statePath = path.join(stateDir, "provision.lock.json");
+    const state = JSON.parse(readFileSync(statePath, "utf8"));
+    const legacyRecord = state.installed["skill/legacy"];
+    delete legacyRecord.installRoot;
+    const recoveryId = "a".repeat(32);
+    const legacyTarget = path.join(legacySkillsDir, "legacy");
+    const recovery = path.join(legacySkillsDir, `.provision-removed-${recoveryId}`);
+    renameSync(legacyTarget, recovery);
+    const recoveryStat = lstatSync(recovery, { bigint: true });
+    const canonicalRoot = path.join(testHome, ".agents", "skills");
+    state.installed["skill/legacy"] = {
+      sha256: "b".repeat(64),
+      files: ["SKILL.md"],
+      directories: [],
+      fileHashes: { "SKILL.md": sha(Buffer.from("replacement")) },
+      installedAt: new Date().toISOString(),
+      installRoot: canonicalRoot,
+      uncommitted: true,
+      candidateIdentity: {
+	dev: recoveryStat.dev.toString(),
+	ino: recoveryStat.ino.toString(),
+      },
+      pending: legacyRecord,
+      legacySkillMigration: {
+	installedKey: "skill/legacy",
+	installRoot: legacySkillsDir,
+	recoveryIdentity: {
+	  dev: recoveryStat.dev.toString(),
+	  ino: recoveryStat.ino.toString(),
+	},
+      },
+      removalRecoveryId: recoveryId,
+    };
+    state.removalRecoveries = [recoveryId];
+    state.removalRecoveryRoots = { [recoveryId]: legacySkillsDir };
+    writeFileSync(statePath, `${JSON.stringify(state, null, 2)}\n`);
+
+    delete process.env.PROVISION_SKILLS_DIR;
+    delete process.env.PROVISION_SKILL_LINK_DIRS;
+    initProvisioning();
+    registerManifestUrl(serveManifest([{
+      type: "skill",
+      name: "legacy",
+      url: `${baseUrl}/missing-after-migration-crash.tgz`,
+      sha256: "c".repeat(64),
+    }]));
+
+    const failed = await syncNow();
+    assert.equal(statusOf(failed, "legacy"), "failed");
+    assert.equal(readFileSync(path.join(legacyTarget, "SKILL.md"), "utf8"), "live legacy skill");
+    assert.equal(existsSync(recovery), false);
+    const restored = JSON.parse(readFileSync(statePath, "utf8"));
+    assert.equal(restored.installed["skill/legacy"].installRoot, legacySkillsDir);
+    assert.equal(restored.installed["skill/legacy"].legacySkillMigration, undefined);
+    assert.deepEqual(restored.removalRecoveries, []);
+  });
+
   test("migrates a legacy root whose interrupted upgrade published the pending snapshot", async () => {
     const testHome = path.join(stateDir, "pending-migration-home");
     const legacySkillsDir = path.join(testHome, ".claude", "skills");
