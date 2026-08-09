@@ -1334,9 +1334,17 @@ function discoverLegacySkillInstallRoots(state: ProvisionStateFile): Map<string,
   if (canonicalRoot !== defaultCanonicalRoot) return failures;
   const legacyRoot = path.resolve(homedir(), ".claude", "skills");
   if (legacyRoot === canonicalRoot) return failures;
+  const canonicalRootReal = existingRealPath(canonicalRoot);
+  const rootsAlias = canonicalRootReal !== undefined
+    && existingRealPath(legacyRoot) === canonicalRootReal;
   let changed = false;
   for (const [key, record] of Object.entries(state.installed)) {
     if (!key.toLowerCase().startsWith("skill/") || record.installRoot) continue;
+    if (rootsAlias) {
+      record.installRoot = canonicalRoot;
+      changed = true;
+      continue;
+    }
     const name = key.slice(key.indexOf("/") + 1);
     const canonicalTarget = path.join(canonicalRoot, name.toLowerCase());
     const legacyTarget = path.join(legacyRoot, name);
@@ -1394,6 +1402,65 @@ interface LegacySkillRootMigration {
   installRoot: string;
 }
 
+function recordedLegacyRecovery(
+  state: ProvisionStateFile,
+  record: InstalledRecord,
+  name: string,
+  installRoot: string,
+): { recoveryId: string; recoveryIdentity: InstalledDirectoryIdentity } | undefined {
+  const recoveryId = record.removalRecoveryId;
+  if (!recoveryId) return undefined;
+  const recoveryRoot = state.removalRecoveryRoots?.[recoveryId];
+  if (recoveryRoot === undefined || path.resolve(recoveryRoot) !== path.resolve(installRoot)) {
+    throw new ProvisionError(
+      `Cannot recover legacy skill "${name}": its recorded recovery root is unavailable`,
+      "untracked_content",
+    );
+  }
+  const recovery = path.join(recoveryRoot, `.provision-removed-${recoveryId}`);
+  const snapshots = [stableSnapshot(record), ...(record.pending ? [record.pending] : [])];
+  if (!snapshots.some((snapshot) => installedSnapshotMatchesEntireTreeAt(recovery, snapshot))) {
+    throw new ProvisionError(
+      `Cannot recover legacy skill "${name}": its recorded recovery is not intact`,
+      "untracked_content",
+    );
+  }
+  const stat = lstatSync(recovery, { bigint: true });
+  if (!stat.isDirectory()) {
+    throw new ProvisionError(
+      `Cannot recover legacy skill "${name}": its recovery identity is unavailable`,
+      "untracked_content",
+    );
+  }
+  return {
+    recoveryId,
+    recoveryIdentity: { dev: stat.dev.toString(), ino: stat.ino.toString() },
+  };
+}
+
+/** Keep the legacy skill live between an interrupted isolation and its retry. */
+function restorePreclaimedLegacyTarget(
+  state: ProvisionStateFile,
+  record: InstalledRecord,
+  name: string,
+  installRoot: string,
+): void {
+  const target = path.join(installRoot, name);
+  if (pathEntryExists(target)) return;
+  const recovery = recordedLegacyRecovery(state, record, name, installRoot);
+  if (!recovery) return;
+  const snapshots = [stableSnapshot(record), ...(record.pending ? [record.pending] : [])];
+  if (!restoreSkillRemovalRecovery(name, {
+    skillsDir: installRoot,
+    ...recovery,
+  }) || !snapshots.some((snapshot) => installedSnapshotMatchesEntireTreeAt(target, snapshot))) {
+    throw new ProvisionError(
+      `Cannot restore legacy skill "${name}" from its recorded recovery`,
+      "untracked_content",
+    );
+  }
+}
+
 /** Plan an old-root move without hiding the live skill before its replacement is ready. */
 function planLegacySkillRootMigrations(
   state: ProvisionStateFile,
@@ -1423,6 +1490,12 @@ function planLegacySkillRootMigrations(
     if (installRoot === canonicalRoot) continue;
     const name = key.slice(key.indexOf("/") + 1);
     const canonicalName = name.toLowerCase();
+    try {
+      restorePreclaimedLegacyTarget(state, record, name, installRoot);
+    } catch (err) {
+      failures.set(canonicalKey, err instanceof Error ? err.message : String(err));
+      continue;
+    }
     if (pathEntryExists(path.join(canonicalRoot, canonicalName))) {
       failures.set(
 	canonicalKey,
@@ -1478,7 +1551,16 @@ function executeLegacySkillRootMigration(
     );
   }
   if (!pathEntryExists(legacyTarget)) {
-    return { record };
+    const recovery = recordedLegacyRecovery(
+      state,
+      record,
+      migration.name,
+      migration.installRoot,
+    );
+    return {
+      record,
+      ...(recovery ? { recoveryIdentity: recovery.recoveryIdentity } : {}),
+    };
   }
   const recovery = prepareRemovalRecovery(state, migration.installedKey);
   let recoveryPath: string | undefined;
