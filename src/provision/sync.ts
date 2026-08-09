@@ -1244,6 +1244,7 @@ function discoverLegacySkillInstallRoots(state: ProvisionStateFile): Map<string,
     if (!key.toLowerCase().startsWith("skill/") || record.installRoot) continue;
     const name = key.slice(key.indexOf("/") + 1);
     const canonicalTarget = path.join(canonicalRoot, name.toLowerCase());
+    const ownershipSnapshots = [stableSnapshot(record), ...(record.pending ? [record.pending] : [])];
     if (record.uncommitted) {
       const canonicalCandidate = auditFirstInstallCandidate(name, record, canonicalRoot);
       const legacyCandidate = canonicalCandidate.originalCandidateIsTarget
@@ -1261,12 +1262,14 @@ function discoverLegacySkillInstallRoots(state: ProvisionStateFile): Map<string,
     }
     const linkedToCanonical = (record.skillLinks ?? []).some((link) =>
       link.target === canonicalTarget && sameSkillLinkIdentity(link.path, link));
-    if (linkedToCanonical && installedSnapshotIntactAt(canonicalTarget, record)) {
+    if (linkedToCanonical
+	&& ownershipSnapshots.some((snapshot) => installedSnapshotIntactAt(canonicalTarget, snapshot))) {
       record.installRoot = canonicalRoot;
       changed = true;
       continue;
     }
-    if (installedSnapshotMatchesEntireTreeAt(path.join(legacyRoot, name), record)) {
+    if (ownershipSnapshots.some((snapshot) =>
+      installedSnapshotMatchesEntireTreeAt(path.join(legacyRoot, name), snapshot))) {
       record.installRoot = legacyRoot;
       changed = true;
       continue;

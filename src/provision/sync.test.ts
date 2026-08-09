@@ -513,6 +513,54 @@ describe("provision sync", () => {
     );
   });
 
+  test("migrates a legacy root whose interrupted upgrade published the pending snapshot", async () => {
+    const testHome = path.join(stateDir, "pending-migration-home");
+    const legacySkillsDir = path.join(testHome, ".claude", "skills");
+    process.env.HOME = testHome;
+    process.env.PROVISION_SKILLS_DIR = legacySkillsDir;
+    process.env.PROVISION_SKILL_LINK_DIRS = "";
+    process.env.PROVISION_AUTOAPPLY = "auto";
+    initProvisioning();
+    const stable = serveSkill("/legacy-pending-v1.tgz", "stable contents");
+    registerManifestUrl(serveManifest([{ type: "skill", name: "legacy-pending", ...stable }]));
+    await syncNow();
+
+    const statePath = path.join(stateDir, "provision.lock.json");
+    const legacyState = JSON.parse(readFileSync(statePath, "utf8"));
+    const record = legacyState.installed["skill/legacy-pending"];
+    const pending = serveSkill("/legacy-pending-v2.tgz", "pending contents");
+    delete record.installRoot;
+    record.pending = {
+	sha256: pending.sha256,
+	files: ["SKILL.md"],
+	directories: [],
+	fileHashes: { "SKILL.md": sha(Buffer.from("pending contents")) },
+	installedAt: new Date().toISOString(),
+    };
+    writeFileSync(
+      path.join(legacySkillsDir, "legacy-pending", "SKILL.md"),
+      "pending contents",
+    );
+    writeFileSync(statePath, `${JSON.stringify(legacyState, null, 2)}\n`);
+
+    delete process.env.PROVISION_SKILLS_DIR;
+    delete process.env.PROVISION_SKILL_LINK_DIRS;
+    initProvisioning();
+    registerManifestUrl(serveManifest([{ type: "skill", name: "legacy-pending", ...pending }]));
+
+    const migrated = await syncNow();
+    const canonical = path.join(testHome, ".agents", "skills", "legacy-pending");
+    assert.equal(statusOf(migrated, "legacy-pending"), "installed");
+    assert.equal(readFileSync(path.join(canonical, "SKILL.md"), "utf8"), "pending contents");
+    assert.equal(lstatSync(path.join(legacySkillsDir, "legacy-pending")).isSymbolicLink(), true);
+    const migratedState = JSON.parse(readFileSync(statePath, "utf8"));
+    assert.equal(migratedState.installed["skill/legacy-pending"].pending, undefined);
+    assert.equal(
+      migratedState.installed["skill/legacy-pending"].installRoot,
+      path.join(testHome, ".agents", "skills"),
+    );
+  });
+
   test("reconciles a legacy first-install journal at its original root", async () => {
     const testHome = path.join(stateDir, "journal-home");
     const legacySkillsDir = path.join(testHome, ".claude", "skills");
