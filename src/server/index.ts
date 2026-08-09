@@ -24,6 +24,7 @@ import {
   PROVISION_PREFIX,
   handleProvisionApprove,
   handleProvisionDelete,
+  handleProvisionRegisterManifest,
   handleProvisionStatus,
   handleProvisionSync,
   provisionAdminMiddleware,
@@ -270,6 +271,7 @@ export function createApp(config: AppConfig = {}): Express {
   // runs its own engine in its own HOME, so the surface forwards like /v1/auth;
   // solo gateways keep the process-local engine.
   app.get(PROVISION_PREFIX, ...scoped(handleProvisionStatus));
+  app.post(`${PROVISION_PREFIX}/manifest`, ...scoped(handleProvisionRegisterManifest));
   app.post(`${PROVISION_PREFIX}/sync`, ...scoped(handleProvisionSync));
   app.post(`${PROVISION_PREFIX}/items/:type/:name/approve`, ...scoped(handleProvisionApprove));
   app.delete(`${PROVISION_PREFIX}/items/:type/:name`, ...scoped(handleProvisionDelete));

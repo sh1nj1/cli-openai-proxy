@@ -1,6 +1,6 @@
 import { test, describe, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "fs";
+import { existsSync, mkdtempSync, rmSync } from "fs";
 import { createServer } from "http";
 import type { Server } from "node:http";
 import type { AddressInfo } from "node:net";
@@ -11,6 +11,7 @@ import {
   PROVISION_PREFIX,
   handleProvisionApprove,
   handleProvisionDelete,
+  handleProvisionRegisterManifest,
   handleProvisionStatus,
   handleProvisionSync,
   provisionAdminMiddleware,
@@ -18,7 +19,15 @@ import {
 import { handleCreateAuthSession, initAuthAdmin } from "./auth-routes.js";
 import { authMiddleware, initAuth } from "./auth.js";
 import { createApp } from "./index.js";
-import { getStatus, initProvisioning, registerManifestUrl, shutdownProvisioning } from "../provision/sync.js";
+import {
+  getStatus,
+  initProvisioning,
+  registerManifestUrl,
+  shutdownProvisioning,
+  syncNow,
+} from "../provision/sync.js";
+import { registeredManifestFilePath } from "../provision/state.js";
+import { resetCapturedProxySecrets } from "../config.js";
 import { engineRegistry } from "../auth/registry.js";
 import { resetSessions } from "../auth/session-manager.js";
 import type { EngineAuthDescriptor, EngineAuthSession } from "../auth/types.js";
@@ -56,6 +65,8 @@ const SAVED_VARS = [
   "PROVISION_STATE_DIR",
   "PROVISION_SKILLS_DIR",
   "PROVISION_WORKSPACE_ROOT",
+  "PROVISION_MANIFEST_URL",
+  "PROVISION_REFETCH_MS",
   "AUTH_ADMIN_KEYS",
 ] as const;
 
@@ -68,6 +79,9 @@ describe("provision-routes", () => {
       saved.set(name, process.env[name]);
       delete process.env[name];
     }
+    // takeProxySecret answers from its capture once a variable has been taken,
+    // so a pinned PROVISION_MANIFEST_URL would survive into unrelated tests.
+    resetCapturedProxySecrets();
     stateDir = mkdtempSync(path.join(tmpdir(), "provision-routes-"));
     process.env.PROVISION_STATE_DIR = stateDir;
     process.env.PROVISION_SKILLS_DIR = path.join(stateDir, "skills");
@@ -82,6 +96,7 @@ describe("provision-routes", () => {
       if (value === undefined) delete process.env[name];
       else process.env[name] = value;
     }
+    resetCapturedProxySecrets();
     initAuthAdmin();
     rmSync(stateDir, { recursive: true, force: true });
   });
@@ -91,6 +106,26 @@ describe("provision-routes", () => {
     process.env.AUTH_ADMIN_KEYS = "admin-1";
     initProvisioning();
     initAuthAdmin();
+  }
+
+  /** Enable with an operator-pinned manifest URL, joined to its startup sync. */
+  async function enablePinned(url: string): Promise<void> {
+    process.env.PROVISION_MANIFEST_URL = url;
+    enable();
+    await syncNow().catch(() => undefined);
+  }
+
+  /** A manifest registry on loopback; `items: []` is a valid manifest that installs nothing. */
+  async function serveManifest(items: unknown[] = []): Promise<{ url: string; close: () => Promise<void> }> {
+    const server = createServer((_req, response) => {
+      response.setHeader("content-type", "application/json");
+      response.end(JSON.stringify({ schema: "agent-provisioning/v1", items }));
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    return {
+      url: `http://127.0.0.1:${(server.address() as AddressInfo).port}/provision.json`,
+      close: () => new Promise<void>((resolve, reject) => server.close((err) => err ? reject(err) : resolve())),
+    };
   }
 
   // Fail-closed: without the opt-in the surface does not exist, valid key or not.
@@ -224,6 +259,117 @@ describe("provision-routes", () => {
     assert.equal(res.statusCode, 400);
   });
 
+  describe("manifest registration", () => {
+    test("a missing or non-string url is a 400", async () => {
+      enable();
+      for (const body of [undefined, {}, { url: 42 }, { url: "   " }]) {
+        const res = fakeRes();
+        await handleProvisionRegisterManifest(fakeReq({ body }), res);
+        assert.equal(res.statusCode, 400);
+        assert.equal(errorOf(res).code, "invalid_provisioning_url");
+      }
+    });
+
+    test("an over-long url is refused before anything is registered", async () => {
+      enable();
+      const res = fakeRes();
+      await handleProvisionRegisterManifest(
+        fakeReq({ body: { url: `https://registry.test/${"a".repeat(8192)}.json` } }),
+        res,
+      );
+      assert.equal(res.statusCode, 400);
+      assert.equal(errorOf(res).code, "invalid_provisioning_url");
+      assert.equal(getStatus().manifest_url, null);
+    });
+
+    test("host policy applies to the manual route too", async () => {
+      enable();
+      const res = fakeRes();
+      await handleProvisionRegisterManifest(fakeReq({ body: { url: "http://registry.test/provision.json" } }), res);
+      assert.equal(res.statusCode, 400);
+      assert.equal(errorOf(res).code, "url_not_allowed");
+      assert.equal(getStatus().manifest_url, null);
+    });
+
+    test("registering a url syncs it and persists it for the next restart", async () => {
+      enable();
+      const registry = await serveManifest();
+      try {
+        const res = fakeRes();
+        await handleProvisionRegisterManifest(fakeReq({ body: { url: registry.url } }), res);
+        assert.equal(res.statusCode, 200);
+        assert.equal((res.payload as { manifest_url: string }).manifest_url, registry.url);
+        assert.equal(getStatus().manifest_url, registry.url);
+        assert.equal(existsSync(registeredManifestFilePath()), true);
+      } finally {
+        await registry.close();
+      }
+    });
+
+    // Unlike the login path, which swallows provisioning failures to keep the
+    // login itself succeeding, a caller who asked only to provision gets the error.
+    test("an unreachable manifest is an upstream 502", async () => {
+      enable();
+      const res = fakeRes();
+      await handleProvisionRegisterManifest(
+        fakeReq({ body: { url: "http://127.0.0.1:1/provision.json" } }),
+        res,
+      );
+      assert.equal(res.statusCode, 502);
+      assert.equal(errorOf(res).code, "manifest_fetch_failed");
+    });
+  });
+
+  describe("PROVISION_MANIFEST_URL pin", () => {
+    test("refuses a different url with 409 and keeps the pinned one", async () => {
+      const registry = await serveManifest();
+      const other = await serveManifest();
+      try {
+        await enablePinned(registry.url);
+        const res = fakeRes();
+        await handleProvisionRegisterManifest(fakeReq({ body: { url: other.url } }), res);
+        assert.equal(res.statusCode, 409);
+        assert.equal(errorOf(res).code, "manifest_url_locked");
+        assert.equal(getStatus().manifest_url, registry.url);
+      } finally {
+        await Promise.all([registry.close(), other.close()]);
+      }
+    });
+
+    // The pinned URL is taken from the environment because it may carry signed
+    // credentials; re-registering it must not become a way to write it to disk.
+    test("accepts the pinned url without persisting it", async () => {
+      const registry = await serveManifest();
+      try {
+        await enablePinned(registry.url);
+        const res = fakeRes();
+        await handleProvisionRegisterManifest(fakeReq({ body: { url: registry.url } }), res);
+        assert.equal(res.statusCode, 200);
+        assert.equal(existsSync(registeredManifestFilePath()), false);
+      } finally {
+        await registry.close();
+      }
+    });
+
+    test("a named workspace keeps its own manifest url", async () => {
+      const registry = await serveManifest();
+      const workspaceRegistry = await serveManifest();
+      try {
+        await enablePinned(registry.url);
+        const res = fakeRes();
+        await runInWorkspace("agent-9", () => handleProvisionRegisterManifest(
+          fakeReq({ body: { url: workspaceRegistry.url } }),
+          res,
+        ));
+        assert.equal(res.statusCode, 200);
+        assert.equal(runInWorkspace("agent-9", () => getStatus()).manifest_url, workspaceRegistry.url);
+        assert.equal(getStatus().manifest_url, registry.url);
+      } finally {
+        await Promise.all([registry.close(), workspaceRegistry.close()]);
+      }
+    });
+  });
+
   describe("auth session provisioning_url pass-through", () => {
     class FakeSession implements EngineAuthSession {
       async start() { return { verificationUrl: "https://example.test/authorize", instructions: "open it" }; }
@@ -307,6 +453,37 @@ describe("provision-routes", () => {
       assert.equal((submitted.payload as { status: string }).status, "authorized");
       assert.equal(runInWorkspace("agent-12", () => getStatus()).manifest_url, url);
       assert.equal(runInWorkspace("agent-11", () => getStatus()).manifest_url, null);
+    });
+
+    // Pinning is a policy refusal, not a transport failure: the login still
+    // succeeds and the reason lands where every other provisioning fault does.
+    test("a login cannot repoint an operator-pinned manifest url", async () => {
+      const registry = await serveManifest();
+      try {
+        await enablePinned(registry.url);
+        const created = fakeRes();
+        await handleCreateAuthSession(
+          fakeReq({
+            params: { engine: "fake" } as any,
+            body: { provisioning_url: "http://127.0.0.1:1/attacker.json" },
+          }),
+          created,
+        );
+        const { sessionId } = created.payload as { sessionId: string };
+
+        const { handleSubmitAuthSession } = await import("./auth-routes.js");
+        const res = fakeRes();
+        await handleSubmitAuthSession(
+          fakeReq({ params: { engine: "fake", sessionId } as any, body: { value: "code" } }),
+          res,
+        );
+        assert.equal((res.payload as { status: string }).status, "authorized");
+        const status = getStatus();
+        assert.equal(status.manifest_url, registry.url);
+        assert.match(status.last_error ?? "", /pinned by PROVISION_MANIFEST_URL/);
+      } finally {
+        await registry.close();
+      }
     });
 
     test("with provisioning disabled the url is accepted but ignored", async () => {
