@@ -561,6 +561,62 @@ describe("provision sync", () => {
     );
   });
 
+  test("preserves case-fold-colliding records during legacy root migration", async () => {
+    const testHome = path.join(stateDir, "case-fold-migration-home");
+    const legacySkillsDir = path.join(testHome, ".claude", "skills");
+    const records = {
+	"skill/demo": "managed contents",
+	"skill/Demo": "managed contents",
+    };
+    const installed: Record<string, object> = {};
+    for (const [key, contents] of Object.entries(records)) {
+	const name = key.slice(key.indexOf("/") + 1);
+	const target = path.join(legacySkillsDir, name);
+	mkdirSync(target, { recursive: true });
+	writeFileSync(path.join(target, "SKILL.md"), contents);
+	installed[key] = {
+	  sha256: "a".repeat(64),
+	  files: ["SKILL.md"],
+	  directories: [],
+	  fileHashes: { "SKILL.md": sha(Buffer.from(contents)) },
+	  installedAt: new Date().toISOString(),
+	};
+    }
+    writeFileSync(path.join(stateDir, "provision.lock.json"), JSON.stringify({
+	version: 1,
+	approved: [],
+	revoked: [],
+	installed,
+    }));
+    process.env.HOME = testHome;
+    delete process.env.PROVISION_SKILLS_DIR;
+    delete process.env.PROVISION_SKILL_LINK_DIRS;
+    process.env.PROVISION_AUTOAPPLY = "auto";
+    initProvisioning();
+    const replacement = serveSkill("/case-fold-root-migration.tgz", "canonical replacement");
+    registerManifestUrl(serveManifest([{ type: "skill", name: "demo", ...replacement }]));
+
+    const refused = await syncNow();
+
+    assert.equal(statusOf(refused, "demo"), "failed");
+    assert.match(refused.data[0]!.error!, /multiple installed records case-fold to the same key/);
+    assert.equal(
+	readFileSync(path.join(legacySkillsDir, "demo", "SKILL.md"), "utf8"),
+	"managed contents",
+    );
+    assert.equal(
+	readFileSync(path.join(legacySkillsDir, "Demo", "SKILL.md"), "utf8"),
+	"managed contents",
+    );
+    assert.equal(existsSync(path.join(testHome, ".agents", "skills", "demo")), false);
+    assert.equal(
+	readdirSync(legacySkillsDir).some((entry) => entry.startsWith(".provision-removed-")),
+	false,
+    );
+    const state = JSON.parse(readFileSync(path.join(stateDir, "provision.lock.json"), "utf8"));
+    assert.deepEqual(Object.keys(state.installed).sort(), ["skill/Demo", "skill/demo"]);
+  });
+
   test("reconciles a legacy first-install journal at its original root", async () => {
     const testHome = path.join(stateDir, "journal-home");
     const legacySkillsDir = path.join(testHome, ".claude", "skills");

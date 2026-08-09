@@ -1290,13 +1290,27 @@ function migrateLegacySkillRoots(
 ): Map<string, string> {
   const failures = new Map<string, string>();
   const canonicalRoot = path.resolve(skillsDir());
+  const desiredRecords = new Map<string, string[]>();
+  for (const key of Object.keys(state.installed)) {
+    const canonicalKey = canonicalStateKey(key);
+    if (!key.toLowerCase().startsWith("skill/") || !desired.has(canonicalKey)) continue;
+    desiredRecords.set(canonicalKey, [...(desiredRecords.get(canonicalKey) ?? []), key]);
+  }
+  for (const [canonicalKey, keys] of desiredRecords) {
+    if (keys.length < 2) continue;
+    failures.set(
+      canonicalKey,
+      `Cannot migrate legacy skills ${keys.map((key) => `"${key}"`).join(", ")}: multiple installed records case-fold to the same key`,
+    );
+  }
   for (const [key, record] of Object.entries(state.installed)) {
-    if (!key.toLowerCase().startsWith("skill/") || !desired.has(canonicalStateKey(key))) continue;
+    const canonicalKey = canonicalStateKey(key);
+    if (!key.toLowerCase().startsWith("skill/") || !desired.has(canonicalKey)) continue;
+    if (failures.has(canonicalKey)) continue;
     const installRoot = skillInstallRoot(record);
     if (installRoot === canonicalRoot) continue;
     const name = key.slice(key.indexOf("/") + 1);
     const canonicalName = name.toLowerCase();
-    const canonicalKey = `skill/${canonicalName}`;
     try {
       if (pathEntryExists(path.join(canonicalRoot, canonicalName))) {
 	throw new ProvisionError(
