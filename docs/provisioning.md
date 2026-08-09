@@ -265,7 +265,8 @@ curl -X POST http://127.0.0.1:3456/v1/provision/manifest \
 
 Unlike the login path — which must not fail a successful authentication because
 its manifest was unreachable — this route reports the failure: `400` for a
-malformed URL or one the host policy refuses, `409 manifest_url_locked` when
+malformed URL, one the host policy refuses, or one over 8 KiB of UTF-8 (the
+bound the encrypted registration file is sized by), `409 manifest_url_locked` when
 `PROVISION_MANIFEST_URL` pins the workspace, `502` when the manifest cannot be
 fetched or parsed. Re-registering the same URL is a plain re-sync. With per-user
 workers the request forwards to the caller's worker, so a worker without

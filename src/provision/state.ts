@@ -20,6 +20,7 @@ import path from "path";
 import { isCanonicalGitPath, isGitObjectId, isValidGitRevision } from "./git-source.js";
 import { managedPathParts } from "./path-policy.js";
 import { currentWorkspaceContext } from "./workspace-context.js";
+import { ProvisionError } from "./types.js";
 import type {
   InstalledFileIdentity,
   InstalledRecord,
@@ -90,6 +91,16 @@ export function loadOrCreateLocalManifestKey(): string {
 }
 
 const MAX_REGISTERED_MANIFEST_BYTES = 16 * 1024;
+/**
+ * Acceptance bound for a persistable URL, in UTF-8 bytes.
+ *
+ * The record stores the ciphertext base64url-encoded, so the file is ~4/3 the
+ * URL's UTF-8 size. Callers must bound the same units the record grows in: a
+ * limit on UTF-16 code units lets a non-ASCII URL write a file that exceeds
+ * MAX_REGISTERED_MANIFEST_BYTES, which loading then discards — the registration
+ * would look accepted and vanish at the next restart.
+ */
+export const MAX_REGISTERED_MANIFEST_URL_BYTES = 8 * 1024;
 const MANIFEST_CIPHER_AAD = Buffer.from("cli-openai-proxy/provision-manifest/v1", "utf8");
 
 function decodeField(value: unknown, expectedBytes?: number): Buffer | null {
@@ -132,6 +143,11 @@ export function loadRegisteredManifestUrl(keys: readonly string[]): string | nul
 /** Persist signed query URLs outside the non-secret ownership lockfile. */
 export function saveRegisteredManifestUrl(url: string, key: string | undefined): void {
   if (!key) throw new Error("Cannot persist an auth-delivered manifest URL without an auth-admin key.");
+  // Enforced here rather than only at the entry points so no caller can write a
+  // record that loadRegisteredManifestUrl will silently drop.
+  if (Buffer.byteLength(url, "utf8") > MAX_REGISTERED_MANIFEST_URL_BYTES) {
+    throw new ProvisionError("Manifest URL is too long to persist.", "invalid_provisioning_url");
+  }
   const salt = randomBytes(16);
   const iv = randomBytes(12);
   const cipher = createCipheriv("aes-256-gcm", scryptSync(key, salt, 32), iv);

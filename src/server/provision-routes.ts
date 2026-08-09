@@ -22,17 +22,14 @@ import {
   syncNow,
 } from "../provision/sync.js";
 import { ProvisionError } from "../provision/types.js";
+// Registration bound: the URL is persisted, so the acceptance limit is the
+// persistence limit. Unrelated to the login path's tighter base64url budget,
+// which exists only because that URL travels in a response header.
+import { MAX_REGISTERED_MANIFEST_URL_BYTES } from "../provision/state.js";
 
 /** Path prefix these handlers own. authMiddleware defers to this module's gate for it. */
 export const PROVISION_PREFIX = "/v1/provision";
 
-/**
- * Registration bound: the URL is persisted, encrypted at rest, and echoed in
- * every status view, so it must not be able to grow without limit. Unrelated to
- * the login path's tighter base64url budget, which exists only because that URL
- * travels in a worker-to-gateway response header.
- */
-const MAX_MANIFEST_URL_LENGTH = 8192;
 
 function fail(res: Response, status: number, message: string, code: string): void {
   res.status(status).json({ error: { message, type: "invalid_request_error", code } });
@@ -98,7 +95,7 @@ export async function handleProvisionRegisterManifest(req: Request, res: Respons
     return;
   }
   const url = raw.trim();
-  if (url.length > MAX_MANIFEST_URL_LENGTH) {
+  if (Buffer.byteLength(url, "utf8") > MAX_REGISTERED_MANIFEST_URL_BYTES) {
     fail(res, 400, "`url` is too long.", "invalid_provisioning_url");
     return;
   }

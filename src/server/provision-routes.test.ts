@@ -282,6 +282,19 @@ describe("provision-routes", () => {
       assert.equal(getStatus().manifest_url, null);
     });
 
+    // A URL under the limit in UTF-16 code units can still exceed it in the
+    // UTF-8 bytes the encrypted record is sized by.
+    test("an over-long url is measured in utf-8 bytes, not code units", async () => {
+      enable();
+      const url = `https://registry.test/${"가".repeat(4096)}.json`;
+      assert.ok(url.length < 8192 && Buffer.byteLength(url, "utf8") > 8192);
+      const res = fakeRes();
+      await handleProvisionRegisterManifest(fakeReq({ body: { url } }), res);
+      assert.equal(res.statusCode, 400);
+      assert.equal(errorOf(res).code, "invalid_provisioning_url");
+      assert.equal(getStatus().manifest_url, null);
+    });
+
     test("host policy applies to the manual route too", async () => {
       enable();
       const res = fakeRes();
