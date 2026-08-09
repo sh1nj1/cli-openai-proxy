@@ -1391,6 +1391,47 @@ describe("provision sync", () => {
     assert.equal(existsSync(path.join(legacySkillsDir, "legacy")), false);
   });
 
+  test("discovers legacy ownership through an aliased default canonical root", async () => {
+    const testHome = path.join(stateDir, "aliased-default-migration-home");
+    const legacySkillsDir = path.join(testHome, ".claude", "skills");
+    const canonicalSkillsDir = path.join(testHome, ".agents", "skills");
+    const canonicalAlias = path.join(testHome, "canonical-skills-alias");
+    process.env.HOME = testHome;
+    process.env.PROVISION_SKILLS_DIR = legacySkillsDir;
+    process.env.PROVISION_SKILL_LINK_DIRS = "";
+    process.env.PROVISION_AUTOAPPLY = "auto";
+    initProvisioning();
+    const skill = serveSkill("/aliased-default-migration.tgz", "same contents");
+    const manifestUrl = serveManifest([{ type: "skill", name: "legacy", ...skill }]);
+    registerManifestUrl(manifestUrl);
+    await syncNow();
+
+    const statePath = path.join(stateDir, "provision.lock.json");
+    const legacyState = JSON.parse(readFileSync(statePath, "utf8"));
+    delete legacyState.installed["skill/legacy"].installRoot;
+    writeFileSync(statePath, `${JSON.stringify(legacyState, null, 2)}\n`);
+    const canonical = path.join(canonicalSkillsDir, "legacy");
+    mkdirSync(canonical, { recursive: true });
+    writeFileSync(path.join(canonical, "SKILL.md"), "same contents");
+    symlinkSync(canonicalSkillsDir, canonicalAlias, process.platform === "win32" ? "junction" : "dir");
+
+    process.env.PROVISION_SKILLS_DIR = canonicalAlias;
+    delete process.env.PROVISION_SKILL_LINK_DIRS;
+    initProvisioning();
+    registerManifestUrl(manifestUrl);
+    const refused = await syncNow();
+
+    assert.equal(statusOf(refused, "legacy"), "failed");
+    assert.match(refused.data[0]!.error!, /untracked canonical target/);
+    assert.equal(readFileSync(path.join(canonical, "SKILL.md"), "utf8"), "same contents");
+    assert.equal(
+      readFileSync(path.join(legacySkillsDir, "legacy", "SKILL.md"), "utf8"),
+      "same contents",
+    );
+    const state = JSON.parse(readFileSync(statePath, "utf8"));
+    assert.equal(state.installed["skill/legacy"].installRoot, legacySkillsDir);
+  });
+
   test("never infers legacy ownership from a matching Claude skill", async () => {
     const testHome = path.join(stateDir, "matching-claude-home");
     const claudeSkill = path.join(testHome, ".claude", "skills", "matching");

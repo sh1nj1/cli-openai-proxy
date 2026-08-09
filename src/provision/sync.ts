@@ -1413,7 +1413,8 @@ function discoverLegacySkillInstallRoots(state: ProvisionStateFile): Map<string,
   const failures = new Map<string, string>();
   const canonicalRoot = path.resolve(skillsDir());
   const defaultCanonicalRoot = path.resolve(homedir(), ".agents", "skills");
-  if (canonicalRoot !== defaultCanonicalRoot) return failures;
+  if (resolvedPathThroughExistingAncestor(canonicalRoot)
+    !== resolvedPathThroughExistingAncestor(defaultCanonicalRoot)) return failures;
   const legacyRoot = path.resolve(homedir(), ".claude", "skills");
   if (legacyRoot === canonicalRoot) return failures;
   const canonicalRootReal = existingRealPath(canonicalRoot);
