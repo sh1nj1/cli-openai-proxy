@@ -742,6 +742,34 @@ describe("provision sync", () => {
     assert.equal(state.installed["skill/aliased"].installRoot, actualRoot);
   });
 
+  test("keeps a discovery link when its canonical target changes to an alias", async () => {
+    const actualRoot = path.join(stateDir, "linked-canonical-root");
+    const aliasRoot = path.join(stateDir, "linked-canonical-alias");
+    const linkRoot = path.join(stateDir, "linked-canonical-discovery");
+    process.env.PROVISION_SKILLS_DIR = actualRoot;
+    process.env.PROVISION_SKILL_LINK_DIRS = linkRoot;
+    process.env.PROVISION_AUTOAPPLY = "auto";
+    initProvisioning();
+    const skill = serveSkill("/linked-canonical-alias.tgz", "linked canonical alias");
+    const manifestUrl = serveManifest([{ type: "skill", name: "aliased", ...skill }]);
+    registerManifestUrl(manifestUrl);
+    assert.equal(statusOf(await syncNow(), "aliased"), "installed");
+    const link = path.join(linkRoot, "aliased");
+    const actualTarget = path.join(actualRoot, "aliased");
+    const linkIdentity = lstatSync(link, { bigint: true }).ino;
+    symlinkSync(actualRoot, aliasRoot, process.platform === "win32" ? "junction" : "dir");
+
+    process.env.PROVISION_SKILLS_DIR = aliasRoot;
+    initProvisioning();
+    registerManifestUrl(manifestUrl);
+    assert.equal(statusOf(await syncNow(), "aliased"), "installed");
+    assert.equal(lstatSync(link, { bigint: true }).ino, linkIdentity);
+    assert.equal(path.resolve(path.dirname(link), readlinkSync(link)), actualTarget);
+    assert.equal(statusOf(await syncNow(), "aliased"), "installed");
+    const state = JSON.parse(readFileSync(path.join(stateDir, "provision.lock.json"), "utf8"));
+    assert.equal(state.installed["skill/aliased"].skillLinks[0].target, actualTarget);
+  });
+
   test("repairs a missing legacy skill while migrating to the shared Codex source", async () => {
     const testHome = path.join(stateDir, "missing-legacy-home");
     const legacySkillsDir = path.join(testHome, ".claude", "skills");

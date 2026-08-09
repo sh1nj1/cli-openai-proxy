@@ -951,8 +951,13 @@ function ensureSkillLinks(
 	    "untracked_content",
 	  );
 	}
-	if (owned.target === target) {
-	  result.push(owned.path === linkPath ? owned : adoptPublishedSkillLink(linkPath, target));
+	const sameTarget = owned.target === target
+	  || resolvedPathThroughExistingAncestor(owned.target)
+	    === resolvedPathThroughExistingAncestor(target);
+	if (sameTarget) {
+	  result.push(owned.path === linkPath
+	    ? owned
+	    : adoptPublishedSkillLink(linkPath, owned.target));
 	  continue;
 	}
 	isolateRecordedSkillLink(owned);
