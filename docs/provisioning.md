@@ -37,7 +37,8 @@ enabling a manifest that contains `git` sources.
 | `PROVISION_AUTOAPPLY` | `approve` (default): first-seen items stop at `pending_approval`. `auto`: install immediately. |
 | `PROVISION_REFETCH_MS` | Drift-correction re-fetch interval. Default 3600000 (1h), `0` disables. |
 | `PROVISION_STATE_DIR` | Lockfile directory. Default `~/.cli-openai-proxy`. |
-| `PROVISION_SKILLS_DIR` | Install dir for `skill` items. Default `~/.claude/skills`. |
+| `PROVISION_SKILLS_DIR` | Canonical install dir for `skill` items. Default `~/.agents/skills` (read natively by Codex). |
+| `PROVISION_SKILL_LINK_DIRS` | Comma-separated discovery directories that receive managed links to canonical skills. Default `~/.claude/skills`; set to an empty string to disable link fanout. |
 | `PROVISION_CONFIG_DIR` | Install root for `config` items. Default `~/.config`; `XDG_CONFIG_HOME` is intentionally ignored because consuming CLIs read `~/.config` directly. |
 
 ## Per-user scope (worker mode)
@@ -45,10 +46,12 @@ enabling a manifest that contains `git` sources.
 Where the engine runs depends on deployment mode, not on any new flag:
 
 - **Solo gateway** (no per-user workers) — one process-local engine, running
-  in the gateway's own HOME (`~/.claude/skills`, `~/.cli-openai-proxy`).
+  in the gateway's own HOME (`~/.agents/skills`, linked from
+  `~/.claude/skills`, plus `~/.cli-openai-proxy`).
 - **Per-user Linux workers** (`deploy/linux/cli-openai-proxy-worker@.service`)
   — each worker runs its own engine in its own HOME
-  (`/var/lib/cli-openai-proxy/users/%i/.claude/skills`,
+  (`/var/lib/cli-openai-proxy/users/%i/.agents/skills`, linked from
+  `.../.claude/skills`,
   `.../.cli-openai-proxy`). `PROVISION_SYNC` on the worker unit is the opt-in,
   same as it is on a solo gateway; unset leaves that worker's
   `/v1/provision/*` answering `404 provisioning_disabled` as usual.
@@ -145,7 +148,8 @@ gateway behavior during a mixed rollout.
     Slash-containing branch names use the explicit `url` + `rev` + `path` form
     because GitHub tree URLs do not delimit the branch from the path.
 - **The manifest never chooses paths.** Each type maps to a hardcoded sandbox
-  (`skill` → `~/.claude/skills/{name}`, `config` → `~/.config/{name}`).
+  (`skill` → `~/.agents/skills/{name}` with a managed
+  `~/.claude/skills/{name}` link, `config` → `~/.config/{name}`).
   `git.path` selects source content only;
   it never affects the destination, so the channel cannot become an arbitrary
   remote file write.
@@ -155,6 +159,16 @@ directory. Git sources reject submodules and install only the selected tree.
 Removing an item from the manifest uninstalls it on the next sync; an **empty
 `items` array removes everything managed** (distinct from having no manifest
 registered, which syncs nothing).
+
+Skill content has one canonical copy. Codex discovers the default
+`~/.agents/skills/{name}` directly, while Claude discovers the managed link at
+`~/.claude/skills/{name}`. Additional link roots can be configured with
+`PROVISION_SKILL_LINK_DIRS`. Link paths and filesystem identities are recorded
+in the lockfile; changed or untracked entries fail with `untracked_content`
+instead of being replaced or removed. On upgrade from the previous default,
+an exact lockfile-owned `~/.claude/skills/{name}` tree is retained in a hidden
+recovery directory and replaced by the discovery link. Modified or ambiguous
+legacy trees are left untouched.
 
 ### `type: "config"`
 
@@ -300,7 +314,9 @@ the manifest.
   closed instead of falling back to racy path checks.
 - **Lockfile ownership.** `~/.cli-openai-proxy/provision.lock.json` records
   what the proxy installed, including archive-owned directories and per-file
-  hashes used to repair missing or modified content on the next sync. Upgrades
+  hashes used to repair missing or modified content on the next sync. Managed
+  discovery links are also recorded by path, target, and filesystem identity;
+  they are isolated and rechecked before removal. Upgrades
   journal both the stable and candidate ownership snapshots before swapping
   directories, so an interrupted swap is recoverable. Removal records its
   recovery identity before inspecting the target, atomically moves an owned
@@ -311,7 +327,8 @@ the manifest.
   a manifest item whose name collides with an untracked directory fails with
   `Refusing to replace untracked directory` instead of replacing it. Hidden
   removal, upgrade, and failed candidate recoveries are retained for explicit
-  operator cleanup. They are never automatically unlinked because an already-open
+  operator cleanup. Failed link isolation can likewise retain a hidden
+  `.provision-link-*` entry. Recoveries are never automatically unlinked because an already-open
   descriptor can modify an inode after any integrity check.
 - **TOFU approval.** In the default `approve` mode a first-seen `(type, name)`
   stops at `pending_approval` until an admin approves it.
@@ -331,7 +348,8 @@ declaration that the manifest's publisher is inside your trust boundary.
 Provisioning installs into whichever process's HOME its engine runs in — see
 [Per-user scope (worker mode)](#per-user-scope-worker-mode) above. With
 `PROVISION_SYNC=1` on the worker units, each user's worker installs skills
-and config into that worker's own `~/.claude/skills` and `~/.config`, so the
+and config into that worker's own `~/.agents/skills` (with Claude discovery
+links in `~/.claude/skills`) and `~/.config`, so the
 CLI process that actually runs as that user sees them. Leaving
 `PROVISION_SYNC` unset on worker units
 (the default) leaves provisioning off for that deployment entirely; it does

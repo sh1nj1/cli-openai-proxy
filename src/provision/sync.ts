@@ -23,6 +23,10 @@ import {
   openSync,
   readdirSync,
   readFileSync,
+  readlinkSync,
+  mkdirSync,
+  renameSync,
+  symlinkSync,
   unlinkSync,
 } from "fs";
 import { homedir } from "os";
@@ -49,6 +53,7 @@ import {
   installConfig,
   removeConfig,
 } from "./config-installer.js";
+import { renameDirectoryNoReplace } from "./rename-no-replace.js";
 import {
   loadRegisteredManifestUrl,
   loadOrCreateLocalManifestKey,
@@ -64,6 +69,7 @@ import {
   type InstalledRecord,
   type InstalledDirectoryIdentity,
   type InstalledSnapshot,
+  type InstalledSkillLink,
   type ProvisionManifest,
   type ProvisionStateFile,
 } from "./types.js";
@@ -182,7 +188,17 @@ function assertAcceptingOperations(): void {
 }
 
 function skillsDir(): string {
-  return process.env.PROVISION_SKILLS_DIR?.trim() || path.join(homedir(), ".claude", "skills");
+  return process.env.PROVISION_SKILLS_DIR?.trim() || path.join(homedir(), ".agents", "skills");
+}
+
+function skillLinkDirs(): string[] {
+  const configured = process.env.PROVISION_SKILL_LINK_DIRS;
+  const entries = configured === undefined
+    ? [path.join(homedir(), ".claude", "skills")]
+    : configured.split(",").map((entry) => entry.trim()).filter(Boolean);
+  const canonical = path.resolve(skillsDir());
+  return [...new Set(entries.map((entry) => path.resolve(entry)))]
+    .filter((entry) => entry !== canonical);
 }
 
 function configDir(): string {
@@ -607,9 +623,186 @@ function stableSnapshot(record: InstalledRecord): InstalledSnapshot {
     installMarker: _installMarker,
     rejectionRecoveryId: _rejectionRecoveryId,
     removalRecoveryId: _removalRecoveryId,
+    skillLinks: _skillLinks,
     ...stable
   } = record;
   return stable;
+}
+
+function absoluteLinkTarget(linkPath: string): string {
+  const raw = readlinkSync(linkPath);
+  return path.resolve(path.dirname(linkPath), raw);
+}
+
+function sameSkillLinkIdentity(linkPath: string, expected: InstalledSkillLink): boolean {
+  try {
+    const stat = lstatSync(linkPath, { bigint: true });
+    return stat.isSymbolicLink()
+      && stat.dev.toString() === expected.dev
+      && stat.ino.toString() === expected.ino
+      && absoluteLinkTarget(linkPath) === expected.target;
+  } catch {
+    return false;
+  }
+}
+
+function pathEntryExists(candidate: string): boolean {
+  try {
+    lstatSync(candidate);
+    return true;
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") return false;
+    throw err;
+  }
+}
+
+function isolateRecordedSkillLink(link: InstalledSkillLink): boolean {
+  const quarantine = path.join(
+    path.dirname(link.path),
+    `.provision-link-${randomBytes(16).toString("hex")}`,
+  );
+  try {
+    const moved = process.platform === "win32"
+      ? (() => {
+	  try {
+	    renameSync(link.path, quarantine);
+	    return true;
+	  } catch (err) {
+	    if ((err as NodeJS.ErrnoException).code === "ENOENT") return false;
+	    throw err;
+	  }
+	})()
+      : renameDirectoryNoReplace(link.path, quarantine);
+    if (!moved) {
+      throw new ProvisionError(`Skill link recovery path already exists for "${link.path}"`, "untracked_content");
+    }
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") return false;
+    throw err;
+  }
+
+  if (!sameSkillLinkIdentity(quarantine, link)) {
+    try {
+      if (process.platform === "win32") renameSync(quarantine, link.path);
+      else renameDirectoryNoReplace(quarantine, link.path);
+    } catch {
+      // Preserve the raced-in entry at its random recovery pathname.
+    }
+    throw new ProvisionError(
+      `Refusing to remove changed skill link "${link.path}"`,
+      "untracked_content",
+    );
+  }
+  unlinkSync(quarantine);
+  return true;
+}
+
+function createSkillLink(linkPath: string, target: string): InstalledSkillLink {
+  mkdirSync(path.dirname(linkPath), { recursive: true });
+  try {
+    symlinkSync(target, linkPath, process.platform === "win32" ? "junction" : "dir");
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "EEXIST") {
+      throw new ProvisionError(
+	`Refusing to replace untracked content at skill link "${linkPath}"`,
+	"untracked_content",
+      );
+    }
+    throw err;
+  }
+  const stat = lstatSync(linkPath, { bigint: true });
+  if (!stat.isSymbolicLink() || absoluteLinkTarget(linkPath) !== target) {
+    throw new ProvisionError(`Skill link publication failed at "${linkPath}"`, "untracked_content");
+  }
+  return { path: linkPath, target, dev: stat.dev.toString(), ino: stat.ino.toString() };
+}
+
+function removeRecordedSkillLinks(name: string, record: InstalledRecord): void {
+  for (const link of record.skillLinks ?? []) {
+    if (path.basename(link.path) !== name || path.basename(link.target) !== name) {
+      throw new ProvisionError(`Invalid recorded skill link for "${name}"`, "untracked_content");
+    }
+    isolateRecordedSkillLink(link);
+  }
+}
+
+function ensureSkillLinks(
+  name: string,
+  record: InstalledRecord,
+  legacySnapshot: InstalledSnapshot = record,
+): InstalledSkillLink[] {
+  const target = path.resolve(skillsDir(), name);
+  const desiredPaths = skillLinkDirs().map((directory) => path.join(directory, name));
+  const recorded = new Map((record.skillLinks ?? []).map((link) => [link.path, link]));
+
+  for (const link of record.skillLinks ?? []) {
+    if (desiredPaths.includes(link.path)) continue;
+    isolateRecordedSkillLink(link);
+  }
+
+  const result: InstalledSkillLink[] = [];
+  const created: InstalledSkillLink[] = [];
+  try {
+    for (const linkPath of desiredPaths) {
+      const owned = recorded.get(linkPath);
+      if (owned) {
+	if (!pathEntryExists(linkPath)) {
+	  const replacement = createSkillLink(linkPath, target);
+	  result.push(replacement);
+	  created.push(replacement);
+	  continue;
+	}
+	if (!sameSkillLinkIdentity(linkPath, owned)) {
+	  throw new ProvisionError(
+	    `Refusing to replace changed skill link "${linkPath}"`,
+	    "untracked_content",
+	  );
+	}
+	if (owned.target === target) {
+	  result.push(owned);
+	  continue;
+	}
+	isolateRecordedSkillLink(owned);
+	const replacement = createSkillLink(linkPath, target);
+	result.push(replacement);
+	created.push(replacement);
+	continue;
+      }
+
+      if (pathEntryExists(linkPath)) {
+	// Before Codex support, the default canonical directory was Claude's
+	// discovery directory. Re-home only an exact lockfile-owned snapshot;
+	// the normal removal path retains it in a hidden recovery directory.
+	const legacyDefault = process.env.PROVISION_SKILLS_DIR === undefined
+	  && linkPath === path.join(homedir(), ".claude", "skills", name);
+	if (!legacyDefault || !installedSnapshotMatchesEntireTreeAt(linkPath, legacySnapshot)) {
+	  throw new ProvisionError(
+	    `Refusing to replace untracked content at skill link "${linkPath}"`,
+	    "untracked_content",
+	  );
+	}
+	removeSkill(name, {
+	  skillsDir: path.dirname(linkPath),
+	  files: legacySnapshot.files,
+	  directories: legacySnapshot.directories,
+	  fileHashes: legacySnapshot.fileHashes,
+	});
+      }
+      const link = createSkillLink(linkPath, target);
+      result.push(link);
+      created.push(link);
+    }
+    return result;
+  } catch (err) {
+    for (const link of created.reverse()) {
+      try {
+	isolateRecordedSkillLink(link);
+      } catch {
+	// Preserve an entry that changed before rollback.
+      }
+    }
+    throw err;
+  }
 }
 
 function targetMatchesCandidateIdentity(
@@ -912,8 +1105,13 @@ function reconcileUpgradeJournal(name: string, record: InstalledRecord): Install
   // A crash can leave either side of the swap visible. Whichever complete
   // snapshot is on disk becomes stable; if neither is intact, retain both
   // ownership sets so the next install/removal can recover safely.
-  if (installedRecordMatchesEntireTree(name, record.pending)) return { ...record.pending };
-  if (installedRecordMatchesEntireTree(name, record)) return { ...stableSnapshot(record) };
+  const skillLinks = record.skillLinks;
+  if (installedRecordMatchesEntireTree(name, record.pending)) {
+    return { ...record.pending, ...(skillLinks ? { skillLinks } : {}) };
+  }
+  if (installedRecordMatchesEntireTree(name, record)) {
+    return { ...stableSnapshot(record), ...(skillLinks ? { skillLinks } : {}) };
+  }
   return record;
 }
 
@@ -1140,6 +1338,11 @@ async function runSync(generation: number): Promise<ProvisionStatusView> {
 	&& !state.installed[key]!.pending
 	&& !state.installed[key]!.installMarker
 	&& installedRecordIntact(item.type, item.name, state.installed[key]!)) {
+	if (item.type === "skill") {
+	  const links = ensureSkillLinks(item.name, state.installed[key]!);
+	  state.installed[key]!.skillLinks = links;
+	  saveState(state);
+	}
 	if (state.installed[key]!.removalRecoveryId) {
 	  delete state.installed[key]!.removalRecoveryId;
 	  finalizeRemovalRecoveries(state);
@@ -1264,7 +1467,11 @@ async function runSync(generation: number): Promise<ProvisionStatusView> {
 		installedAt: new Date().toISOString(),
 	      };
 	      const nextRecord: InstalledRecord = previousRecord
-		? { ...stableSnapshot(previousRecord), pending: candidateRecord }
+		? {
+		    ...stableSnapshot(previousRecord),
+		    ...(previousRecord.skillLinks ? { skillLinks: previousRecord.skillLinks } : {}),
+		    pending: candidateRecord,
+		  }
 		: {
 		  ...candidateRecord,
 		  uncommitted: true,
@@ -1308,7 +1515,17 @@ async function runSync(generation: number): Promise<ProvisionStatusView> {
 	directories: result.directories ?? [],
 	fileHashes: result.fileHashes,
 	installedAt: new Date().toISOString(),
+	...(previousRecord?.skillLinks ? { skillLinks: previousRecord.skillLinks } : {}),
       };
+
+      if (item.type === "skill") {
+	const installedRecord = state.installed[key]!;
+	installedRecord.skillLinks = ensureSkillLinks(
+	  item.name,
+	  installedRecord,
+	  previousRecord ?? installedRecord,
+	);
+      }
       if (!state.approved.includes(key)) state.approved.push(key);
       views.push({
 	type: item.type,
@@ -1350,6 +1567,7 @@ async function runSync(generation: number): Promise<ProvisionStatusView> {
     try {
       const record = state.installed[key]!;
       if (canonicalType === "skill") {
+	removeRecordedSkillLinks(name, record);
 	const recovery = prepareRemovalRecovery(state, key);
 	try {
 	  const snapshot = removalSnapshot(record);
@@ -1486,6 +1704,7 @@ export function deleteItem(type: string, name: string): Promise<{ removed: boole
     const record = installedKey ? state.installed[installedKey] : undefined;
     if (record && type === "skill") {
 	const installedName = installedKey!.slice(installedKey!.indexOf("/") + 1);
+      removeRecordedSkillLinks(installedName, record);
       const recovery = prepareRemovalRecovery(state, installedKey!);
       try {
 	const snapshot = removalSnapshot(record);

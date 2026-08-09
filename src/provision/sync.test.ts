@@ -11,9 +11,12 @@ import {
   mkdtempSync,
   readdirSync,
   readFileSync,
+  readlinkSync,
   renameSync,
   rmSync,
   statSync,
+  symlinkSync,
+  unlinkSync,
   writeFileSync,
 } from "fs";
 import { createServer, type Server } from "http";
@@ -148,9 +151,11 @@ const SAVED_VARS = [
   "PROVISION_ALLOWLIST",
   "PROVISION_STATE_DIR",
   "PROVISION_SKILLS_DIR",
+  "PROVISION_SKILL_LINK_DIRS",
   "PROVISION_CONFIG_DIR",
   "PROVISION_REFETCH_MS",
   "AUTH_ADMIN_KEYS",
+  "HOME",
 ] as const;
 
 describe("provision sync", () => {
@@ -210,6 +215,7 @@ describe("provision sync", () => {
     configDir = mkdtempSync(path.join(tmpdir(), "provision-sync-config-"));
     process.env.PROVISION_STATE_DIR = stateDir;
     process.env.PROVISION_SKILLS_DIR = skillsDir;
+    process.env.PROVISION_SKILL_LINK_DIRS = "";
     process.env.PROVISION_CONFIG_DIR = configDir;
     process.env.PROVISION_SYNC = "1";
     process.env.AUTH_ADMIN_KEYS = "test-admin-secret";
@@ -387,6 +393,108 @@ describe("provision sync", () => {
     registerManifestUrl(serveManifest([{ type: "skill", name: "pr-monitor", ...upgraded }]));
     const view = await syncNow();
     assert.equal(statusOf(view, "pr-monitor"), "installed");
+  });
+
+  test("fans one canonical skill out through managed discovery links", async () => {
+    const linkDir = path.join(stateDir, "claude-skills");
+    process.env.PROVISION_SKILL_LINK_DIRS = linkDir;
+    process.env.PROVISION_AUTOAPPLY = "auto";
+    initProvisioning();
+    const skill = serveSkill("/linked.tgz", "linked skill");
+    registerManifestUrl(serveManifest([{ type: "skill", name: "linked", ...skill }]));
+
+    const installed = await syncNow();
+    const link = path.join(linkDir, "linked");
+    const target = path.join(skillsDir, "linked");
+    assert.equal(statusOf(installed, "linked"), "installed");
+    assert.equal(lstatSync(link).isSymbolicLink(), true);
+    assert.equal(path.resolve(path.dirname(link), readlinkSync(link)), target);
+    const state = JSON.parse(readFileSync(path.join(stateDir, "provision.lock.json"), "utf8"));
+    assert.equal(state.installed["skill/linked"].skillLinks[0].path, link);
+
+    const linkIdentity = lstatSync(link, { bigint: true }).ino;
+    const upgradedSkill = serveSkill("/linked-v2.tgz", "linked skill v2");
+    registerManifestUrl(serveManifest([{ type: "skill", name: "linked", ...upgradedSkill }]));
+    const upgraded = await syncNow();
+    assert.equal(statusOf(upgraded, "linked"), "installed");
+    assert.equal(lstatSync(link, { bigint: true }).ino, linkIdentity);
+    assert.equal(readFileSync(path.join(target, "SKILL.md"), "utf8"), "linked skill v2");
+
+    responses.set("/provision.json", { schema: "agent-provisioning/v1", items: [] });
+    const removed = await syncNow();
+    assert.equal(statusOf(removed, "linked"), "removed");
+    assert.equal(existsSync(link), false);
+    assert.equal(existsSync(target), false);
+  });
+
+  test("migrates the previous Claude default into the shared Codex source", async () => {
+    const testHome = path.join(stateDir, "home");
+    const legacySkillsDir = path.join(testHome, ".claude", "skills");
+    process.env.HOME = testHome;
+    process.env.PROVISION_SKILLS_DIR = legacySkillsDir;
+    process.env.PROVISION_SKILL_LINK_DIRS = "";
+    process.env.PROVISION_AUTOAPPLY = "auto";
+    initProvisioning();
+    const skill = serveSkill("/legacy-default.tgz", "legacy managed skill");
+    registerManifestUrl(serveManifest([{ type: "skill", name: "legacy", ...skill }]));
+    await syncNow();
+    assert.equal(existsSync(path.join(legacySkillsDir, "legacy", "SKILL.md")), true);
+
+    delete process.env.PROVISION_SKILLS_DIR;
+    delete process.env.PROVISION_SKILL_LINK_DIRS;
+    initProvisioning();
+    registerManifestUrl(`${baseUrl}/provision.json`);
+    const migrated = await syncNow();
+    const canonical = path.join(testHome, ".agents", "skills", "legacy");
+    const link = path.join(legacySkillsDir, "legacy");
+    assert.equal(statusOf(migrated, "legacy"), "installed");
+    assert.equal(readFileSync(path.join(canonical, "SKILL.md"), "utf8"), "legacy managed skill");
+    assert.equal(lstatSync(link).isSymbolicLink(), true);
+    assert.equal(path.resolve(path.dirname(link), readlinkSync(link)), canonical);
+    assert.equal(
+      readdirSync(legacySkillsDir).some((entry) => entry.startsWith(".provision-removed-")),
+      true,
+    );
+  });
+
+  test("refuses an untracked discovery-path collision", async () => {
+    const linkDir = path.join(stateDir, "claude-skills");
+    const collision = path.join(linkDir, "linked");
+    mkdirSync(collision, { recursive: true });
+    writeFileSync(path.join(collision, "SKILL.md"), "user owned");
+    process.env.PROVISION_SKILL_LINK_DIRS = linkDir;
+    process.env.PROVISION_AUTOAPPLY = "auto";
+    initProvisioning();
+    const skill = serveSkill("/linked-collision.tgz", "managed");
+    registerManifestUrl(serveManifest([{ type: "skill", name: "linked", ...skill }]));
+
+    const status = await syncNow();
+    assert.equal(statusOf(status, "linked"), "failed");
+    assert.match(status.data[0]!.error!, /untracked content at skill link/);
+    assert.equal(readFileSync(path.join(collision, "SKILL.md"), "utf8"), "user owned");
+  });
+
+  test("preserves a changed managed link and refuses skill removal", async () => {
+    const linkDir = path.join(stateDir, "claude-skills");
+    process.env.PROVISION_SKILL_LINK_DIRS = linkDir;
+    process.env.PROVISION_AUTOAPPLY = "auto";
+    initProvisioning();
+    const skill = serveSkill("/changed-link.tgz", "managed");
+    registerManifestUrl(serveManifest([{ type: "skill", name: "linked", ...skill }]));
+    await syncNow();
+
+    const link = path.join(linkDir, "linked");
+    const replacement = path.join(stateDir, "replacement");
+    mkdirSync(replacement);
+    unlinkSync(link);
+    symlinkSync(replacement, link, process.platform === "win32" ? "junction" : "dir");
+    responses.set("/provision.json", { schema: "agent-provisioning/v1", items: [] });
+
+    const status = await syncNow();
+    assert.equal(statusOf(status, "linked"), "failed");
+    assert.match(status.data[0]!.error!, /changed skill link/);
+    assert.equal(path.resolve(path.dirname(link), readlinkSync(link)), replacement);
+    assert.equal(existsSync(path.join(skillsDir, "linked")), true);
   });
 
   test("approval queued during an active sync survives its stale snapshot and installs", async () => {

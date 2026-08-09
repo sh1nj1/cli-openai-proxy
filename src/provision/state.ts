@@ -23,6 +23,7 @@ import type {
   InstalledFileIdentity,
   InstalledRecord,
   InstalledSnapshot,
+  InstalledSkillLink,
   ProvisionStateFile,
 } from "./types.js";
 
@@ -232,10 +233,33 @@ function installedSnapshot(value: unknown): InstalledSnapshot | null {
   };
 }
 
-function installedRecord(value: unknown): InstalledRecord | null {
+function installedSkillLinks(value: unknown, installedKey: string): InstalledSkillLink[] | null {
+  if (value === undefined) return [];
+  if (!Array.isArray(value)) return null;
+  const name = installedKey.slice(installedKey.indexOf("/") + 1);
+  const links: InstalledSkillLink[] = [];
+  for (const entry of value) {
+    if (typeof entry !== "object" || entry === null || Array.isArray(entry)) return null;
+    const record = entry as Record<string, unknown>;
+    if (typeof record.path !== "string" || !path.isAbsolute(record.path)
+      || path.basename(record.path) !== name
+      || typeof record.target !== "string" || !path.isAbsolute(record.target)
+      || path.basename(record.target) !== name
+      || typeof record.dev !== "string" || !FILESYSTEM_ID_PATTERN.test(record.dev)
+      || typeof record.ino !== "string" || !FILESYSTEM_ID_PATTERN.test(record.ino)) return null;
+    links.push({ path: path.normalize(record.path), target: path.normalize(record.target), dev: record.dev, ino: record.ino });
+  }
+  if (new Set(links.map((link) => link.path)).size !== links.length) return null;
+  return links;
+}
+
+function installedRecord(value: unknown, installedKey: string): InstalledRecord | null {
   const stable = installedSnapshot(value);
   if (!stable) return null;
   const raw = value as Record<string, unknown>;
+  const skillLinks = installedSkillLinks(raw.skillLinks, installedKey);
+  if (skillLinks === null) return null;
+  if (!installedKey.toLowerCase().startsWith("skill/") && skillLinks.length > 0) return null;
   const pending = raw.pending === undefined ? null : installedSnapshot(raw.pending);
   const rawCandidateIdentity = raw.candidateIdentity;
   const candidateIdentity = typeof rawCandidateIdentity === "object"
@@ -269,6 +293,7 @@ function installedRecord(value: unknown): InstalledRecord | null {
       : undefined;
   return {
     ...stable,
+    ...(skillLinks.length > 0 ? { skillLinks } : {}),
     ...(raw.uncommitted === true ? { uncommitted: true as const } : {}),
     ...(candidateIdentity ? { candidateIdentity } : {}),
     ...(configCandidate ? { configCandidate } : {}),
@@ -298,7 +323,7 @@ export function loadState(): ProvisionStateFile {
     const installed: Record<string, InstalledRecord> = {};
     if (typeof parsed.installed === "object" && parsed.installed !== null) {
       for (const [key, value] of Object.entries(parsed.installed)) {
-	const record = KEY_PATTERN.test(key) ? installedRecord(value) : null;
+	const record = KEY_PATTERN.test(key) ? installedRecord(value, key) : null;
 	if (record) installed[key] = record;
       }
     }

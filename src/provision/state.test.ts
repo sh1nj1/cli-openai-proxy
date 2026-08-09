@@ -67,6 +67,12 @@ describe("provision state", () => {
           files: ["SKILL.md"],
 	  directories: ["examples", "examples/empty"],
           installedAt: "2026-08-02T00:00:00.000Z",
+	  skillLinks: [{
+	    path: "/home/test/.claude/skills/pr-monitor",
+	    target: "/home/test/.agents/skills/pr-monitor",
+	    dev: "12",
+	    ino: "34",
+	  }],
 	  removalRecoveryId: "f".repeat(32),
         },
       },

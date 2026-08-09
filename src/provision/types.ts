@@ -81,8 +81,18 @@ export interface InstalledFileIdentity extends InstalledDirectoryIdentity {
   name: string;
 }
 
+/** One proxy-owned skill discovery link. */
+export interface InstalledSkillLink extends InstalledDirectoryIdentity {
+  /** Absolute link pathname. */
+  path: string;
+  /** Absolute canonical skill directory the link resolves to. */
+  target: string;
+}
+
 /** One installed artifact as the lockfile records it. */
 export interface InstalledRecord extends InstalledSnapshot {
+  /** Discovery links published for other supported agent CLIs. */
+  skillLinks?: InstalledSkillLink[];
   /**
    * First-install ownership written before exposure. Recovery accepts only the
    * original staged directory identity at the canonical target.

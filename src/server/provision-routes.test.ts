@@ -50,7 +50,13 @@ function fakeReq(overrides: Partial<Request> = {}): Request {
 
 const errorOf = (res: FakeRes) => (res.payload as { error: { code: string; message: string } }).error;
 
-const SAVED_VARS = ["PROVISION_SYNC", "PROVISION_STATE_DIR", "PROVISION_SKILLS_DIR", "AUTH_ADMIN_KEYS"] as const;
+const SAVED_VARS = [
+  "PROVISION_SYNC",
+  "PROVISION_STATE_DIR",
+  "PROVISION_SKILLS_DIR",
+  "PROVISION_SKILL_LINK_DIRS",
+  "AUTH_ADMIN_KEYS",
+] as const;
 
 describe("provision-routes", () => {
   const saved = new Map<string, string | undefined>();
@@ -64,6 +70,7 @@ describe("provision-routes", () => {
     stateDir = mkdtempSync(path.join(tmpdir(), "provision-routes-"));
     process.env.PROVISION_STATE_DIR = stateDir;
     process.env.PROVISION_SKILLS_DIR = path.join(stateDir, "skills");
+    process.env.PROVISION_SKILL_LINK_DIRS = "";
   });
 
   afterEach(async () => {
