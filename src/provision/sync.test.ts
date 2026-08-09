@@ -4274,6 +4274,42 @@ describe("provision sync", () => {
     assert.equal(existsSync(path.join(configDir, "collavre")), false, "named config ignores legacy override");
   });
 
+  test("named workspaces migrate pre-scoped skills from their Claude root", async () => {
+    process.env.PROVISION_AUTOAPPLY = "auto";
+    initProvisioning();
+    const skill = serveSkill("/named-legacy-skill.tar.gz", "# named legacy");
+    responses.set("/named-legacy.json", {
+      schema: "agent-provisioning/v1",
+      items: [{ type: "skill", name: "legacy", ...skill }],
+    });
+    const workspaceId = "agent-legacy";
+    await runInWorkspace(workspaceId, async () => {
+      registerManifestUrl(`${baseUrl}/named-legacy.json`, { persist: true });
+      await syncNow();
+    });
+
+    const root = path.join(workspaceRoot, workspaceId);
+    const canonicalTarget = path.join(root, ".agents", "skills", "legacy");
+    const legacyTarget = path.join(root, ".claude", "skills", "legacy");
+    unlinkSync(legacyTarget);
+    renameSync(canonicalTarget, legacyTarget);
+    const stateFile = path.join(root, ".cli-openai-proxy", "provision.lock.json");
+    const legacyState = JSON.parse(readFileSync(stateFile, "utf8"));
+    delete legacyState.installed["skill/legacy"].installRoot;
+    delete legacyState.installed["skill/legacy"].skillLinks;
+    delete legacyState.installed["skill/legacy"].skillLinkPublication;
+    writeFileSync(stateFile, JSON.stringify(legacyState));
+
+    const status = await runInWorkspace(workspaceId, () => syncNow());
+    assert.equal(statusOf(status, "legacy"), "installed");
+    assert.equal(readFileSync(path.join(canonicalTarget, "SKILL.md"), "utf8"), "# named legacy");
+    assert.equal(lstatSync(legacyTarget).isSymbolicLink(), true);
+    assert.equal(readFileSync(path.join(legacyTarget, "SKILL.md"), "utf8"), "# named legacy");
+    const migratedState = JSON.parse(readFileSync(stateFile, "utf8"));
+    assert.equal(migratedState.installed["skill/legacy"].installRoot, path.dirname(canonicalTarget));
+    assert.equal(migratedState.installed["skill/legacy"].skillLinks[0].path, legacyTarget);
+  });
+
   test("enforces the named workspace count without affecting the legacy workspace", async () => {
     process.env.PROVISION_MAX_WORKSPACES_PER_USER = "1";
     initProvisioning();

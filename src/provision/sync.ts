@@ -1648,8 +1648,7 @@ function reconcileFirstInstallJournals(
 	    "untracked_content",
 	  );
 	}
-	if (resolvedPathThroughExistingAncestor(installRoot)
-	  !== resolvedPathThroughExistingAncestor(skillsDir())) {
+	if (!pathsEqualByFilesystemLookup(installRoot, skillsDir())) {
 	  throw new ProvisionError(
 	    `Cannot reconcile canonical migration candidate for "${name}" after the skills root changed`,
 	    "untracked_content",
@@ -1969,14 +1968,14 @@ function canonicalStateKey(key: string): string {
 /** Bind pre-Codex records to a proven root before either pathname is touched. */
 function discoverLegacySkillInstallRoots(state: ProvisionStateFile): Map<string, string> {
   const failures = new Map<string, string>();
+  const workspace = currentWorkspaceContext();
+  const legacyBase = workspace?.scoped && workspace.root ? workspace.root : homedir();
   const canonicalRoot = path.resolve(skillsDir());
-  const defaultCanonicalRoot = path.resolve(homedir(), ".agents", "skills");
+  const defaultCanonicalRoot = path.resolve(legacyBase, ".agents", "skills");
   if (!pathsEqualByFilesystemLookup(canonicalRoot, defaultCanonicalRoot)) return failures;
-  const legacyRoot = path.resolve(homedir(), ".claude", "skills");
+  const legacyRoot = path.resolve(legacyBase, ".claude", "skills");
   if (legacyRoot === canonicalRoot) return failures;
-  const canonicalRootReal = existingRealPath(canonicalRoot);
-  const rootsAlias = canonicalRootReal !== undefined
-    && existingRealPath(legacyRoot) === canonicalRootReal;
+  const rootsAlias = pathsEqualByFilesystemLookup(canonicalRoot, legacyRoot);
   let changed = false;
   for (const [key, record] of Object.entries(state.installed)) {
     if (!key.toLowerCase().startsWith("skill/") || record.installRoot) continue;
@@ -2127,8 +2126,7 @@ function planLegacySkillRootMigrations(
     if (!key.toLowerCase().startsWith("skill/") || !desired.has(canonicalKey)) continue;
     if (failures.has(canonicalKey)) continue;
     const installRoot = skillInstallRoot(record);
-    if (resolvedPathThroughExistingAncestor(installRoot)
-      === resolvedPathThroughExistingAncestor(canonicalRoot)) continue;
+    if (pathsEqualByFilesystemLookup(installRoot, canonicalRoot)) continue;
     const name = key.slice(key.indexOf("/") + 1);
     const canonicalName = name.toLowerCase();
     try {
