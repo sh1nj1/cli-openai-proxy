@@ -207,15 +207,15 @@ export function renameAtNoReplace(
   destination: string,
   runtimePlatform: NodeJS.Platform = process.platform,
   sourceFd?: number,
+  runVerifiedChild: VerifiedChildRunner = spawnVerifiedChild,
 ): boolean {
   assertSiblingBasenames(source, destination);
   if (runtimePlatform === "win32") {
-    const child = spawnVerifiedChild(parentFd, parentPath, WINDOWS_NOREPLACE_SCRIPT, [
+    const child = runVerifiedChild(parentFd, parentPath, WINDOWS_NOREPLACE_SCRIPT, [
       source,
       destination,
     ]);
     if (child.status === 0) return true;
-    if (child.status === 17) return false;
     if (child.status === 65) {
       throw new ProvisionError("Rename target changed during publication", "untracked_content");
     }
@@ -236,6 +236,12 @@ export function renameAtNoReplace(
       }
       return true;
     }
+    if (child.status === 17) return false;
+    // The helper can also be terminated after removing the source link. The
+    // open candidate descriptor still proves that the destination is the
+    // published inode, so caller cleanup must not truncate it.
+    if (sourceFd !== undefined
+      && destinationMatchesDescriptor(parentPath, destination, sourceFd)) return true;
     throw new ProvisionError("Atomic no-replace rename helper failed", "atomic_rename_unavailable");
   }
 

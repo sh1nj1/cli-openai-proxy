@@ -151,6 +151,7 @@ let afterFirstInstallMove: ((target: string) => void) | undefined;
 let afterFirstInstallReconciliationIdentityCheck: ((target: string) => void) | undefined;
 let afterRemovalAudit: ((target: string) => void) | undefined;
 let afterRemovalIsolation: ((target: string) => void) | undefined;
+let afterConfigRemoval: ((target: string) => void) | undefined;
 let perUserWorkers = false;
 
 class SupersededSyncError extends Error {
@@ -211,6 +212,8 @@ export function initProvisioning(hooks: {
   afterRemovalAudit?: (target: string) => void;
   /** Test seam for a namespace mutation after removal isolates the owned root. */
   afterRemovalIsolation?: (target: string) => void;
+  /** Test seam for a crash after config unlink but before final state cleanup. */
+  afterConfigRemoval?: (target: string) => void;
 } = {}): {
   enabled: boolean;
   autoApply: "auto" | "approve";
@@ -222,6 +225,7 @@ export function initProvisioning(hooks: {
   afterFirstInstallReconciliationIdentityCheck = hooks.afterFirstInstallReconciliationIdentityCheck;
   afterRemovalAudit = hooks.afterRemovalAudit;
   afterRemovalIsolation = hooks.afterRemovalIsolation;
+  afterConfigRemoval = hooks.afterConfigRemoval;
   const raw = process.env.PROVISION_SYNC?.trim().toLowerCase() ?? "";
   enabled = ["1", "true", "yes", "enabled"].includes(raw);
   autoApply = process.env.PROVISION_AUTOAPPLY?.trim().toLowerCase() === "auto" ? "auto" : "approve";
@@ -556,6 +560,24 @@ function configRecordForRemoval(name: string, record: InstalledRecord): Installe
   return reconciled;
 }
 
+function removeOwnedConfig(
+  name: string,
+  state: ProvisionStateFile,
+  key: string,
+  record: InstalledRecord,
+): void {
+  const removable = configRecordForRemoval(name, record);
+  if (removable !== record) {
+    state.installed[key] = removable;
+    // A completed upgrade journal must become stable before unlink. If the
+    // process exits after removal, the next run can conclusively finish from
+    // this owned snapshot instead of reopening an impossible pending journal.
+    saveState(state);
+  }
+  removeConfig(name, { configDir: configDir(), files: configOwnedFiles(removable) });
+  afterConfigRemoval?.(itemRoot("config", name));
+}
+
 function removeGatewayConfigState(): void {
   const state = loadState();
   reconcileFirstInstallJournals(state);
@@ -563,8 +585,7 @@ function removeGatewayConfigState(): void {
   for (const [key, record] of Object.entries(state.installed)) {
     if (!key.startsWith("config/")) continue;
     const name = key.slice("config/".length);
-    const removable = configRecordForRemoval(name, record);
-    removeConfig(name, { configDir: configDir(), files: configOwnedFiles(removable) });
+    removeOwnedConfig(name, state, key, record);
     delete state.installed[key];
     changed = true;
   }
@@ -1001,7 +1022,7 @@ async function runSync(generation: number): Promise<ProvisionStatusView> {
       const installed = state.installed[key];
       if (installed) {
 	try {
-	  removeConfig(item.name, { configDir: configDir(), files: configOwnedFiles(installed) });
+	  removeOwnedConfig(item.name, state, key, installed);
 	  delete state.installed[key];
 	  saveState(state);
 	} catch (err) {
@@ -1343,8 +1364,7 @@ async function runSync(generation: number): Promise<ProvisionStatusView> {
 	  finalizeRemovalRecoveries(state);
 	}
       } else if (canonicalType === "config") {
-	const removable = configRecordForRemoval(canonicalName, record);
-	removeConfig(canonicalName, { configDir: configDir(), files: configOwnedFiles(removable) });
+	removeOwnedConfig(canonicalName, state, key, record);
       }
       delete state.installed[key];
       views.push({ type: canonicalType, name: canonicalName, status: "removed" });
@@ -1481,8 +1501,7 @@ export function deleteItem(type: string, name: string): Promise<{ removed: boole
 	saveState(state);
       }
     } else if (record && type === "config") {
-      const removable = configRecordForRemoval(name, record);
-      removeConfig(name, { configDir: configDir(), files: configOwnedFiles(removable) });
+      removeOwnedConfig(name, state, installedKey!, record);
     }
     if (installedKey) delete state.installed[installedKey];
     // Revoked, not just uninstalled: auto mode must not undo an explicit DELETE.
@@ -1532,6 +1551,7 @@ function clearProvisioningState(): void {
   afterFirstInstallReconciliationIdentityCheck = undefined;
   afterRemovalAudit = undefined;
   afterRemovalIsolation = undefined;
+  afterConfigRemoval = undefined;
   perUserWorkers = false;
 }
 

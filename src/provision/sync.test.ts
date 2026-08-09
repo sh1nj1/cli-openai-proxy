@@ -2226,6 +2226,68 @@ describe("provision sync", () => {
     assert.equal(readFileSync(path.join(target, "notes.txt"), "utf8"), "mine");
   });
 
+  test("persists a reconciled config upgrade before removing its published file", async () => {
+    process.env.PROVISION_AUTOAPPLY = "auto";
+    initProvisioning();
+    const first = configItem("tok-1", "/config-v1.tar.gz");
+    registerManifestUrl(serveManifest([first.item]));
+    await syncNow();
+
+    const second = configItem("tok-2", "/config-v2.tar.gz");
+    const key = "config/collavre";
+    const target = path.join(configDir, "collavre");
+    const published = path.join(target, "config.json");
+    const candidateName = `.provision-config-candidate-${"a".repeat(32)}`;
+    const candidate = path.join(target, candidateName);
+    writeFileSync(candidate, second.body, { mode: 0o600 });
+    const targetStat = lstatSync(target, { bigint: true });
+    const candidateStat = lstatSync(candidate, { bigint: true });
+    rmSync(published);
+    renameSync(candidate, published);
+
+    const stateFile = path.join(stateDir, "provision.lock.json");
+    const state = JSON.parse(readFileSync(stateFile, "utf8"));
+    state.installed[key].pending = {
+      sha256: second.item.sha256,
+      files: ["config.json"],
+      directories: [],
+      fileHashes: { "config.json": sha(Buffer.from(second.body)) },
+      installedAt: new Date().toISOString(),
+    };
+    state.installed[key].candidateIdentity = {
+      dev: targetStat.dev.toString(),
+      ino: targetStat.ino.toString(),
+    };
+    state.installed[key].configCandidate = {
+      name: candidateName,
+      dev: candidateStat.dev.toString(),
+      ino: candidateStat.ino.toString(),
+    };
+    writeFileSync(stateFile, JSON.stringify(state));
+    responses.set("/provision.json", { schema: "agent-provisioning/v1", items: [] });
+
+    initProvisioning({
+      afterConfigRemoval: () => {
+	const persisted = JSON.parse(readFileSync(stateFile, "utf8"));
+	assert.equal(persisted.installed[key].sha256, second.item.sha256);
+	assert.equal(persisted.installed[key].pending, undefined);
+	assert.equal(persisted.installed[key].configCandidate, undefined);
+	throw new Error("simulated crash after config unlink");
+      },
+    });
+    registerManifestUrl(`${baseUrl}/provision.json`);
+    const interrupted = await syncNow();
+    assert.equal(interrupted.data[0]!.status, "failed");
+    assert.match(interrupted.data[0]!.error!, /simulated crash/);
+    assert.equal(existsSync(published), false);
+
+    initProvisioning();
+    registerManifestUrl(`${baseUrl}/provision.json`);
+    const recovered = await syncNow();
+    assert.equal(recovered.data[0]!.status, "removed");
+    assert.equal(key in JSON.parse(readFileSync(stateFile, "utf8")).installed, false);
+  });
+
   test("DELETE revokes config and the next sync returns it to pending approval", async () => {
     process.env.PROVISION_AUTOAPPLY = "auto";
     initProvisioning();

@@ -52,6 +52,59 @@ describe("Windows config file operations", () => {
     assert.equal(readFileSync(path.join(parent, "candidate"), "utf8"), "replacement");
   });
 
+  test("accepts publication completed before helper termination", () => {
+    const candidate = path.join(parent, "candidate");
+    const published = path.join(parent, "config.json");
+    writeFileSync(candidate, "secret");
+    const candidateFd = openSync(candidate, constants.O_RDONLY);
+    try {
+      assert.equal(renameAtNoReplace(
+	parentFd,
+	parent,
+	"candidate",
+	"config.json",
+	"win32",
+	candidateFd,
+	(_parentFd, parentPath, _script, [source, destination]) => {
+	  linkSync(path.join(parentPath, source!), path.join(parentPath, destination!));
+	  rmSync(path.join(parentPath, source!));
+	  return { status: null };
+	},
+      ), true);
+    } finally {
+      closeSync(candidateFd);
+    }
+
+    assert.equal(existsSync(candidate), false);
+    assert.equal(readFileSync(published, "utf8"), "secret");
+  });
+
+  test("accepts an EEXIST race that published the opened candidate inode", () => {
+    const candidate = path.join(parent, "candidate");
+    const published = path.join(parent, "config.json");
+    writeFileSync(candidate, "secret");
+    const candidateFd = openSync(candidate, constants.O_RDONLY);
+    try {
+      assert.equal(renameAtNoReplace(
+	parentFd,
+	parent,
+	"candidate",
+	"config.json",
+	"win32",
+	candidateFd,
+	(_parentFd, parentPath, _script, [source, destination]) => {
+	  linkSync(path.join(parentPath, source!), path.join(parentPath, destination!));
+	  return { status: 17 };
+	},
+      ), true);
+    } finally {
+      closeSync(candidateFd);
+    }
+
+    assert.equal(existsSync(candidate), false);
+    assert.equal(readFileSync(published, "utf8"), "secret");
+  });
+
   test("removes one managed basename and reports an absent file", () => {
     writeFileSync(path.join(parent, "config.json"), "secret");
     assert.equal(removeAt(parentFd, parent, "config.json", false, "win32"), true);
