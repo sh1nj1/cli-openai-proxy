@@ -52,6 +52,7 @@ describe("request identity", () => {
     resetRequestIdentityForTests();
     delete process.env.USER_API_KEYS;
     delete process.env.USER_IDENTITY_HMAC_SECRET;
+    delete process.env.PROXY_REQUIRE_IDENTITY_V2;
   });
 
   afterEach(() => {
@@ -59,6 +60,7 @@ describe("request identity", () => {
     resetRequestIdentityForTests();
     delete process.env.USER_API_KEYS;
     delete process.env.USER_IDENTITY_HMAC_SECRET;
+    delete process.env.PROXY_REQUIRE_IDENTITY_V2;
   });
 
   test("maps an opaque user API key to a trusted stable identity", () => {
@@ -74,7 +76,12 @@ describe("request identity", () => {
     requireRequestIdentity(request, response, () => { nexted = true; });
 
     assert.equal(nexted, true);
-    assert.deepEqual(requestIdentity(request), { tenantId: "tenant-a", userId: "user-a" });
+    assert.deepEqual(requestIdentity(request), {
+      tenantId: "tenant-a",
+      userId: "user-a",
+      workspaceId: "user-a",
+      workspaceScoped: false,
+    });
   });
 
   test("accepts an HMAC-bound identity and rejects tampering", () => {
@@ -117,7 +124,89 @@ describe("request identity", () => {
     }, "/");
     request.originalUrl = "/v1/chat/completions?stream=true";
 
-    assert.deepEqual(resolveRequestIdentity(request), { tenantId: "tenant-a", userId: "user-a" });
+    assert.deepEqual(resolveRequestIdentity(request), {
+      tenantId: "tenant-a",
+      userId: "user-a",
+      workspaceId: "user-a",
+      workspaceScoped: false,
+    });
+  });
+
+  test("requires a v2 signature for an explicit workspace and binds the workspace", () => {
+    const secret = "identity-secret-that-is-long-enough";
+    process.env.USER_IDENTITY_HMAC_SECRET = secret;
+    initRequestIdentity();
+    const timestamp = String(Math.floor(Date.now() / 1000));
+    const base = {
+      "x-cli-proxy-tenant-id": "tenant-a",
+      "x-cli-proxy-user-id": "user-a",
+      "x-cli-proxy-workspace-id": "agent-12",
+      "x-cli-proxy-identity-timestamp": timestamp,
+    };
+    const v2Payload = [
+      "v2", "POST", "/v1/chat/completions", timestamp, "tenant-a", "user-a", "agent-12",
+    ].join("\n");
+    const signature = createHmac("sha256", secret).update(v2Payload).digest("hex");
+    assert.deepEqual(resolveRequestIdentity(fakeRequest({
+      ...base,
+      "x-cli-proxy-identity-signature": signature,
+    })), {
+      tenantId: "tenant-a",
+      userId: "user-a",
+      workspaceId: "agent-12",
+      workspaceScoped: true,
+    });
+
+    assert.equal(resolveRequestIdentity(fakeRequest({
+      ...base,
+      "x-cli-proxy-workspace-id": "agent-11",
+      "x-cli-proxy-identity-signature": signature,
+    })), null, "workspace tampering must invalidate the signature");
+
+    const v1Payload = ["v1", "POST", "/v1/chat/completions", timestamp, "tenant-a", "user-a"].join("\n");
+    assert.equal(resolveRequestIdentity(fakeRequest({
+      ...base,
+      "x-cli-proxy-identity-signature": createHmac("sha256", secret).update(v1Payload).digest("hex"),
+    })), null, "an explicit workspace cannot downgrade to v1");
+    assert.equal(resolveRequestIdentity(fakeRequest({
+      ...base,
+      "x-cli-proxy-workspace-id": "",
+      "x-cli-proxy-identity-signature": createHmac("sha256", secret).update(v1Payload).digest("hex"),
+    })), null, "an empty-but-present workspace header cannot downgrade to v1");
+  });
+
+  test("rejects workspace path traversal and can require signed v2 identities", () => {
+    const secret = "identity-secret-that-is-long-enough";
+    process.env.USER_IDENTITY_HMAC_SECRET = secret;
+    const timestamp = String(Math.floor(Date.now() / 1000));
+    for (const workspaceId of ["../agent", "/absolute", ".hidden", "agent/name", "agent..name", "%2e%2e"]) {
+      resetCapturedProxySecrets();
+      process.env.USER_IDENTITY_HMAC_SECRET = secret;
+      initRequestIdentity();
+      const payload = [
+	"v2", "POST", "/v1/chat/completions", timestamp, "tenant-a", "user-a", workspaceId,
+      ].join("\n");
+      assert.equal(resolveRequestIdentity(fakeRequest({
+	"x-cli-proxy-tenant-id": "tenant-a",
+	"x-cli-proxy-user-id": "user-a",
+	"x-cli-proxy-workspace-id": workspaceId,
+	"x-cli-proxy-identity-timestamp": timestamp,
+	"x-cli-proxy-identity-signature": createHmac("sha256", secret).update(payload).digest("hex"),
+      })), null, `workspace traversal must be rejected: ${workspaceId}`);
+    }
+
+    resetCapturedProxySecrets();
+    process.env.USER_IDENTITY_HMAC_SECRET = secret;
+    process.env.PROXY_REQUIRE_IDENTITY_V2 = "1";
+    initRequestIdentity();
+    const v1Payload = ["v1", "POST", "/v1/chat/completions", timestamp, "tenant-a", "user-a"].join("\n");
+    assert.equal(resolveRequestIdentity(fakeRequest({
+      "x-cli-proxy-tenant-id": "tenant-a",
+      "x-cli-proxy-user-id": "user-a",
+      "x-cli-proxy-identity-timestamp": timestamp,
+      "x-cli-proxy-identity-signature": createHmac("sha256", secret).update(v1Payload).digest("hex"),
+    })), null);
+    delete process.env.PROXY_REQUIRE_IDENTITY_V2;
   });
 
   test("fails closed on malformed mapping configuration", () => {

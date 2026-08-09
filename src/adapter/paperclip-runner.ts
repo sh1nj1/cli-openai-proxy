@@ -10,6 +10,7 @@ import os from "os";
 import fs from "fs/promises";
 import path from "path";
 import type { AdapterExecutionContext, AdapterExecutionResult } from "@paperclipai/adapter-utils";
+import { resolvePaperclipInstanceRootForAdapter } from "@paperclipai/adapter-utils/server-utils";
 import type { ClaudeCliResult, ClaudeCliStreamEvent } from "../types/claude-cli.js";
 import { isSystemInit } from "../types/claude-cli.js";
 import type { AgentRunner, RunnerOptions } from "./agent-runner.js";
@@ -18,6 +19,10 @@ import { CodexJsonlParser } from "./codex-jsonl-parser.js";
 import { adapterRunError } from "./adapter-error.js";
 import { blankedProxySecrets, getBgWaitCeilingMs } from "../config.js";
 import { getProvisionedAuthEnv } from "../auth/token-store.js";
+import {
+  currentWorkspaceContext,
+  ensureWorkspaceRoot,
+} from "../provision/workspace-context.js";
 
 export type AdapterExecute = (ctx: AdapterExecutionContext) => Promise<AdapterExecutionResult>;
 
@@ -100,6 +105,17 @@ export class PaperclipRunner extends EventEmitter implements AgentRunner {
   }
 
   async start(prompt: string, options: RunnerOptions): Promise<void> {
+    const workspace = currentWorkspaceContext();
+    if (workspace?.scoped) ensureWorkspaceRoot(workspace);
+    const sharedPaperclipHome = workspace?.scoped
+      ? path.join(workspace.userHome, ".paperclip")
+      : undefined;
+    const sharedPaperclipInstanceRoot = sharedPaperclipHome
+      ? resolvePaperclipInstanceRootForAdapter({ homeDir: sharedPaperclipHome })
+      : undefined;
+    const sharedCodexHome = sharedPaperclipInstanceRoot
+      ? path.join(sharedPaperclipInstanceRoot, "companies", "local", "codex-home")
+      : undefined;
     // Each adapter emits a different stdout dialect: claude speaks stream-json
     // (per-token deltas), codex speaks `codex exec --json` NDJSON (per-message
     // blocks). Pick the matching live parser; both expose push()/flush().
@@ -164,6 +180,16 @@ export class PaperclipRunner extends EventEmitter implements AgentRunner {
         extraArgs,
         env: {
           CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS: String(getBgWaitCeilingMs()),
+	  ...(workspace?.scoped ? {
+	    HOME: workspace.root!,
+	    CLAUDE_CONFIG_DIR: path.join(workspace.root!, ".claude"),
+	    PAPERCLIP_HOME: sharedPaperclipHome!,
+	    ...(this.engine === "codex" ? {
+	      // Keep Codex on the user-scoped managed home even though HOME points at
+	      // the agent workspace. The adapter seeds it from the login CLI's ~/.codex.
+	      CODEX_HOME: sharedCodexHome!,
+	    } : {}),
+	  } : {}),
           // The adapter merges this over process.env, so shadowing is the only way
           // to keep the keys that authenticate callers TO the proxy out of a child
           // that runs with permissions skipped.

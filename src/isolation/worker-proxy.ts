@@ -7,12 +7,16 @@ import { v7 as uuidv7 } from "uuid";
 import { getAuthSessionTtlMs, getWorkerConnectTimeoutMs } from "../config.js";
 import { checkUrlAllowed, getAllowlist } from "../provision/manifest.js";
 import { provisionStateDir } from "../provision/state.js";
+import { validWorkspaceId } from "../provision/workspace-context.js";
 import { requestIdentity } from "./request-identity.js";
 import type { WorkerProvisioner, WorkerTarget } from "./types.js";
 import { WorkerIsolationError } from "./types.js";
 import {
   AUTHORIZED_PROVISIONING_HEADER,
   AUTH_UI_AVAILABLE_HEADER,
+  INTERNAL_WORKSPACE_ID_HEADER,
+  INTERNAL_WORKSPACE_SCOPED_HEADER,
+  INTERNAL_USER_ID_HEADER,
   PROVISIONING_GENERATION_HEADER,
   PROVISIONING_SESSION_TTL_HEADER,
   SUPERSEDED_PROVISIONING_GENERATION_HEADER,
@@ -37,12 +41,16 @@ const PRIVATE_HEADERS = new Set([
   "x-cli-proxy-user-key",
   "x-cli-proxy-tenant-id",
   "x-cli-proxy-user-id",
+  "x-cli-proxy-workspace-id",
   "x-cli-proxy-identity-timestamp",
   "x-cli-proxy-identity-signature",
   PROVISIONING_GENERATION_HEADER,
   PROVISIONING_SESSION_TTL_HEADER,
   SUPERSEDED_PROVISIONING_GENERATION_HEADER,
   AUTH_UI_AVAILABLE_HEADER,
+  INTERNAL_WORKSPACE_ID_HEADER,
+  INTERNAL_WORKSPACE_SCOPED_HEADER,
+  INTERNAL_USER_ID_HEADER,
 ]);
 
 const REGENERATED_BODY_HEADERS = new Set(["content-encoding", "content-length"]);
@@ -57,6 +65,7 @@ interface IssuedProvisioningBinding {
   engine: string;
   expiresAt: number;
   sessionId?: string;
+  workspaceId?: string;
 }
 
 interface IssuedProvisioningState {
@@ -129,6 +138,10 @@ function loadIssuedProvisioningState(file: string): IssuedProvisioningState {
 	  || binding.sessionId.length > 256
 	  || binding.sessionId.includes("/")
 	))
+	|| (binding.workspaceId !== undefined && (
+	  typeof binding.workspaceId !== "string"
+	  || !validWorkspaceId(binding.workspaceId)
+	))
       ) continue;
       bindings.set(generation, {
 	generation,
@@ -137,6 +150,7 @@ function loadIssuedProvisioningState(file: string): IssuedProvisioningState {
 	engine: binding.engine,
 	expiresAt,
 	...(typeof binding.sessionId === "string" ? { sessionId: binding.sessionId } : {}),
+	...(typeof binding.workspaceId === "string" ? { workspaceId: binding.workspaceId } : {}),
       });
       if (!latestGeneration || generation > latestGeneration) latestGeneration = generation;
     }
@@ -208,6 +222,9 @@ function outgoingHeaders(
   provisioningGeneration?: string,
   provisioningSessionTtlMs?: number,
   authUiAvailable = false,
+  workspaceId?: string,
+  workspaceScoped = false,
+  userId?: string,
 ): IncomingHttpHeaders {
   const result: IncomingHttpHeaders = {};
   for (const [name, value] of Object.entries(headers)) {
@@ -228,6 +245,9 @@ function outgoingHeaders(
     result[PROVISIONING_SESSION_TTL_HEADER] = String(provisioningSessionTtlMs);
   }
   if (authUiAvailable) result[AUTH_UI_AVAILABLE_HEADER] = "1";
+  if (workspaceId) result[INTERNAL_WORKSPACE_ID_HEADER] = workspaceId;
+  if (workspaceScoped) result[INTERNAL_WORKSPACE_SCOPED_HEADER] = "1";
+  if (userId) result[INTERNAL_USER_ID_HEADER] = userId;
   return result;
 }
 
@@ -236,10 +256,8 @@ function copyResponseHeaders(source: IncomingHttpHeaders, destination: Response)
     if (
       value !== undefined
       && !HOP_BY_HOP_HEADERS.has(name.toLowerCase())
+      && !PRIVATE_HEADERS.has(name.toLowerCase())
       && name.toLowerCase() !== AUTHORIZED_PROVISIONING_HEADER
-      && name.toLowerCase() !== PROVISIONING_GENERATION_HEADER
-      && name.toLowerCase() !== PROVISIONING_SESSION_TTL_HEADER
-      && name.toLowerCase() !== SUPERSEDED_PROVISIONING_GENERATION_HEADER
     ) {
       destination.setHeader(name, value);
     }
@@ -268,7 +286,7 @@ export class UserWorkerProxy {
   async forward(
     req: Request,
     res: Response,
-    onAuthorizedProvisioningUrl?: (url: string) => void | Promise<void>,
+    onAuthorizedProvisioningUrl?: (url: string, workspaceId?: string) => void | Promise<void>,
     authUiAvailable = false,
   ): Promise<void> {
     let upstream: http.ClientRequest | undefined;
@@ -280,8 +298,12 @@ export class UserWorkerProxy {
     res.once("close", closeUpstream);
 
     let target: WorkerTarget;
+    const identity = requestIdentity(req);
     try {
-      target = await this.provisioner.ensureWorker(requestIdentity(req));
+      target = await this.provisioner.ensureWorker({
+	tenantId: identity.tenantId,
+	userId: identity.userId,
+      });
     } catch (error) {
       res.off("close", closeUpstream);
       if (!clientClosed && !res.destroyed) this.sendFailure(res, error);
@@ -308,6 +330,7 @@ export class UserWorkerProxy {
 	  url: requestedProvisioningUrl,
 	  accountName: target.accountName,
 	  engine: sessionCollection.engine,
+	  workspaceId: identity.workspaceScoped ? identity.workspaceId : undefined,
 	});
 	provisioningGeneration = issuedBinding.generation;
       } catch (error) {
@@ -333,6 +356,9 @@ export class UserWorkerProxy {
 	    provisioningGeneration,
 	    issuedBinding ? getAuthSessionTtlMs() : undefined,
 	    authUiAvailable,
+	    identity.workspaceId,
+	    identity.workspaceScoped,
+	    identity.userId,
 	  ),
         },
 	(workerResponse) => {
@@ -497,6 +523,7 @@ export class UserWorkerProxy {
     url: string;
     accountName: string;
     engine: string;
+    workspaceId?: string;
   }): IssuedProvisioningBinding {
     let generation = uuidv7();
     if (this.latestIssuedProvisioningGeneration && generation <= this.latestIssuedProvisioningGeneration) {
@@ -514,6 +541,7 @@ export class UserWorkerProxy {
       accountName: options.accountName,
       engine: options.engine,
       expiresAt: Date.now() + getAuthSessionTtlMs() + this.connectTimeoutMs,
+      ...(options.workspaceId ? { workspaceId: options.workspaceId } : {}),
     };
     const previousBindings = new Map(this.issuedProvisioningBindings);
     const now = Date.now();
@@ -658,7 +686,7 @@ export class UserWorkerProxy {
     generation: string,
     accountName: string,
     requestPath: string,
-    callback: (url: string) => void | Promise<void>,
+    callback: (url: string, workspaceId?: string) => void | Promise<void>,
   ): void {
     const binding = this.issuedProvisioningBindings.get(generation);
     const session = authSessionResource(requestPath);
@@ -690,7 +718,7 @@ export class UserWorkerProxy {
 	return;
       }
     }
-    void Promise.resolve(callback(url)).catch((error) => {
+    void Promise.resolve(callback(url, binding.workspaceId)).catch((error) => {
       console.error(
 	`[UserWorkerProxy] provisioning notification failed: ${error instanceof Error ? error.message : String(error)}`,
       );

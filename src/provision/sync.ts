@@ -67,6 +67,12 @@ import {
   type ProvisionManifest,
   type ProvisionStateFile,
 } from "./types.js";
+import {
+  currentWorkspaceContext,
+  currentWorkspaceId,
+  currentWorkspaceKey,
+  ensureWorkspaceRoot,
+} from "./workspace-context.js";
 
 export interface ProvisionItemView {
   type: string;
@@ -84,6 +90,7 @@ export interface ProvisionStatusView {
   manifest_url: string | null;
   last_sync_at: string | null;
   last_error: string | null;
+  workspace_id: string | null;
   data: ProvisionItemView[];
 }
 
@@ -132,19 +139,25 @@ function installedSource(
 
 let enabled = false;
 let autoApply: "auto" | "approve" = "approve";
-let manifestPersistenceKeys: string[] = [];
-let manifestUrl: string | null = null;
-let lastManifest: ProvisionManifest | null = null;
-let lastManifestGeneration: number | null = null;
-let lastSyncAt: string | null = null;
-let lastError: string | null = null;
-let itemViews: ProvisionItemView[] = [];
-let refetchTimer: NodeJS.Timeout | null = null;
-let inFlight: Promise<ProvisionStatusView> | null = null;
-let manifestGeneration = 0;
-let syncRequested = false;
-let operationTail: Promise<void> = Promise.resolve();
-let pendingOperations = 0;
+interface WorkspaceRuntime {
+  manifestPersistenceKeys: string[];
+  manifestUrl: string | null;
+  lastManifest: ProvisionManifest | null;
+  lastManifestGeneration: number | null;
+  lastSyncAt: string | null;
+  lastError: string | null;
+  itemViews: ProvisionItemView[];
+  refetchTimer: NodeJS.Timeout | null;
+  inFlight: Promise<ProvisionStatusView> | null;
+  manifestGeneration: number;
+  syncRequested: boolean;
+  operationTail: Promise<void>;
+  pendingOperations: number;
+}
+
+let workspaceRuntimes = new Map<string, WorkspaceRuntime>();
+let configuredManifestPersistenceKeys: string[] = [];
+let fixedManifestUrl: string | null = null;
 let shuttingDown = false;
 let shutdownPromise: Promise<void> | null = null;
 let afterFirstInstallMove: ((target: string) => void) | undefined;
@@ -153,6 +166,99 @@ let afterRemovalAudit: ((target: string) => void) | undefined;
 let afterRemovalIsolation: ((target: string) => void) | undefined;
 let afterConfigRemoval: ((target: string) => void) | undefined;
 let perUserWorkers = false;
+let warnedNamedWorkspaceOverrides = false;
+
+function freshRuntime(): WorkspaceRuntime {
+  return {
+    manifestPersistenceKeys: [],
+    manifestUrl: null,
+    lastManifest: null,
+    lastManifestGeneration: null,
+    lastSyncAt: null,
+    lastError: null,
+    itemViews: [],
+    refetchTimer: null,
+    inFlight: null,
+    manifestGeneration: 0,
+    syncRequested: false,
+    operationTail: Promise.resolve(),
+    pendingOperations: 0,
+  };
+}
+
+function runtime(): WorkspaceRuntime {
+  const key = currentWorkspaceKey();
+  const existing = workspaceRuntimes.get(key);
+  if (existing) return existing;
+  const workspace = currentWorkspaceContext();
+  if (workspace?.scoped) {
+    try {
+      ensureWorkspaceRoot(workspace);
+    } catch (err) {
+      throw new ProvisionError(
+	err instanceof Error ? err.message : String(err),
+	err instanceof Error && /workspace limit/i.test(err.message)
+	  ? "workspace_limit_reached"
+	  : "invalid_workspace_root",
+      );
+    }
+  }
+  const created = freshRuntime();
+  workspaceRuntimes.set(key, created);
+  initializeRuntime(created, key === "legacy");
+  return created;
+}
+
+function initializeRuntime(target: WorkspaceRuntime, legacy: boolean): void {
+  if (!enabled || perUserWorkers) return;
+  if (!legacy && !warnedNamedWorkspaceOverrides && [
+    "PROVISION_SKILLS_DIR",
+    "PROVISION_CONFIG_DIR",
+    "PROVISION_STATE_DIR",
+  ].some((name) => process.env[name]?.trim())) {
+    warnedNamedWorkspaceOverrides = true;
+    console.warn(
+      "[Provision] Named workspaces ignore PROVISION_SKILLS_DIR, PROVISION_CONFIG_DIR, and PROVISION_STATE_DIR",
+    );
+  }
+  target.manifestPersistenceKeys = configuredManifestPersistenceKeys.length > 0
+    ? [...configuredManifestPersistenceKeys]
+    : [loadOrCreateLocalManifestKey()];
+  target.itemViews = Object.entries(loadState().installed)
+    .filter(([, record]) => !record.uncommitted && !record.pending && !record.removalRecoveryId)
+    .map(([key, record]) => {
+      const [type, ...rest] = canonicalStateKey(key).split("/");
+      return {
+	type: type ?? "skill",
+	name: rest.join("/"),
+	status: "installed" as const,
+	...(record.source?.type === "git"
+	  ? {
+	      git: {
+		rev: record.source.ref,
+		resolved_rev: record.source.rev,
+		...(record.source.path ? { path: record.source.path } : {}),
+	      },
+	    }
+	  : { sha256: record.sha256 }),
+      };
+    });
+  const startupManifestUrl = (legacy ? fixedManifestUrl : null)
+    || loadRegisteredManifestUrl(target.manifestPersistenceKeys);
+  if (!startupManifestUrl) return;
+  try {
+    registerManifestUrl(startupManifestUrl);
+  } catch (err) {
+    if (!(legacy && fixedManifestUrl)) {
+      target.lastError = err instanceof Error ? err.message : String(err);
+      return;
+    }
+    throw err;
+  }
+  void syncNow().catch(() => {
+    // syncNow records lastError; startup remains available for status/retry
+  });
+}
 
 class SupersededSyncError extends Error {
   constructor() {
@@ -162,15 +268,16 @@ class SupersededSyncError extends Error {
 }
 
 function assertCurrentGeneration(generation: number): void {
-  if (generation !== manifestGeneration) throw new SupersededSyncError();
+  if (generation !== runtime().manifestGeneration) throw new SupersededSyncError();
 }
 
 function serialize<T>(operation: () => Promise<T> | T): Promise<T> {
-  pendingOperations += 1;
-  const result = operationTail.then(operation, operation);
-  operationTail = result.then(
-    () => { pendingOperations -= 1; },
-    () => { pendingOperations -= 1; },
+  const workspace = runtime();
+  workspace.pendingOperations += 1;
+  const result = workspace.operationTail.then(operation, operation);
+  workspace.operationTail = result.then(
+    () => { workspace.pendingOperations -= 1; },
+    () => { workspace.pendingOperations -= 1; },
   );
   return result;
 }
@@ -182,12 +289,18 @@ function assertAcceptingOperations(): void {
 }
 
 function skillsDir(): string {
-  return process.env.PROVISION_SKILLS_DIR?.trim() || path.join(homedir(), ".claude", "skills");
+  const workspace = currentWorkspaceContext();
+  return workspace?.scoped && workspace.skillsDir
+    ? workspace.skillsDir
+    : process.env.PROVISION_SKILLS_DIR?.trim() || path.join(homedir(), ".claude", "skills");
 }
 
 function configDir(): string {
   // Collavre reads ~/.config directly; honoring XDG here would split producer and consumer paths.
-  return process.env.PROVISION_CONFIG_DIR?.trim() || path.join(homedir(), ".config");
+  const workspace = currentWorkspaceContext();
+  return workspace?.scoped && workspace.configDir
+    ? workspace.configDir
+    : process.env.PROVISION_CONFIG_DIR?.trim() || path.join(homedir(), ".config");
 }
 
 function itemRoot(type: string, name: string): string {
@@ -233,61 +346,15 @@ export function initProvisioning(hooks: {
     .split(",")
     .map((key) => key.trim())
     .filter(Boolean);
-  // Workers have no admin keys; a per-state-dir key keeps persistence working
-  // there without weakening the admin-key encryption used on the gateway.
-  manifestPersistenceKeys = adminKeys.length > 0 || !enabled
-    ? adminKeys
-    : [loadOrCreateLocalManifestKey()];
+  // Workers have no admin keys; each workspace creates a key beside its own
+  // lockfile lazily, while gateways retain the configured admin-key set.
+  configuredManifestPersistenceKeys = adminKeys;
   // Consume even while provisioning is disabled: a signed URL left in the
   // gateway environment is readable through /proc by same-uid CLI children.
-  const fixed = takeProxySecret("PROVISION_MANIFEST_URL")?.trim();
+  fixedManifestUrl = takeProxySecret("PROVISION_MANIFEST_URL")?.trim() || null;
   if (perUserWorkers) removeGatewayConfigState();
-  if (enabled) {
-    // What the lockfile already records survives a restart in the status view,
-    // so an operator sees their installs before (and without) the next sync.
-    itemViews = Object.entries(loadState().installed)
-      // An unresolved journal does not prove which complete tree is visible.
-      // Leave it out until a target-touching operation reconciles the state.
-      .filter(([, record]) => !record.uncommitted && !record.pending && !record.removalRecoveryId)
-      .map(([key, record]) => {
-	const [type, ...rest] = canonicalStateKey(key).split("/");
-	return {
-	  type: type ?? "skill",
-	  name: rest.join("/"),
-	  status: "installed" as const,
-	  ...(record.source?.type === "git"
-	    ? {
-		git: {
-		  rev: record.source.ref,
-		  resolved_rev: record.source.rev,
-		  ...(record.source.path ? { path: record.source.path } : {}),
-		},
-	      }
-	    : { sha256: record.sha256 }),
-	};
-      });
-    const startupManifestUrl = fixed || loadRegisteredManifestUrl(manifestPersistenceKeys);
-    if (startupManifestUrl) {
-      try {
-	registerManifestUrl(startupManifestUrl);
-      } catch (err) {
-	// A persisted auth URL is untrusted startup input and may no longer
-	// satisfy a changed allowlist. Keep the gateway available for a new login.
-	if (!fixed) {
-	  lastError = err instanceof Error ? err.message : String(err);
-	  return { enabled, autoApply, manifestUrl };
-	}
-	throw err;
-      }
-      // A fixed startup URL is itself a request to provision now. The interval
-      // is drift repair, not the first-run trigger (and may be disabled). The
-      // same applies to an auth registration restored after a process restart.
-      void syncNow().catch(() => {
-	// syncNow records lastError; startup remains available for status/retry
-      });
-    }
-  }
-  return { enabled, autoApply, manifestUrl };
+  const legacy = runtime();
+  return { enabled, autoApply, manifestUrl: legacy.manifestUrl };
 }
 
 export function provisionEnabled(): boolean {
@@ -295,31 +362,33 @@ export function provisionEnabled(): boolean {
 }
 
 function startRefetchTimer(): void {
-  if (refetchTimer) clearInterval(refetchTimer);
-  refetchTimer = null;
+  const workspace = runtime();
+  if (workspace.refetchTimer) clearInterval(workspace.refetchTimer);
+  workspace.refetchTimer = null;
   const interval = refetchMs();
   if (interval <= 0) return;
-  refetchTimer = setInterval(() => {
+  workspace.refetchTimer = setInterval(() => {
     void syncNow().catch(() => {
       // recorded in lastError by syncNow; the next tick retries
     });
   }, interval);
-  refetchTimer.unref?.();
+  workspace.refetchTimer.unref?.();
 }
 
 export function registerManifestUrl(url: string, options: { persist?: boolean } = {}): void {
   assertAcceptingOperations();
   if (!enabled) return;
+  const workspace = runtime();
   checkUrlAllowed(url, { allowlist: getAllowlist() });
-  if (options.persist) saveRegisteredManifestUrl(url, manifestPersistenceKeys[0]);
-  if (manifestUrl !== url) {
-    manifestUrl = url;
-    manifestGeneration += 1;
+  if (options.persist) saveRegisteredManifestUrl(url, workspace.manifestPersistenceKeys[0]);
+  if (workspace.manifestUrl !== url) {
+    workspace.manifestUrl = url;
+    workspace.manifestGeneration += 1;
     // Approvals are consent to the manifest currently registered. A previously
     // fetched manifest must not authorize names while the replacement is pending.
-    lastManifest = null;
-    lastManifestGeneration = null;
-    if (inFlight) syncRequested = true;
+    workspace.lastManifest = null;
+    workspace.lastManifestGeneration = null;
+    if (workspace.inFlight) workspace.syncRequested = true;
   }
   startRefetchTimer();
 }
@@ -991,18 +1060,19 @@ function migrateLegacyDesiredItems(
 }
 
 async function runSync(generation: number): Promise<ProvisionStatusView> {
+  const workspace = runtime();
   if (!enabled) {
     throw new ProvisionError("Provisioning is disabled. Set PROVISION_SYNC=1 to enable it.", "provisioning_disabled");
   }
-  if (!manifestUrl) {
+  if (!workspace.manifestUrl) {
     throw new ProvisionError("No manifest URL registered.", "no_manifest_url");
   }
-  const url = manifestUrl;
+  const url = workspace.manifestUrl;
   const allowlist = getAllowlist();
   const manifest = await fetchManifest(url);
   assertCurrentGeneration(generation);
-  lastManifest = manifest;
-  lastManifestGeneration = generation;
+  workspace.lastManifest = manifest;
+  workspace.lastManifestGeneration = generation;
 
   const state = loadState();
   reconcileFirstInstallJournals(state);
@@ -1380,52 +1450,55 @@ async function runSync(generation: number): Promise<ProvisionStatusView> {
   state.adopted = (state.adopted ?? []).filter((key) => desired.has(key));
 
   saveState(state);
-  itemViews = views;
-  lastSyncAt = new Date().toISOString();
-  lastError = null;
+  workspace.itemViews = views;
+  workspace.lastSyncAt = new Date().toISOString();
+  workspace.lastError = null;
   return getStatus();
 }
 
 /** Serialized and coalesced; URL changes during a run queue one follow-up run. */
 export async function syncNow(): Promise<ProvisionStatusView> {
   assertAcceptingOperations();
-  if (inFlight) return inFlight;
+  const workspace = runtime();
+  if (workspace.inFlight) return workspace.inFlight;
   const loop = async (): Promise<ProvisionStatusView> => {
     let result!: ProvisionStatusView;
     do {
-      syncRequested = false;
-      const startedGeneration = manifestGeneration;
+      workspace.syncRequested = false;
+      const startedGeneration = workspace.manifestGeneration;
       try {
 	result = await serialize(() => runSync(startedGeneration));
       } catch (err) {
 	// A superseded URL's failure must not prevent the newly registered URL
 	// from running; only surface an error from the still-current generation.
-	if (startedGeneration === manifestGeneration && !syncRequested) throw err;
+	if (startedGeneration === workspace.manifestGeneration && !workspace.syncRequested) throw err;
       }
-      if (startedGeneration !== manifestGeneration) syncRequested = true;
-    } while (syncRequested);
+      if (startedGeneration !== workspace.manifestGeneration) workspace.syncRequested = true;
+    } while (workspace.syncRequested);
     return result;
   };
-  inFlight = loop()
+  workspace.inFlight = loop()
     .catch((err) => {
-      lastError = err instanceof Error ? err.message : String(err);
+      workspace.lastError = err instanceof Error ? err.message : String(err);
       throw err;
     })
     .finally(() => {
-      inFlight = null;
+      workspace.inFlight = null;
     });
-  return inFlight;
+  return workspace.inFlight;
 }
 
 export function getStatus(): ProvisionStatusView {
+  const workspace = runtime();
   return {
     object: "list",
     enabled,
     auto_apply: autoApply,
-    manifest_url: manifestUrl,
-    last_sync_at: lastSyncAt,
-    last_error: lastError,
-    data: [...itemViews],
+    manifest_url: workspace.manifestUrl,
+    last_sync_at: workspace.lastSyncAt,
+    last_error: workspace.lastError,
+    workspace_id: currentWorkspaceId() ?? null,
+    data: [...workspace.itemViews],
   };
 }
 
@@ -1438,21 +1511,22 @@ export async function approveItem(
   if (opts.adopt && type !== "config") {
     throw new ProvisionError("`adopt` is supported only for config items", "invalid_item");
   }
+  const workspace = runtime();
   const key = `${type}/${name}`;
-  const approvalGeneration = manifestGeneration;
+  const approvalGeneration = workspace.manifestGeneration;
   // Approval is consent to something the operator has SEEN: only names the
   // current manifest carries can be approved, so the list cannot be pre-seeded
   // with grants for items that never appeared.
-  const known = lastManifestGeneration === approvalGeneration
-    && lastManifest?.items.some((item) => item.type === type && item.name === name);
+  const known = workspace.lastManifestGeneration === approvalGeneration
+    && workspace.lastManifest?.items.some((item) => item.type === type && item.name === name);
   if (!known) {
     throw new ProvisionError(`No item "${key}" in the current manifest`, "unknown_item");
   }
-  if (inFlight) syncRequested = true;
+  if (workspace.inFlight) workspace.syncRequested = true;
   await serialize(() => {
-    const stillKnown = approvalGeneration === manifestGeneration
-      && lastManifestGeneration === approvalGeneration
-      && lastManifest?.items.some((item) => item.type === type && item.name === name);
+    const stillKnown = approvalGeneration === workspace.manifestGeneration
+      && workspace.lastManifestGeneration === approvalGeneration
+      && workspace.lastManifest?.items.some((item) => item.type === type && item.name === name);
     if (!stillKnown) {
       throw new ProvisionError(`No item "${key}" in the current manifest`, "unknown_item");
     }
@@ -1472,8 +1546,9 @@ export function deleteItem(type: string, name: string): Promise<{ removed: boole
   if (!isValidItemName(type) || !isValidItemName(name)) {
     throw new ProvisionError(`Invalid item key "${type}/${name}"`, "invalid_item");
   }
+  const workspace = runtime();
   const key = `${type}/${name}`;
-  if (inFlight) syncRequested = true;
+  if (workspace.inFlight) workspace.syncRequested = true;
   return serialize(() => {
     const state = loadState();
     reconcileFirstInstallJournals(state);
@@ -1509,7 +1584,7 @@ export function deleteItem(type: string, name: string): Promise<{ removed: boole
     state.adopted = (state.adopted ?? []).filter((entry) => entry !== key);
     if (!state.revoked.includes(key)) state.revoked.push(key);
     saveState(state);
-    itemViews = itemViews.filter((item) => !(item.type === type && item.name === name));
+    workspace.itemViews = workspace.itemViews.filter((item) => !(item.type === type && item.name === name));
     return { removed: installed };
   });
 }
@@ -1525,27 +1600,19 @@ export async function handleAuthorizedSession(url: string | undefined): Promise<
     registerManifestUrl(url, { persist: true });
     await syncNow();
   } catch (err) {
-    lastError = err instanceof Error ? err.message : String(err);
+    runtime().lastError = err instanceof Error ? err.message : String(err);
   }
 }
 
 function clearProvisioningState(): void {
-  if (refetchTimer) clearInterval(refetchTimer);
-  refetchTimer = null;
+  for (const workspace of workspaceRuntimes.values()) {
+    if (workspace.refetchTimer) clearInterval(workspace.refetchTimer);
+  }
   enabled = false;
   autoApply = "approve";
-  manifestPersistenceKeys = [];
-  manifestUrl = null;
-  lastManifest = null;
-  lastManifestGeneration = null;
-  lastSyncAt = null;
-  lastError = null;
-  itemViews = [];
-  inFlight = null;
-  manifestGeneration = 0;
-  syncRequested = false;
-  operationTail = Promise.resolve();
-  pendingOperations = 0;
+  workspaceRuntimes = new Map();
+  configuredManifestPersistenceKeys = [];
+  fixedManifestUrl = null;
   shuttingDown = false;
   afterFirstInstallMove = undefined;
   afterFirstInstallReconciliationIdentityCheck = undefined;
@@ -1553,6 +1620,7 @@ function clearProvisioningState(): void {
   afterRemovalIsolation = undefined;
   afterConfigRemoval = undefined;
   perUserWorkers = false;
+  warnedNamedWorkspaceOverrides = false;
 }
 
 /**
@@ -1563,12 +1631,14 @@ function clearProvisioningState(): void {
 export function shutdownProvisioning(): Promise<void> {
   if (shutdownPromise) return shutdownPromise;
   shuttingDown = true;
-  if (refetchTimer) clearInterval(refetchTimer);
-  refetchTimer = null;
-  const active = inFlight;
+  const runtimes = [...workspaceRuntimes.values()];
+  for (const workspace of runtimes) {
+    if (workspace.refetchTimer) clearInterval(workspace.refetchTimer);
+    workspace.refetchTimer = null;
+  }
   const shutdown = (async () => {
-    if (active) await active.catch(() => undefined);
-    await operationTail;
+    await Promise.all(runtimes.map((workspace) => workspace.inFlight?.catch(() => undefined)));
+    await Promise.all(runtimes.map((workspace) => workspace.operationTail));
     clearProvisioningState();
   })();
   shutdownPromise = shutdown.finally(() => {
@@ -1579,7 +1649,9 @@ export function shutdownProvisioning(): Promise<void> {
 
 /** Clear idle module state (not disk). Tests and the first step of init only. */
 export function resetProvisioning(): void {
-  if (inFlight || pendingOperations > 0 || shuttingDown) {
+  if ([...workspaceRuntimes.values()].some((workspace) => (
+    workspace.inFlight || workspace.pendingOperations > 0
+  )) || shuttingDown) {
     throw new Error("Cannot reset provisioning while operations are active; await shutdownProvisioning()");
   }
   clearProvisioningState();
