@@ -83,7 +83,10 @@ const REMOTE_EXEC_PATTERNS: Array<[RegExp, string]> = [
   [/\beval\s*"?\$\(/, "evals command substitution"],
 ];
 
-async function download(url: string, checkUrl?: (url: string) => void): Promise<Buffer> {
+export async function downloadArtifact(
+  url: string,
+  checkUrl?: (url: string) => void,
+): Promise<Buffer> {
   const response = await fetchWithPolicy(url, {
     checkUrl: checkUrl ?? (() => {}),
     timeoutMs: DOWNLOAD_TIMEOUT_MS,
@@ -113,7 +116,7 @@ async function download(url: string, checkUrl?: (url: string) => void): Promise<
  * gzip bomb) must never reach the filesystem. The audit's per-file/total caps
  * remain as the backstop for what fits under this bound.
  */
-function assertDecompressionBounded(buf: Buffer): void {
+export function assertDecompressionBounded(buf: Buffer): void {
   try {
     gunzipSync(buf, { maxOutputLength: MAX_DECOMPRESSED_BYTES });
   } catch (err) {
@@ -132,7 +135,7 @@ function assertDecompressionBounded(buf: Buffer): void {
  * entries (a symlinked directory would let a later entry write through it) and
  * any traversal or absolute name.
  */
-function assertArchiveSafe(archivePath: string, compressed = true): boolean {
+export function assertArchiveSafe(archivePath: string, compressed = true): boolean {
   let verbose: string;
   let names: string;
   try {
@@ -526,7 +529,7 @@ async function prepareSource(
     return prepareGitSource(item.git, item.resolvedGitRevision, temporary, checkUrl);
   }
 
-  const buf = await download(item.url, checkUrl);
+  const buf = await downloadArtifact(item.url, checkUrl);
   const digest = createHash("sha256").update(buf).digest("hex");
   if (digest !== item.sha256.toLowerCase()) {
     throw new ProvisionError(

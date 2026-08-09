@@ -102,6 +102,10 @@ export function parseManifest(raw: unknown): ProvisionManifest {
     if (seen.has(key)) throw invalidItem(index, `duplicate item "${key}"`);
     seen.add(key);
 
+    if (item.type === "config" && item.git !== undefined) {
+      throw invalidItem(index, "config items must use `url` + `sha256`, not `git`");
+    }
+
     // Only supported types get their artifact fields enforced: an unknown type
     // may carry a shape this version cannot judge, and it only ever reports
     // `unsupported` — it never reaches a download.

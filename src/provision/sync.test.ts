@@ -3,7 +3,9 @@ import assert from "node:assert/strict";
 import { execFileSync, spawn } from "child_process";
 import { createHash } from "crypto";
 import {
+  chmodSync,
   existsSync,
+  linkSync,
   lstatSync,
   mkdirSync,
   mkdtempSync,
@@ -146,6 +148,7 @@ const SAVED_VARS = [
   "PROVISION_ALLOWLIST",
   "PROVISION_STATE_DIR",
   "PROVISION_SKILLS_DIR",
+  "PROVISION_CONFIG_DIR",
   "PROVISION_REFETCH_MS",
   "AUTH_ADMIN_KEYS",
 ] as const;
@@ -157,6 +160,7 @@ describe("provision sync", () => {
   let responseGates: Map<string, Promise<void>>;
   let stateDir: string;
   let skillsDir: string;
+  let configDir: string;
   const saved = new Map<string, string | undefined>();
 
   let redirects: Map<string, string>;
@@ -203,8 +207,10 @@ describe("provision sync", () => {
     }
     stateDir = mkdtempSync(path.join(tmpdir(), "provision-sync-state-"));
     skillsDir = mkdtempSync(path.join(tmpdir(), "provision-sync-skills-"));
+    configDir = mkdtempSync(path.join(tmpdir(), "provision-sync-config-"));
     process.env.PROVISION_STATE_DIR = stateDir;
     process.env.PROVISION_SKILLS_DIR = skillsDir;
+    process.env.PROVISION_CONFIG_DIR = configDir;
     process.env.PROVISION_SYNC = "1";
     process.env.AUTH_ADMIN_KEYS = "test-admin-secret";
     responses.clear();
@@ -223,6 +229,7 @@ describe("provision sync", () => {
     }
     rmSync(stateDir, { recursive: true, force: true });
     rmSync(skillsDir, { recursive: true, force: true });
+    rmSync(configDir, { recursive: true, force: true });
   });
 
   function serveManifest(items: object[]): string {
@@ -234,6 +241,21 @@ describe("provision sync", () => {
     const archive = skillArchive(content);
     responses.set(pathName, archive);
     return { url: `${baseUrl}${pathName}`, sha256: sha(archive) };
+  }
+
+  function configItem(token: string, artifactPath = "/config.tar.gz") {
+    const body = JSON.stringify({ url: "https://collavre.example.com", token });
+    const archive = skillArchive(body, "config.json");
+    responses.set(artifactPath, archive);
+    return {
+      body,
+      item: {
+	type: "config",
+	name: "collavre",
+	url: `${baseUrl}${artifactPath}`,
+	sha256: sha(archive),
+      },
+    };
   }
 
   const codeOf = async (fn: () => Promise<unknown>): Promise<string> => {
@@ -1902,5 +1924,499 @@ describe("provision sync", () => {
     assert.equal(statusOf(getStatus(), "startup-removal"), undefined);
     const state = JSON.parse(readFileSync(path.join(stateDir, "provision.lock.json"), "utf8"));
     assert.equal(state.installed[key].removalRecoveryId, removalRecoveryId);
+  });
+
+  test("installs and rotates an approved config item without rewriting unchanged content", async () => {
+    const first = configItem("tok-1");
+    registerManifestUrl(serveManifest([first.item]));
+    const pending = await syncNow();
+    assert.equal(pending.data[0]!.status, "pending_approval");
+    assert.equal(existsSync(path.join(configDir, "collavre")), false);
+
+    const installed = await approveItem("config", "collavre");
+    const file = path.join(configDir, "collavre", "config.json");
+    assert.equal(installed.data[0]!.status, "installed");
+    assert.equal(readFileSync(file, "utf8"), first.body);
+    assert.equal(lstatSync(file).mode & 0o777, 0o600);
+    assert.equal(lstatSync(path.dirname(file)).mode & 0o777, 0o700);
+
+    const before = statSync(file).mtimeMs;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    await syncNow();
+    assert.equal(statSync(file).mtimeMs, before);
+
+    const rotated = configItem("tok-2");
+    responses.set("/provision.json", { schema: "agent-provisioning/v1", items: [rotated.item] });
+    const upgraded = await syncNow();
+    assert.equal(upgraded.data[0]!.status, "installed");
+    assert.equal(readFileSync(file, "utf8"), rotated.body);
+  });
+
+  test("repairs loosened config permissions without another approval", async () => {
+    process.env.PROVISION_AUTOAPPLY = "auto";
+    initProvisioning();
+    const config = configItem("tok-1");
+    registerManifestUrl(serveManifest([config.item]));
+    await syncNow();
+    const target = path.join(configDir, "collavre");
+    const file = path.join(target, "config.json");
+    chmodSync(target, 0o755);
+    chmodSync(file, 0o644);
+
+    const repaired = await syncNow();
+    assert.equal(repaired.data[0]!.status, "installed");
+    assert.equal(lstatSync(target).mode & 0o777, 0o700);
+    assert.equal(lstatSync(file).mode & 0o777, 0o600);
+  });
+
+  test("restart erases only the recorded pre-publication candidate before retrying", async () => {
+    const config = configItem("tok-1");
+    const key = "config/collavre";
+    const target = path.join(configDir, "collavre");
+    mkdirSync(target);
+    const candidateName = `.provision-config-candidate-${"c".repeat(32)}`;
+    const untrackedName = `.provision-config-candidate-${"d".repeat(32)}`;
+    const candidatePath = path.join(target, candidateName);
+    writeFileSync(candidatePath, config.body, { mode: 0o600 });
+    writeFileSync(path.join(target, untrackedName), "user-owned", { mode: 0o600 });
+    const targetStat = lstatSync(target, { bigint: true });
+    const candidateStat = lstatSync(candidatePath, { bigint: true });
+    writeFileSync(path.join(stateDir, "provision.lock.json"), JSON.stringify({
+      version: 1,
+      approved: [key],
+      revoked: [],
+      installed: {
+	[key]: {
+	  sha256: config.item.sha256,
+	  files: ["config.json"],
+	  directories: [],
+	  fileHashes: { "config.json": sha(Buffer.from(config.body)) },
+	  installedAt: new Date().toISOString(),
+	  uncommitted: true,
+	  candidateIdentity: {
+	    dev: targetStat.dev.toString(),
+	    ino: targetStat.ino.toString(),
+	  },
+	  configCandidate: {
+	    name: candidateName,
+	    dev: candidateStat.dev.toString(),
+	    ino: candidateStat.ino.toString(),
+	  },
+	},
+      },
+    }));
+    registerManifestUrl(serveManifest([config.item]));
+
+    const status = await syncNow();
+    assert.equal(status.data[0]!.status, "installed");
+    assert.equal(readFileSync(candidatePath).length, 0);
+    assert.equal(readFileSync(path.join(target, untrackedName), "utf8"), "user-owned");
+    assert.equal(readFileSync(path.join(target, "config.json"), "utf8"), config.body);
+  });
+
+  test("restart removes Windows hard-link candidates before committing ownership", {
+    skip: process.platform !== "win32",
+  }, async () => {
+    const first = configItem("tok-1", "/config-v1.tar.gz");
+    const key = "config/collavre";
+    const target = path.join(configDir, "collavre");
+    mkdirSync(target);
+    const firstCandidateName = `.provision-config-candidate-${"a".repeat(32)}`;
+    const firstCandidatePath = path.join(target, firstCandidateName);
+    const publishedPath = path.join(target, "config.json");
+    writeFileSync(firstCandidatePath, first.body, { mode: 0o600 });
+    linkSync(firstCandidatePath, publishedPath);
+    const targetStat = lstatSync(target, { bigint: true });
+    const firstCandidateStat = lstatSync(firstCandidatePath, { bigint: true });
+    const stateFile = path.join(stateDir, "provision.lock.json");
+    writeFileSync(stateFile, JSON.stringify({
+      version: 1,
+      approved: [key],
+      revoked: [],
+      installed: {
+	[key]: {
+	  sha256: first.item.sha256,
+	  files: ["config.json"],
+	  directories: [],
+	  fileHashes: { "config.json": sha(Buffer.from(first.body)) },
+	  installedAt: new Date().toISOString(),
+	  uncommitted: true,
+	  candidateIdentity: {
+	    dev: targetStat.dev.toString(),
+	    ino: targetStat.ino.toString(),
+	  },
+	  configCandidate: {
+	    name: firstCandidateName,
+	    dev: firstCandidateStat.dev.toString(),
+	    ino: firstCandidateStat.ino.toString(),
+	  },
+	},
+      },
+    }));
+    registerManifestUrl(serveManifest([first.item]));
+
+    const firstStatus = await syncNow();
+    assert.equal(firstStatus.data[0]!.status, "installed");
+    assert.equal(existsSync(firstCandidatePath), false);
+    assert.equal(readFileSync(publishedPath, "utf8"), first.body);
+    const state = JSON.parse(readFileSync(stateFile, "utf8"));
+    assert.equal(state.installed[key].uncommitted, undefined);
+    assert.equal(state.installed[key].configCandidate, undefined);
+
+    const second = configItem("tok-2", "/config-v2.tar.gz");
+    const secondCandidateName = `.provision-config-candidate-${"b".repeat(32)}`;
+    const secondCandidatePath = path.join(target, secondCandidateName);
+    writeFileSync(secondCandidatePath, second.body, { mode: 0o600 });
+    rmSync(publishedPath);
+    linkSync(secondCandidatePath, publishedPath);
+    const secondCandidateStat = lstatSync(secondCandidatePath, { bigint: true });
+    state.installed[key].pending = {
+      sha256: second.item.sha256,
+      files: ["config.json"],
+      directories: [],
+      fileHashes: { "config.json": sha(Buffer.from(second.body)) },
+      installedAt: new Date().toISOString(),
+    };
+    state.installed[key].candidateIdentity = {
+      dev: targetStat.dev.toString(),
+      ino: targetStat.ino.toString(),
+    };
+    state.installed[key].configCandidate = {
+      name: secondCandidateName,
+      dev: secondCandidateStat.dev.toString(),
+      ino: secondCandidateStat.ino.toString(),
+    };
+    writeFileSync(stateFile, JSON.stringify(state));
+    registerManifestUrl(serveManifest([second.item]));
+
+    const secondStatus = await syncNow();
+    assert.equal(secondStatus.data[0]!.status, "installed");
+    assert.equal(existsSync(secondCandidatePath), false);
+    assert.equal(readFileSync(publishedPath, "utf8"), second.body);
+    const upgradedState = JSON.parse(readFileSync(stateFile, "utf8"));
+    assert.equal(upgradedState.installed[key].sha256, second.item.sha256);
+    assert.equal(upgradedState.installed[key].pending, undefined);
+    assert.equal(upgradedState.installed[key].configCandidate, undefined);
+  });
+
+  test("an unresolved config upgrade journal blocks replacement", async () => {
+    process.env.PROVISION_AUTOAPPLY = "auto";
+    initProvisioning();
+    const first = configItem("tok-1");
+    registerManifestUrl(serveManifest([first.item]));
+    await syncNow();
+    const key = "config/collavre";
+    const target = path.join(configDir, "collavre");
+    const displaced = path.join(configDir, "displaced");
+    const targetStat = lstatSync(target, { bigint: true });
+    const candidateName = `.provision-config-candidate-${"f".repeat(32)}`;
+    const candidatePath = path.join(target, candidateName);
+    writeFileSync(candidatePath, "candidate", { mode: 0o600 });
+    const candidateStat = lstatSync(candidatePath, { bigint: true });
+    const second = configItem("tok-2");
+    const stateFile = path.join(stateDir, "provision.lock.json");
+    const state = JSON.parse(readFileSync(stateFile, "utf8"));
+    state.installed[key].pending = {
+      sha256: second.item.sha256,
+      files: ["config.json"],
+      directories: [],
+      fileHashes: { "config.json": sha(Buffer.from(second.body)) },
+      installedAt: new Date().toISOString(),
+    };
+    state.installed[key].candidateIdentity = {
+      dev: targetStat.dev.toString(),
+      ino: targetStat.ino.toString(),
+    };
+    state.installed[key].configCandidate = {
+      name: candidateName,
+      dev: candidateStat.dev.toString(),
+      ino: candidateStat.ino.toString(),
+    };
+    writeFileSync(stateFile, JSON.stringify(state));
+    renameSync(target, displaced);
+    mkdirSync(target, { mode: 0o700 });
+    writeFileSync(path.join(target, "config.json"), first.body, { mode: 0o600 });
+    responses.set("/provision.json", { schema: "agent-provisioning/v1", items: [second.item] });
+
+    const status = await syncNow();
+    assert.equal(status.data[0]!.status, "failed");
+    assert.match(status.data[0]!.error!, /interrupted upgrade journal/);
+    assert.equal(readFileSync(path.join(target, "config.json"), "utf8"), first.body);
+    assert.equal(JSON.parse(readFileSync(stateFile, "utf8")).installed[key].pending.sha256,
+      second.item.sha256);
+    await assert.rejects(
+      () => deleteItem("config", "collavre"),
+      (err: ProvisionError) => err.code === "untracked_content" && /journal/.test(err.message),
+    );
+    assert.equal(readFileSync(path.join(target, "config.json"), "utf8"), first.body);
+  });
+
+  test("restart never adopts a same-content config with the wrong inode", async () => {
+    const config = configItem("tok-1");
+    const key = "config/collavre";
+    const target = path.join(configDir, "collavre");
+    mkdirSync(target, { mode: 0o700 });
+    const original = path.join(target, "original-candidate");
+    writeFileSync(original, config.body, { mode: 0o600 });
+    const targetStat = lstatSync(target, { bigint: true });
+    const originalStat = lstatSync(original, { bigint: true });
+    const replacement = path.join(target, "config.json");
+    writeFileSync(replacement, config.body, { mode: 0o600 });
+    writeFileSync(path.join(stateDir, "provision.lock.json"), JSON.stringify({
+      version: 1,
+      approved: [key],
+      revoked: [],
+      installed: {
+	[key]: {
+	  sha256: config.item.sha256,
+	  files: ["config.json"],
+	  directories: [],
+	  fileHashes: { "config.json": sha(Buffer.from(config.body)) },
+	  installedAt: new Date().toISOString(),
+	  uncommitted: true,
+	  candidateIdentity: {
+	    dev: targetStat.dev.toString(),
+	    ino: targetStat.ino.toString(),
+	  },
+	  configCandidate: {
+	    name: `.provision-config-candidate-${"e".repeat(32)}`,
+	    dev: originalStat.dev.toString(),
+	    ino: originalStat.ino.toString(),
+	  },
+	},
+      },
+    }));
+    registerManifestUrl(serveManifest([config.item]));
+
+    const status = await syncNow();
+    assert.equal(status.data[0]!.status, "failed");
+    assert.match(status.data[0]!.error!, /ownership journal/);
+    assert.equal(readFileSync(replacement, "utf8"), config.body);
+    const state = JSON.parse(readFileSync(path.join(stateDir, "provision.lock.json"), "utf8"));
+    assert.equal(state.installed[key].uncommitted, true);
+  });
+
+  test("skill and config items with the same name install side by side", async () => {
+    process.env.PROVISION_AUTOAPPLY = "auto";
+    initProvisioning();
+    const config = configItem("tok-1");
+    const skill = serveSkill("/skill.tar.gz", "# collavre skill");
+    registerManifestUrl(serveManifest([
+      { type: "skill", name: "collavre", ...skill },
+      config.item,
+    ]));
+    const status = await syncNow();
+    assert.deepEqual(status.data.map((item) => item.status), ["installed", "installed"]);
+    assert.equal(existsSync(path.join(skillsDir, "collavre", "SKILL.md")), true);
+    assert.equal(existsSync(path.join(configDir, "collavre", "config.json")), true);
+  });
+
+  test("removing config desired state preserves user files", async () => {
+    process.env.PROVISION_AUTOAPPLY = "auto";
+    initProvisioning();
+    const config = configItem("tok-1");
+    registerManifestUrl(serveManifest([config.item]));
+    await syncNow();
+    const target = path.join(configDir, "collavre");
+    writeFileSync(path.join(target, "notes.txt"), "mine");
+    responses.set("/provision.json", { schema: "agent-provisioning/v1", items: [] });
+    const status = await syncNow();
+    assert.equal(status.data[0]!.status, "removed");
+    assert.equal(existsSync(path.join(target, "config.json")), false);
+    assert.equal(readFileSync(path.join(target, "notes.txt"), "utf8"), "mine");
+  });
+
+  test("persists a reconciled config upgrade before removing its published file", async () => {
+    process.env.PROVISION_AUTOAPPLY = "auto";
+    initProvisioning();
+    const first = configItem("tok-1", "/config-v1.tar.gz");
+    registerManifestUrl(serveManifest([first.item]));
+    await syncNow();
+
+    const second = configItem("tok-2", "/config-v2.tar.gz");
+    const key = "config/collavre";
+    const target = path.join(configDir, "collavre");
+    const published = path.join(target, "config.json");
+    const candidateName = `.provision-config-candidate-${"a".repeat(32)}`;
+    const candidate = path.join(target, candidateName);
+    writeFileSync(candidate, second.body, { mode: 0o600 });
+    const targetStat = lstatSync(target, { bigint: true });
+    const candidateStat = lstatSync(candidate, { bigint: true });
+    rmSync(published);
+    renameSync(candidate, published);
+
+    const stateFile = path.join(stateDir, "provision.lock.json");
+    const state = JSON.parse(readFileSync(stateFile, "utf8"));
+    state.installed[key].pending = {
+      sha256: second.item.sha256,
+      files: ["config.json"],
+      directories: [],
+      fileHashes: { "config.json": sha(Buffer.from(second.body)) },
+      installedAt: new Date().toISOString(),
+    };
+    state.installed[key].candidateIdentity = {
+      dev: targetStat.dev.toString(),
+      ino: targetStat.ino.toString(),
+    };
+    state.installed[key].configCandidate = {
+      name: candidateName,
+      dev: candidateStat.dev.toString(),
+      ino: candidateStat.ino.toString(),
+    };
+    writeFileSync(stateFile, JSON.stringify(state));
+    responses.set("/provision.json", { schema: "agent-provisioning/v1", items: [] });
+
+    initProvisioning({
+      afterConfigRemoval: () => {
+	const persisted = JSON.parse(readFileSync(stateFile, "utf8"));
+	assert.equal(persisted.installed[key].sha256, second.item.sha256);
+	assert.equal(persisted.installed[key].pending, undefined);
+	assert.equal(persisted.installed[key].configCandidate, undefined);
+	throw new Error("simulated crash after config unlink");
+      },
+    });
+    registerManifestUrl(`${baseUrl}/provision.json`);
+    const interrupted = await syncNow();
+    assert.equal(interrupted.data[0]!.status, "failed");
+    assert.match(interrupted.data[0]!.error!, /simulated crash/);
+    assert.equal(existsSync(published), false);
+
+    initProvisioning();
+    registerManifestUrl(`${baseUrl}/provision.json`);
+    const recovered = await syncNow();
+    assert.equal(recovered.data[0]!.status, "removed");
+    assert.equal(key in JSON.parse(readFileSync(stateFile, "utf8")).installed, false);
+  });
+
+  test("DELETE revokes config and the next sync returns it to pending approval", async () => {
+    process.env.PROVISION_AUTOAPPLY = "auto";
+    initProvisioning();
+    const config = configItem("tok-1");
+    registerManifestUrl(serveManifest([config.item]));
+    await syncNow();
+    assert.deepEqual(await deleteItem("config", "collavre"), { removed: true });
+    assert.deepEqual(getStatus().data, []);
+    assert.deepEqual(readdirSync(path.join(configDir, "collavre")), []);
+    const status = await syncNow();
+    assert.equal(status.data[0]!.status, "pending_approval");
+  });
+
+  test("adopt approval takes over an untracked config file and consumes its grant", async () => {
+    const target = path.join(configDir, "collavre");
+    mkdirSync(target);
+    writeFileSync(path.join(target, "config.json"), "hand-written");
+    const config = configItem("tok-1");
+    registerManifestUrl(serveManifest([config.item]));
+    await syncNow();
+
+    const status = await approveItem("config", "collavre", { adopt: true });
+    assert.equal(status.data[0]!.status, "installed");
+    assert.equal(readFileSync(path.join(target, "config.json"), "utf8"), config.body);
+    const state = JSON.parse(readFileSync(path.join(stateDir, "provision.lock.json"), "utf8"));
+    assert.deepEqual(state.adopted, []);
+  });
+
+  test("an idempotent adopt request consumes its one-shot grant immediately", async () => {
+    process.env.PROVISION_AUTOAPPLY = "auto";
+    initProvisioning();
+    const config = configItem("tok-1");
+    registerManifestUrl(serveManifest([config.item]));
+    await syncNow();
+
+    const unchanged = await approveItem("config", "collavre", { adopt: true });
+    assert.equal(unchanged.data[0]!.status, "installed");
+    const state = JSON.parse(readFileSync(path.join(stateDir, "provision.lock.json"), "utf8"));
+    assert.deepEqual(state.adopted, []);
+  });
+
+  test("a failed adopt attempt does not authorize a later overwrite", async () => {
+    const target = path.join(configDir, "collavre");
+    mkdirSync(target);
+    writeFileSync(path.join(target, "config.json"), "hand-written");
+    const config = configItem("tok-1");
+    registerManifestUrl(serveManifest([config.item]));
+    await syncNow();
+
+    const artifact = responses.get("/config.tar.gz")!;
+    responses.delete("/config.tar.gz");
+    const failed = await approveItem("config", "collavre", { adopt: true });
+    assert.equal(failed.data[0]!.status, "failed");
+    responses.set("/config.tar.gz", artifact);
+
+    const retried = await syncNow();
+    assert.equal(retried.data[0]!.status, "failed");
+    assert.match(retried.data[0]!.error!, /untracked file/);
+    assert.equal(readFileSync(path.join(target, "config.json"), "utf8"), "hand-written");
+    const state = JSON.parse(readFileSync(path.join(stateDir, "provision.lock.json"), "utf8"));
+    assert.deepEqual(state.adopted, []);
+  });
+
+  test("an untracked config collision fails without touching the file", async () => {
+    process.env.PROVISION_AUTOAPPLY = "auto";
+    initProvisioning();
+    const target = path.join(configDir, "collavre");
+    mkdirSync(target);
+    writeFileSync(path.join(target, "config.json"), "hand-written");
+    const config = configItem("tok-1");
+    registerManifestUrl(serveManifest([config.item]));
+    const status = await syncNow();
+    assert.equal(status.data[0]!.status, "failed");
+    assert.match(status.data[0]!.error!, /untracked file "config\.json"/);
+    assert.equal(readFileSync(path.join(target, "config.json"), "utf8"), "hand-written");
+  });
+
+  test("a per-user gateway refuses config while leaving skill provisioning enabled", async () => {
+    process.env.PROVISION_AUTOAPPLY = "auto";
+    initProvisioning();
+    const config = configItem("tok-1");
+    registerManifestUrl(serveManifest([config.item]));
+    await syncNow();
+    const configTarget = path.join(configDir, "collavre");
+    writeFileSync(path.join(configTarget, "notes.txt"), "mine");
+
+    initProvisioning({ perUserWorkers: true });
+    assert.equal(
+      existsSync(path.join(configTarget, "config.json")),
+      false,
+      "gateway transition removes credentials before a manifest is available",
+    );
+    assert.equal(readFileSync(path.join(configTarget, "notes.txt"), "utf8"), "mine");
+    const gatewayState = JSON.parse(
+      readFileSync(path.join(stateDir, "provision.lock.json"), "utf8"),
+    );
+    assert.equal("config/collavre" in gatewayState.installed, false);
+    const skill = serveSkill("/skill.tar.gz", "# gateway skill");
+    responses.set("/provision.json", { schema: "agent-provisioning/v1", items: [
+      config.item,
+      { type: "skill", name: "gateway-skill", ...skill },
+    ] });
+    registerManifestUrl(`${baseUrl}/provision.json`);
+    const status = await syncNow();
+    assert.equal(status.data[0]!.status, "failed");
+    assert.match(status.data[0]!.error!, /per-user/);
+    assert.equal(status.data[1]!.status, "installed");
+    assert.equal(existsSync(path.join(configTarget, "config.json")), false);
+    assert.equal(readFileSync(path.join(configTarget, "notes.txt"), "utf8"), "mine");
+  });
+
+  test("config status and download errors never expose artifact or callback tokens", async () => {
+    process.env.PROVISION_AUTOAPPLY = "auto";
+    initProvisioning();
+    const artifactToken = "artifact-token-abcdef";
+    const callbackToken = "callback-token-abcdef";
+    const config = configItem(callbackToken, `/artifacts/${artifactToken}/config.tar.gz`);
+    registerManifestUrl(serveManifest([config.item]));
+    await syncNow();
+    let serialized = JSON.stringify(getStatus());
+    assert.equal(serialized.includes(artifactToken), false);
+    assert.equal(serialized.includes(callbackToken), false);
+
+    responses.delete(`/artifacts/${artifactToken}/config.tar.gz`);
+    rmSync(path.join(configDir, "collavre"), { recursive: true, force: true });
+    const failed = await syncNow();
+    serialized = JSON.stringify(failed);
+    assert.match(failed.data[0]!.error!, /HTTP 404/);
+    assert.equal(serialized.includes(artifactToken), false);
+    assert.equal(serialized.includes(callbackToken), false);
   });
 });

@@ -47,7 +47,7 @@ export type ProvisionItemStatus =
   | "failed";
 
 /** Types this proxy version can install. Everything else reports `unsupported`. */
-export const SUPPORTED_PROVISION_TYPES: ReadonlySet<string> = new Set(["skill"]);
+export const SUPPORTED_PROVISION_TYPES: ReadonlySet<string> = new Set(["skill", "config"]);
 
 /** One filesystem snapshot owned by the proxy. */
 export interface InstalledSnapshot {
@@ -75,6 +75,12 @@ export interface InstalledDirectoryIdentity {
   ino: string;
 }
 
+/** Durable identity of a reserved config candidate file. */
+export interface InstalledFileIdentity extends InstalledDirectoryIdentity {
+  /** Random flat filename below the identity-checked config directory. */
+  name: string;
+}
+
 /** One installed artifact as the lockfile records it. */
 export interface InstalledRecord extends InstalledSnapshot {
   /**
@@ -82,8 +88,10 @@ export interface InstalledRecord extends InstalledSnapshot {
    * original staged directory identity at the canonical target.
    */
   uncommitted?: true;
-  /** Physical identity of the original staged directory, captured before exposure. */
+  /** Physical identity of the staged skill or config target directory. */
   candidateIdentity?: InstalledDirectoryIdentity;
+  /** Reserved config candidate that crash recovery may safely discard. */
+  configCandidate?: InstalledFileIdentity;
   /**
    * Random marker placed in the candidate and removed after ownership commits.
    * It is lifecycle metadata, not ownership evidence: its value is readable.
@@ -110,6 +118,8 @@ export interface ProvisionStateFile {
   approved: string[];
   /** Explicit DELETE tombstones; override auto-apply while the item stays desired. */
   revoked: string[];
+  /** One-shot grants allowing a config item to replace colliding untracked files. */
+  adopted?: string[];
   /** Exact random identities of retained removal recoveries. */
   removalRecoveries?: string[];
   /** Exact random identities of retained upgrade or rejected-candidate recovery trees. */

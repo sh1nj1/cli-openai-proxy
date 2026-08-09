@@ -173,6 +173,35 @@ describe("provision-routes", () => {
     assert.equal(errorOf(res).code, "unknown_item");
   });
 
+  test("approve validates the optional adopt flag", async () => {
+    enable();
+    const invalid = fakeRes();
+    await handleProvisionApprove(fakeReq({
+      params: { type: "config", name: "collavre" } as any,
+      body: { adopt: "yes" },
+    }), invalid);
+    assert.equal(invalid.statusCode, 400);
+    assert.equal(errorOf(invalid).code, "invalid_item");
+
+    const wrongType = fakeRes();
+    await handleProvisionApprove(fakeReq({
+      params: { type: "skill", name: "collavre" } as any,
+      body: { adopt: true },
+    }), wrongType);
+    assert.equal(wrongType.statusCode, 400);
+    assert.equal(errorOf(wrongType).code, "invalid_item");
+
+    for (const body of [undefined, { adopt: true }]) {
+      const accepted = fakeRes();
+      await handleProvisionApprove(fakeReq({
+	params: { type: "config", name: "collavre" } as any,
+	body,
+      }), accepted);
+      assert.equal(accepted.statusCode, 404);
+      assert.equal(errorOf(accepted).code, "unknown_item");
+    }
+  });
+
   test("deleting an item that was never installed reports removed: false", async () => {
     enable();
     const res = fakeRes();

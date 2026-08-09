@@ -97,7 +97,7 @@ export function createApp(config: AppConfig = {}): Express {
         ? `[Server] CLI auth provisioning enabled (${adminStatus.keyCount} admin key(s))`
         : "[Server] CLI auth provisioning disabled (set AUTH_ADMIN_KEYS to enable)",
     );
-    const provisionStatus = initProvisioning();
+    const provisionStatus = initProvisioning({ perUserWorkers: userWorkerProxy !== undefined });
     if (provisionStatus.enabled) {
       onAuthorizedProvisioningUrl = config.onAuthorizedProvisioningUrl ?? handleAuthorizedSession;
     }

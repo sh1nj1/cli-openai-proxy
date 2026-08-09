@@ -19,7 +19,12 @@ import { homedir } from "os";
 import path from "path";
 import { isCanonicalGitPath, isGitObjectId, isValidGitRevision } from "./git-source.js";
 import { managedPathParts } from "./path-policy.js";
-import type { InstalledRecord, InstalledSnapshot, ProvisionStateFile } from "./types.js";
+import type {
+  InstalledFileIdentity,
+  InstalledRecord,
+  InstalledSnapshot,
+  ProvisionStateFile,
+} from "./types.js";
 
 export function provisionStateDir(): string {
   return process.env.PROVISION_STATE_DIR?.trim() || path.join(homedir(), ".cli-openai-proxy");
@@ -155,6 +160,7 @@ const HASH_PATTERN = /^[0-9a-f]{64}$/i;
 const INSTALL_MARKER_PATTERN = /^[0-9a-f]{32}$/;
 const RECOVERY_ID_PATTERN = /^[0-9a-f]{32}$/;
 const FILESYSTEM_ID_PATTERN = /^(?:0|[1-9][0-9]*)$/;
+const CONFIG_CANDIDATE_PATTERN = /^\.provision-config-candidate-[0-9a-f]{32}$/;
 // Loading remains case-insensitive for lockfiles written before names became
 // lowercase-only. Installed keys retain their spelling because it identifies
 // the legacy on-disk directory; consent/tombstone keys have no path identity
@@ -244,10 +250,28 @@ function installedRecord(value: unknown): InstalledRecord | null {
 	ino: (rawCandidateIdentity as Record<string, string>).ino,
       }
     : undefined;
+  const rawConfigCandidate = raw.configCandidate;
+  const configCandidate: InstalledFileIdentity | undefined =
+    typeof rawConfigCandidate === "object"
+    && rawConfigCandidate !== null
+    && !Array.isArray(rawConfigCandidate)
+    && typeof (rawConfigCandidate as Record<string, unknown>).name === "string"
+    && CONFIG_CANDIDATE_PATTERN.test((rawConfigCandidate as Record<string, string>).name)
+    && typeof (rawConfigCandidate as Record<string, unknown>).dev === "string"
+    && FILESYSTEM_ID_PATTERN.test((rawConfigCandidate as Record<string, string>).dev)
+    && typeof (rawConfigCandidate as Record<string, unknown>).ino === "string"
+    && FILESYSTEM_ID_PATTERN.test((rawConfigCandidate as Record<string, string>).ino)
+      ? {
+	  name: (rawConfigCandidate as Record<string, string>).name,
+	  dev: (rawConfigCandidate as Record<string, string>).dev,
+	  ino: (rawConfigCandidate as Record<string, string>).ino,
+	}
+      : undefined;
   return {
     ...stable,
     ...(raw.uncommitted === true ? { uncommitted: true as const } : {}),
     ...(candidateIdentity ? { candidateIdentity } : {}),
+    ...(configCandidate ? { configCandidate } : {}),
     ...(typeof raw.installMarker === "string" && INSTALL_MARKER_PATTERN.test(raw.installMarker)
       ? { installMarker: raw.installMarker }
       : {}),
@@ -282,6 +306,7 @@ export function loadState(): ProvisionStateFile {
       version: 1,
       approved: canonicalKeys(parsed.approved),
       revoked: canonicalKeys(parsed.revoked),
+      ...(parsed.adopted !== undefined ? { adopted: canonicalKeys(parsed.adopted) } : {}),
       ...(Array.isArray(parsed.removalRecoveries)
 	? {
 	  removalRecoveries: [...new Set(parsed.removalRecoveries.filter(
