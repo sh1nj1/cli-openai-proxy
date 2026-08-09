@@ -20,6 +20,7 @@ import {
   removeAt,
   removeWindowsPublishedCandidate,
   renameAtNoReplace,
+  renameAtReplace,
 } from "./rename-no-replace.js";
 import { ProvisionError } from "./types.js";
 
@@ -106,5 +107,62 @@ describe("Windows config file operations", () => {
       (err: ProvisionError) => err.code === "untracked_content",
     );
     assert.equal(readFileSync(path.join(parent, "config.json"), "utf8"), "user-owned");
+  });
+});
+
+describe("atomic config replacement", () => {
+  let root: string;
+  let parent: string;
+  let parentFd: number;
+  let candidateFd: number;
+
+  beforeEach(() => {
+    root = mkdtempSync(path.join(tmpdir(), "provision-replace-ops-"));
+    parent = path.join(root, "config");
+    mkdirSync(parent);
+    writeFileSync(path.join(parent, "candidate"), "new-secret");
+    writeFileSync(path.join(parent, "config.json"), "old-secret");
+    parentFd = openSync(parent, constants.O_RDONLY | constants.O_DIRECTORY);
+    candidateFd = openSync(path.join(parent, "candidate"), constants.O_RDONLY);
+  });
+
+  afterEach(() => {
+    closeSync(candidateFd);
+    closeSync(parentFd);
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  test("accepts a replace committed before helper termination", () => {
+    renameAtReplace(
+      parentFd,
+      parent,
+      "candidate",
+      "config.json",
+      candidateFd,
+      (_parentFd, parentPath, _script, [source, destination]) => {
+	renameSync(path.join(parentPath, source!), path.join(parentPath, destination!));
+	return { status: null };
+      },
+    );
+
+    assert.equal(readFileSync(path.join(parent, "config.json"), "utf8"), "new-secret");
+    assert.equal(existsSync(path.join(parent, "candidate")), false);
+  });
+
+  test("rejects helper failure when the destination is still the old inode", () => {
+    assert.throws(
+      () => renameAtReplace(
+	parentFd,
+	parent,
+	"candidate",
+	"config.json",
+	candidateFd,
+	() => ({ status: null }),
+      ),
+      (err: ProvisionError) => err.code === "atomic_rename_unavailable",
+    );
+
+    assert.equal(readFileSync(path.join(parent, "candidate"), "utf8"), "new-secret");
+    assert.equal(readFileSync(path.join(parent, "config.json"), "utf8"), "old-secret");
   });
 });

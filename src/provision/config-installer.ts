@@ -483,6 +483,7 @@ export async function installConfig(
 	target,
 	candidateJournal.candidate.name,
 	"config.json",
+	candidateFd,
       );
       candidateOwned = false;
       opts.afterPublish?.(target);

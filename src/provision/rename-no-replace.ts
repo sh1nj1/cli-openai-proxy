@@ -174,6 +174,31 @@ function spawnVerifiedChild(
   });
 }
 
+type VerifiedChildResult = Pick<ReturnType<typeof spawnSync>, "status">;
+type VerifiedChildRunner = (
+  parentFd: number,
+  parentPath: string,
+  script: string,
+  args: string[],
+) => VerifiedChildResult;
+
+function destinationMatchesDescriptor(
+  parentPath: string,
+  destination: string,
+  sourceFd: number,
+): boolean {
+  try {
+    const published = lstatSync(path.join(parentPath, destination), { bigint: true });
+    const source = fstatSync(sourceFd, { bigint: true });
+    return published.isFile()
+      && source.isFile()
+      && published.dev === source.dev
+      && published.ino === source.ino;
+  } catch {
+    return false;
+  }
+}
+
 /** Atomically rename paths relative to an already-open directory descriptor. */
 export function renameAtNoReplace(
   parentFd: number,
@@ -293,10 +318,16 @@ export function renameAtReplace(
   parentPath: string,
   source: string,
   destination: string,
+  sourceFd: number,
+  runVerifiedChild: VerifiedChildRunner = spawnVerifiedChild,
 ): void {
   assertSiblingBasenames(source, destination);
-  const child = spawnVerifiedChild(parentFd, parentPath, REPLACE_SCRIPT, [source, destination]);
+  const child = runVerifiedChild(parentFd, parentPath, REPLACE_SCRIPT, [source, destination]);
   if (child.status === 0) return;
+  // The helper can be terminated after rename(2) commits but before Node exits.
+  // The still-open candidate descriptor proves whether the destination now is
+  // that exact inode, so the caller must not erase the published credential.
+  if (destinationMatchesDescriptor(parentPath, destination, sourceFd)) return;
   if (child.status === 65) {
     throw new ProvisionError("Rename target changed during publication", "untracked_content");
   }
