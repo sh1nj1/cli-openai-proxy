@@ -24,6 +24,7 @@ import type {
   InstalledRecord,
   InstalledSnapshot,
   InstalledSkillLink,
+  InstalledSkillLinkPublication,
   ProvisionStateFile,
 } from "./types.js";
 
@@ -253,13 +254,31 @@ function installedSkillLinks(value: unknown, installedKey: string): InstalledSki
   return links;
 }
 
+function installedSkillLinkPublication(
+  value: unknown,
+  installedKey: string,
+): InstalledSkillLinkPublication | null | undefined {
+  if (value === undefined) return undefined;
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return null;
+  const name = installedKey.slice(installedKey.indexOf("/") + 1);
+  const record = value as Record<string, unknown>;
+  if (typeof record.path !== "string" || !path.isAbsolute(record.path)
+    || path.basename(record.path) !== name
+    || typeof record.target !== "string" || !path.isAbsolute(record.target)
+    || path.basename(record.target) !== name) return null;
+  return { path: path.normalize(record.path), target: path.normalize(record.target) };
+}
+
 function installedRecord(value: unknown, installedKey: string): InstalledRecord | null {
   const stable = installedSnapshot(value);
   if (!stable) return null;
   const raw = value as Record<string, unknown>;
   const skillLinks = installedSkillLinks(raw.skillLinks, installedKey);
   if (skillLinks === null) return null;
-  if (!installedKey.toLowerCase().startsWith("skill/") && skillLinks.length > 0) return null;
+  const skillLinkPublication = installedSkillLinkPublication(raw.skillLinkPublication, installedKey);
+  if (skillLinkPublication === null) return null;
+  if (!installedKey.toLowerCase().startsWith("skill/")
+    && (skillLinks.length > 0 || skillLinkPublication !== undefined)) return null;
   const pending = raw.pending === undefined ? null : installedSnapshot(raw.pending);
   const rawCandidateIdentity = raw.candidateIdentity;
   const candidateIdentity = typeof rawCandidateIdentity === "object"
@@ -294,6 +313,7 @@ function installedRecord(value: unknown, installedKey: string): InstalledRecord 
   return {
     ...stable,
     ...(skillLinks.length > 0 ? { skillLinks } : {}),
+    ...(skillLinkPublication ? { skillLinkPublication } : {}),
     ...(raw.uncommitted === true ? { uncommitted: true as const } : {}),
     ...(candidateIdentity ? { candidateIdentity } : {}),
     ...(configCandidate ? { configCandidate } : {}),

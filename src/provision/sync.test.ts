@@ -427,6 +427,58 @@ describe("provision sync", () => {
     assert.equal(existsSync(target), false);
   });
 
+  test("recovers a discovery link published after its ownership intent was saved", async () => {
+    const linkDir = path.join(stateDir, "claude-skills");
+    process.env.PROVISION_SKILL_LINK_DIRS = linkDir;
+    process.env.PROVISION_AUTOAPPLY = "auto";
+    initProvisioning();
+    const skill = serveSkill("/interrupted-link.tgz", "managed");
+    registerManifestUrl(serveManifest([{ type: "skill", name: "linked", ...skill }]));
+    await syncNow();
+
+    const statePath = path.join(stateDir, "provision.lock.json");
+    const state = JSON.parse(readFileSync(statePath, "utf8"));
+    const link = path.join(linkDir, "linked");
+    const target = path.join(skillsDir, "linked");
+    delete state.installed["skill/linked"].skillLinks;
+    state.installed["skill/linked"].skillLinkPublication = { path: link, target };
+    writeFileSync(statePath, `${JSON.stringify(state, null, 2)}\n`);
+
+    const recovered = await syncNow();
+    assert.equal(statusOf(recovered, "linked"), "installed");
+    const recoveredState = JSON.parse(readFileSync(statePath, "utf8"));
+    assert.equal(recoveredState.installed["skill/linked"].skillLinkPublication, undefined);
+    assert.equal(recoveredState.installed["skill/linked"].skillLinks[0].path, link);
+    assert.equal(
+      recoveredState.installed["skill/linked"].skillLinks[0].ino,
+      lstatSync(link, { bigint: true }).ino.toString(),
+    );
+  });
+
+  test("removes a discovery link left at the ownership-publication crash point", async () => {
+    const linkDir = path.join(stateDir, "claude-skills");
+    process.env.PROVISION_SKILL_LINK_DIRS = linkDir;
+    process.env.PROVISION_AUTOAPPLY = "auto";
+    initProvisioning();
+    const skill = serveSkill("/interrupted-link-removal.tgz", "managed");
+    registerManifestUrl(serveManifest([{ type: "skill", name: "linked", ...skill }]));
+    await syncNow();
+
+    const statePath = path.join(stateDir, "provision.lock.json");
+    const state = JSON.parse(readFileSync(statePath, "utf8"));
+    const link = path.join(linkDir, "linked");
+    const target = path.join(skillsDir, "linked");
+    delete state.installed["skill/linked"].skillLinks;
+    state.installed["skill/linked"].skillLinkPublication = { path: link, target };
+    writeFileSync(statePath, `${JSON.stringify(state, null, 2)}\n`);
+    responses.set("/provision.json", { schema: "agent-provisioning/v1", items: [] });
+
+    const removed = await syncNow();
+    assert.equal(statusOf(removed, "linked"), "removed");
+    assert.equal(existsSync(link), false);
+    assert.equal(existsSync(target), false);
+  });
+
   test("migrates the previous Claude default into the shared Codex source", async () => {
     const testHome = path.join(stateDir, "home");
     const legacySkillsDir = path.join(testHome, ".claude", "skills");

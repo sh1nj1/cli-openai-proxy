@@ -624,6 +624,7 @@ function stableSnapshot(record: InstalledRecord): InstalledSnapshot {
     rejectionRecoveryId: _rejectionRecoveryId,
     removalRecoveryId: _removalRecoveryId,
     skillLinks: _skillLinks,
+    skillLinkPublication: _skillLinkPublication,
     ...stable
   } = record;
   return stable;
@@ -717,7 +718,71 @@ function createSkillLink(linkPath: string, target: string): InstalledSkillLink {
   return { path: linkPath, target, dev: stat.dev.toString(), ino: stat.ino.toString() };
 }
 
-function removeRecordedSkillLinks(name: string, record: InstalledRecord): void {
+function adoptPublishedSkillLink(linkPath: string, target: string): InstalledSkillLink {
+  const stat = lstatSync(linkPath, { bigint: true });
+  if (!stat.isSymbolicLink() || absoluteLinkTarget(linkPath) !== target) {
+    throw new ProvisionError(
+      `Refusing to adopt changed skill link publication at "${linkPath}"`,
+      "untracked_content",
+    );
+  }
+  return { path: linkPath, target, dev: stat.dev.toString(), ino: stat.ino.toString() };
+}
+
+function finishSkillLinkPublication(
+  record: InstalledRecord,
+  persist: () => void,
+  publishIfMissing: boolean,
+): InstalledSkillLink | undefined {
+  const publication = record.skillLinkPublication;
+  if (!publication) return undefined;
+  let link: InstalledSkillLink | undefined;
+  if (pathEntryExists(publication.path)) {
+    link = adoptPublishedSkillLink(publication.path, publication.target);
+  } else if (publishIfMissing) {
+    link = createSkillLink(publication.path, publication.target);
+  }
+  if (link) {
+    const published = link;
+    record.skillLinks = [
+      ...(record.skillLinks ?? []).filter((entry) => entry.path !== published.path),
+      published,
+    ];
+  }
+  delete record.skillLinkPublication;
+  persist();
+  return link;
+}
+
+function publishSkillLink(
+  linkPath: string,
+  target: string,
+  record: InstalledRecord,
+  persist: () => void,
+): InstalledSkillLink {
+  if (record.skillLinkPublication) {
+    throw new ProvisionError("Another skill link publication is still pending", "untracked_content");
+  }
+  record.skillLinkPublication = { path: linkPath, target };
+  // The durable intent makes an exact link recoverable if publication or the
+  // following identity save is interrupted.
+  persist();
+  const link = createSkillLink(linkPath, target);
+  record.skillLinks = [
+    ...(record.skillLinks ?? []).filter((entry) => entry.path !== linkPath),
+    link,
+  ];
+  delete record.skillLinkPublication;
+  persist();
+  return link;
+}
+
+function removeRecordedSkillLinks(
+  name: string,
+  record: InstalledRecord,
+  persist: () => void,
+): void {
+  finishSkillLinkPublication(record, persist, false);
   for (const link of record.skillLinks ?? []) {
     if (path.basename(link.path) !== name || path.basename(link.target) !== name) {
       throw new ProvisionError(`Invalid recorded skill link for "${name}"`, "untracked_content");
@@ -729,10 +794,16 @@ function removeRecordedSkillLinks(name: string, record: InstalledRecord): void {
 function ensureSkillLinks(
   name: string,
   record: InstalledRecord,
-  legacySnapshot: InstalledSnapshot = record,
+  legacySnapshot: InstalledSnapshot,
+  persist: () => void,
 ): InstalledSkillLink[] {
   const target = path.resolve(skillsDir(), name);
   const desiredPaths = skillLinkDirs().map((directory) => path.join(directory, name));
+  const interrupted = record.skillLinkPublication;
+  if (interrupted) {
+    const stillDesired = desiredPaths.includes(interrupted.path) && interrupted.target === target;
+    finishSkillLinkPublication(record, persist, stillDesired);
+  }
   const recorded = new Map((record.skillLinks ?? []).map((link) => [link.path, link]));
 
   for (const link of record.skillLinks ?? []) {
@@ -747,7 +818,7 @@ function ensureSkillLinks(
       const owned = recorded.get(linkPath);
       if (owned) {
 	if (!pathEntryExists(linkPath)) {
-	  const replacement = createSkillLink(linkPath, target);
+	  const replacement = publishSkillLink(linkPath, target, record, persist);
 	  result.push(replacement);
 	  created.push(replacement);
 	  continue;
@@ -763,7 +834,7 @@ function ensureSkillLinks(
 	  continue;
 	}
 	isolateRecordedSkillLink(owned);
-	const replacement = createSkillLink(linkPath, target);
+	const replacement = publishSkillLink(linkPath, target, record, persist);
 	result.push(replacement);
 	created.push(replacement);
 	continue;
@@ -788,7 +859,7 @@ function ensureSkillLinks(
 	  fileHashes: legacySnapshot.fileHashes,
 	});
       }
-      const link = createSkillLink(linkPath, target);
+      const link = publishSkillLink(linkPath, target, record, persist);
       result.push(link);
       created.push(link);
     }
@@ -797,10 +868,12 @@ function ensureSkillLinks(
     for (const link of created.reverse()) {
       try {
 	isolateRecordedSkillLink(link);
+	record.skillLinks = (record.skillLinks ?? []).filter((entry) => entry.path !== link.path);
       } catch {
 	// Preserve an entry that changed before rollback.
       }
     }
+    if (created.length > 0) persist();
     throw err;
   }
 }
@@ -1106,11 +1179,20 @@ function reconcileUpgradeJournal(name: string, record: InstalledRecord): Install
   // snapshot is on disk becomes stable; if neither is intact, retain both
   // ownership sets so the next install/removal can recover safely.
   const skillLinks = record.skillLinks;
+  const skillLinkPublication = record.skillLinkPublication;
   if (installedRecordMatchesEntireTree(name, record.pending)) {
-    return { ...record.pending, ...(skillLinks ? { skillLinks } : {}) };
+    return {
+      ...record.pending,
+      ...(skillLinks ? { skillLinks } : {}),
+      ...(skillLinkPublication ? { skillLinkPublication } : {}),
+    };
   }
   if (installedRecordMatchesEntireTree(name, record)) {
-    return { ...stableSnapshot(record), ...(skillLinks ? { skillLinks } : {}) };
+    return {
+      ...stableSnapshot(record),
+      ...(skillLinks ? { skillLinks } : {}),
+      ...(skillLinkPublication ? { skillLinkPublication } : {}),
+    };
   }
   return record;
 }
@@ -1339,7 +1421,12 @@ async function runSync(generation: number): Promise<ProvisionStatusView> {
 	&& !state.installed[key]!.installMarker
 	&& installedRecordIntact(item.type, item.name, state.installed[key]!)) {
 	if (item.type === "skill") {
-	  const links = ensureSkillLinks(item.name, state.installed[key]!);
+	  const links = ensureSkillLinks(
+	    item.name,
+	    state.installed[key]!,
+	    state.installed[key]!,
+	    () => saveState(state),
+	  );
 	  state.installed[key]!.skillLinks = links;
 	  saveState(state);
 	}
@@ -1470,6 +1557,9 @@ async function runSync(generation: number): Promise<ProvisionStatusView> {
 		? {
 		    ...stableSnapshot(previousRecord),
 		    ...(previousRecord.skillLinks ? { skillLinks: previousRecord.skillLinks } : {}),
+		    ...(previousRecord.skillLinkPublication
+		      ? { skillLinkPublication: previousRecord.skillLinkPublication }
+		      : {}),
 		    pending: candidateRecord,
 		  }
 		: {
@@ -1516,6 +1606,9 @@ async function runSync(generation: number): Promise<ProvisionStatusView> {
 	fileHashes: result.fileHashes,
 	installedAt: new Date().toISOString(),
 	...(previousRecord?.skillLinks ? { skillLinks: previousRecord.skillLinks } : {}),
+	...(previousRecord?.skillLinkPublication
+	  ? { skillLinkPublication: previousRecord.skillLinkPublication }
+	  : {}),
       };
 
       if (item.type === "skill") {
@@ -1524,6 +1617,7 @@ async function runSync(generation: number): Promise<ProvisionStatusView> {
 	  item.name,
 	  installedRecord,
 	  previousRecord ?? installedRecord,
+	  () => saveState(state),
 	);
       }
       if (!state.approved.includes(key)) state.approved.push(key);
@@ -1567,7 +1661,7 @@ async function runSync(generation: number): Promise<ProvisionStatusView> {
     try {
       const record = state.installed[key]!;
       if (canonicalType === "skill") {
-	removeRecordedSkillLinks(name, record);
+	removeRecordedSkillLinks(name, record, () => saveState(state));
 	const recovery = prepareRemovalRecovery(state, key);
 	try {
 	  const snapshot = removalSnapshot(record);
@@ -1704,7 +1798,7 @@ export function deleteItem(type: string, name: string): Promise<{ removed: boole
     const record = installedKey ? state.installed[installedKey] : undefined;
     if (record && type === "skill") {
 	const installedName = installedKey!.slice(installedKey!.indexOf("/") + 1);
-      removeRecordedSkillLinks(installedName, record);
+      removeRecordedSkillLinks(installedName, record, () => saveState(state));
       const recovery = prepareRemovalRecovery(state, installedKey!);
       try {
 	const snapshot = removalSnapshot(record);

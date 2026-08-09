@@ -73,6 +73,10 @@ describe("provision state", () => {
 	    dev: "12",
 	    ino: "34",
 	  }],
+	  skillLinkPublication: {
+	    path: "/home/test/.other-agent/skills/pr-monitor",
+	    target: "/home/test/.agents/skills/pr-monitor",
+	  },
 	  removalRecoveryId: "f".repeat(32),
         },
       },

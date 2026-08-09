@@ -315,8 +315,10 @@ the manifest.
 - **Lockfile ownership.** `~/.cli-openai-proxy/provision.lock.json` records
   what the proxy installed, including archive-owned directories and per-file
   hashes used to repair missing or modified content on the next sync. Managed
-  discovery links are also recorded by path, target, and filesystem identity;
-  they are isolated and rechecked before removal. Upgrades
+  discovery links are also recorded by path, target, and filesystem identity.
+  Their publication intent is journaled before the symlink becomes visible, so
+  an interrupted publication can be recovered or removed safely. Links are
+  isolated and rechecked before removal. Upgrades
   journal both the stable and candidate ownership snapshots before swapping
   directories, so an interrupted swap is recoverable. Removal records its
   recovery identity before inspecting the target, atomically moves an owned

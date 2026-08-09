@@ -89,10 +89,20 @@ export interface InstalledSkillLink extends InstalledDirectoryIdentity {
   target: string;
 }
 
+/** Durable intent written before a skill discovery link becomes visible. */
+export interface InstalledSkillLinkPublication {
+  /** Absolute link pathname reserved for publication. */
+  path: string;
+  /** Absolute canonical skill directory the link must resolve to. */
+  target: string;
+}
+
 /** One installed artifact as the lockfile records it. */
 export interface InstalledRecord extends InstalledSnapshot {
   /** Discovery links published for other supported agent CLIs. */
   skillLinks?: InstalledSkillLink[];
+  /** In-flight publication that crash recovery may safely finish or remove. */
+  skillLinkPublication?: InstalledSkillLinkPublication;
   /**
    * First-install ownership written before exposure. Recovery accepts only the
    * original staged directory identity at the canonical target.
