@@ -24,6 +24,7 @@ import {
   readdirSync,
   readFileSync,
   readlinkSync,
+  realpathSync,
   mkdirSync,
   renameSync,
   symlinkSync,
@@ -193,14 +194,25 @@ function skillsDir(): string {
   return process.env.PROVISION_SKILLS_DIR?.trim() || path.join(homedir(), ".agents", "skills");
 }
 
+function existingRealPath(candidate: string): string | undefined {
+  try {
+    return realpathSync(candidate);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+    throw err;
+  }
+}
+
 function skillLinkDirs(): string[] {
   const configured = process.env.PROVISION_SKILL_LINK_DIRS;
   const entries = configured === undefined
     ? [path.join(homedir(), ".claude", "skills")]
     : configured.split(",").map((entry) => entry.trim()).filter(Boolean);
   const canonical = path.resolve(skillsDir());
+  const canonicalReal = existingRealPath(canonical);
   return [...new Set(entries.map((entry) => path.resolve(entry)))]
-    .filter((entry) => entry !== canonical);
+    .filter((entry) => entry !== canonical
+      && (canonicalReal === undefined || existingRealPath(entry) !== canonicalReal));
 }
 
 function configDir(): string {

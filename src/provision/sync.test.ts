@@ -427,6 +427,30 @@ describe("provision sync", () => {
     assert.equal(existsSync(target), false);
   });
 
+  test("skips a discovery root that aliases the canonical skills directory", async () => {
+    const canonicalRoot = path.join(stateDir, "canonical-skills");
+    const aliasRoot = path.join(stateDir, "claude", "skills");
+    mkdirSync(canonicalRoot, { recursive: true });
+    mkdirSync(path.dirname(aliasRoot), { recursive: true });
+    symlinkSync(canonicalRoot, aliasRoot, process.platform === "win32" ? "junction" : "dir");
+    process.env.PROVISION_SKILLS_DIR = canonicalRoot;
+    process.env.PROVISION_SKILL_LINK_DIRS = aliasRoot;
+    process.env.PROVISION_AUTOAPPLY = "auto";
+    initProvisioning();
+    const skill = serveSkill("/aliased-root.tgz", "aliased root skill");
+    registerManifestUrl(serveManifest([{ type: "skill", name: "aliased", ...skill }]));
+
+    assert.equal(statusOf(await syncNow(), "aliased"), "installed");
+    const canonical = path.join(canonicalRoot, "aliased");
+    const alias = path.join(aliasRoot, "aliased");
+    assert.equal(readFileSync(path.join(alias, "SKILL.md"), "utf8"), "aliased root skill");
+    assert.equal(lstatSync(alias).isSymbolicLink(), false);
+    assert.equal(lstatSync(alias, { bigint: true }).ino, lstatSync(canonical, { bigint: true }).ino);
+    const state = JSON.parse(readFileSync(path.join(stateDir, "provision.lock.json"), "utf8"));
+    assert.deepEqual(state.installed["skill/aliased"].skillLinks, []);
+    assert.equal(statusOf(await syncNow(), "aliased"), "installed");
+  });
+
   test("recovers a discovery link published after its ownership intent was saved", async () => {
     const linkDir = path.join(stateDir, "claude-skills");
     process.env.PROVISION_SKILL_LINK_DIRS = linkDir;
