@@ -871,6 +871,15 @@ function ensureSkillLinks(
       );
     }
   }
+  for (const link of record.skillLinks ?? []) {
+    if (desiredPaths.includes(link.path) || !pathEntryExists(link.path)) continue;
+    if (!sameSkillLinkIdentity(link.path, link)) {
+      throw new ProvisionError(
+	`Refusing to remove changed skill link "${link.path}"`,
+	"untracked_content",
+      );
+    }
+  }
 
   const result: InstalledSkillLink[] = [];
   const created: InstalledSkillLink[] = [];
@@ -1522,7 +1531,8 @@ function planLegacySkillRootMigrations(
     if (!key.toLowerCase().startsWith("skill/") || !desired.has(canonicalKey)) continue;
     if (failures.has(canonicalKey)) continue;
     const installRoot = skillInstallRoot(record);
-    if (installRoot === canonicalRoot) continue;
+    if (resolvedPathThroughExistingAncestor(installRoot)
+      === resolvedPathThroughExistingAncestor(canonicalRoot)) continue;
     const name = key.slice(key.indexOf("/") + 1);
     const canonicalName = name.toLowerCase();
     try {

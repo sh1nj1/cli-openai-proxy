@@ -535,6 +535,39 @@ describe("provision sync", () => {
     assert.equal(state.installed["skill/linked"].skillLinks[0].path, oldLink);
   });
 
+  test("keeps every old discovery link when one obsolete link changed", async () => {
+    const firstRoot = path.join(stateDir, "first-old-discovery-root");
+    const secondRoot = path.join(stateDir, "second-old-discovery-root");
+    process.env.PROVISION_SKILL_LINK_DIRS = `${firstRoot},${secondRoot}`;
+    process.env.PROVISION_AUTOAPPLY = "auto";
+    initProvisioning();
+    const skill = serveSkill("/obsolete-link-roots.tgz", "obsolete link roots");
+    const manifestUrl = serveManifest([{ type: "skill", name: "linked", ...skill }]);
+    registerManifestUrl(manifestUrl);
+    assert.equal(statusOf(await syncNow(), "linked"), "installed");
+    const firstLink = path.join(firstRoot, "linked");
+    const secondLink = path.join(secondRoot, "linked");
+    const firstIdentity = lstatSync(firstLink, { bigint: true }).ino;
+    unlinkSync(secondLink);
+    mkdirSync(secondLink);
+    writeFileSync(path.join(secondLink, "USER.md"), "changed link content");
+
+    process.env.PROVISION_SKILL_LINK_DIRS = "";
+    initProvisioning();
+    registerManifestUrl(manifestUrl);
+    const refused = await syncNow();
+
+    assert.equal(statusOf(refused, "linked"), "failed");
+    assert.match(refused.data[0]!.error!, /remove changed skill link/);
+    assert.equal(lstatSync(firstLink, { bigint: true }).ino, firstIdentity);
+    assert.equal(readFileSync(path.join(secondLink, "USER.md"), "utf8"), "changed link content");
+    const state = JSON.parse(readFileSync(path.join(stateDir, "provision.lock.json"), "utf8"));
+    assert.deepEqual(
+      state.installed["skill/linked"].skillLinks.map((link: { path: string }) => link.path),
+      [firstLink, secondLink],
+    );
+  });
+
   test("recovers a discovery link published after its ownership intent was saved", async () => {
     const linkDir = path.join(stateDir, "claude-skills");
     process.env.PROVISION_SKILL_LINK_DIRS = linkDir;
@@ -619,6 +652,35 @@ describe("provision sync", () => {
       readdirSync(legacySkillsDir).some((entry) => entry.startsWith(".provision-removed-")),
       true,
     );
+  });
+
+  test("does not migrate an install root reached through a canonical alias", async () => {
+    const actualRoot = path.join(stateDir, "actual-canonical-root");
+    const aliasRoot = path.join(stateDir, "aliased-canonical-root");
+    process.env.PROVISION_SKILLS_DIR = actualRoot;
+    process.env.PROVISION_SKILL_LINK_DIRS = "";
+    process.env.PROVISION_AUTOAPPLY = "auto";
+    initProvisioning();
+    const skill = serveSkill("/aliased-canonical-install.tgz", "aliased canonical install");
+    const manifestUrl = serveManifest([{ type: "skill", name: "aliased", ...skill }]);
+    registerManifestUrl(manifestUrl);
+    assert.equal(statusOf(await syncNow(), "aliased"), "installed");
+    symlinkSync(actualRoot, aliasRoot, process.platform === "win32" ? "junction" : "dir");
+
+    process.env.PROVISION_SKILLS_DIR = aliasRoot;
+    initProvisioning();
+    registerManifestUrl(manifestUrl);
+    assert.equal(statusOf(await syncNow(), "aliased"), "installed");
+
+    const actualTarget = path.join(actualRoot, "aliased");
+    const aliasTarget = path.join(aliasRoot, "aliased");
+    assert.equal(lstatSync(actualTarget, { bigint: true }).ino, lstatSync(aliasTarget, { bigint: true }).ino);
+    assert.equal(
+      readdirSync(actualRoot).some((entry) => entry.startsWith(".provision-removed-")),
+      false,
+    );
+    const state = JSON.parse(readFileSync(path.join(stateDir, "provision.lock.json"), "utf8"));
+    assert.equal(state.installed["skill/aliased"].installRoot, actualRoot);
   });
 
   test("repairs a missing legacy skill while migrating to the shared Codex source", async () => {
