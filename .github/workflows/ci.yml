@@ -89,4 +89,4 @@ jobs:
         run: npm run build
 
       - name: Test config provisioning
-        run: node --test dist/provision/config-installer.test.js dist/provision/rename-no-replace.test.js
+        run: node --test dist/provision/config-installer.test.js dist/provision/rename-no-replace.test.js && node --test --test-name-pattern="Windows hard-link candidate" dist/provision/sync.test.js

@@ -5,7 +5,6 @@ import {
   fstatSync,
   lstatSync,
   openSync,
-  unlinkSync,
 } from "node:fs";
 import { createRequire } from "node:module";
 import path from "node:path";
@@ -145,6 +144,24 @@ const WINDOWS_REMOVE_SCRIPT = [
     + 'catch (err) { if (err && err.code === "ENOENT") process.exit(2); throw err }',
 ].join(";");
 
+const WINDOWS_REMOVE_PUBLISHED_LINK_SCRIPT = [
+  ...VERIFIED_DIRECTORY_PREFIX,
+  "const expectedDev = process.argv[3]",
+  "const expectedIno = process.argv[4]",
+  "const published = fs.lstatSync(process.argv[2], { bigint: true })",
+  "if (!published.isFile() || published.dev.toString() !== expectedDev "
+    + "|| published.ino.toString() !== expectedIno) process.exit(66)",
+  "let candidate",
+  "try { candidate = fs.lstatSync(process.argv[1], { bigint: true }) } "
+    + 'catch (err) { if (err && err.code === "ENOENT") process.exit(2); throw err }',
+  "if (!candidate.isFile() || candidate.dev !== published.dev "
+    + "|| candidate.ino !== published.ino || published.nlink < 2n) process.exit(66)",
+  "fs.unlinkSync(process.argv[1])",
+  "const remaining = fs.lstatSync(process.argv[2], { bigint: true })",
+  "if (!remaining.isFile() || remaining.dev.toString() !== expectedDev "
+    + "|| remaining.ino.toString() !== expectedIno) process.exit(66)",
+].join(";");
+
 function spawnVerifiedChild(
   parentFd: number,
   parentPath: string,
@@ -182,7 +199,13 @@ export function renameAtNoReplace(
     // caller never truncates the now-visible credential during cleanup.
     if (sameSiblingIdentity(parentPath, source, destination, sourceFd)) {
       try {
-	unlinkSync(path.join(parentPath, source));
+	const expected = sourceFd === undefined
+	  ? lstatSync(path.join(parentPath, destination), { bigint: true })
+	  : fstatSync(sourceFd, { bigint: true });
+	removeWindowsPublishedCandidate(parentFd, parentPath, source, destination, {
+	  dev: expected.dev.toString(),
+	  ino: expected.ino.toString(),
+	}, runtimePlatform);
       } catch {
 	// The random candidate may remain, but the published credential stays intact.
       }
@@ -227,6 +250,36 @@ export function removeAt(
   const code = getSystemErrorName(-result);
   if (code === "ENOENT") return false;
   throw Object.assign(new Error(`FD-relative removal failed with ${code}`), { code });
+}
+
+/** Remove only a Windows candidate that is a second link to the recorded published file. */
+export function removeWindowsPublishedCandidate(
+  parentFd: number,
+  parentPath: string,
+  candidate: string,
+  published: string,
+  expected: { dev: string; ino: string },
+  runtimePlatform: NodeJS.Platform = process.platform,
+): boolean {
+  assertSiblingBasenames(candidate, published);
+  if (runtimePlatform !== "win32") {
+    throw new ProvisionError(
+      "Windows hard-link cleanup is unavailable on this platform",
+      "atomic_rename_unavailable",
+    );
+  }
+  const child = spawnVerifiedChild(
+    parentFd,
+    parentPath,
+    WINDOWS_REMOVE_PUBLISHED_LINK_SCRIPT,
+    [candidate, published, expected.dev, expected.ino],
+  );
+  if (child.status === 0 || child.status === 2) return true;
+  if (child.status === 66) return false;
+  if (child.status === 65) {
+    throw new ProvisionError("Removal target changed during cleanup", "untracked_content");
+  }
+  throw new ProvisionError("Atomic remove helper failed", "atomic_rename_unavailable");
 }
 
 const REPLACE_SCRIPT = [

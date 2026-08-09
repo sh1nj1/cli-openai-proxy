@@ -5,6 +5,7 @@ import { createHash } from "crypto";
 import {
   chmodSync,
   existsSync,
+  linkSync,
   lstatSync,
   mkdirSync,
   mkdtempSync,
@@ -2011,6 +2012,91 @@ describe("provision sync", () => {
     assert.equal(readFileSync(candidatePath).length, 0);
     assert.equal(readFileSync(path.join(target, untrackedName), "utf8"), "user-owned");
     assert.equal(readFileSync(path.join(target, "config.json"), "utf8"), config.body);
+  });
+
+  test("restart removes Windows hard-link candidates before committing ownership", {
+    skip: process.platform !== "win32",
+  }, async () => {
+    const first = configItem("tok-1", "/config-v1.tar.gz");
+    const key = "config/collavre";
+    const target = path.join(configDir, "collavre");
+    mkdirSync(target);
+    const firstCandidateName = `.provision-config-candidate-${"a".repeat(32)}`;
+    const firstCandidatePath = path.join(target, firstCandidateName);
+    const publishedPath = path.join(target, "config.json");
+    writeFileSync(firstCandidatePath, first.body, { mode: 0o600 });
+    linkSync(firstCandidatePath, publishedPath);
+    const targetStat = lstatSync(target, { bigint: true });
+    const firstCandidateStat = lstatSync(firstCandidatePath, { bigint: true });
+    const stateFile = path.join(stateDir, "provision.lock.json");
+    writeFileSync(stateFile, JSON.stringify({
+      version: 1,
+      approved: [key],
+      revoked: [],
+      installed: {
+	[key]: {
+	  sha256: first.item.sha256,
+	  files: ["config.json"],
+	  directories: [],
+	  fileHashes: { "config.json": sha(Buffer.from(first.body)) },
+	  installedAt: new Date().toISOString(),
+	  uncommitted: true,
+	  candidateIdentity: {
+	    dev: targetStat.dev.toString(),
+	    ino: targetStat.ino.toString(),
+	  },
+	  configCandidate: {
+	    name: firstCandidateName,
+	    dev: firstCandidateStat.dev.toString(),
+	    ino: firstCandidateStat.ino.toString(),
+	  },
+	},
+      },
+    }));
+    registerManifestUrl(serveManifest([first.item]));
+
+    const firstStatus = await syncNow();
+    assert.equal(firstStatus.data[0]!.status, "installed");
+    assert.equal(existsSync(firstCandidatePath), false);
+    assert.equal(readFileSync(publishedPath, "utf8"), first.body);
+    const state = JSON.parse(readFileSync(stateFile, "utf8"));
+    assert.equal(state.installed[key].uncommitted, undefined);
+    assert.equal(state.installed[key].configCandidate, undefined);
+
+    const second = configItem("tok-2", "/config-v2.tar.gz");
+    const secondCandidateName = `.provision-config-candidate-${"b".repeat(32)}`;
+    const secondCandidatePath = path.join(target, secondCandidateName);
+    writeFileSync(secondCandidatePath, second.body, { mode: 0o600 });
+    rmSync(publishedPath);
+    linkSync(secondCandidatePath, publishedPath);
+    const secondCandidateStat = lstatSync(secondCandidatePath, { bigint: true });
+    state.installed[key].pending = {
+      sha256: second.item.sha256,
+      files: ["config.json"],
+      directories: [],
+      fileHashes: { "config.json": sha(Buffer.from(second.body)) },
+      installedAt: new Date().toISOString(),
+    };
+    state.installed[key].candidateIdentity = {
+      dev: targetStat.dev.toString(),
+      ino: targetStat.ino.toString(),
+    };
+    state.installed[key].configCandidate = {
+      name: secondCandidateName,
+      dev: secondCandidateStat.dev.toString(),
+      ino: secondCandidateStat.ino.toString(),
+    };
+    writeFileSync(stateFile, JSON.stringify(state));
+    registerManifestUrl(serveManifest([second.item]));
+
+    const secondStatus = await syncNow();
+    assert.equal(secondStatus.data[0]!.status, "installed");
+    assert.equal(existsSync(secondCandidatePath), false);
+    assert.equal(readFileSync(publishedPath, "utf8"), second.body);
+    const upgradedState = JSON.parse(readFileSync(stateFile, "utf8"));
+    assert.equal(upgradedState.installed[key].sha256, second.item.sha256);
+    assert.equal(upgradedState.installed[key].pending, undefined);
+    assert.equal(upgradedState.installed[key].configCandidate, undefined);
   });
 
   test("an unresolved config upgrade journal blocks replacement", async () => {

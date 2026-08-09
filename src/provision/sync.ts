@@ -44,6 +44,7 @@ import {
   resolveGitRevision,
 } from "./installer.js";
 import {
+  cleanupPublishedConfigCandidate,
   discardConfigCandidate,
   installConfig,
   removeConfig,
@@ -510,7 +511,8 @@ function configTargetIdentityMatches(name: string, record: InstalledRecord): boo
 function reconcileConfigUpgradeJournal(name: string, record: InstalledRecord): InstalledRecord {
   if (!record.pending) return record;
   if (configSnapshotComplete(name, record.pending, record)
-    && publishedConfigCandidateIntact(name, record.pending, record)) return { ...record.pending };
+    && publishedConfigCandidateIntact(name, record.pending, record)
+    && cleanupRecordedPublishedConfigCandidate(name, record)) return { ...record.pending };
   if (configSnapshotComplete(name, record, record.pending)
     && configTargetIdentityMatches(name, record)
     && discardRecordedConfigCandidate(name, record)) {
@@ -529,6 +531,14 @@ function configOwnedFiles(record: InstalledRecord): string[] {
 function discardRecordedConfigCandidate(name: string, record: InstalledRecord): boolean {
   if (!record.candidateIdentity && !record.configCandidate) return true;
   return discardConfigCandidate(name, {
+    configDir: configDir(),
+    targetIdentity: record.candidateIdentity,
+    candidate: record.configCandidate,
+  });
+}
+
+function cleanupRecordedPublishedConfigCandidate(name: string, record: InstalledRecord): boolean {
+  return cleanupPublishedConfigCandidate(name, {
     configDir: configDir(),
     targetIdentity: record.candidateIdentity,
     candidate: record.configCandidate,
@@ -691,7 +701,8 @@ function reconcileFirstInstallJournals(state: ProvisionStateFile): Set<string> {
     if (!record.uncommitted) continue;
     if (key.startsWith("config/")) {
       const name = key.slice(key.indexOf("/") + 1);
-      if (publishedConfigCandidateIntact(name, record, record)) {
+      if (publishedConfigCandidateIntact(name, record, record)
+	&& cleanupRecordedPublishedConfigCandidate(name, record)) {
 	const next = { ...record };
 	delete next.uncommitted;
 	delete next.candidateIdentity;

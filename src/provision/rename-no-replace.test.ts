@@ -1,9 +1,26 @@
 import assert from "node:assert/strict";
-import { closeSync, constants, mkdirSync, mkdtempSync, openSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import {
+  closeSync,
+  constants,
+  existsSync,
+  linkSync,
+  lstatSync,
+  mkdirSync,
+  mkdtempSync,
+  openSync,
+  readFileSync,
+  renameSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, test } from "node:test";
-import { removeAt, renameAtNoReplace } from "./rename-no-replace.js";
+import {
+  removeAt,
+  removeWindowsPublishedCandidate,
+  renameAtNoReplace,
+} from "./rename-no-replace.js";
 import { ProvisionError } from "./types.js";
 
 describe("Windows config file operations", () => {
@@ -38,6 +55,44 @@ describe("Windows config file operations", () => {
     writeFileSync(path.join(parent, "config.json"), "secret");
     assert.equal(removeAt(parentFd, parent, "config.json", false, "win32"), true);
     assert.equal(removeAt(parentFd, parent, "config.json", false, "win32"), false);
+  });
+
+  test("removes a leftover candidate only when it links to the published file", () => {
+    const candidate = path.join(parent, "candidate");
+    const published = path.join(parent, "config.json");
+    writeFileSync(candidate, "secret");
+    linkSync(candidate, published);
+    const identity = lstatSync(published, { bigint: true });
+
+    assert.equal(removeWindowsPublishedCandidate(
+      parentFd,
+      parent,
+      "candidate",
+      "config.json",
+      { dev: identity.dev.toString(), ino: identity.ino.toString() },
+      "win32",
+    ), true);
+    assert.equal(existsSync(candidate), false);
+    assert.equal(readFileSync(published, "utf8"), "secret");
+  });
+
+  test("preserves a candidate whose identity does not match the published file", () => {
+    const candidate = path.join(parent, "candidate");
+    const published = path.join(parent, "config.json");
+    writeFileSync(candidate, "user-owned");
+    writeFileSync(published, "secret");
+    const identity = lstatSync(published, { bigint: true });
+
+    assert.equal(removeWindowsPublishedCandidate(
+      parentFd,
+      parent,
+      "candidate",
+      "config.json",
+      { dev: identity.dev.toString(), ino: identity.ino.toString() },
+      "win32",
+    ), false);
+    assert.equal(readFileSync(candidate, "utf8"), "user-owned");
+    assert.equal(readFileSync(published, "utf8"), "secret");
   });
 
   test("refuses a path that no longer identifies the opened directory", () => {

@@ -32,6 +32,7 @@ import {
 import { managedPathParts } from "./path-policy.js";
 import {
   removeAt,
+  removeWindowsPublishedCandidate,
   renameAtNoReplace,
   renameAtReplace,
 } from "./rename-no-replace.js";
@@ -275,6 +276,39 @@ export function discardConfigCandidate(
     });
   } finally {
     if (candidateFd !== undefined) closeSync(candidateFd);
+    closeSync(targetFd);
+  }
+}
+
+/** Finalize a Windows hard-link publication without deleting an unrelated candidate name. */
+export function cleanupPublishedConfigCandidate(
+  name: string,
+  opts: {
+    configDir: string;
+    targetIdentity?: InstalledDirectoryIdentity;
+    candidate?: InstalledFileIdentity;
+  },
+): boolean {
+  if (process.platform !== "win32") return true;
+  if (!opts.targetIdentity || !opts.candidate
+    || !CONFIG_CANDIDATE_PATTERN.test(opts.candidate.name)) return false;
+  const target = itemTarget(opts.configDir, name);
+  let targetFd: number;
+  try {
+    targetFd = openTargetDirectory(target, name);
+  } catch {
+    return false;
+  }
+  try {
+    if (!sameIdentity(targetFd, opts.targetIdentity)) return false;
+    return removeWindowsPublishedCandidate(
+      targetFd,
+      target,
+      opts.candidate.name,
+      "config.json",
+      opts.candidate,
+    );
+  } finally {
     closeSync(targetFd);
   }
 }
