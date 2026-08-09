@@ -240,6 +240,26 @@ describe("config installer", () => {
     assert.equal(readFileSync(path.join(configDir, "collavre", "config.json"), "utf8"), rotated);
   });
 
+  test("secures an existing directory before publishing a credential", async () => {
+    const target = path.join(configDir, "collavre");
+    mkdirSync(target, { mode: 0o755 });
+    chmodSync(target, 0o755);
+    const item = publish("collavre", makeArchive({ "config.json": CONFIG_JSON }));
+
+    await assert.rejects(
+      () => installConfig(item, {
+	configDir,
+	afterPublish: () => {
+	  assert.equal(lstatSync(target).mode & 0o777, 0o700);
+	  throw new Error("simulated crash after publish");
+	},
+      }),
+      /simulated crash after publish/,
+    );
+    assert.equal(lstatSync(target).mode & 0o777, 0o700);
+    assert.equal(readFileSync(path.join(target, "config.json"), "utf8"), CONFIG_JSON);
+  });
+
   test("rejects extra flat files outside the config artifact contract", async () => {
     const item = publish("collavre", makeArchive({
       "config.json": CONFIG_JSON,

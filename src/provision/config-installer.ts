@@ -323,6 +323,7 @@ export async function installConfig(
     beforeMutation?: () => void;
     beforePublish?: (target: string) => void;
     beforeReplace?: (target: string) => void;
+    afterPublish?: (target: string) => void;
   },
 ): Promise<ConfigInstallResult> {
   const target = itemTarget(opts.configDir, item.name);
@@ -386,14 +387,19 @@ export async function installConfig(
 	  fchmodSync(candidateFd, FILE_MODE);
 	  fsyncSync(candidateFd);
 	  assertTargetIdentity(target, targetFd, item.name);
+	  const previousDirectoryMode = fstatSync(targetFd).mode & 0o777;
+	  fchmodSync(targetFd, DIRECTORY_MODE);
+	  fsyncSync(targetFd);
 	  if (!renameAtNoReplace(targetFd, candidateJournal.candidate.name, "config.json")) {
+	    fchmodSync(targetFd, previousDirectoryMode);
+	    fsyncSync(targetFd);
 	    throw new ProvisionError(
 	      `Refusing to replace untracked file "config.json" in config "${item.name}"`,
 	      "untracked_content",
 	    );
 	  }
 	  candidateOwned = false;
-	  fchmodSync(targetFd, DIRECTORY_MODE);
+	  opts.afterPublish?.(target);
 	  fsyncSync(targetFd);
 	  return result;
 	}
@@ -416,6 +422,8 @@ export async function installConfig(
       fchmodSync(candidateFd, FILE_MODE);
       fsyncSync(candidateFd);
       assertTargetIdentity(target, targetFd, item.name);
+      fchmodSync(targetFd, DIRECTORY_MODE);
+      fsyncSync(targetFd);
       opts.beforeReplace?.(target);
       renameAtReplace(
 	targetFd,
@@ -424,7 +432,7 @@ export async function installConfig(
 	"config.json",
       );
       candidateOwned = false;
-      fchmodSync(targetFd, DIRECTORY_MODE);
+      opts.afterPublish?.(target);
       fsyncSync(targetFd);
 
       for (const stale of managed) {
