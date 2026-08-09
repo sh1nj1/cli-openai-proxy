@@ -94,8 +94,10 @@ describe("config installer", () => {
     const target = path.join(configDir, "collavre");
     assert.deepEqual(result.files, ["config.json"]);
     assert.equal(readFileSync(path.join(target, "config.json"), "utf8"), CONFIG_JSON);
-    assert.equal(lstatSync(target).mode & 0o777, 0o700);
-    assert.equal(lstatSync(path.join(target, "config.json")).mode & 0o777, 0o600);
+    if (process.platform !== "win32") {
+      assert.equal(lstatSync(target).mode & 0o777, 0o700);
+      assert.equal(lstatSync(path.join(target, "config.json")).mode & 0o777, 0o600);
+    }
     assert.equal(
       result.fileHashes["config.json"],
       createHash("sha256").update(CONFIG_JSON).digest("hex"),
@@ -117,7 +119,9 @@ describe("config installer", () => {
     const item = publish("collavre", readFileSync(archivePath));
     rmSync(build, { recursive: true, force: true });
     await installConfig(item, { configDir });
-    assert.equal(lstatSync(path.join(configDir, "collavre", "config.json")).mode & 0o777, 0o600);
+    if (process.platform !== "win32") {
+      assert.equal(lstatSync(path.join(configDir, "collavre", "config.json")).mode & 0o777, 0o600);
+    }
   });
 
   test("rejects invalid hashes, nested files, oversized files, and binary files", async () => {
@@ -250,13 +254,17 @@ describe("config installer", () => {
       () => installConfig(item, {
 	configDir,
 	afterPublish: () => {
-	  assert.equal(lstatSync(target).mode & 0o777, 0o700);
+	  if (process.platform !== "win32") {
+	    assert.equal(lstatSync(target).mode & 0o777, 0o700);
+	  }
 	  throw new Error("simulated crash after publish");
 	},
       }),
       /simulated crash after publish/,
     );
-    assert.equal(lstatSync(target).mode & 0o777, 0o700);
+    if (process.platform !== "win32") {
+      assert.equal(lstatSync(target).mode & 0o777, 0o700);
+    }
     assert.equal(readFileSync(path.join(target, "config.json"), "utf8"), CONFIG_JSON);
   });
 
@@ -347,13 +355,13 @@ describe("config installer", () => {
     assert.equal(existsSync(target), true);
   });
 
-  test("removal drops an empty item directory and rejects escaped records", async () => {
+  test("removal retains an empty shared item directory and rejects escaped records", async () => {
     const installed = await installConfig(
       publish("collavre", makeArchive({ "config.json": CONFIG_JSON })),
       { configDir },
     );
     removeConfig("collavre", { configDir, files: installed.files });
-    assert.equal(existsSync(path.join(configDir, "collavre")), false);
+    assert.deepEqual(readdirSync(path.join(configDir, "collavre")), []);
     assert.throws(
       () => removeConfig("collavre", { configDir, files: ["../escape"] }),
       (err: ProvisionError) => err.code === "invalid_item",

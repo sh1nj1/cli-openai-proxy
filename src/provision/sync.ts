@@ -374,6 +374,7 @@ function installedSnapshotIntactAt(root: string, record: InstalledSnapshot): boo
 function configSnapshotIntact(name: string, record: InstalledSnapshot): boolean {
   const root = itemRoot("config", name);
   if (!installedSnapshotIntactAt(root, record)) return false;
+  if (process.platform === "win32") return true;
   try {
     if ((lstatSync(root).mode & 0o777) !== 0o700) return false;
     return record.files.every((relative) =>
@@ -469,7 +470,7 @@ function publishedConfigCandidateIntact(
     const targetStat = fstatSync(targetFd, { bigint: true });
     if (targetStat.dev.toString() !== record.candidateIdentity.dev
       || targetStat.ino.toString() !== record.candidateIdentity.ino
-      || (targetStat.mode & 0o777n) !== 0o700n) return false;
+      || (process.platform !== "win32" && (targetStat.mode & 0o777n) !== 0o700n)) return false;
     fileFd = openSync(
       path.join(target, "config.json"),
       fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW,
@@ -477,7 +478,7 @@ function publishedConfigCandidateIntact(
     const fileStat = fstatSync(fileFd, { bigint: true });
     if (fileStat.dev.toString() !== record.configCandidate.dev
       || fileStat.ino.toString() !== record.configCandidate.ino
-      || (fileStat.mode & 0o777n) !== 0o600n) return false;
+      || (process.platform !== "win32" && (fileStat.mode & 0o777n) !== 0o600n)) return false;
     const digest = createHash("sha256").update(readFileSync(fileFd)).digest("hex");
     if (digest !== snapshot.fileHashes["config.json"]) return false;
     const canonicalTarget = lstatSync(target, { bigint: true });

@@ -20,7 +20,6 @@ import {
   readdirSync,
   readFileSync,
   rmSync,
-  rmdirSync,
   unlinkSync,
   writeFileSync,
 } from "fs";
@@ -53,6 +52,21 @@ const NAME_PATTERN = /^[a-z0-9][a-z0-9_-]{0,63}$/;
 const DIRECTORY_MODE = 0o700;
 const FILE_MODE = 0o600;
 const CONFIG_CANDIDATE_PATTERN = /^\.provision-config-candidate-[0-9a-f]{32}$/;
+
+function secureFileDescriptor(fd: number): void {
+  if (process.platform !== "win32") fchmodSync(fd, FILE_MODE);
+  fsyncSync(fd);
+}
+
+function secureDirectoryDescriptor(fd: number): void {
+  if (process.platform === "win32") return;
+  fchmodSync(fd, DIRECTORY_MODE);
+  fsyncSync(fd);
+}
+
+function syncDirectoryDescriptor(fd: number): void {
+  if (process.platform !== "win32") fsyncSync(fd);
+}
 
 export interface ConfigCandidateJournal {
   targetIdentity: InstalledDirectoryIdentity;
@@ -384,15 +398,22 @@ export async function installConfig(
 	  opts.beforePublish?.(target);
 	  assertTargetIdentity(target, targetFd, item.name);
 	  writeFileSync(candidateFd, readFileSync(path.join(extracted, "config.json")));
-	  fchmodSync(candidateFd, FILE_MODE);
-	  fsyncSync(candidateFd);
+	  secureFileDescriptor(candidateFd);
 	  assertTargetIdentity(target, targetFd, item.name);
 	  const previousDirectoryMode = fstatSync(targetFd).mode & 0o777;
-	  fchmodSync(targetFd, DIRECTORY_MODE);
-	  fsyncSync(targetFd);
-	  if (!renameAtNoReplace(targetFd, candidateJournal.candidate.name, "config.json")) {
-	    fchmodSync(targetFd, previousDirectoryMode);
-	    fsyncSync(targetFd);
+	  secureDirectoryDescriptor(targetFd);
+	  if (!renameAtNoReplace(
+	    targetFd,
+	    target,
+	    candidateJournal.candidate.name,
+	    "config.json",
+	    process.platform,
+	    candidateFd,
+	  )) {
+	    if (process.platform !== "win32") {
+	      fchmodSync(targetFd, previousDirectoryMode);
+	      fsyncSync(targetFd);
+	    }
 	    throw new ProvisionError(
 	      `Refusing to replace untracked file "config.json" in config "${item.name}"`,
 	      "untracked_content",
@@ -400,7 +421,7 @@ export async function installConfig(
 	  }
 	  candidateOwned = false;
 	  opts.afterPublish?.(target);
-	  fsyncSync(targetFd);
+	  syncDirectoryDescriptor(targetFd);
 	  return result;
 	}
 	throw new ProvisionError(
@@ -419,11 +440,9 @@ export async function installConfig(
       opts.beforePublish?.(target);
       assertTargetIdentity(target, targetFd, item.name);
       writeFileSync(candidateFd, readFileSync(path.join(extracted, "config.json")));
-      fchmodSync(candidateFd, FILE_MODE);
-      fsyncSync(candidateFd);
+      secureFileDescriptor(candidateFd);
       assertTargetIdentity(target, targetFd, item.name);
-      fchmodSync(targetFd, DIRECTORY_MODE);
-      fsyncSync(targetFd);
+      secureDirectoryDescriptor(targetFd);
       opts.beforeReplace?.(target);
       renameAtReplace(
 	targetFd,
@@ -433,7 +452,7 @@ export async function installConfig(
       );
       candidateOwned = false;
       opts.afterPublish?.(target);
-      fsyncSync(targetFd);
+      syncDirectoryDescriptor(targetFd);
 
       for (const stale of managed) {
 	if (stale === "config.json") continue;
@@ -445,7 +464,7 @@ export async function installConfig(
 	  );
 	}
 	try {
-	  removeAt(targetFd, parts[0]!);
+	  removeAt(targetFd, target, parts[0]!);
 	} catch (err) {
 	  if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
 	}
@@ -494,19 +513,14 @@ export function removeConfig(
     assertTargetIdentity(target, targetFd, name);
     for (const file of files) {
       try {
-	if (removeAt(targetFd, file)) removed.push(file);
+	if (removeAt(targetFd, target, file)) removed.push(file);
       } catch (err) {
 	if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
       }
     }
-    if (removed.length > 0) fsyncSync(targetFd);
+    if (removed.length > 0) syncDirectoryDescriptor(targetFd);
   } finally {
     closeSync(targetFd);
-  }
-  try {
-    rmdirSync(target);
-  } catch {
-    // A non-empty user-owned directory and an already absent directory both stay untouched.
   }
   return { removed };
 }

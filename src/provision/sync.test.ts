@@ -2148,7 +2148,7 @@ describe("provision sync", () => {
     await syncNow();
     assert.deepEqual(await deleteItem("config", "collavre"), { removed: true });
     assert.deepEqual(getStatus().data, []);
-    assert.equal(existsSync(path.join(configDir, "collavre")), false);
+    assert.deepEqual(readdirSync(path.join(configDir, "collavre")), []);
     const status = await syncNow();
     assert.equal(status.data[0]!.status, "pending_approval");
   });

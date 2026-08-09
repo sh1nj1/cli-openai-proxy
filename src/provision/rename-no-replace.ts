@@ -1,5 +1,12 @@
 import { spawnSync } from "node:child_process";
-import { closeSync, constants, openSync } from "node:fs";
+import {
+  closeSync,
+  constants,
+  fstatSync,
+  lstatSync,
+  openSync,
+  unlinkSync,
+} from "node:fs";
 import { createRequire } from "node:module";
 import path from "node:path";
 import { getSystemErrorName } from "node:util";
@@ -90,17 +97,98 @@ function resultCode(result: unknown, operation: string): number {
   return result as number;
 }
 
+function assertSiblingBasenames(...names: string[]): void {
+  if (names.some((name) => path.basename(name) !== name || name === "." || name === "..")) {
+    throw new ProvisionError("FD-relative operation requires sibling basenames", "invalid_item");
+  }
+}
+
+function sameSiblingIdentity(
+  parentPath: string,
+  first: string,
+  second: string,
+  expectedFd?: number,
+): boolean {
+  try {
+    const left = lstatSync(path.join(parentPath, first), { bigint: true });
+    const right = lstatSync(path.join(parentPath, second), { bigint: true });
+    const expected = expectedFd === undefined ? left : fstatSync(expectedFd, { bigint: true });
+    return left.isFile()
+      && right.isFile()
+      && expected.isFile()
+      && left.dev === right.dev
+      && left.ino === right.ino
+      && left.dev === expected.dev
+      && left.ino === expected.ino;
+  } catch {
+    return false;
+  }
+}
+
+const VERIFIED_DIRECTORY_PREFIX = [
+  'const fs = require("node:fs")',
+  "const opened = fs.fstatSync(3, { bigint: true })",
+  'const cwd = fs.statSync(".", { bigint: true })',
+  "if (!opened.isDirectory() || opened.dev !== cwd.dev || opened.ino !== cwd.ino) process.exit(65)",
+];
+
+const WINDOWS_NOREPLACE_SCRIPT = [
+  ...VERIFIED_DIRECTORY_PREFIX,
+  "try { fs.linkSync(process.argv[1], process.argv[2]) } "
+    + 'catch (err) { if (err && err.code === "EEXIST") process.exit(17); throw err }',
+  "fs.unlinkSync(process.argv[1])",
+].join(";");
+
+const WINDOWS_REMOVE_SCRIPT = [
+  ...VERIFIED_DIRECTORY_PREFIX,
+  "try { process.argv[2] === \"1\" ? fs.rmdirSync(process.argv[1]) : fs.unlinkSync(process.argv[1]) } "
+    + 'catch (err) { if (err && err.code === "ENOENT") process.exit(2); throw err }',
+].join(";");
+
+function spawnVerifiedChild(
+  parentFd: number,
+  parentPath: string,
+  script: string,
+  args: string[],
+) {
+  return spawnSync(process.execPath, ["-e", script, ...args], {
+    cwd: parentPath,
+    stdio: ["ignore", "ignore", "ignore", parentFd],
+  });
+}
+
 /** Atomically rename paths relative to an already-open directory descriptor. */
 export function renameAtNoReplace(
   parentFd: number,
+  parentPath: string,
   source: string,
   destination: string,
+  runtimePlatform: NodeJS.Platform = process.platform,
+  sourceFd?: number,
 ): boolean {
-  if (process.platform === "win32") {
-    throw new ProvisionError(
-      "Windows uses the platform rename implementation directly",
-      "atomic_rename_unavailable",
-    );
+  assertSiblingBasenames(source, destination);
+  if (runtimePlatform === "win32") {
+    const child = spawnVerifiedChild(parentFd, parentPath, WINDOWS_NOREPLACE_SCRIPT, [
+      source,
+      destination,
+    ]);
+    if (child.status === 0) return true;
+    if (child.status === 17) return false;
+    if (child.status === 65) {
+      throw new ProvisionError("Rename target changed during publication", "untracked_content");
+    }
+    // A terminated helper may have created the destination hard link before
+    // removing the candidate. Treat that exact identity as published so the
+    // caller never truncates the now-visible credential during cleanup.
+    if (sameSiblingIdentity(parentPath, source, destination, sourceFd)) {
+      try {
+	unlinkSync(path.join(parentPath, source));
+      } catch {
+	// The random candidate may remain, but the published credential stays intact.
+      }
+      return true;
+    }
+    throw new ProvisionError("Atomic no-replace rename helper failed", "atomic_rename_unavailable");
   }
 
   const result = resultCode(
@@ -114,9 +202,25 @@ export function renameAtNoReplace(
 }
 
 /** Remove one basename relative to an open directory descriptor. */
-export function removeAt(parentFd: number, basename: string, directory = false): boolean {
-  if (path.basename(basename) !== basename || basename === "." || basename === "..") {
-    throw new ProvisionError("FD-relative removal requires one basename", "invalid_item");
+export function removeAt(
+  parentFd: number,
+  parentPath: string,
+  basename: string,
+  directory = false,
+  runtimePlatform: NodeJS.Platform = process.platform,
+): boolean {
+  assertSiblingBasenames(basename);
+  if (runtimePlatform === "win32") {
+    const child = spawnVerifiedChild(parentFd, parentPath, WINDOWS_REMOVE_SCRIPT, [
+      basename,
+      directory ? "1" : "0",
+    ]);
+    if (child.status === 0) return true;
+    if (child.status === 2) return false;
+    if (child.status === 65) {
+      throw new ProvisionError("Removal target changed during cleanup", "untracked_content");
+    }
+    throw new ProvisionError("Atomic remove helper failed", "atomic_rename_unavailable");
   }
   const result = resultCode(loadBinding().removeAt(parentFd, basename, directory), "remove-at");
   if (result === 0) return true;
@@ -126,10 +230,7 @@ export function removeAt(parentFd: number, basename: string, directory = false):
 }
 
 const REPLACE_SCRIPT = [
-  'const fs = require("node:fs")',
-  "const opened = fs.fstatSync(3, { bigint: true })",
-  'const cwd = fs.statSync(".", { bigint: true })',
-  "if (!opened.isDirectory() || opened.dev !== cwd.dev || opened.ino !== cwd.ino) process.exit(65)",
+  ...VERIFIED_DIRECTORY_PREFIX,
   "fs.renameSync(process.argv[1], process.argv[2])",
 ].join(";");
 
@@ -140,14 +241,8 @@ export function renameAtReplace(
   source: string,
   destination: string,
 ): void {
-  if ([source, destination].some((name) =>
-    path.basename(name) !== name || name === "." || name === "..")) {
-    throw new ProvisionError("FD-relative rename requires sibling basenames", "invalid_item");
-  }
-  const child = spawnSync(process.execPath, ["-e", REPLACE_SCRIPT, source, destination], {
-    cwd: parentPath,
-    stdio: ["ignore", "ignore", "ignore", parentFd],
-  });
+  assertSiblingBasenames(source, destination);
+  const child = spawnVerifiedChild(parentFd, parentPath, REPLACE_SCRIPT, [source, destination]);
   if (child.status === 0) return;
   if (child.status === 65) {
     throw new ProvisionError("Rename target changed during publication", "untracked_content");
@@ -167,7 +262,12 @@ export function renameDirectoryNoReplace(source: string, target: string): boolea
 
   const parentFd = openSync(parent, constants.O_RDONLY | constants.O_DIRECTORY);
   try {
-    return renameAtNoReplace(parentFd, path.basename(source), path.basename(target));
+    return renameAtNoReplace(
+      parentFd,
+      parent,
+      path.basename(source),
+      path.basename(target),
+    );
   } finally {
     closeSync(parentFd);
   }

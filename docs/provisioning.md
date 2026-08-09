@@ -174,8 +174,8 @@ as the item name—for Collavre, `name: "collavre"` places `config.json` at
   sibling files survive upgrades and removal. A colliding untracked file fails
   with `untracked_content`; approve again with `{"adopt": true}` to hand that
   file to provisioning explicitly.
-- Removing the item deletes only lockfile-recorded files, then removes its
-  directory only when empty. A changed archive hash rotates credentials without
+- Removing the item deletes only lockfile-recorded files and leaves the shared
+  item directory in place. A changed archive hash rotates credentials without
   another approval; an unchanged, intact item is not rewritten.
 - Interrupted publication recovery reopens the recorded inode and erases its
   credential bytes through that descriptor. It may retain an empty, random
