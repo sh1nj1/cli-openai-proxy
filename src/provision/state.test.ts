@@ -43,6 +43,20 @@ describe("provision state", () => {
     assert.equal(loadRegisteredManifestUrl(["another-key", "admin-secret"]), url);
   });
 
+  test("a persisted manifest URL at the size bound survives a reload", () => {
+    const prefix = "https://registry.test/?q=";
+    const url = prefix + "가".repeat((8 * 1024 - prefix.length) / 3);
+    saveRegisteredManifestUrl(url, "admin-secret");
+
+    assert.equal(loadRegisteredManifestUrl(["admin-secret"]), url);
+  });
+
+  test("a manifest URL too large to reload is refused instead of written", () => {
+    const url = `https://registry.test/?q=${"가".repeat(4096)}`;
+    assert.throws(() => saveRegisteredManifestUrl(url, "admin-secret"), /too long to persist/);
+    assert.equal(loadRegisteredManifestUrl(["admin-secret"]), null);
+  });
+
   test("a corrupt registered manifest file loads as absent", () => {
     writeFileSync(registeredManifestFilePath(), "{ not json");
     assert.equal(loadRegisteredManifestUrl(["admin-secret"]), null);

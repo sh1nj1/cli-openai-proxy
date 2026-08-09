@@ -18,12 +18,18 @@ import {
   deleteItem,
   getStatus,
   provisionEnabled,
+  registerManifestUrl,
   syncNow,
 } from "../provision/sync.js";
 import { ProvisionError } from "../provision/types.js";
+// Registration bound: the URL is persisted, so the acceptance limit is the
+// persistence limit. Unrelated to the login path's tighter base64url budget,
+// which exists only because that URL travels in a response header.
+import { MAX_REGISTERED_MANIFEST_URL_BYTES } from "../provision/state.js";
 
 /** Path prefix these handlers own. authMiddleware defers to this module's gate for it. */
 export const PROVISION_PREFIX = "/v1/provision";
+
 
 function fail(res: Response, status: number, message: string, code: string): void {
   res.status(status).json({ error: { message, type: "invalid_request_error", code } });
@@ -45,17 +51,22 @@ export function provisionAdminMiddleware(req: Request, res: Response, next: Next
 
 function sendError(res: Response, err: unknown, invalidItemIsUpstream = false): void {
   if (err instanceof ProvisionError) {
+    // 409 for the pin: the request is well-formed and the key is valid — the
+    // server refuses on policy, and retrying changes nothing until the operator
+    // unsets PROVISION_MANIFEST_URL.
     // 502 for upstream faults: the request was fine, the registry's answer was
     // not — retrying may succeed once the remote side is fixed.
     const status =
       err.code === "unknown_item" || err.code === "provisioning_disabled"
         ? 404
-        : err.code === "manifest_fetch_failed" ||
-            err.code === "invalid_manifest" ||
-	    (invalidItemIsUpstream && err.code === "invalid_item") ||
-            err.code === "download_failed"
-          ? 502
-          : 400;
+        : err.code === "manifest_url_locked"
+          ? 409
+          : err.code === "manifest_fetch_failed" ||
+              err.code === "invalid_manifest" ||
+              (invalidItemIsUpstream && err.code === "invalid_item") ||
+              err.code === "download_failed"
+            ? 502
+            : 400;
     fail(res, status, err.message, err.code);
     return;
   }
@@ -66,6 +77,34 @@ function sendError(res: Response, err: unknown, invalidItemIsUpstream = false): 
 /** GET /v1/provision — item states from the last sync (or the lockfile before one). */
 export function handleProvisionStatus(_req: Request, res: Response): void {
   res.json(getStatus());
+}
+
+/**
+ * POST /v1/provision/manifest — register a manifest URL, then apply it now.
+ *
+ * The login-carried `provisioning_url` does the same thing as a side effect of
+ * authenticating; this route decouples the two so an already-authorized agent
+ * can be (re)provisioned on its own. It also reports failures instead of
+ * swallowing them: a login must not fail because its manifest did, while a
+ * caller who asked only to provision wants the 4xx/5xx.
+ */
+export async function handleProvisionRegisterManifest(req: Request, res: Response): Promise<void> {
+  const raw = (req.body as { url?: unknown } | undefined)?.url;
+  if (typeof raw !== "string" || !raw.trim()) {
+    fail(res, 400, "Request body must include a non-empty `url`.", "invalid_provisioning_url");
+    return;
+  }
+  const url = raw.trim();
+  if (Buffer.byteLength(url, "utf8") > MAX_REGISTERED_MANIFEST_URL_BYTES) {
+    fail(res, 400, "`url` is too long.", "invalid_provisioning_url");
+    return;
+  }
+  try {
+    registerManifestUrl(url, { persist: true });
+    res.json(await syncNow());
+  } catch (err) {
+    sendError(res, err, true);
+  }
 }
 
 /** POST /v1/provision/sync — re-fetch the manifest and apply it now. */

@@ -32,7 +32,7 @@ enabling a manifest that contains `git` sources.
 | Env | Meaning |
 | --- | --- |
 | `PROVISION_SYNC` | `1` to enable. Unset = feature off (fail-closed). |
-| `PROVISION_MANIFEST_URL` | Fixed manifest registration at startup (optional). |
+| `PROVISION_MANIFEST_URL` | Fixed manifest registration at startup (optional). Also **pins** the default workspace: while set, no request can register a different URL. |
 | `PROVISION_ALLOWLIST` | Comma-separated hostnames allowed for the manifest **and** artifacts. Unset = artifacts must share the manifest's host. |
 | `PROVISION_AUTOAPPLY` | `approve` (default): first-seen items stop at `pending_approval`. `auto`: install immediately. |
 | `PROVISION_REFETCH_MS` | Drift-correction re-fetch interval. Default 3600000 (1h), `0` disables. |
@@ -211,7 +211,7 @@ as the item name—for Collavre, `name: "collavre"` places `config.json` at
 
 ## How the manifest URL arrives
 
-Three ways, all equivalent once registered:
+Four ways, all equivalent once registered:
 
 1. **With a login** — `POST /v1/auth/{engine}/sessions` accepts an optional
    `provisioning_url`. When that session reaches `authorized`, the proxy
@@ -226,10 +226,29 @@ Three ways, all equivalent once registered:
    view's `last_error`. URLs whose base64url representation exceeds 8 KiB are
    rejected so the private worker-to-gateway notification stays within the
    HTTP response-header budget.
-2. **At startup** — `PROVISION_MANIFEST_URL`.
-3. **Re-fetch** — once registered, the proxy re-pulls every
+2. **On its own** — `POST /v1/provision/manifest`, for an agent that is already
+   authenticated or whose credentials arrived some other way. Same registration
+   as (1), minus the login; see [Endpoints](#post-v1provisionmanifest--status-view).
+3. **At startup** — `PROVISION_MANIFEST_URL`.
+4. **Re-fetch** — once registered, the proxy re-pulls every
    `PROVISION_REFETCH_MS` (default 1h). Updating the JSON is all an external
    app does to roll out changes; a failed sync retries on the next tick.
+
+### Pinning the publisher
+
+Setting `PROVISION_MANIFEST_URL` is not just a startup convenience: while it is
+set, the default workspace refuses to register any other URL. Both (1) and (2)
+answer `manifest_url_locked` instead of repointing — a login carrying a
+different `provisioning_url` still succeeds and records the refusal in
+`last_error`, while `POST /v1/provision/manifest` answers `409`. The operator's
+deploy-time trust decision therefore outlives runtime possession of an admin
+key. A pinned URL is never written to the lockfile directory, including when a
+request re-registers the same value: it is taken from the environment precisely
+because it may carry signed credentials.
+
+The pin covers the default workspace only, matching the env var's own scope —
+named workspaces own their manifest URL by design and can still register their
+own. To keep a deployment fully pinned, do not enable named workspaces.
 
 Manifest and archive URLs may use signed query parameters, but embedded
 `https://user:password@host/` credentials are rejected before any request. Git
@@ -254,6 +273,29 @@ plus `workspace_id`, `manifest_url`, `last_sync_at`, `last_error`. Archive items
 `sha256`; git items report the requested `git.rev`, its `git.resolved_rev`
 commit after resolution, and optional `git.path` without echoing the repository
 URL.
+
+### `POST /v1/provision/manifest` → status view
+
+Register a manifest URL for this workspace and apply it now, decoupled from any
+login. The body is `{"url": "https://…/provision.json"}`; the URL is persisted
+(encrypted at rest) so it survives a restart.
+
+```bash
+curl -X POST http://127.0.0.1:3456/v1/provision/manifest \
+  -H "Authorization: Bearer $ADMIN_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"url":"https://collavre.example/agents/vrex/provision.json"}'
+```
+
+Unlike the login path — which must not fail a successful authentication because
+its manifest was unreachable — this route reports the failure: `400` for a
+malformed URL, one the host policy refuses, or one over 8 KiB of UTF-8 (the
+bound the encrypted registration file is sized by), `409 manifest_url_locked` when
+`PROVISION_MANIFEST_URL` pins the workspace, `502` when the manifest cannot be
+fetched or parsed. Re-registering the same URL is a plain re-sync. With per-user
+workers the request forwards to the caller's worker, so a worker without
+`PROVISION_SYNC=1` answers `404 provisioning_disabled` — there is no gateway
+fallback.
 
 ### `POST /v1/provision/sync` → status view
 

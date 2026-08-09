@@ -643,8 +643,22 @@ export function registerManifestUrl(url: string, options: { persist?: boolean } 
   assertAcceptingOperations();
   if (!enabled) return;
   const workspace = runtime();
+  // PROVISION_MANIFEST_URL is the operator pinning the publisher at deploy time.
+  // Holding an admin key must not silently repoint that trust decision, so the
+  // pinned workspace refuses a different URL instead of taking the last writer.
+  // Scoped to the default workspace because the env var itself is (docs/provisioning.md).
+  const pinned = fixedManifestUrl !== null && currentWorkspaceKey() === "legacy";
+  if (pinned && url !== fixedManifestUrl) {
+    throw new ProvisionError(
+      "Manifest URL is pinned by PROVISION_MANIFEST_URL and cannot be changed at runtime.",
+      "manifest_url_locked",
+    );
+  }
   checkUrlAllowed(url, { allowlist: getAllowlist() });
-  if (options.persist) saveRegisteredManifestUrl(url, workspace.manifestPersistenceKeys[0]);
+  // A pinned URL stays out of the lockfile: it is taken from the environment
+  // precisely because it may carry signed credentials, and re-registering the
+  // same value must not be a way to get it written to disk.
+  if (options.persist && !pinned) saveRegisteredManifestUrl(url, workspace.manifestPersistenceKeys[0]);
   if (workspace.manifestUrl !== url) {
     workspace.manifestUrl = url;
     workspace.manifestGeneration += 1;
