@@ -187,6 +187,7 @@ identity with `USER_IDENTITY_HMAC_SECRET` (minimum 32 bytes). Send:
 ```text
 X-CLI-Proxy-Tenant-ID
 X-CLI-Proxy-User-ID
+X-CLI-Proxy-Workspace-ID
 X-CLI-Proxy-Identity-Timestamp
 X-CLI-Proxy-Identity-Signature
 ```
@@ -195,8 +196,17 @@ The timestamp is Unix seconds and must be within five minutes. The signature is
 lowercase hex HMAC-SHA256 over:
 
 ```text
-v1\n<METHOD>\n<PATH>\n<TIMESTAMP>\n<TENANT_ID>\n<USER_ID>
+v2\n<METHOD>\n<PATH>\n<TIMESTAMP>\n<TENANT_ID>\n<USER_ID>\n<WORKSPACE_ID>
 ```
+
+`USER_ID` selects the Linux account, worker, and shared engine login.
+`WORKSPACE_ID` selects only that user's agent workspace. It must be one path
+segment matching `[A-Za-z0-9][A-Za-z0-9_:@-]{0,199}`. The workspace header is
+part of the v2 HMAC; changing or adding it while retaining a v1 signature is
+rejected. For rollout compatibility, omitting the header keeps the v1 payload
+and legacy HOME layout. `PROXY_REQUIRE_IDENTITY_V2=1` rejects that signed-v1
+fallback after every upstream has migrated. `USER_API_KEYS` remain legacy and
+cannot select a named workspace.
 
 `METHOD` is uppercase and `PATH` excludes the query string. Terminate TLS at the
 gateway or a trusted reverse proxy; otherwise bearer keys, signed identities,
@@ -229,8 +239,10 @@ their HOME, `UMask=0077`, resource limits, and `KillMode=control-group`.
 Unix-socket mode `0600` limits connections to the gateway service account.
 
 The worker also owns the user's `/v1/auth/*` sessions and `/v1/usage` data.
-Thus CLI login state and usage are per user. `/health` and `/v1/models` remain
-gateway-level endpoints.
+Thus CLI login state and usage are per user. Named agent workspaces live below
+`~/workspaces/<workspace-id>` and share that user login; skills, config, and
+provisioning state remain workspace-specific. `/health` and `/v1/models`
+remain gateway-level endpoints.
 
 ## Agent provisioning (optional)
 
@@ -243,9 +255,13 @@ unit, not gateway-wide. Uncomment the block already present in
 | `PROVISION_SYNC` | `1` to enable this worker's own provisioning engine, syncing into its own HOME. See [docs/provisioning.md](provisioning.md#per-user-scope-worker-mode). |
 | `PROVISION_ALLOWLIST` | Comma-separated hostnames allowed for the manifest and its artifacts. See [docs/provisioning.md](provisioning.md#enabling-it). |
 | `PROVISION_AUTOAPPLY` | `approve` (default) or `auto`. See [docs/provisioning.md](provisioning.md#enabling-it). |
+| `PROVISION_WORKSPACE_ROOT` | Named workspace parent; default `~/workspaces`. |
+| `PROVISION_MAX_WORKSPACES_PER_USER` | Named workspace limit; default `32`. |
 
-Leave `PROVISION_SYNC` unset on the gateway unit in this mode — see the
-anti-footgun note in [docs/provisioning.md](provisioning.md#per-user-scope-worker-mode).
+Leave `PROVISION_SYNC` unset on the gateway unit in this mode. The gateway
+validates notification ordering but intentionally does not install a
+worker-routed manifest; see
+[docs/provisioning.md](provisioning.md#per-user-scope-worker-mode).
 
 ## Multi-OS boundary
 

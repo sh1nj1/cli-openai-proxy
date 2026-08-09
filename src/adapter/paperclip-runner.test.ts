@@ -3,6 +3,10 @@ import assert from "node:assert/strict";
 import { PaperclipRunner, type AdapterExecute } from "./paperclip-runner.js";
 import { AdapterRunError } from "./adapter-error.js";
 import type { ClaudeCliStreamEvent, ClaudeCliResult } from "../types/claude-cli.js";
+import { mkdtemp, rm } from "node:fs/promises";
+import { homedir, tmpdir } from "node:os";
+import path from "node:path";
+import { runInWorkspace } from "../provision/workspace-context.js";
 
 const deltaLine = JSON.stringify({
   type: "stream_event",
@@ -125,6 +129,67 @@ test("assigns a unique runId per run even within the same millisecond/process", 
 
   assert.equal(runIds.length, 3);
   assert.equal(new Set(runIds).size, 3, "each run must get a distinct runId");
+});
+
+test("a named workspace changes agent HOME while sharing the user's Paperclip credentials", async () => {
+  const workspaceBase = await mkdtemp(path.join(tmpdir(), "paperclip-workspaces-"));
+  const previous = process.env.PROVISION_WORKSPACE_ROOT;
+  process.env.PROVISION_WORKSPACE_ROOT = workspaceBase;
+  let captured: import("@paperclipai/adapter-utils").AdapterExecutionContext | undefined;
+  try {
+    await runInWorkspace("agent-12", async () => {
+      const runner = new PaperclipRunner(async (ctx) => {
+	captured = ctx;
+	return { exitCode: 0, signal: null, timedOut: false, sessionId: "s" };
+      }, { engine: "cli" });
+      const closed = new Promise<void>((resolve) => runner.on("close", () => resolve()));
+      await runner.start("workspace prompt", {});
+      await closed;
+    });
+    assert.ok(captured);
+    const env = captured!.config.env as Record<string, string>;
+    const workspace = path.join(workspaceBase, "agent-12");
+    assert.equal(env.HOME, workspace);
+    assert.equal(env.CLAUDE_CONFIG_DIR, path.join(workspace, ".claude"));
+    assert.equal(env.PAPERCLIP_HOME, path.join(homedir(), ".paperclip"));
+    assert.match(String(captured!.config.cwd), /paperclip-run-/, "cwd remains ephemeral per run");
+  } finally {
+    if (previous === undefined) delete process.env.PROVISION_WORKSPACE_ROOT;
+    else process.env.PROVISION_WORKSPACE_ROOT = previous;
+    await rm(workspaceBase, { recursive: true, force: true });
+  }
+});
+
+test("completion workspace creation obeys the persistent per-user limit", async () => {
+  const workspaceBase = await mkdtemp(path.join(tmpdir(), "paperclip-workspace-limit-"));
+  const previousRoot = process.env.PROVISION_WORKSPACE_ROOT;
+  const previousMax = process.env.PROVISION_MAX_WORKSPACES_PER_USER;
+  process.env.PROVISION_WORKSPACE_ROOT = workspaceBase;
+  process.env.PROVISION_MAX_WORKSPACES_PER_USER = "1";
+  const execute: AdapterExecute = async () => ({
+    exitCode: 0,
+    signal: null,
+    timedOut: false,
+    sessionId: "s",
+  });
+  try {
+    await runInWorkspace("agent-11", async () => {
+      const runner = new PaperclipRunner(execute, { engine: "cli" });
+      const closed = new Promise<void>((resolve) => runner.on("close", () => resolve()));
+      await runner.start("first", {});
+      await closed;
+    });
+    await assert.rejects(
+      runInWorkspace("agent-12", () => new PaperclipRunner(execute, { engine: "cli" }).start("second", {})),
+      /Workspace limit \(1\) reached/,
+    );
+  } finally {
+    if (previousRoot === undefined) delete process.env.PROVISION_WORKSPACE_ROOT;
+    else process.env.PROVISION_WORKSPACE_ROOT = previousRoot;
+    if (previousMax === undefined) delete process.env.PROVISION_MAX_WORKSPACES_PER_USER;
+    else process.env.PROVISION_MAX_WORKSPACES_PER_USER = previousMax;
+    await rm(workspaceBase, { recursive: true, force: true });
+  }
 });
 
 // Mirror of the adapter's single-pass renderTemplate + resolvePathValue (string case)

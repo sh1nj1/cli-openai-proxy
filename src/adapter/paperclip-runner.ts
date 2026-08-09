@@ -18,6 +18,10 @@ import { CodexJsonlParser } from "./codex-jsonl-parser.js";
 import { adapterRunError } from "./adapter-error.js";
 import { blankedProxySecrets, getBgWaitCeilingMs } from "../config.js";
 import { getProvisionedAuthEnv } from "../auth/token-store.js";
+import {
+  currentWorkspaceContext,
+  ensureWorkspaceRoot,
+} from "../provision/workspace-context.js";
 
 export type AdapterExecute = (ctx: AdapterExecutionContext) => Promise<AdapterExecutionResult>;
 
@@ -100,6 +104,8 @@ export class PaperclipRunner extends EventEmitter implements AgentRunner {
   }
 
   async start(prompt: string, options: RunnerOptions): Promise<void> {
+    const workspace = currentWorkspaceContext();
+    if (workspace?.scoped) ensureWorkspaceRoot(workspace);
     // Each adapter emits a different stdout dialect: claude speaks stream-json
     // (per-token deltas), codex speaks `codex exec --json` NDJSON (per-message
     // blocks). Pick the matching live parser; both expose push()/flush().
@@ -164,6 +170,11 @@ export class PaperclipRunner extends EventEmitter implements AgentRunner {
         extraArgs,
         env: {
           CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS: String(getBgWaitCeilingMs()),
+	  ...(workspace?.scoped ? {
+	    HOME: workspace.root!,
+	    CLAUDE_CONFIG_DIR: path.join(workspace.root!, ".claude"),
+	    PAPERCLIP_HOME: path.join(workspace.userHome, ".paperclip"),
+	  } : {}),
           // The adapter merges this over process.env, so shadowing is the only way
           // to keep the keys that authenticate callers TO the proxy out of a child
           // that runs with permissions skipped.

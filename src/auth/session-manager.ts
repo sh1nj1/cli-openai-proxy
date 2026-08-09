@@ -25,6 +25,10 @@ import {
   trustsCompletionCallers,
 } from "../config.js";
 import { handleAuthorizedSession } from "../provision/sync.js";
+import {
+  currentWorkspaceContext,
+  runInBoundWorkspace,
+} from "../provision/workspace-context.js";
 import { resolveEngine } from "./registry.js";
 import { setCredential } from "./token-store.js";
 import {
@@ -67,6 +71,8 @@ interface SessionRecord extends Omit<SessionView, "expiresAt"> {
   provisioningUrl?: string;
   /** Gateway-issued ordering identity paired with provisioningUrl. */
   provisioningGeneration?: string;
+  /** Explicit path workspace captured at session creation (legacy layout when absent). */
+  provisioningWorkspaceId?: string;
   /**
    * Set for the duration of submit(). Not part of SessionView: the session is
    * still "pending" to an observer — nothing has been decided yet — and this only
@@ -97,6 +103,7 @@ function view(record: SessionRecord): SessionView {
     submitting: _submitting,
     provisioningUrl: _provisioningUrl,
     provisioningGeneration: _provisioningGeneration,
+    provisioningWorkspaceId: _provisioningWorkspaceId,
     expiresAt,
     ...rest
   } = record;
@@ -131,6 +138,7 @@ export async function createSession(
   opts: {
     provisioningUrl?: string;
     provisioningGeneration?: string;
+    provisioningWorkspaceId?: string;
     sessionTtlMs?: number;
     onSupersededProvisioningGeneration?: (generation: string) => void;
   } = {},
@@ -234,6 +242,8 @@ export async function createSession(
     submitting: false,
     provisioningUrl: opts.provisioningUrl,
     provisioningGeneration: opts.provisioningGeneration,
+    provisioningWorkspaceId: opts.provisioningWorkspaceId
+      ?? (currentWorkspaceContext()?.scoped ? currentWorkspaceContext()!.workspaceId : undefined),
   };
   byId.set(sessionId, record);
   byEngine.set(engine, sessionId);
@@ -261,7 +271,12 @@ function settleWhenDone(record: SessionRecord): void {
       conclude("authorized");
       // Only on the transition this call made: a session already concluded (or
       // superseded) must not re-trigger a sync from a stale outcome.
-      if (record.status === "authorized") void handleAuthorizedSession(record.provisioningUrl);
+      if (record.status === "authorized") {
+	void runInBoundWorkspace(
+	  record.provisioningWorkspaceId,
+	  () => handleAuthorizedSession(record.provisioningUrl),
+	);
+      }
     },
     (err) => {
       const message = err instanceof Error ? err.message : String(err);
@@ -332,7 +347,10 @@ export async function submitSession(
     if (byEngine.get(record.engine) === record.sessionId) byEngine.delete(record.engine);
     // Fire-and-forget: provisioning is a follow-on to a successful login, and
     // its failure must not turn this response into an error (see sync.ts).
-    void handleAuthorizedSession(record.provisioningUrl);
+    void runInBoundWorkspace(
+      record.provisioningWorkspaceId,
+      () => handleAuthorizedSession(record.provisioningUrl),
+    );
     return view(record);
   } catch (err) {
     // Do not resurrect or rewrite a record already disposed by another request.

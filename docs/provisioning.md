@@ -39,6 +39,8 @@ enabling a manifest that contains `git` sources.
 | `PROVISION_STATE_DIR` | Lockfile directory. Default `~/.cli-openai-proxy`. |
 | `PROVISION_SKILLS_DIR` | Install dir for `skill` items. Default `~/.claude/skills`. |
 | `PROVISION_CONFIG_DIR` | Install root for `config` items. Default `~/.config`; `XDG_CONFIG_HOME` is intentionally ignored because consuming CLIs read `~/.config` directly. |
+| `PROVISION_WORKSPACE_ROOT` | Named workspace parent. Default `<worker HOME>/workspaces`. |
+| `PROVISION_MAX_WORKSPACES_PER_USER` | Maximum named workspaces per worker/user. Default `32`; existing on-disk workspaces count toward the limit. |
 
 ## Per-user scope (worker mode)
 
@@ -47,11 +49,10 @@ Where the engine runs depends on deployment mode, not on any new flag:
 - **Solo gateway** (no per-user workers) — one process-local engine, running
   in the gateway's own HOME (`~/.claude/skills`, `~/.cli-openai-proxy`).
 - **Per-user Linux workers** (`deploy/linux/cli-openai-proxy-worker@.service`)
-  — each worker runs its own engine in its own HOME
-  (`/var/lib/cli-openai-proxy/users/%i/.claude/skills`,
-  `.../.cli-openai-proxy`). `PROVISION_SYNC` on the worker unit is the opt-in,
-  same as it is on a solo gateway; unset leaves that worker's
-  `/v1/provision/*` answering `404 provisioning_disabled` as usual.
+  — `X-CLI-Proxy-User-ID` selects the worker and shared engine credentials.
+  With signed v2 identity, `X-CLI-Proxy-Workspace-ID` selects
+  `<worker HOME>/workspaces/<id>` for skills, config, and lockfiles. Requests
+  without that header retain the pre-v2 HOME paths exactly.
 
 In worker mode `/v1/provision/*` still requires the admin key, and — like
 every other scoped route — also requires a user identity
@@ -60,33 +61,32 @@ every other scoped route — also requires a user identity
 The gateway forwards the request to that user's worker, which answers from
 its own state — there is no cross-user status view or shared endpoint.
 
-Because each worker's lockfile lives inside that worker's own HOME, TOFU
-approvals are per user by construction: approving an item for one user's
-worker has no effect on any other user's `pending_approval` items.
+Each named workspace owns its manifest URL, lockfile, TOFU approvals, sync
+serialization, errors, and refetch timer. Approving or rotating an item in one
+agent workspace cannot mutate another workspace's provisioning state.
 
 Workers never receive `AUTH_ADMIN_KEYS` (only the gateway holds it), so a
 worker's persisted manifest URL is encrypted at rest with a per-user
 `manifest.key` generated alongside its lockfile instead of the admin key
 material a solo gateway uses.
 
-**Anti-footgun:** do not set `PROVISION_SYNC=1` on the gateway unit while
-worker units also have it. A worker with its local engine enabled deliberately
-keeps authorized-login provisioning notifications local, so normal logins do
-not overwrite gateway state. Even so, a gateway-side engine would retain and
-periodically sync its own separate, process-global manifest. A mixed rollout
-also leaves any worker without `PROVISION_SYNC` set using the legacy upward
-relay. Keep
-`PROVISION_SYNC` on the gateway OFF in worker mode so there is one clear owner
-per user — the commented-out block in the worker unit file calls this out for
-the same reason.
+When worker routing is active, the gateway validates auth-session notification
+ordering but never installs the manifest itself. Enable `PROVISION_SYNC=1` on
+worker units; a worker without it returns `404 provisioning_disabled` and does
+not fall back to gateway installation.
 
-`config` items make this rule fail closed: a gateway configured with per-user
-workers reports them as `failed` and instructs the operator to enable
-`PROVISION_SYNC` on the worker unit. A workspace credential is installed only
-by the worker whose HOME and lockfile belong to that identity. Any config files
-previously managed by the gateway are removed with the normal file-level
-ownership rules during this transition. `skill` items retain their existing
-gateway behavior during a mixed rollout.
+`PROVISION_SKILLS_DIR`, `PROVISION_CONFIG_DIR`, and `PROVISION_STATE_DIR` apply
+only to the legacy/default workspace. Named workspaces always rebase those
+locations below their workspace root; the worker logs one warning if legacy
+overrides are present. `PROVISION_MANIFEST_URL` likewise applies only to the
+default workspace.
+
+The OS security boundary remains the user, not the agent. Workspaces belonging
+to the same user run as the same `cap_*` account and can read one another by
+path; this separation prevents accidental state/config collisions, not a
+malicious prompt from crossing agent directories. Different users retain the
+existing Linux-account boundary and cannot read each other's credentials or
+workspace config.
 
 ## The manifest
 
@@ -226,7 +226,7 @@ All under the admin key (`Authorization: Bearer <admin-key>`).
 
 Status of every item from the last sync (or the lockfile before one):
 `installed | pending_approval | unsupported | removed | failed` (+ `error`),
-plus `manifest_url`, `last_sync_at`, `last_error`. Archive items report
+plus `workspace_id`, `manifest_url`, `last_sync_at`, `last_error`. Archive items report
 `sha256`; git items report the requested `git.rev`, its `git.resolved_rev`
 commit after resolution, and optional `git.path` without echoing the repository
 URL.
@@ -328,11 +328,10 @@ declaration that the manifest's publisher is inside your trust boundary.
 
 ### Per-user Linux workers
 
-Provisioning installs into whichever process's HOME its engine runs in — see
-[Per-user scope (worker mode)](#per-user-scope-worker-mode) above. With
-`PROVISION_SYNC=1` on the worker units, each user's worker installs skills
-and config into that worker's own `~/.claude/skills` and `~/.config`, so the
-CLI process that actually runs as that user sees them. Leaving
-`PROVISION_SYNC` unset on worker units
-(the default) leaves provisioning off for that deployment entirely; it does
-not fall back to installing into the gateway's HOME.
+See [Per-user scope (worker mode)](#per-user-scope-worker-mode) above. With
+`PROVISION_SYNC=1` on worker units, v2 requests install skills and config below
+`~/workspaces/<workspace-id>`, while the CLI child receives that directory as
+`HOME`. `PAPERCLIP_HOME` remains `<worker HOME>/.paperclip`, so Codex login is
+shared by all of that user's agents. The run `cwd` remains a fresh temporary
+directory. Leaving `PROVISION_SYNC` unset on worker units (the default) leaves
+provisioning off; it does not fall back to the gateway HOME.

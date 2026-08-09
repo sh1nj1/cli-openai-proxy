@@ -219,6 +219,9 @@ walkthrough: [docs/paperclip-adapters.md](docs/paperclip-adapters.md#collavre-in
 | `USER_WORKER_MODE` | *(unset)* | Route user-scoped APIs to isolated OS-user workers |
 | `USER_API_KEYS` | *(unset)* | JSON mapping of opaque caller keys to stable `tenantId` + `userId` |
 | `USER_IDENTITY_HMAC_SECRET` | *(unset)* | Shared secret for trusted upstream identity headers |
+| `PROXY_REQUIRE_IDENTITY_V2` | *(unset)* | Require signed workspace-aware v2 identities; mapped user keys remain supported |
+| `PROVISION_WORKSPACE_ROOT` | `~/workspaces` | Parent directory for named agent workspaces in worker mode |
+| `PROVISION_MAX_WORKSPACES_PER_USER` | `32` | Bound named workspaces per user/worker |
 | `USER_WORKER_PROVISIONER_ENDPOINT` | platform default | Provisioner Unix socket or Windows Named Pipe |
 | `TIMEOUT` | `0` (none) | Per-request ceiling in ms |
 | `DEBUG` | *(unset)* | Verbose logging |
