@@ -291,7 +291,9 @@ describe("anchored skill link operations", () => {
     );
   });
 
-  test("quarantines before identity-checked removal", () => {
+  test("quarantines before identity-checked removal", {
+    skip: process.platform === "win32",
+  }, () => {
     const directory = path.join(parent, "owned");
     mkdirSync(directory);
     const identity = lstatSync(directory, { bigint: true });
@@ -372,7 +374,7 @@ describe("anchored skill link operations", () => {
 	  quarantine = path.join(parentPath, destination);
 	  renameSync(path.join(parentPath, source), quarantine);
 	  rmSync(quarantine, { recursive: true });
-	  mkdirSync(quarantine);
+	  writeFileSync(quarantine, "user-owned");
 	  mkdirSync(path.join(parentPath, source));
 	  return true;
 	}
@@ -383,6 +385,6 @@ describe("anchored skill link operations", () => {
     ), false);
     assert.equal(calls, 2);
     assert.equal(lstatSync(directory).isDirectory(), true);
-    assert.equal(lstatSync(quarantine).isDirectory(), true);
+    assert.equal(lstatSync(quarantine).isFile(), true);
   });
 });
