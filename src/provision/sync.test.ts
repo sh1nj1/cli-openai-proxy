@@ -593,6 +593,49 @@ describe("provision sync", () => {
     assert.equal(state.installed["skill/legacy"].removalRecoveryId, undefined);
   });
 
+  test("keeps the legacy skill live when another discovery root has a collision", async () => {
+    const testHome = path.join(stateDir, "migration-link-collision-home");
+    const legacySkillsDir = path.join(testHome, ".claude", "skills");
+    process.env.HOME = testHome;
+    process.env.PROVISION_SKILLS_DIR = legacySkillsDir;
+    process.env.PROVISION_SKILL_LINK_DIRS = "";
+    process.env.PROVISION_AUTOAPPLY = "auto";
+    initProvisioning();
+    const skill = serveSkill("/legacy-before-link-collision.tgz", "live legacy skill");
+    const manifestUrl = serveManifest([{ type: "skill", name: "legacy", ...skill }]);
+    registerManifestUrl(manifestUrl);
+    await syncNow();
+
+    const statePath = path.join(stateDir, "provision.lock.json");
+    const legacyState = JSON.parse(readFileSync(statePath, "utf8"));
+    delete legacyState.installed["skill/legacy"].installRoot;
+    writeFileSync(statePath, `${JSON.stringify(legacyState, null, 2)}\n`);
+    const otherLinkRoot = path.join(testHome, "other-skills");
+    const collision = path.join(otherLinkRoot, "legacy");
+    mkdirSync(collision, { recursive: true });
+    writeFileSync(path.join(collision, "USER.md"), "untracked collision");
+
+    delete process.env.PROVISION_SKILLS_DIR;
+    process.env.PROVISION_SKILL_LINK_DIRS = `${legacySkillsDir},${otherLinkRoot}`;
+    initProvisioning();
+    registerManifestUrl(manifestUrl);
+
+    const refused = await syncNow();
+    const legacyTarget = path.join(legacySkillsDir, "legacy");
+    assert.equal(statusOf(refused, "legacy"), "failed");
+    assert.match(refused.data[0]!.error!, /untracked content at skill link/);
+    assert.equal(readFileSync(path.join(legacyTarget, "SKILL.md"), "utf8"), "live legacy skill");
+    assert.equal(lstatSync(legacyTarget).isSymbolicLink(), false);
+    assert.equal(readFileSync(path.join(collision, "USER.md"), "utf8"), "untracked collision");
+    assert.equal(existsSync(path.join(testHome, ".agents", "skills", "legacy")), false);
+    assert.equal(
+      readdirSync(legacySkillsDir).some((entry) => entry.startsWith(".provision-removed-")),
+      false,
+    );
+    const state = JSON.parse(readFileSync(statePath, "utf8"));
+    assert.equal(state.installed["skill/legacy"].installRoot, legacySkillsDir);
+  });
+
   test("restores the legacy skill when canonical publication loses a race", async () => {
     const testHome = path.join(stateDir, "migration-race-home");
     const legacySkillsDir = path.join(testHome, ".claude", "skills");

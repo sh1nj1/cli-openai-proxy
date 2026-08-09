@@ -665,6 +665,17 @@ function pathEntryExists(candidate: string): boolean {
   }
 }
 
+function samePathEntryIdentity(left: string, right: string): boolean {
+  try {
+    const leftStat = lstatSync(left, { bigint: true });
+    const rightStat = lstatSync(right, { bigint: true });
+    return leftStat.dev === rightStat.dev && leftStat.ino === rightStat.ino;
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") return false;
+    throw err;
+  }
+}
+
 function isolateRecordedSkillLink(link: InstalledSkillLink): boolean {
   const quarantine = path.join(
     path.dirname(link.path),
@@ -1431,6 +1442,16 @@ function executeLegacySkillRootMigration(
       "untracked_content",
     );
   }
+  const legacyTarget = path.join(migration.installRoot, migration.name);
+  const canonicalName = migration.canonicalKey.slice(migration.canonicalKey.indexOf("/") + 1);
+  for (const directory of skillLinkDirs()) {
+    const linkPath = path.join(directory, canonicalName);
+    if (!pathEntryExists(linkPath) || samePathEntryIdentity(linkPath, legacyTarget)) continue;
+    throw new ProvisionError(
+      `Refusing to replace untracked content at skill link "${linkPath}"`,
+      "untracked_content",
+    );
+  }
   const canonicalTarget = path.join(skillsDir(), migration.name.toLowerCase());
   if (pathEntryExists(canonicalTarget)) {
     throw new ProvisionError(
@@ -1444,7 +1465,7 @@ function executeLegacySkillRootMigration(
       "untracked_content",
     );
   }
-  if (!pathEntryExists(path.join(migration.installRoot, migration.name))) {
+  if (!pathEntryExists(legacyTarget)) {
     return { record };
   }
   const recovery = prepareRemovalRecovery(state, migration.installedKey);
@@ -1460,7 +1481,7 @@ function executeLegacySkillRootMigration(
   } finally {
     finalizeRemovalRecoveries(state);
   }
-  if (pathEntryExists(path.join(migration.installRoot, migration.name))) {
+  if (pathEntryExists(legacyTarget)) {
     throw new ProvisionError(
       `Cannot migrate legacy skill "${migration.name}" without verified ownership of its original target`,
       "untracked_content",
