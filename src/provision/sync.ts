@@ -1234,8 +1234,9 @@ function canonicalStateKey(key: string): string {
 /** Bind pre-Codex records to a proven root before either pathname is touched. */
 function discoverLegacySkillInstallRoots(state: ProvisionStateFile): Map<string, string> {
   const failures = new Map<string, string>();
-  if (process.env.PROVISION_SKILLS_DIR?.trim()) return failures;
   const canonicalRoot = path.resolve(skillsDir());
+  const defaultCanonicalRoot = path.resolve(homedir(), ".agents", "skills");
+  if (canonicalRoot !== defaultCanonicalRoot) return failures;
   const legacyRoot = path.resolve(homedir(), ".claude", "skills");
   if (legacyRoot === canonicalRoot) return failures;
   let changed = false;

@@ -496,7 +496,7 @@ describe("provision sync", () => {
     delete legacyState.installed["skill/legacy"].installRoot;
     writeFileSync(statePath, `${JSON.stringify(legacyState, null, 2)}\n`);
 
-    delete process.env.PROVISION_SKILLS_DIR;
+    process.env.PROVISION_SKILLS_DIR = path.join(testHome, ".agents", "skills");
     delete process.env.PROVISION_SKILL_LINK_DIRS;
     initProvisioning();
     registerManifestUrl(`${baseUrl}/provision.json`);
