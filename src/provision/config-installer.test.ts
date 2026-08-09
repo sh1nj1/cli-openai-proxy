@@ -161,7 +161,9 @@ describe("config installer", () => {
     );
     assert.equal(readFileSync(path.join(target, "config.json"), "utf8"), "hand-written");
     assert.equal(readFileSync(path.join(target, "notes.txt"), "utf8"), "mine");
-    assert.equal(lstatSync(target).mode & 0o777, 0o755);
+    if (process.platform !== "win32") {
+      assert.equal(lstatSync(target).mode & 0o777, 0o755);
+    }
   });
 
   test("a file created after the collision audit is not adopted implicitly", async () => {
@@ -177,7 +179,11 @@ describe("config installer", () => {
     assert.equal(readFileSync(path.join(target, "config.json"), "utf8"), "raced");
   });
 
-  test("a directory swap cannot redirect credential publication", async () => {
+  test("a directory swap cannot redirect credential publication", {
+    skip: process.platform === "win32"
+      ? "Windows prevents renaming a directory that contains the open candidate"
+      : false,
+  }, async () => {
     const elsewhere = mkdtempSync(path.join(tmpdir(), "config-race-elsewhere-"));
     const displaced = path.join(configDir, "displaced");
     const target = path.join(configDir, "collavre");
@@ -197,7 +203,11 @@ describe("config installer", () => {
     rmSync(elsewhere, { recursive: true, force: true });
   });
 
-  test("a directory swap cannot redirect an atomic credential replacement", async () => {
+  test("a directory swap cannot redirect an atomic credential replacement", {
+    skip: process.platform === "win32"
+      ? "Windows prevents renaming a directory that contains the open candidate"
+      : false,
+  }, async () => {
     const first = publish("collavre", makeArchive({ "config.json": CONFIG_JSON }));
     const installed = await installConfig(first, { configDir });
     const target = path.join(configDir, "collavre");
