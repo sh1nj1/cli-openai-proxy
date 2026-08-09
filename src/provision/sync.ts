@@ -252,6 +252,21 @@ function configDir(): string {
   return process.env.PROVISION_CONFIG_DIR?.trim() || path.join(homedir(), ".config");
 }
 
+function reconcileStartupProvisionState(): ProvisionStateFile {
+  const state = loadState();
+  const migrationKeys = new Set(Object.entries(state.installed)
+    .filter(([, record]) => record.legacySkillMigration !== undefined)
+    .map(([key]) => key));
+  if (migrationKeys.size === 0) return state;
+  try {
+    reconcileFirstInstallJournals(state, migrationKeys);
+  } catch (err) {
+    lastError = err instanceof Error ? err.message : String(err);
+    return state;
+  }
+  return state;
+}
+
 function itemRoot(type: string, name: string): string {
   return path.join(type === "config" ? configDir() : skillsDir(), name);
 }
@@ -312,9 +327,10 @@ export function initProvisioning(hooks: {
   const fixed = takeProxySecret("PROVISION_MANIFEST_URL")?.trim();
   if (perUserWorkers) removeGatewayConfigState();
   if (enabled) {
+    const startupState = reconcileStartupProvisionState();
     // What the lockfile already records survives a restart in the status view,
     // so an operator sees their installs before (and without) the next sync.
-    itemViews = Object.entries(loadState().installed)
+    itemViews = Object.entries(startupState.installed)
       // An unresolved journal does not prove which complete tree is visible.
       // Leave it out until a target-touching operation reconciles the state.
       .filter(([, record]) => !record.uncommitted && !record.pending && !record.removalRecoveryId)
@@ -1110,10 +1126,14 @@ function firstInstallMarkerStatus(
 }
 
 /** Resolve every first-install journal before its target can be inspected. */
-function reconcileFirstInstallJournals(state: ProvisionStateFile): Set<string> {
+function reconcileFirstInstallJournals(
+  state: ProvisionStateFile,
+  onlyKeys?: ReadonlySet<string>,
+): Set<string> {
   let changed = false;
   const rejected = new Set<string>();
   for (const [key, record] of Object.entries(state.installed)) {
+    if (onlyKeys && !onlyKeys.has(key)) continue;
     if (!record.uncommitted) continue;
     if (key.startsWith("config/")) {
       const name = key.slice(key.indexOf("/") + 1);
@@ -1147,9 +1167,21 @@ function reconcileFirstInstallJournals(state: ProvisionStateFile): Set<string> {
 	    "untracked_content",
 	  );
 	}
+	if (resolvedPathThroughExistingAncestor(installRoot)
+	  !== resolvedPathThroughExistingAncestor(skillsDir())) {
+	  throw new ProvisionError(
+	    `Cannot reconcile canonical migration candidate for "${name}" after the skills root changed`,
+	    "untracked_content",
+	  );
+	}
+	record.skillLinks = ensureSkillLinks(name, record, () => saveState(state));
 	state.installed[key] = {
 	  ...stableSnapshot(record),
 	  installRoot,
+	  ...(record.skillLinks ? { skillLinks: record.skillLinks } : {}),
+	  ...(record.skillLinkPublication
+	    ? { skillLinkPublication: record.skillLinkPublication }
+	    : {}),
 	  ...(record.installMarker ? { installMarker: record.installMarker } : {}),
 	};
       } else {
@@ -1204,6 +1236,7 @@ function reconcileFirstInstallJournals(state: ProvisionStateFile): Set<string> {
 
   changed = false;
   for (const [key, record] of Object.entries(state.installed)) {
+    if (onlyKeys && !onlyKeys.has(key)) continue;
     if (!key.startsWith("skill/")) continue;
     if (record.uncommitted || !record.installMarker) continue;
     const name = key.slice(key.indexOf("/") + 1);
@@ -1391,6 +1424,10 @@ function restoreLegacySkillMigration(
   state.installed[migration.installedKey] = {
     ...snapshot,
     installRoot: migration.installRoot,
+    ...(record.skillLinks ? { skillLinks: record.skillLinks } : {}),
+    ...(record.skillLinkPublication
+      ? { skillLinkPublication: record.skillLinkPublication }
+      : {}),
   };
   finalizeRemovalRecoveries(state);
 }
@@ -1606,11 +1643,10 @@ function planLegacySkillRootMigrations(
       );
       continue;
     }
-    if (record.skillLinks?.length || record.skillLinkPublication) {
-      failures.set(
-	canonicalKey,
-	`Cannot migrate legacy skill "${name}" while discovery-link ownership is still recorded`,
-      );
+    try {
+      assertRecordedSkillLinksRemovable(name, record);
+    } catch (err) {
+      failures.set(canonicalKey, err instanceof Error ? err.message : String(err));
       continue;
     }
     migrations.set(canonicalKey, { installedKey: key, canonicalKey, name, installRoot });
@@ -1634,9 +1670,16 @@ function executeLegacySkillRootMigration(
   const canonicalName = migration.canonicalKey.slice(migration.canonicalKey.indexOf("/") + 1);
   for (const directory of skillLinkDirs()) {
     const linkPath = path.join(directory, canonicalName);
-    if (pathEntryExists(linkPath) && !samePathEntryIdentity(linkPath, legacyTarget)) {
+    let ownedPublication = false;
+    if (record.skillLinkPublication?.path === linkPath && pathEntryExists(linkPath)) {
+      adoptPublishedSkillLink(linkPath, record.skillLinkPublication.target);
+      ownedPublication = true;
+    }
+    const ownedLink = ownedPublication
+      || record.skillLinks?.some((link) => sameSkillLinkIdentity(linkPath, link));
+    if (pathEntryExists(linkPath) && !samePathEntryIdentity(linkPath, legacyTarget) && !ownedLink) {
       throw new ProvisionError(
-	`Refusing to replace untracked content at skill link "${linkPath}"`,
+	`Refusing to replace untracked content at skill link "${linkPath}" during root migration`,
 	"untracked_content",
       );
     }
@@ -1651,12 +1694,7 @@ function executeLegacySkillRootMigration(
       "untracked_content",
     );
   }
-  if (record.skillLinks?.length || record.skillLinkPublication) {
-    throw new ProvisionError(
-      `Cannot migrate legacy skill "${migration.name}" while discovery-link ownership is still recorded`,
-      "untracked_content",
-    );
-  }
+  assertRecordedSkillLinksRemovable(migration.name, record);
   if (!pathEntryExists(legacyTarget)) {
     const recovery = recordedLegacyRecovery(
       state,
@@ -2133,6 +2171,10 @@ async function runSync(generation: number): Promise<ProvisionStatusView> {
 			removalRecoveryId: migratedRecord.removalRecoveryId,
 		      }
 		    : {}),
+		  ...(migratedRecord?.skillLinks ? { skillLinks: migratedRecord.skillLinks } : {}),
+		  ...(migratedRecord?.skillLinkPublication
+		    ? { skillLinkPublication: migratedRecord.skillLinkPublication }
+		    : {}),
 		};
 	      if (legacyRootMigration && legacyRootMigration.installedKey !== key) {
 		delete state.installed[legacyRootMigration.installedKey];
@@ -2165,6 +2207,7 @@ async function runSync(generation: number): Promise<ProvisionStatusView> {
       }
       // Finalizing drops the upgrade journal. If this save later fails, the
       // persisted stable+pending pair lets the next sync recognize either side.
+      const linkOwnershipRecord = item.type === "skill" ? state.installed[key] : previousRecord;
       state.installed[key] = {
 	sha256: fingerprint,
 	...(source ? { source } : {}),
@@ -2173,9 +2216,9 @@ async function runSync(generation: number): Promise<ProvisionStatusView> {
 	fileHashes: result.fileHashes,
 	installedAt: new Date().toISOString(),
 	...(item.type === "skill" ? { installRoot: path.resolve(skillsDir()) } : {}),
-	...(previousRecord?.skillLinks ? { skillLinks: previousRecord.skillLinks } : {}),
-	...(previousRecord?.skillLinkPublication
-	  ? { skillLinkPublication: previousRecord.skillLinkPublication }
+	...(linkOwnershipRecord?.skillLinks ? { skillLinks: linkOwnershipRecord.skillLinks } : {}),
+	...(linkOwnershipRecord?.skillLinkPublication
+	  ? { skillLinkPublication: linkOwnershipRecord.skillLinkPublication }
 	  : {}),
       };
 
