@@ -513,6 +513,43 @@ describe("provision sync", () => {
     );
   });
 
+  test("repairs a missing legacy skill while migrating to the shared Codex source", async () => {
+    const testHome = path.join(stateDir, "missing-legacy-home");
+    const legacySkillsDir = path.join(testHome, ".claude", "skills");
+    process.env.HOME = testHome;
+    process.env.PROVISION_SKILLS_DIR = legacySkillsDir;
+    process.env.PROVISION_SKILL_LINK_DIRS = "";
+    process.env.PROVISION_AUTOAPPLY = "auto";
+    initProvisioning();
+    const skill = serveSkill("/missing-legacy-default.tgz", "repaired legacy skill");
+    const manifestUrl = serveManifest([{ type: "skill", name: "legacy", ...skill }]);
+    registerManifestUrl(manifestUrl);
+    await syncNow();
+
+    const statePath = path.join(stateDir, "provision.lock.json");
+    const legacyState = JSON.parse(readFileSync(statePath, "utf8"));
+    delete legacyState.installed["skill/legacy"].installRoot;
+    writeFileSync(statePath, `${JSON.stringify(legacyState, null, 2)}\n`);
+    rmSync(path.join(legacySkillsDir, "legacy"), { recursive: true });
+
+    delete process.env.PROVISION_SKILLS_DIR;
+    delete process.env.PROVISION_SKILL_LINK_DIRS;
+    initProvisioning();
+    registerManifestUrl(manifestUrl);
+
+    const repaired = await syncNow();
+    const canonical = path.join(testHome, ".agents", "skills", "legacy");
+    const link = path.join(legacySkillsDir, "legacy");
+    assert.equal(statusOf(repaired, "legacy"), "installed");
+    assert.equal(readFileSync(path.join(canonical, "SKILL.md"), "utf8"), "repaired legacy skill");
+    assert.equal(lstatSync(link).isSymbolicLink(), true);
+    assert.equal(path.resolve(path.dirname(link), readlinkSync(link)), canonical);
+    assert.equal(
+      readdirSync(legacySkillsDir).some((entry) => entry.startsWith(".provision-removed-")),
+      false,
+    );
+  });
+
   test("keeps the legacy skill live when its migration artifact fails", async () => {
     const testHome = path.join(stateDir, "failed-migration-home");
     const legacySkillsDir = path.join(testHome, ".claude", "skills");
