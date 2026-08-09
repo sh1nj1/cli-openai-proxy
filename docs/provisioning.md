@@ -170,7 +170,8 @@ the lockfile first records the proven legacy install root. Migration proceeds
 only when the new canonical pathname is absent; an exact lockfile-owned
 `~/.claude/skills/{name}` tree is then retained in a hidden recovery directory
 and replaced by the discovery link. Canonical collisions and modified or
-ambiguous legacy trees are left untouched.
+ambiguous legacy trees are left untouched. The recovery identity and its
+install root are journaled before isolation so restart reuses the same recovery.
 
 ### `type: "config"`
 

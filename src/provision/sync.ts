@@ -600,6 +600,7 @@ function removeOwnedConfig(
 
 function removeGatewayConfigState(): void {
   const state = loadState();
+  discoverLegacySkillInstallRoots(state);
   reconcileFirstInstallJournals(state);
   let changed = false;
   for (const [key, record] of Object.entries(state.installed)) {
@@ -886,10 +887,11 @@ function ensureSkillLinks(
 function targetMatchesCandidateIdentity(
   name: string,
   expected: InstalledDirectoryIdentity | undefined,
+  installRoot = skillsDir(),
 ): boolean {
   if (expected === undefined) return false;
   try {
-    const stat = lstatSync(path.join(skillsDir(), name), { bigint: true });
+    const stat = lstatSync(path.join(installRoot, name), { bigint: true });
     return stat.isDirectory()
       && stat.dev.toString() === expected.dev
       && stat.ino.toString() === expected.ino;
@@ -923,18 +925,23 @@ function directoryDescriptorPath(fd: number): string | undefined {
 function auditFirstInstallCandidate(
   name: string,
   record: InstalledRecord,
+  installRoot = skillInstallRoot(record),
 ): { contentsMatch: boolean; originalCandidateIsTarget: boolean } {
   if (!record.candidateIdentity) {
     return { contentsMatch: false, originalCandidateIsTarget: false };
   }
-  const target = path.join(skillsDir(), name);
+  const target = path.join(installRoot, name);
   if (process.platform === "win32") {
-    const originalCandidateWasTarget = targetMatchesCandidateIdentity(name, record.candidateIdentity);
+    const originalCandidateWasTarget = targetMatchesCandidateIdentity(
+      name,
+      record.candidateIdentity,
+      installRoot,
+    );
     if (originalCandidateWasTarget) afterFirstInstallReconciliationIdentityCheck?.(target);
     return {
       contentsMatch: originalCandidateWasTarget && firstInstallRecordMatchesEntireTreeAt(target, record),
       originalCandidateIsTarget: originalCandidateWasTarget
-	&& targetMatchesCandidateIdentity(name, record.candidateIdentity),
+	&& targetMatchesCandidateIdentity(name, record.candidateIdentity, installRoot),
     };
   }
   let fd: number;
@@ -964,7 +971,11 @@ function auditFirstInstallCandidate(
     const contentsMatch = firstInstallRecordMatchesEntireTreeAt(auditRoot, record);
     return {
       contentsMatch,
-      originalCandidateIsTarget: targetMatchesCandidateIdentity(name, record.candidateIdentity),
+      originalCandidateIsTarget: targetMatchesCandidateIdentity(
+	name,
+	record.candidateIdentity,
+	installRoot,
+      ),
     };
   } finally {
     closeSync(fd);
@@ -974,8 +985,9 @@ function auditFirstInstallCandidate(
 function firstInstallMarkerStatus(
   name: string,
   marker: string,
+  installRoot = skillsDir(),
 ): "matching" | "missing" | "modified" {
-  const file = firstInstallMarkerPath(path.join(skillsDir(), name), marker);
+  const file = firstInstallMarkerPath(path.join(installRoot, name), marker);
   try {
     if (!lstatSync(file).isFile()) return "modified";
     return readFileSync(file, "utf8") === marker ? "matching" : "modified";
@@ -1011,7 +1023,8 @@ function reconcileFirstInstallJournals(state: ProvisionStateFile): Set<string> {
     }
     if (!key.startsWith("skill/")) continue;
     const name = key.slice(key.indexOf("/") + 1);
-    const target = path.join(skillsDir(), name);
+    const installRoot = skillInstallRoot(record);
+    const target = path.join(installRoot, name);
     const { originalCandidateIsTarget, contentsMatch } = auditFirstInstallCandidate(name, record);
     const exposed = originalCandidateIsTarget && contentsMatch;
     if (!exposed) {
@@ -1021,7 +1034,7 @@ function reconcileFirstInstallJournals(state: ProvisionStateFile): Set<string> {
 	isolateRejectedCandidate(
 	  target,
 	  name,
-	  skillsDir(),
+	  installRoot,
 	  record.rejectionRecoveryId,
 	  record.candidateIdentity,
 	);
@@ -1031,7 +1044,7 @@ function reconcileFirstInstallJournals(state: ProvisionStateFile): Set<string> {
     } else {
       // Keep the ownership decision adjacent to one final identity read. If the
       // namespace changed since the scan, preserve the replacement as unowned.
-      if (!targetMatchesCandidateIdentity(name, record.candidateIdentity)) {
+      if (!targetMatchesCandidateIdentity(name, record.candidateIdentity, installRoot)) {
 	delete state.installed[key];
 	rejected.add(key);
 	changed = true;
@@ -1054,9 +1067,10 @@ function reconcileFirstInstallJournals(state: ProvisionStateFile): Set<string> {
     if (!key.startsWith("skill/")) continue;
     if (record.uncommitted || !record.installMarker) continue;
     const name = key.slice(key.indexOf("/") + 1);
+    const installRoot = skillInstallRoot(record);
     const marker = record.installMarker;
-    const markerFile = firstInstallMarkerPath(path.join(skillsDir(), name), marker);
-    const markerStatus = firstInstallMarkerStatus(name, marker);
+    const markerFile = firstInstallMarkerPath(path.join(installRoot, name), marker);
+    const markerStatus = firstInstallMarkerStatus(name, marker, installRoot);
     const next = { ...record };
     let markerFinalized = markerStatus === "missing";
     if (markerStatus === "matching") {
@@ -1067,7 +1081,7 @@ function reconcileFirstInstallJournals(state: ProvisionStateFile): Set<string> {
 	if (lstatSync(markerFile).isFile()) {
 	  const relative = path.basename(markerFile);
 	  const ownedHashes = next.fileHashes ?? Object.fromEntries(next.files.map((owned) => {
-	    const ownedFile = path.join(skillsDir(), name, ...owned.split("/"));
+	    const ownedFile = path.join(installRoot, name, ...owned.split("/"));
 	    if (!lstatSync(ownedFile).isFile()) throw new Error("Owned path is no longer a file");
 	    return [owned, createHash("sha256").update(readFileSync(ownedFile)).digest("hex")];
 	  }));
@@ -1095,19 +1109,41 @@ function reconcileFirstInstallJournals(state: ProvisionStateFile): Set<string> {
 function prepareRemovalRecovery(state: ProvisionStateFile, key: string): {
   recoveryId: string;
 } {
-  const recoveryId = randomBytes(16).toString("hex");
-  state.removalRecoveries = [...(state.removalRecoveries ?? []), recoveryId];
   const record = state.installed[key];
-  if (record) record.removalRecoveryId = recoveryId;
+  const recoveryId = record?.removalRecoveryId ?? randomBytes(16).toString("hex");
+  state.removalRecoveries = [...new Set([...(state.removalRecoveries ?? []), recoveryId])];
+  if (record) {
+    record.removalRecoveryId = recoveryId;
+    state.removalRecoveryRoots = {
+      ...(state.removalRecoveryRoots ?? {}),
+      [recoveryId]: skillInstallRoot(record),
+    };
+  }
   // Persist the exact identity before its recovery directory can appear.
   saveState(state);
   return { recoveryId };
 }
 
 function finalizeRemovalRecoveries(state: ProvisionStateFile): void {
-  state.removalRecoveries = (state.removalRecoveries ?? []).filter((recoveryId) =>
-    existsSync(path.join(skillsDir(), `.provision-removed-${recoveryId}`))
-    || existsSync(path.join(skillsDir(), `.provision-removing-${recoveryId}`)));
+  const rootsById = state.removalRecoveryRoots ?? {};
+  const recordRoots = new Map<string, string>();
+  for (const record of Object.values(state.installed)) {
+    if (record.removalRecoveryId) {
+      recordRoots.set(record.removalRecoveryId, skillInstallRoot(record));
+    }
+  }
+  const retained = (state.removalRecoveries ?? []).filter((recoveryId) => {
+    const root = rootsById[recoveryId] ?? recordRoots.get(recoveryId) ?? skillsDir();
+    return existsSync(path.join(root, `.provision-removed-${recoveryId}`))
+      || existsSync(path.join(root, `.provision-removing-${recoveryId}`));
+  });
+  state.removalRecoveries = retained;
+  const retainedRoots = Object.fromEntries(retained.flatMap((recoveryId) => {
+    const root = rootsById[recoveryId] ?? recordRoots.get(recoveryId);
+    return root ? [[recoveryId, root]] : [];
+  }));
+  if (Object.keys(retainedRoots).length > 0) state.removalRecoveryRoots = retainedRoots;
+  else delete state.removalRecoveryRoots;
 }
 
 function prepareUpgradeRecovery(state: ProvisionStateFile): {
@@ -1221,6 +1257,21 @@ function discoverLegacySkillInstallRoots(state: ProvisionStateFile): Map<string,
     if (!key.toLowerCase().startsWith("skill/") || record.installRoot) continue;
     const name = key.slice(key.indexOf("/") + 1);
     const canonicalTarget = path.join(canonicalRoot, name.toLowerCase());
+    if (record.uncommitted) {
+      const canonicalCandidate = auditFirstInstallCandidate(name, record, canonicalRoot);
+      const legacyCandidate = canonicalCandidate.originalCandidateIsTarget
+	? { originalCandidateIsTarget: false, contentsMatch: false }
+	: auditFirstInstallCandidate(name, record, legacyRoot);
+      record.installRoot = canonicalCandidate.originalCandidateIsTarget
+	? canonicalRoot
+	: legacyCandidate.originalCandidateIsTarget
+	  ? legacyRoot
+	  // Rootless first-install journals predate the new default. If exposure
+	  // never happened, reconciling at the old root safely drops the preclaim.
+	  : legacyRoot;
+      changed = true;
+      continue;
+    }
     const linkedToCanonical = (record.skillLinks ?? []).some((link) =>
       link.target === canonicalTarget && sameSkillLinkIdentity(link.path, link));
     if (linkedToCanonical && installedSnapshotIntactAt(canonicalTarget, record)) {
@@ -1269,7 +1320,18 @@ function migrateLegacySkillRoots(
 	  "untracked_content",
 	);
       }
-      removeSkill(name, { skillsDir: installRoot, ...removalSnapshot(record) });
+      const recovery = prepareRemovalRecovery(state, key);
+      try {
+	removeSkill(name, {
+	  skillsDir: installRoot,
+	  ...removalSnapshot(record),
+	  ...recovery,
+	  afterRootAudit: afterRemovalAudit,
+	  afterRootIsolation: afterRemovalIsolation,
+	});
+      } finally {
+	finalizeRemovalRecoveries(state);
+      }
       if (pathEntryExists(path.join(installRoot, name))) {
 	throw new ProvisionError(
 	  `Cannot migrate legacy skill "${name}" without verified ownership of its original target`,
@@ -1377,8 +1439,8 @@ async function runSync(generation: number): Promise<ProvisionStatusView> {
   lastManifestGeneration = generation;
 
   const state = loadState();
-  reconcileFirstInstallJournals(state);
   const legacyRootDiscoveryFailures = discoverLegacySkillInstallRoots(state);
+  reconcileFirstInstallJournals(state);
   const views: ProvisionItemView[] = [];
   const desired = new Set(manifest.items.map((item) => `${item.type}/${item.name}`));
   const legacyRootMigrationFailures = migrateLegacySkillRoots(state, desired);
@@ -1896,8 +1958,8 @@ export function deleteItem(type: string, name: string): Promise<{ removed: boole
   if (inFlight) syncRequested = true;
   return serialize(() => {
     const state = loadState();
-    reconcileFirstInstallJournals(state);
     const legacyRootDiscoveryFailures = discoverLegacySkillInstallRoots(state);
+    reconcileFirstInstallJournals(state);
     const legacyMatches = Object.keys(state.installed)
       .filter((entry) => canonicalStateKey(entry) === key);
     const installedKey = key in state.installed

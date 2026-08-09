@@ -54,6 +54,7 @@ describe("provision state", () => {
       approved: ["skill/pr-monitor"],
       revoked: [],
       removalRecoveries: ["f".repeat(32)],
+      removalRecoveryRoots: { ["f".repeat(32)]: "/home/test/.agents/skills" },
       upgradeRecoveries: ["e".repeat(32)],
       installed: {
         "skill/pr-monitor": {

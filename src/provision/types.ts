@@ -144,6 +144,8 @@ export interface ProvisionStateFile {
   adopted?: string[];
   /** Exact random identities of retained removal recoveries. */
   removalRecoveries?: string[];
+  /** Install root for each retained removal recovery identity. */
+  removalRecoveryRoots?: Record<string, string>;
   /** Exact random identities of retained upgrade or rejected-candidate recovery trees. */
   upgradeRecoveries?: string[];
   installed: Record<string, InstalledRecord>;

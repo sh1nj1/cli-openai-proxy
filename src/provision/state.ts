@@ -351,17 +351,27 @@ export function loadState(): ProvisionStateFile {
 	if (record) installed[key] = record;
       }
     }
+    const removalRecoveries = Array.isArray(parsed.removalRecoveries)
+      ? [...new Set(parsed.removalRecoveries.filter(
+	(id): id is string => typeof id === "string" && RECOVERY_ID_PATTERN.test(id),
+      ))]
+      : undefined;
+    const rawRemovalRecoveryRoots = parsed.removalRecoveryRoots;
+    const removalRecoveryRoots = removalRecoveries && typeof rawRemovalRecoveryRoots === "object"
+      && rawRemovalRecoveryRoots !== null && !Array.isArray(rawRemovalRecoveryRoots)
+      ? Object.fromEntries(removalRecoveries.flatMap((id) => {
+	const root = (rawRemovalRecoveryRoots as Record<string, unknown>)[id];
+	return typeof root === "string" && path.isAbsolute(root) ? [[id, path.normalize(root)]] : [];
+      }))
+      : undefined;
     return {
       version: 1,
       approved: canonicalKeys(parsed.approved),
       revoked: canonicalKeys(parsed.revoked),
       ...(parsed.adopted !== undefined ? { adopted: canonicalKeys(parsed.adopted) } : {}),
-      ...(Array.isArray(parsed.removalRecoveries)
-	? {
-	  removalRecoveries: [...new Set(parsed.removalRecoveries.filter(
-	    (id): id is string => typeof id === "string" && RECOVERY_ID_PATTERN.test(id),
-	  ))],
-	}
+      ...(removalRecoveries ? { removalRecoveries } : {}),
+      ...(removalRecoveryRoots && Object.keys(removalRecoveryRoots).length > 0
+	? { removalRecoveryRoots }
 	: {}),
       ...(Array.isArray(parsed.upgradeRecoveries)
 	? {
