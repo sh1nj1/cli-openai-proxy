@@ -22,6 +22,7 @@ import { getStatus, initProvisioning, registerManifestUrl, shutdownProvisioning 
 import { engineRegistry } from "../auth/registry.js";
 import { resetSessions } from "../auth/session-manager.js";
 import type { EngineAuthDescriptor, EngineAuthSession } from "../auth/types.js";
+import { runInWorkspace } from "../provision/workspace-context.js";
 
 /** Matches the fetch-against-a-listening-server idiom used by the sibling *-restart/*-ordering tests. */
 async function listen(app: Express): Promise<{ server: Server; port: number }> {
@@ -55,6 +56,7 @@ const SAVED_VARS = [
   "PROVISION_STATE_DIR",
   "PROVISION_SKILLS_DIR",
   "PROVISION_SKILL_LINK_DIRS",
+  "PROVISION_WORKSPACE_ROOT",
   "AUTH_ADMIN_KEYS",
 ] as const;
 
@@ -71,6 +73,7 @@ describe("provision-routes", () => {
     process.env.PROVISION_STATE_DIR = stateDir;
     process.env.PROVISION_SKILLS_DIR = path.join(stateDir, "skills");
     process.env.PROVISION_SKILL_LINK_DIRS = "";
+    process.env.PROVISION_WORKSPACE_ROOT = path.join(stateDir, "workspaces");
   });
 
   afterEach(async () => {
@@ -285,6 +288,27 @@ describe("provision-routes", () => {
       );
       assert.equal((res.payload as { status: string }).status, "authorized");
       assert.equal(getStatus().manifest_url, url);
+    });
+
+    test("an auth session keeps its provisioning URL bound to its creation workspace", async () => {
+      enable();
+      const url = "http://127.0.0.1:1/agents/vrex/agent-12.json";
+      const created = fakeRes();
+      await runInWorkspace("agent-12", () => handleCreateAuthSession(
+	fakeReq({ params: { engine: "fake" } as any, body: { provisioning_url: url } }),
+	created,
+      ));
+      const { sessionId } = created.payload as { sessionId: string };
+
+      const { handleSubmitAuthSession } = await import("./auth-routes.js");
+      const submitted = fakeRes();
+      await runInWorkspace("agent-11", () => handleSubmitAuthSession(
+	fakeReq({ params: { engine: "fake", sessionId } as any, body: { value: "code" } }),
+	submitted,
+      ));
+      assert.equal((submitted.payload as { status: string }).status, "authorized");
+      assert.equal(runInWorkspace("agent-12", () => getStatus()).manifest_url, url);
+      assert.equal(runInWorkspace("agent-11", () => getStatus()).manifest_url, null);
     });
 
     test("with provisioning disabled the url is accepted but ignored", async () => {

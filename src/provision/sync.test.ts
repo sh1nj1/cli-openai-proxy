@@ -39,6 +39,7 @@ import {
 import { ProvisionError } from "./types.js";
 import { firstInstallMarkerPath } from "./installer.js";
 import { registeredManifestFilePath } from "./state.js";
+import { runInWorkspace } from "./workspace-context.js";
 
 /** Single-file tar.gz, enough for sync-level tests (installer has its own suite). */
 function skillArchive(content: string, fileName = "SKILL.md"): Buffer {
@@ -154,6 +155,8 @@ const SAVED_VARS = [
   "PROVISION_SKILL_LINK_DIRS",
   "PROVISION_CONFIG_DIR",
   "PROVISION_REFETCH_MS",
+  "PROVISION_WORKSPACE_ROOT",
+  "PROVISION_MAX_WORKSPACES_PER_USER",
   "AUTH_ADMIN_KEYS",
   "HOME",
 ] as const;
@@ -166,6 +169,7 @@ describe("provision sync", () => {
   let stateDir: string;
   let skillsDir: string;
   let configDir: string;
+  let workspaceRoot: string;
   const saved = new Map<string, string | undefined>();
 
   let redirects: Map<string, string>;
@@ -213,10 +217,12 @@ describe("provision sync", () => {
     stateDir = mkdtempSync(path.join(tmpdir(), "provision-sync-state-"));
     skillsDir = mkdtempSync(path.join(tmpdir(), "provision-sync-skills-"));
     configDir = mkdtempSync(path.join(tmpdir(), "provision-sync-config-"));
+    workspaceRoot = mkdtempSync(path.join(tmpdir(), "provision-sync-workspaces-"));
     process.env.PROVISION_STATE_DIR = stateDir;
     process.env.PROVISION_SKILLS_DIR = skillsDir;
     process.env.PROVISION_SKILL_LINK_DIRS = "";
     process.env.PROVISION_CONFIG_DIR = configDir;
+    process.env.PROVISION_WORKSPACE_ROOT = workspaceRoot;
     process.env.PROVISION_SYNC = "1";
     process.env.AUTH_ADMIN_KEYS = "test-admin-secret";
     responses.clear();
@@ -236,6 +242,7 @@ describe("provision sync", () => {
     rmSync(stateDir, { recursive: true, force: true });
     rmSync(skillsDir, { recursive: true, force: true });
     rmSync(configDir, { recursive: true, force: true });
+    rmSync(workspaceRoot, { recursive: true, force: true });
   });
 
   function serveManifest(items: object[]): string {
@@ -795,6 +802,37 @@ describe("provision sync", () => {
       initProvisioning();
       registerManifestUrl(manifestUrl);
       assert.equal(statusOf(await syncNow(), "linked"), "installed");
+    } finally {
+      chmodSync(commonParent, 0o755);
+    }
+  });
+
+  test("does not probe a read-only common parent when existing case variants are distinct", {
+    skip: process.platform === "win32",
+  }, async () => {
+    const commonParent = path.join(stateDir, "read-only-case-parent");
+    const canonicalRoot = path.join(commonParent, "Foo");
+    const discoveryParent = path.join(commonParent, "foo");
+    const linkRoot = path.join(discoveryParent, "missing-links");
+    mkdirSync(canonicalRoot, { recursive: true });
+    if (existsSync(discoveryParent)) return;
+    mkdirSync(discoveryParent);
+    const canonicalIdentity = lstatSync(canonicalRoot, { bigint: true });
+    const discoveryIdentity = lstatSync(discoveryParent, { bigint: true });
+    if (canonicalIdentity.dev === discoveryIdentity.dev
+      && canonicalIdentity.ino === discoveryIdentity.ino) return;
+    process.env.PROVISION_SKILLS_DIR = canonicalRoot;
+    process.env.PROVISION_SKILL_LINK_DIRS = linkRoot;
+    process.env.PROVISION_AUTOAPPLY = "auto";
+    const skill = serveSkill("/read-only-case-parent.tgz", "case-distinct roots");
+    const manifestUrl = serveManifest([{ type: "skill", name: "linked", ...skill }]);
+
+    chmodSync(commonParent, 0o555);
+    try {
+      initProvisioning();
+      registerManifestUrl(manifestUrl);
+      assert.equal(statusOf(await syncNow(), "linked"), "installed");
+      assert.equal(lstatSync(path.join(linkRoot, "linked")).isSymbolicLink(), true);
     } finally {
       chmodSync(commonParent, 0o755);
     }
@@ -2017,6 +2055,46 @@ describe("provision sync", () => {
     );
     const state = JSON.parse(readFileSync(statePath, "utf8"));
     assert.equal(state.installed["skill/legacy"].installRoot, legacySkillsDir);
+  });
+
+  test("discovers legacy ownership through a missing case alias of the default root", async () => {
+    const testHome = path.join(stateDir, "case-aliased-default-migration-home");
+    mkdirSync(testHome);
+    const caseProbe = path.join(testHome, "Case-Probe");
+    mkdirSync(caseProbe);
+    const caseInsensitive = existsSync(path.join(testHome, "case-probe"));
+    rmSync(caseProbe, { recursive: true });
+    if (!caseInsensitive) return;
+
+    const legacySkillsDir = path.join(testHome, ".claude", "skills");
+    const canonicalAlias = path.join(testHome, ".Agents", "skills");
+    process.env.HOME = testHome;
+    process.env.PROVISION_SKILLS_DIR = legacySkillsDir;
+    process.env.PROVISION_SKILL_LINK_DIRS = "";
+    process.env.PROVISION_AUTOAPPLY = "auto";
+    initProvisioning();
+    const skill = serveSkill("/case-aliased-default-migration.tgz", "legacy contents");
+    const manifestUrl = serveManifest([{ type: "skill", name: "legacy", ...skill }]);
+    registerManifestUrl(manifestUrl);
+    assert.equal(statusOf(await syncNow(), "legacy"), "installed");
+
+    const statePath = path.join(stateDir, "provision.lock.json");
+    const legacyState = JSON.parse(readFileSync(statePath, "utf8"));
+    delete legacyState.installed["skill/legacy"].installRoot;
+    writeFileSync(statePath, `${JSON.stringify(legacyState, null, 2)}\n`);
+    process.env.PROVISION_SKILLS_DIR = canonicalAlias;
+    delete process.env.PROVISION_SKILL_LINK_DIRS;
+    initProvisioning();
+    registerManifestUrl(manifestUrl);
+
+    assert.equal(statusOf(await syncNow(), "legacy"), "installed");
+    assert.equal(
+      readFileSync(path.join(canonicalAlias, "legacy", "SKILL.md"), "utf8"),
+      "legacy contents",
+    );
+    assert.equal(lstatSync(path.join(legacySkillsDir, "legacy")).isSymbolicLink(), true);
+    const state = JSON.parse(readFileSync(statePath, "utf8"));
+    assert.equal(state.installed["skill/legacy"].installRoot, canonicalAlias);
   });
 
   test("never infers legacy ownership from a matching Claude skill", async () => {
@@ -4136,5 +4214,74 @@ describe("provision sync", () => {
     assert.match(failed.data[0]!.error!, /HTTP 404/);
     assert.equal(serialized.includes(artifactToken), false);
     assert.equal(serialized.includes(callbackToken), false);
+  });
+
+  test("named workspaces isolate manifest state, approvals, skills, and config tokens", async () => {
+    // This is collision/state isolation, not a security boundary: both paths
+    // remain readable by the same user's cap_* account by design.
+    process.env.PROVISION_AUTOAPPLY = "auto";
+    initProvisioning();
+    const skillA = serveSkill("/agent-a-skill.tar.gz", "# agent a");
+    const skillB = serveSkill("/agent-b-skill.tar.gz", "# agent b");
+    const configA = configItem("agent-a-token", "/agent-a-config.tar.gz");
+    const configB = configItem("agent-b-token", "/agent-b-config.tar.gz");
+    responses.set("/agent-a.json", {
+      schema: "agent-provisioning/v1",
+      items: [{ type: "skill", name: "collavre", ...skillA }, configA.item],
+    });
+    responses.set("/agent-b.json", {
+      schema: "agent-provisioning/v1",
+      items: [{ type: "skill", name: "collavre", ...skillB }, configB.item],
+    });
+
+    const statusA = await runInWorkspace("agent-11", async () => {
+      registerManifestUrl(`${baseUrl}/agent-a.json`, { persist: true });
+      return syncNow();
+    });
+    const statusB = await runInWorkspace("agent-12", async () => {
+      registerManifestUrl(`${baseUrl}/agent-b.json`, { persist: true });
+      return syncNow();
+    });
+
+    assert.equal(statusA.workspace_id, "agent-11");
+    assert.equal(statusB.workspace_id, "agent-12");
+    assert.equal(statusA.manifest_url, `${baseUrl}/agent-a.json`);
+    assert.equal(statusB.manifest_url, `${baseUrl}/agent-b.json`);
+    assert.equal(
+      readFileSync(path.join(workspaceRoot, "agent-11", ".config", "collavre", "config.json"), "utf8"),
+      configA.body,
+    );
+    assert.equal(
+      readFileSync(path.join(workspaceRoot, "agent-12", ".config", "collavre", "config.json"), "utf8"),
+      configB.body,
+    );
+    assert.equal(
+      readFileSync(path.join(workspaceRoot, "agent-11", ".claude", "skills", "collavre", "SKILL.md"), "utf8"),
+      "# agent a",
+    );
+    assert.equal(
+      readFileSync(path.join(workspaceRoot, "agent-12", ".claude", "skills", "collavre", "SKILL.md"), "utf8"),
+      "# agent b",
+    );
+    assert.equal(
+      readFileSync(path.join(workspaceRoot, "agent-11", ".agents", "skills", "collavre", "SKILL.md"), "utf8"),
+      "# agent a",
+    );
+    assert.equal(
+      lstatSync(path.join(workspaceRoot, "agent-11", ".claude", "skills", "collavre")).isSymbolicLink(),
+      true,
+    );
+    assert.equal(existsSync(path.join(configDir, "collavre")), false, "named config ignores legacy override");
+  });
+
+  test("enforces the named workspace count without affecting the legacy workspace", async () => {
+    process.env.PROVISION_MAX_WORKSPACES_PER_USER = "1";
+    initProvisioning();
+    assert.equal(runInWorkspace("agent-11", () => getStatus()).workspace_id, "agent-11");
+    assert.throws(
+      () => runInWorkspace("agent-12", () => getStatus()),
+      (err: ProvisionError) => err.code === "workspace_limit_reached",
+    );
+    assert.equal(getStatus().workspace_id, null);
   });
 });

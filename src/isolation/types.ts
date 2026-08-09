@@ -3,6 +3,13 @@ export interface UserIdentity {
   userId: string;
 }
 
+export interface RequestIdentity extends UserIdentity {
+  /** Credential routing remains tenantId + userId; this field selects only a path workspace. */
+  workspaceId: string;
+  /** False for mapped keys and legacy v1 signatures, preserving the legacy HOME layout. */
+  workspaceScoped: boolean;
+}
+
 export type IpcEndpoint =
   | { kind: "unix"; address: string }
   | { kind: "named-pipe"; address: string };

@@ -11,6 +11,12 @@ export const PROVISIONING_SESSION_TTL_HEADER = "x-cli-proxy-provisioning-session
 export const SUPERSEDED_PROVISIONING_GENERATION_HEADER = "x-cli-proxy-superseded-provisioning-generation";
 /** Gateway-only signal that a worker may advertise the relative auth UI path. */
 export const AUTH_UI_AVAILABLE_HEADER = "x-cli-proxy-auth-ui-available";
+/** Gateway-validated workspace selector; callers cannot forward this header directly. */
+export const INTERNAL_WORKSPACE_ID_HEADER = "x-cli-proxy-internal-workspace-id";
+/** Distinguishes an explicit v2 path workspace from a legacy identity label. */
+export const INTERNAL_WORKSPACE_SCOPED_HEADER = "x-cli-proxy-internal-workspace-scoped";
+/** Gateway-validated credential identity used only for worker observability. */
+export const INTERNAL_USER_ID_HEADER = "x-cli-proxy-internal-user-id";
 /** Leaves ample room under Node's default aggregate HTTP header limit. */
 export const MAX_AUTHORIZED_PROVISIONING_HEADER_BYTES = 8 * 1024;
 

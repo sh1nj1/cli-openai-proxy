@@ -19,6 +19,7 @@ import { homedir } from "os";
 import path from "path";
 import { isCanonicalGitPath, isGitObjectId, isValidGitRevision } from "./git-source.js";
 import { managedPathParts } from "./path-policy.js";
+import { currentWorkspaceContext } from "./workspace-context.js";
 import type {
   InstalledFileIdentity,
   InstalledLegacySkillMigration,
@@ -30,7 +31,10 @@ import type {
 } from "./types.js";
 
 export function provisionStateDir(): string {
-  return process.env.PROVISION_STATE_DIR?.trim() || path.join(homedir(), ".cli-openai-proxy");
+  const workspace = currentWorkspaceContext();
+  return workspace?.scoped && workspace.stateDir
+    ? workspace.stateDir
+    : process.env.PROVISION_STATE_DIR?.trim() || path.join(homedir(), ".cli-openai-proxy");
 }
 
 export function stateFilePath(): string {

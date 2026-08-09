@@ -39,6 +39,12 @@ import {
 } from "../isolation/request-identity.js";
 import type { UserWorkerProxy } from "../isolation/worker-proxy.js";
 import { AUTH_UI_PATH, handleAuthUi } from "./auth-ui.js";
+import {
+  INTERNAL_WORKSPACE_ID_HEADER,
+  INTERNAL_WORKSPACE_SCOPED_HEADER,
+  INTERNAL_USER_ID_HEADER,
+} from "../isolation/worker-protocol.js";
+import { runInWorkspace, validWorkspaceId } from "../provision/workspace-context.js";
 
 export interface ServerConfig {
   port?: number;
@@ -52,7 +58,7 @@ export interface AppConfig {
   role?: "gateway" | "worker";
   userWorkerProxy?: UserWorkerProxy;
   /** Test seam; production defaults to the gateway-owned provisioning engine. */
-  onAuthorizedProvisioningUrl?: (url: string) => void | Promise<void>;
+  onAuthorizedProvisioningUrl?: (url: string, workspaceId?: string) => void | Promise<void>;
 }
 
 let serverInstance: Server | null = null;
@@ -99,7 +105,11 @@ export function createApp(config: AppConfig = {}): Express {
     );
     const provisionStatus = initProvisioning({ perUserWorkers: userWorkerProxy !== undefined });
     if (provisionStatus.enabled) {
-      onAuthorizedProvisioningUrl = config.onAuthorizedProvisioningUrl ?? handleAuthorizedSession;
+      // Worker routing keeps generation/order validation at the gateway, but
+      // the callback is intentionally a no-op: only the selected user worker
+      // may install a workspace manifest.
+      onAuthorizedProvisioningUrl = config.onAuthorizedProvisioningUrl
+	?? (userWorkerProxy ? (() => undefined) : handleAuthorizedSession);
     }
     console.log(
       provisionStatus.enabled
@@ -144,6 +154,7 @@ export function createApp(config: AppConfig = {}): Express {
         "X-CLI-Proxy-User-Key",
         "X-CLI-Proxy-Tenant-ID",
         "X-CLI-Proxy-User-ID",
+	"X-CLI-Proxy-Workspace-ID",
         "X-CLI-Proxy-Identity-Timestamp",
         "X-CLI-Proxy-Identity-Signature",
       ].join(", "),
@@ -155,6 +166,36 @@ export function createApp(config: AppConfig = {}): Express {
   app.options("*", (_req: Request, res: Response) => {
     res.sendStatus(200);
   });
+
+  // Only the gateway can mint this private header. The worker socket is already
+  // scoped to one OS user; this context selects that user's agent workspace.
+  if (role === "worker") {
+    app.use((req: Request, res: Response, next: NextFunction) => {
+      const workspaceId = req.header(INTERNAL_WORKSPACE_ID_HEADER);
+      const workspaceScoped = req.header(INTERNAL_WORKSPACE_SCOPED_HEADER) === "1";
+      const userId = req.header(INTERNAL_USER_ID_HEADER) ?? "local";
+      if (workspaceId === undefined) {
+	next();
+	return;
+      }
+      if (workspaceScoped && !validWorkspaceId(workspaceId)) {
+	res.status(400).json({
+	  error: {
+	    message: "The internal workspace identity is invalid",
+	    type: "invalid_request_error",
+	    code: "invalid_workspace_id",
+	  },
+	});
+	return;
+      }
+      if (req.path === "/v1/chat/completions" || req.path.startsWith(PROVISION_PREFIX)) {
+	console.log(
+	  `[Worker] ${req.method} ${req.path} user=${userId} workspace=${workspaceId}`,
+	);
+      }
+      runInWorkspace(workspaceId, next, workspaceScoped);
+    });
+  }
 
   // Auth middleware (skips /health automatically). Runs BEFORE the body parser
   // so an unauthenticated request is rejected with 401 without the server first

@@ -20,6 +20,8 @@ import { UserWorkerProxy } from "./worker-proxy.js";
 import {
   AUTHORIZED_PROVISIONING_HEADER,
   AUTH_UI_AVAILABLE_HEADER,
+  INTERNAL_WORKSPACE_ID_HEADER,
+  INTERNAL_WORKSPACE_SCOPED_HEADER,
   PROVISIONING_GENERATION_HEADER,
   PROVISIONING_SESSION_TTL_HEADER,
   SUPERSEDED_PROVISIONING_GENERATION_HEADER,
@@ -207,6 +209,76 @@ test("gateway provisions by authenticated identity and strips private headers", 
     ]);
     assert.equal(seenHeaders.authorization, undefined);
     assert.equal(seenHeaders["x-cli-proxy-user-key"], undefined);
+  } finally {
+    await new Promise<void>((resolve) => gateway.close(() => resolve()));
+    await new Promise<void>((resolve) => worker.close(() => resolve()));
+    await rm(socketPath, { force: true });
+  }
+});
+
+test("v2 workspaces share credential routing while the gateway injects distinct internal paths", async () => {
+  const socketPath = `/tmp/cap-worker-${randomUUID().slice(0, 8)}.sock`;
+  const seenWorkspaces: Array<{ id: string | undefined; scoped: string | undefined }> = [];
+  const worker = http.createServer((request, response) => {
+    seenWorkspaces.push({
+      id: request.headers[INTERNAL_WORKSPACE_ID_HEADER] as string | undefined,
+      scoped: request.headers[INTERNAL_WORKSPACE_SCOPED_HEADER] as string | undefined,
+    });
+    response.writeHead(200, {
+      "content-type": "application/json",
+      [INTERNAL_WORKSPACE_ID_HEADER]: "must-not-leak",
+    });
+    response.end(JSON.stringify({ ok: true }));
+  });
+  await new Promise<void>((resolve) => worker.listen(socketPath, resolve));
+  const identities: unknown[] = [];
+  const provisioner: WorkerProvisioner = {
+    async ensureWorker(identity) {
+      identities.push(identity);
+      return {
+	accountName: "cap_0123456789abcdef0123",
+	endpoint: { kind: "unix", address: socketPath },
+      };
+    },
+  };
+  const secret = "identity-secret-that-is-long-enough";
+  process.env.API_KEYS = "shared-completion-key-123";
+  process.env.USER_IDENTITY_HMAC_SECRET = secret;
+  const gateway = createApp({ userWorkerProxy: new UserWorkerProxy(provisioner) }).listen(0);
+  await new Promise<void>((resolve) => gateway.once("listening", resolve));
+  try {
+    const port = (gateway.address() as AddressInfo).port;
+    for (const workspaceId of ["agent-11", "agent-12"]) {
+      const timestamp = String(Math.floor(Date.now() / 1000));
+      const payload = [
+	"v2", "POST", "/v1/chat/completions", timestamp, "collavre", "user-1", workspaceId,
+      ].join("\n");
+      const response = await fetch(`http://127.0.0.1:${port}/v1/chat/completions`, {
+	method: "POST",
+	headers: {
+	  authorization: "Bearer shared-completion-key-123",
+	  "content-type": "application/json",
+	  "x-cli-proxy-tenant-id": "collavre",
+	  "x-cli-proxy-user-id": "user-1",
+	  "x-cli-proxy-workspace-id": workspaceId,
+	  "x-cli-proxy-identity-timestamp": timestamp,
+	  "x-cli-proxy-identity-signature": createHmac("sha256", secret).update(payload).digest("hex"),
+	  [INTERNAL_WORKSPACE_ID_HEADER]: "attacker-workspace",
+	  [INTERNAL_WORKSPACE_SCOPED_HEADER]: "0",
+	},
+	body: JSON.stringify({ messages: [{ role: "user", content: "hi" }] }),
+      });
+      assert.equal(response.status, 200);
+      assert.equal(response.headers.get(INTERNAL_WORKSPACE_ID_HEADER), null);
+    }
+    assert.deepEqual(identities, [
+      { tenantId: "collavre", userId: "user-1" },
+      { tenantId: "collavre", userId: "user-1" },
+    ]);
+    assert.deepEqual(seenWorkspaces, [
+      { id: "agent-11", scoped: "1" },
+      { id: "agent-12", scoped: "1" },
+    ]);
   } finally {
     await new Promise<void>((resolve) => gateway.close(() => resolve()));
     await new Promise<void>((resolve) => worker.close(() => resolve()));
