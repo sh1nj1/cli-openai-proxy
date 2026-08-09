@@ -491,6 +491,10 @@ describe("provision sync", () => {
     registerManifestUrl(serveManifest([{ type: "skill", name: "legacy", ...skill }]));
     await syncNow();
     assert.equal(existsSync(path.join(legacySkillsDir, "legacy", "SKILL.md")), true);
+    const statePath = path.join(stateDir, "provision.lock.json");
+    const legacyState = JSON.parse(readFileSync(statePath, "utf8"));
+    delete legacyState.installed["skill/legacy"].installRoot;
+    writeFileSync(statePath, `${JSON.stringify(legacyState, null, 2)}\n`);
 
     delete process.env.PROVISION_SKILLS_DIR;
     delete process.env.PROVISION_SKILL_LINK_DIRS;
@@ -507,6 +511,47 @@ describe("provision sync", () => {
       readdirSync(legacySkillsDir).some((entry) => entry.startsWith(".provision-removed-")),
       true,
     );
+  });
+
+  test("refuses a canonical collision while migrating the previous Claude default", async () => {
+    const testHome = path.join(stateDir, "home");
+    const legacySkillsDir = path.join(testHome, ".claude", "skills");
+    const canonicalSkillsDir = path.join(testHome, ".agents", "skills");
+    process.env.HOME = testHome;
+    process.env.PROVISION_SKILLS_DIR = legacySkillsDir;
+    process.env.PROVISION_SKILL_LINK_DIRS = "";
+    process.env.PROVISION_AUTOAPPLY = "auto";
+    initProvisioning();
+    const skill = serveSkill("/legacy-collision.tgz", "same contents");
+    registerManifestUrl(serveManifest([{ type: "skill", name: "legacy", ...skill }]));
+    await syncNow();
+    const statePath = path.join(stateDir, "provision.lock.json");
+    const legacyState = JSON.parse(readFileSync(statePath, "utf8"));
+    delete legacyState.installed["skill/legacy"].installRoot;
+    writeFileSync(statePath, `${JSON.stringify(legacyState, null, 2)}\n`);
+
+    const canonical = path.join(canonicalSkillsDir, "legacy");
+    mkdirSync(canonical, { recursive: true });
+    writeFileSync(path.join(canonical, "SKILL.md"), "same contents");
+    delete process.env.PROVISION_SKILLS_DIR;
+    delete process.env.PROVISION_SKILL_LINK_DIRS;
+    initProvisioning();
+    registerManifestUrl(`${baseUrl}/provision.json`);
+
+    const refused = await syncNow();
+    assert.equal(statusOf(refused, "legacy"), "failed");
+    assert.match(refused.data[0]!.error!, /untracked canonical target/);
+    assert.equal(readFileSync(path.join(canonical, "SKILL.md"), "utf8"), "same contents");
+    assert.equal(
+      readFileSync(path.join(legacySkillsDir, "legacy", "SKILL.md"), "utf8"),
+      "same contents",
+    );
+    const state = JSON.parse(readFileSync(statePath, "utf8"));
+    assert.equal(state.installed["skill/legacy"].installRoot, legacySkillsDir);
+
+    await deleteItem("skill", "legacy");
+    assert.equal(readFileSync(path.join(canonical, "SKILL.md"), "utf8"), "same contents");
+    assert.equal(existsSync(path.join(legacySkillsDir, "legacy")), false);
   });
 
   test("refuses an untracked discovery-path collision", async () => {

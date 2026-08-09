@@ -99,6 +99,8 @@ export interface InstalledSkillLinkPublication {
 
 /** One installed artifact as the lockfile records it. */
 export interface InstalledRecord extends InstalledSnapshot {
+  /** Absolute parent directory that owns this skill's canonical tree. */
+  installRoot?: string;
   /** Discovery links published for other supported agent CLIs. */
   skillLinks?: InstalledSkillLink[];
   /** In-flight publication that crash recovery may safely finish or remove. */

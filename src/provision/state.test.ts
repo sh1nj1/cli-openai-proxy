@@ -58,6 +58,7 @@ describe("provision state", () => {
       installed: {
         "skill/pr-monitor": {
           sha256: "a".repeat(64),
+	  installRoot: "/home/test/.agents/skills",
 	  source: {
 	    type: "git" as const,
 	    ref: "main",

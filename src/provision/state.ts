@@ -273,6 +273,9 @@ function installedRecord(value: unknown, installedKey: string): InstalledRecord 
   const stable = installedSnapshot(value);
   if (!stable) return null;
   const raw = value as Record<string, unknown>;
+  const installRoot = typeof raw.installRoot === "string" && path.isAbsolute(raw.installRoot)
+    ? path.normalize(raw.installRoot)
+    : undefined;
   const skillLinks = installedSkillLinks(raw.skillLinks, installedKey);
   if (skillLinks === null) return null;
   const skillLinkPublication = installedSkillLinkPublication(raw.skillLinkPublication, installedKey);
@@ -312,6 +315,7 @@ function installedRecord(value: unknown, installedKey: string): InstalledRecord 
       : undefined;
   return {
     ...stable,
+    ...(installedKey.toLowerCase().startsWith("skill/") && installRoot ? { installRoot } : {}),
     ...(skillLinks.length > 0 ? { skillLinks } : {}),
     ...(skillLinkPublication ? { skillLinkPublication } : {}),
     ...(raw.uncommitted === true ? { uncommitted: true as const } : {}),

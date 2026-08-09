@@ -166,9 +166,11 @@ Skill content has one canonical copy. Codex discovers the default
 `PROVISION_SKILL_LINK_DIRS`. Link paths and filesystem identities are recorded
 in the lockfile; changed or untracked entries fail with `untracked_content`
 instead of being replaced or removed. On upgrade from the previous default,
-an exact lockfile-owned `~/.claude/skills/{name}` tree is retained in a hidden
-recovery directory and replaced by the discovery link. Modified or ambiguous
-legacy trees are left untouched.
+the lockfile first records the proven legacy install root. Migration proceeds
+only when the new canonical pathname is absent; an exact lockfile-owned
+`~/.claude/skills/{name}` tree is then retained in a hidden recovery directory
+and replaced by the discovery link. Canonical collisions and modified or
+ambiguous legacy trees are left untouched.
 
 ### `type: "config"`
 
