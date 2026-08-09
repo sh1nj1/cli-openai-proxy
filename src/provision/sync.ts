@@ -210,9 +210,15 @@ function skillLinkDirs(): string[] {
     : configured.split(",").map((entry) => entry.trim()).filter(Boolean);
   const canonical = path.resolve(skillsDir());
   const canonicalReal = existingRealPath(canonical);
-  return [...new Set(entries.map((entry) => path.resolve(entry)))]
-    .filter((entry) => entry !== canonical
-      && (canonicalReal === undefined || existingRealPath(entry) !== canonicalReal));
+  const seenRealPaths = new Set(canonicalReal ? [canonicalReal] : []);
+  return [...new Set(entries.map((entry) => path.resolve(entry)))].filter((entry) => {
+    if (entry === canonical) return false;
+    const real = existingRealPath(entry);
+    if (real === undefined) return true;
+    if (seenRealPaths.has(real)) return false;
+    seenRealPaths.add(real);
+    return true;
+  });
 }
 
 function configDir(): string {
@@ -1620,6 +1626,11 @@ function migrateLegacyDesiredItems(
     const canonicalKey = canonicalStateKey(legacyKey);
     if (legacyKey === canonicalKey || !desired.has(canonicalKey)) continue;
     if (blocked.has(canonicalKey)) {
+      // The legacy ownership record is sufficient proof that this item passed
+      // its original approval gate, even while another migration stage owns it.
+      if (!state.revoked.includes(canonicalKey) && !state.approved.includes(canonicalKey)) {
+	state.approved.push(canonicalKey);
+      }
       desired.add(legacyKey);
       continue;
     }
