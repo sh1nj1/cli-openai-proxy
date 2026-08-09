@@ -460,10 +460,6 @@ function installedSnapshotMatchesEntireTreeAt(root: string, record: InstalledSna
   return actual.size === expected.size && [...actual].every((entry) => expected.has(entry));
 }
 
-function installedRecordMatchesEntireTree(name: string, record: InstalledSnapshot): boolean {
-  return installedSnapshotMatchesEntireTreeAt(path.join(skillsDir(), name), record);
-}
-
 function configSnapshotComplete(
   name: string,
   snapshot: InstalledSnapshot,
@@ -1208,7 +1204,8 @@ function reconcileUpgradeJournal(name: string, record: InstalledRecord): Install
   const skillLinks = record.skillLinks;
   const skillLinkPublication = record.skillLinkPublication;
   const installRoot = record.installRoot;
-  if (installedRecordMatchesEntireTree(name, record.pending)) {
+  const target = path.join(skillInstallRoot(record), name);
+  if (installedSnapshotMatchesEntireTreeAt(target, record.pending)) {
     return {
       ...record.pending,
       ...(installRoot ? { installRoot } : {}),
@@ -1216,7 +1213,7 @@ function reconcileUpgradeJournal(name: string, record: InstalledRecord): Install
       ...(skillLinkPublication ? { skillLinkPublication } : {}),
     };
   }
-  if (installedRecordMatchesEntireTree(name, record)) {
+  if (installedSnapshotMatchesEntireTreeAt(target, record)) {
     return {
       ...stableSnapshot(record),
       ...(installRoot ? { installRoot } : {}),
@@ -1283,12 +1280,20 @@ function discoverLegacySkillInstallRoots(state: ProvisionStateFile): Map<string,
   return failures;
 }
 
-/** Release an old-root record only while the new canonical pathname is absent. */
-function migrateLegacySkillRoots(
+interface LegacySkillRootMigration {
+  installedKey: string;
+  canonicalKey: string;
+  name: string;
+  installRoot: string;
+}
+
+/** Plan an old-root move without hiding the live skill before its replacement is ready. */
+function planLegacySkillRootMigrations(
   state: ProvisionStateFile,
   desired: Set<string>,
-): Map<string, string> {
+): { failures: Map<string, string>; migrations: Map<string, LegacySkillRootMigration> } {
   const failures = new Map<string, string>();
+  const migrations = new Map<string, LegacySkillRootMigration>();
   const canonicalRoot = path.resolve(skillsDir());
   const desiredRecords = new Map<string, string[]>();
   for (const key of Object.keys(state.installed)) {
@@ -1311,47 +1316,73 @@ function migrateLegacySkillRoots(
     if (installRoot === canonicalRoot) continue;
     const name = key.slice(key.indexOf("/") + 1);
     const canonicalName = name.toLowerCase();
-    try {
-      if (pathEntryExists(path.join(canonicalRoot, canonicalName))) {
-	throw new ProvisionError(
-	  `Cannot migrate legacy skill "${name}": untracked canonical target already exists in ${canonicalRoot}`,
-	  "untracked_content",
-	);
-      }
-      if (record.skillLinks?.length || record.skillLinkPublication) {
-	throw new ProvisionError(
-	  `Cannot migrate legacy skill "${name}" while discovery-link ownership is still recorded`,
-	  "untracked_content",
-	);
-      }
-      const recovery = prepareRemovalRecovery(state, key);
-      try {
-	removeSkill(name, {
-	  skillsDir: installRoot,
-	  ...removalSnapshot(record),
-	  ...recovery,
-	  afterRootAudit: afterRemovalAudit,
-	  afterRootIsolation: afterRemovalIsolation,
-	});
-      } finally {
-	finalizeRemovalRecoveries(state);
-      }
-      if (pathEntryExists(path.join(installRoot, name))) {
-	throw new ProvisionError(
-	  `Cannot migrate legacy skill "${name}" without verified ownership of its original target`,
-	  "untracked_content",
-	);
-      }
-      if (!state.revoked.includes(canonicalKey) && !state.approved.includes(canonicalKey)) {
-	state.approved.push(canonicalKey);
-      }
-      delete state.installed[key];
-      saveState(state);
-    } catch (err) {
-      failures.set(canonicalKey, err instanceof Error ? err.message : String(err));
+    if (pathEntryExists(path.join(canonicalRoot, canonicalName))) {
+      failures.set(
+	canonicalKey,
+	`Cannot migrate legacy skill "${name}": untracked canonical target already exists in ${canonicalRoot}`,
+      );
+      continue;
     }
+    if (record.skillLinks?.length || record.skillLinkPublication) {
+      failures.set(
+	canonicalKey,
+	`Cannot migrate legacy skill "${name}" while discovery-link ownership is still recorded`,
+      );
+      continue;
+    }
+    migrations.set(canonicalKey, { installedKey: key, canonicalKey, name, installRoot });
   }
-  return failures;
+  return { failures, migrations };
+}
+
+/** Isolate a planned legacy tree only after the replacement candidate passed its full audit. */
+function executeLegacySkillRootMigration(
+  state: ProvisionStateFile,
+  migration: LegacySkillRootMigration,
+): InstalledRecord {
+  const record = state.installed[migration.installedKey];
+  if (!record || skillInstallRoot(record) !== migration.installRoot) {
+    throw new ProvisionError(
+      `Cannot migrate legacy skill "${migration.name}": its ownership record changed`,
+      "untracked_content",
+    );
+  }
+  const canonicalTarget = path.join(skillsDir(), migration.name.toLowerCase());
+  if (pathEntryExists(canonicalTarget)) {
+    throw new ProvisionError(
+      `Cannot migrate legacy skill "${migration.name}": untracked canonical target already exists in ${skillsDir()}`,
+      "untracked_content",
+    );
+  }
+  if (record.skillLinks?.length || record.skillLinkPublication) {
+    throw new ProvisionError(
+      `Cannot migrate legacy skill "${migration.name}" while discovery-link ownership is still recorded`,
+      "untracked_content",
+    );
+  }
+  const recovery = prepareRemovalRecovery(state, migration.installedKey);
+  try {
+    removeSkill(migration.name, {
+      skillsDir: migration.installRoot,
+      ...removalSnapshot(record),
+      ...recovery,
+      afterRootAudit: afterRemovalAudit,
+      afterRootIsolation: afterRemovalIsolation,
+    });
+  } finally {
+    finalizeRemovalRecoveries(state);
+  }
+  if (pathEntryExists(path.join(migration.installRoot, migration.name))) {
+    throw new ProvisionError(
+      `Cannot migrate legacy skill "${migration.name}" without verified ownership of its original target`,
+      "untracked_content",
+    );
+  }
+  if (!state.revoked.includes(migration.canonicalKey)
+    && !state.approved.includes(migration.canonicalKey)) {
+    state.approved.push(migration.canonicalKey);
+  }
+  return record;
 }
 
 /**
@@ -1447,18 +1478,23 @@ async function runSync(generation: number): Promise<ProvisionStatusView> {
   reconcileFirstInstallJournals(state);
   const views: ProvisionItemView[] = [];
   const desired = new Set(manifest.items.map((item) => `${item.type}/${item.name}`));
-  const legacyRootMigrationFailures = migrateLegacySkillRoots(state, desired);
+  const {
+    failures: legacyRootMigrationFailures,
+    migrations: legacyRootMigrations,
+  } = planLegacySkillRootMigrations(state, desired);
   const legacyMigrationFailures = migrateLegacyDesiredItems(
     state,
     desired,
     new Set([
       ...legacyRootDiscoveryFailures.keys(),
       ...legacyRootMigrationFailures.keys(),
+      ...legacyRootMigrations.keys(),
     ]),
   );
 
   for (const item of manifest.items) {
     const key = `${item.type}/${item.name}`;
+    const legacyRootMigration = legacyRootMigrations.get(key);
 
     if (!SUPPORTED_PROVISION_TYPES.has(item.type)) {
       views.push({ type: item.type, name: item.name, status: "unsupported" });
@@ -1585,7 +1621,8 @@ async function runSync(generation: number): Promise<ProvisionStatusView> {
       // not reinstall.
       const fingerprint = itemFingerprint(item, resolvedGitRevision);
       const source = installedSource(item, resolvedGitRevision);
-      if (state.installed[key]?.sha256 === fingerprint
+      if (!legacyRootMigration
+	&& state.installed[key]?.sha256 === fingerprint
 	&& !state.installed[key]!.pending
 	&& !state.installed[key]!.installMarker
 	&& installedRecordIntact(item.type, item.name, state.installed[key]!)) {
@@ -1614,7 +1651,7 @@ async function runSync(generation: number): Promise<ProvisionStatusView> {
 	continue;
       }
 
-      const previousRecord = state.installed[key];
+      const previousRecord = legacyRootMigration ? undefined : state.installed[key];
       const managedFiles = previousRecord
 	? [...new Set([...previousRecord.files, ...(previousRecord.pending?.files ?? [])])]
 	: undefined;
@@ -1713,6 +1750,10 @@ async function runSync(generation: number): Promise<ProvisionStatusView> {
 	    firstInstallMarker,
 	    afterFirstInstallMove,
 	    beforeCommit: (candidate, candidateIdentity) => {
+	      let migratedRecord: InstalledRecord | undefined;
+	      if (legacyRootMigration) {
+		migratedRecord = executeLegacySkillRootMigration(state, legacyRootMigration);
+	      }
 	      const candidateRecord: InstalledSnapshot = {
 		sha256: fingerprint,
 		...(source ? { source } : {}),
@@ -1739,17 +1780,26 @@ async function runSync(generation: number): Promise<ProvisionStatusView> {
 		  installMarker: firstInstallMarker,
 		  rejectionRecoveryId: rejectedCandidateRecovery.rejectionRecoveryId,
 		};
+	      if (legacyRootMigration && legacyRootMigration.installedKey !== key) {
+		delete state.installed[legacyRootMigration.installedKey];
+	      }
 	      state.installed[key] = nextRecord;
 	      try {
 		saveState(state);
 	      } catch (err) {
+		delete state.installed[key];
 		if (previousRecord) state.installed[key] = previousRecord;
-		else delete state.installed[key];
+		else if (migratedRecord && legacyRootMigration) {
+		  state.installed[legacyRootMigration.installedKey] = migratedRecord;
+		}
 		throw err;
 	      }
 	      if (!previousRecord) {
 		return () => {
 		  delete state.installed[key];
+		  if (migratedRecord && legacyRootMigration) {
+		    state.installed[legacyRootMigration.installedKey] = migratedRecord;
+		  }
 		  saveState(state);
 		};
 	      }

@@ -513,6 +513,49 @@ describe("provision sync", () => {
     );
   });
 
+  test("keeps the legacy skill live when its migration artifact fails", async () => {
+    const testHome = path.join(stateDir, "failed-migration-home");
+    const legacySkillsDir = path.join(testHome, ".claude", "skills");
+    process.env.HOME = testHome;
+    process.env.PROVISION_SKILLS_DIR = legacySkillsDir;
+    process.env.PROVISION_SKILL_LINK_DIRS = "";
+    process.env.PROVISION_AUTOAPPLY = "auto";
+    initProvisioning();
+    const skill = serveSkill("/legacy-before-failed-migration.tgz", "live legacy skill");
+    registerManifestUrl(serveManifest([{ type: "skill", name: "legacy", ...skill }]));
+    await syncNow();
+
+    const statePath = path.join(stateDir, "provision.lock.json");
+    const legacyState = JSON.parse(readFileSync(statePath, "utf8"));
+    delete legacyState.installed["skill/legacy"].installRoot;
+    writeFileSync(statePath, `${JSON.stringify(legacyState, null, 2)}\n`);
+
+    delete process.env.PROVISION_SKILLS_DIR;
+    delete process.env.PROVISION_SKILL_LINK_DIRS;
+    initProvisioning();
+    registerManifestUrl(serveManifest([{
+      type: "skill",
+      name: "legacy",
+      url: `${baseUrl}/missing-migration-artifact.tgz`,
+      sha256: "a".repeat(64),
+    }]));
+
+    const failed = await syncNow();
+    const legacyTarget = path.join(legacySkillsDir, "legacy");
+    assert.equal(statusOf(failed, "legacy"), "failed");
+    assert.match(failed.data[0]!.error!, /Download failed: HTTP 404/);
+    assert.equal(readFileSync(path.join(legacyTarget, "SKILL.md"), "utf8"), "live legacy skill");
+    assert.equal(lstatSync(legacyTarget).isSymbolicLink(), false);
+    assert.equal(existsSync(path.join(testHome, ".agents", "skills", "legacy")), false);
+    assert.equal(
+      readdirSync(legacySkillsDir).some((entry) => entry.startsWith(".provision-removed-")),
+      false,
+    );
+    const state = JSON.parse(readFileSync(statePath, "utf8"));
+    assert.equal(state.installed["skill/legacy"].installRoot, legacySkillsDir);
+    assert.equal(state.installed["skill/legacy"].removalRecoveryId, undefined);
+  });
+
   test("migrates a legacy root whose interrupted upgrade published the pending snapshot", async () => {
     const testHome = path.join(stateDir, "pending-migration-home");
     const legacySkillsDir = path.join(testHome, ".claude", "skills");
