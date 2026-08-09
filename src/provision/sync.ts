@@ -800,7 +800,6 @@ function removeRecordedSkillLinks(
 function ensureSkillLinks(
   name: string,
   record: InstalledRecord,
-  legacySnapshot: InstalledSnapshot,
   persist: () => void,
 ): InstalledSkillLink[] {
   const target = path.resolve(skillsDir(), name);
@@ -847,23 +846,10 @@ function ensureSkillLinks(
       }
 
       if (pathEntryExists(linkPath)) {
-	// Before Codex support, the default canonical directory was Claude's
-	// discovery directory. Re-home only an exact lockfile-owned snapshot;
-	// the normal removal path retains it in a hidden recovery directory.
-	const legacyDefault = process.env.PROVISION_SKILLS_DIR === undefined
-	  && linkPath === path.join(homedir(), ".claude", "skills", name);
-	if (!legacyDefault || !installedSnapshotMatchesEntireTreeAt(linkPath, legacySnapshot)) {
-	  throw new ProvisionError(
-	    `Refusing to replace untracked content at skill link "${linkPath}"`,
-	    "untracked_content",
-	  );
-	}
-	removeSkill(name, {
-	  skillsDir: path.dirname(linkPath),
-	  files: legacySnapshot.files,
-	  directories: legacySnapshot.directories,
-	  fileHashes: legacySnapshot.fileHashes,
-	});
+	throw new ProvisionError(
+	  `Refusing to replace untracked content at skill link "${linkPath}"`,
+	  "untracked_content",
+	);
       }
       const link = publishSkillLink(linkPath, target, record, persist);
       result.push(link);
@@ -1248,7 +1234,7 @@ function canonicalStateKey(key: string): string {
 /** Bind pre-Codex records to a proven root before either pathname is touched. */
 function discoverLegacySkillInstallRoots(state: ProvisionStateFile): Map<string, string> {
   const failures = new Map<string, string>();
-  if (process.env.PROVISION_SKILLS_DIR !== undefined) return failures;
+  if (process.env.PROVISION_SKILLS_DIR?.trim()) return failures;
   const canonicalRoot = path.resolve(skillsDir());
   const legacyRoot = path.resolve(homedir(), ".claude", "skills");
   if (legacyRoot === canonicalRoot) return failures;
@@ -1589,7 +1575,6 @@ async function runSync(generation: number): Promise<ProvisionStatusView> {
 	  const links = ensureSkillLinks(
 	    item.name,
 	    state.installed[key]!,
-	    state.installed[key]!,
 	    () => saveState(state),
 	  );
 	  state.installed[key]!.skillLinks = links;
@@ -1784,7 +1769,6 @@ async function runSync(generation: number): Promise<ProvisionStatusView> {
 	installedRecord.skillLinks = ensureSkillLinks(
 	  item.name,
 	  installedRecord,
-	  previousRecord ?? installedRecord,
 	  () => saveState(state),
 	);
       }

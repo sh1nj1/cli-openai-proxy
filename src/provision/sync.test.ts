@@ -635,7 +635,7 @@ describe("provision sync", () => {
     const canonical = path.join(canonicalSkillsDir, "legacy");
     mkdirSync(canonical, { recursive: true });
     writeFileSync(path.join(canonical, "SKILL.md"), "same contents");
-    delete process.env.PROVISION_SKILLS_DIR;
+    process.env.PROVISION_SKILLS_DIR = "   ";
     delete process.env.PROVISION_SKILL_LINK_DIRS;
     initProvisioning();
     registerManifestUrl(`${baseUrl}/provision.json`);
@@ -654,6 +654,26 @@ describe("provision sync", () => {
     await deleteItem("skill", "legacy");
     assert.equal(readFileSync(path.join(canonical, "SKILL.md"), "utf8"), "same contents");
     assert.equal(existsSync(path.join(legacySkillsDir, "legacy")), false);
+  });
+
+  test("never infers legacy ownership from a matching Claude skill", async () => {
+    const testHome = path.join(stateDir, "matching-claude-home");
+    const claudeSkill = path.join(testHome, ".claude", "skills", "matching");
+    process.env.HOME = testHome;
+    delete process.env.PROVISION_SKILLS_DIR;
+    delete process.env.PROVISION_SKILL_LINK_DIRS;
+    process.env.PROVISION_AUTOAPPLY = "auto";
+    mkdirSync(claudeSkill, { recursive: true });
+    writeFileSync(path.join(claudeSkill, "SKILL.md"), "identical contents");
+    initProvisioning();
+    const skill = serveSkill("/matching-claude.tgz", "identical contents");
+    registerManifestUrl(serveManifest([{ type: "skill", name: "matching", ...skill }]));
+
+    const refused = await syncNow();
+    assert.equal(statusOf(refused, "matching"), "failed");
+    assert.match(refused.data[0]!.error!, /untracked content at skill link/);
+    assert.equal(lstatSync(claudeSkill).isDirectory(), true);
+    assert.equal(readFileSync(path.join(claudeSkill, "SKILL.md"), "utf8"), "identical contents");
   });
 
   test("refuses an untracked discovery-path collision", async () => {
