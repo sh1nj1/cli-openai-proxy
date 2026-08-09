@@ -565,6 +565,31 @@ describe("provision sync", () => {
     assert.equal(lstatSync(path.join(actualRoot, "deduplicated")).isSymbolicLink(), true);
   });
 
+  test("handles missing discovery-root suffix case using actual filesystem identity", async () => {
+    const parent = path.join(stateDir, "case-folded-discovery-parent");
+    mkdirSync(parent);
+    const probe = path.join(parent, "Case-Probe");
+    mkdirSync(probe);
+    const caseInsensitive = existsSync(path.join(parent, "case-probe"));
+    rmSync(probe, { recursive: true });
+    const firstRoot = path.join(parent, "New-Skills");
+    const secondRoot = path.join(parent, "new-skills");
+    process.env.PROVISION_SKILL_LINK_DIRS = `${firstRoot},${secondRoot}`;
+    process.env.PROVISION_AUTOAPPLY = "auto";
+    initProvisioning();
+    const skill = serveSkill("/case-folded-missing-roots.tgz", "case-folded missing roots");
+    registerManifestUrl(serveManifest([{ type: "skill", name: "deduplicated", ...skill }]));
+
+    assert.equal(statusOf(await syncNow(), "deduplicated"), "installed");
+    assert.equal(statusOf(await syncNow(), "deduplicated"), "installed");
+    const state = JSON.parse(readFileSync(path.join(stateDir, "provision.lock.json"), "utf8"));
+    assert.deepEqual(
+      state.installed["skill/deduplicated"].skillLinks.map((link: { path: string }) => link.path),
+      (caseInsensitive ? [firstRoot] : [firstRoot, secondRoot])
+	.map((root) => path.join(root, "deduplicated")),
+    );
+  });
+
   test("keeps old discovery links when a newly configured root collides", async () => {
     const oldRoot = path.join(stateDir, "old-discovery-root");
     const newRoot = path.join(stateDir, "new-discovery-root");
@@ -807,6 +832,143 @@ describe("provision sync", () => {
     assert.equal(state.installed["skill/migrated"].installRoot, newRoot);
     assert.equal(state.installed["skill/migrated"].skillLinks[0].path, link);
     assert.equal(state.installed["skill/migrated"].skillLinks[0].target, newTarget);
+  });
+
+  test("retains a root-migration journal when a link race blocks rollback", async () => {
+    const oldRoot = path.join(stateDir, "failed-linked-migration-old");
+    const newRoot = path.join(stateDir, "failed-linked-migration-new");
+    const linkRoot = path.join(stateDir, "failed-linked-migration-discovery");
+    process.env.PROVISION_SKILLS_DIR = oldRoot;
+    process.env.PROVISION_SKILL_LINK_DIRS = linkRoot;
+    process.env.PROVISION_AUTOAPPLY = "auto";
+    initProvisioning();
+    const skill = serveSkill("/failed-linked-root-migration.tgz", "live before link race");
+    const manifestUrl = serveManifest([{ type: "skill", name: "migrated", ...skill }]);
+    registerManifestUrl(manifestUrl);
+    assert.equal(statusOf(await syncNow(), "migrated"), "installed");
+
+    const link = path.join(linkRoot, "migrated");
+    const oldTarget = path.join(oldRoot, "migrated");
+    const newTarget = path.join(newRoot, "migrated");
+    process.env.PROVISION_SKILLS_DIR = newRoot;
+    let raced = false;
+    initProvisioning({
+      beforeSkillLinkPublication: (linkPath) => {
+	if (raced || linkPath !== link) return;
+	raced = true;
+	mkdirSync(linkPath);
+	writeFileSync(path.join(linkPath, "USER.md"), "link race winner");
+      },
+    });
+    registerManifestUrl(manifestUrl);
+
+    const failed = await syncNow();
+    assert.equal(statusOf(failed, "migrated"), "failed");
+    assert.match(failed.data[0]!.error!, /discovery-link rollback could not complete/);
+    assert.equal(existsSync(oldTarget), false);
+    assert.equal(readFileSync(path.join(link, "USER.md"), "utf8"), "link race winner");
+    assert.equal(readFileSync(path.join(newTarget, "SKILL.md"), "utf8"), "live before link race");
+    const state = JSON.parse(readFileSync(path.join(stateDir, "provision.lock.json"), "utf8"));
+    assert.equal(state.installed["skill/migrated"].installRoot, newRoot);
+    assert.notEqual(state.installed["skill/migrated"].legacySkillMigration, undefined);
+    assert.notEqual(state.installed["skill/migrated"].skillLinkPublication, undefined);
+    assert.equal(state.removalRecoveries.length, 1);
+    assert.equal(state.upgradeRecoveries.length, 1);
+
+    rmSync(link, { recursive: true });
+    initProvisioning();
+    registerManifestUrl(manifestUrl);
+    assert.equal(statusOf(await syncNow(), "migrated"), "installed");
+    assert.equal(path.resolve(path.dirname(link), readlinkSync(link)), newTarget);
+    const recovered = JSON.parse(readFileSync(path.join(stateDir, "provision.lock.json"), "utf8"));
+    assert.equal(recovered.installed["skill/migrated"].legacySkillMigration, undefined);
+  });
+
+  test("restores the old discovery link when migration publication fails", async () => {
+    const oldRoot = path.join(stateDir, "publication-failure-migration-old");
+    const newRoot = path.join(stateDir, "publication-failure-migration-new");
+    const linkRoot = path.join(stateDir, "publication-failure-migration-discovery");
+    process.env.PROVISION_SKILLS_DIR = oldRoot;
+    process.env.PROVISION_SKILL_LINK_DIRS = linkRoot;
+    process.env.PROVISION_AUTOAPPLY = "auto";
+    initProvisioning();
+    const skill = serveSkill("/publication-failure-migration.tgz", "live before publication failure");
+    const manifestUrl = serveManifest([{ type: "skill", name: "migrated", ...skill }]);
+    registerManifestUrl(manifestUrl);
+    assert.equal(statusOf(await syncNow(), "migrated"), "installed");
+
+    const link = path.join(linkRoot, "migrated");
+    const oldTarget = path.join(oldRoot, "migrated");
+    const oldLinkIdentity = lstatSync(link, { bigint: true }).ino;
+    process.env.PROVISION_SKILLS_DIR = newRoot;
+    initProvisioning({
+      afterSkillLinkPublication: (linkPath) => {
+	if (linkPath === link) throw Object.assign(new Error("simulated ENOSPC"), { code: "ENOSPC" });
+      },
+    });
+    registerManifestUrl(manifestUrl);
+
+    const failed = await syncNow();
+    assert.equal(statusOf(failed, "migrated"), "failed");
+    assert.match(failed.data[0]!.error!, /simulated ENOSPC/);
+    assert.equal(lstatSync(link, { bigint: true }).ino, oldLinkIdentity);
+    assert.equal(path.resolve(path.dirname(link), readlinkSync(link)), oldTarget);
+    assert.equal(
+      readFileSync(path.join(oldTarget, "SKILL.md"), "utf8"),
+      "live before publication failure",
+    );
+    const state = JSON.parse(readFileSync(path.join(stateDir, "provision.lock.json"), "utf8"));
+    assert.equal(state.installed["skill/migrated"].installRoot, oldRoot);
+    assert.equal(state.installed["skill/migrated"].legacySkillMigration, undefined);
+    assert.equal(state.installed["skill/migrated"].skillLinks[0].ino, oldLinkIdentity.toString());
+  });
+
+  test("retains the migration journal when discovery-link rollback cannot complete", {
+    skip: process.platform === "win32",
+  }, async () => {
+    const oldRoot = path.join(stateDir, "rollback-failure-migration-old");
+    const newRoot = path.join(stateDir, "rollback-failure-migration-new");
+    const linkRoot = path.join(stateDir, "rollback-failure-migration-discovery");
+    process.env.PROVISION_SKILLS_DIR = oldRoot;
+    process.env.PROVISION_SKILL_LINK_DIRS = linkRoot;
+    process.env.PROVISION_AUTOAPPLY = "auto";
+    initProvisioning();
+    const skill = serveSkill("/rollback-failure-migration.tgz", "migration journal retained");
+    const manifestUrl = serveManifest([{ type: "skill", name: "migrated", ...skill }]);
+    registerManifestUrl(manifestUrl);
+    assert.equal(statusOf(await syncNow(), "migrated"), "installed");
+
+    const link = path.join(linkRoot, "migrated");
+    const newTarget = path.join(newRoot, "migrated");
+    process.env.PROVISION_SKILLS_DIR = newRoot;
+    initProvisioning({
+      afterSkillLinkPublication: (linkPath) => {
+	if (linkPath !== link) return;
+	chmodSync(linkRoot, 0o500);
+	throw new Error("simulated post-publication failure");
+      },
+    });
+    registerManifestUrl(manifestUrl);
+
+    try {
+      const failed = await syncNow();
+      assert.equal(statusOf(failed, "migrated"), "failed");
+      assert.match(failed.data[0]!.error!, /discovery-link rollback could not complete/);
+      assert.equal(path.resolve(path.dirname(link), readlinkSync(link)), newTarget);
+      assert.equal(readFileSync(path.join(newTarget, "SKILL.md"), "utf8"), "migration journal retained");
+      const retained = JSON.parse(readFileSync(path.join(stateDir, "provision.lock.json"), "utf8"));
+      assert.notEqual(retained.installed["skill/migrated"].legacySkillMigration, undefined);
+      assert.equal(retained.removalRecoveries.length, 1);
+    } finally {
+      chmodSync(linkRoot, 0o700);
+    }
+
+    initProvisioning();
+    registerManifestUrl(manifestUrl);
+    assert.equal(statusOf(await syncNow(), "migrated"), "installed");
+    const recovered = JSON.parse(readFileSync(path.join(stateDir, "provision.lock.json"), "utf8"));
+    assert.equal(recovered.installed["skill/migrated"].legacySkillMigration, undefined);
+    assert.equal(path.resolve(path.dirname(link), readlinkSync(link)), newTarget);
   });
 
   test("repairs a missing legacy skill while migrating to the shared Codex source", async () => {
@@ -1174,6 +1336,10 @@ describe("provision sync", () => {
 	    dev: linkStat.dev.toString(),
 	    ino: linkStat.ino.toString(),
 	  }],
+	  skillLinkPublication: {
+	    path: link,
+	    target: canonical,
+	  },
 	},
       },
     }));

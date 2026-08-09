@@ -159,6 +159,8 @@ let shutdownPromise: Promise<void> | null = null;
 let afterFirstInstallMove: ((target: string) => void) | undefined;
 let beforeSkillCandidateMove: ((target: string) => void) | undefined;
 let afterFirstInstallReconciliationIdentityCheck: ((target: string) => void) | undefined;
+let beforeSkillLinkPublication: ((linkPath: string) => void) | undefined;
+let afterSkillLinkPublication: ((linkPath: string) => void) | undefined;
 let afterRemovalAudit: ((target: string) => void) | undefined;
 let afterRemovalIsolation: ((target: string) => void) | undefined;
 let afterConfigRemoval: ((target: string) => void) | undefined;
@@ -168,6 +170,17 @@ class SupersededSyncError extends Error {
   constructor() {
     super("Provisioning sync was superseded by a newer manifest URL.");
     this.name = "SupersededSyncError";
+  }
+}
+
+class SkillLinkRollbackError extends Error {
+  constructor(original: unknown, rollbackErrors: unknown[]) {
+    const originalMessage = original instanceof Error ? original.message : String(original);
+    const rollbackMessage = rollbackErrors
+      .map((error) => error instanceof Error ? error.message : String(error))
+      .join("; ");
+    super(`${originalMessage}; discovery-link rollback could not complete: ${rollbackMessage}`);
+    this.name = "SkillLinkRollbackError";
   }
 }
 
@@ -291,6 +304,10 @@ export function initProvisioning(hooks: {
   beforeSkillCandidateMove?: (target: string) => void;
   /** Test seam for a namespace swap after restart reconciliation checks identity. */
   afterFirstInstallReconciliationIdentityCheck?: (target: string) => void;
+  /** Test seam for a discovery-path race after link preflight. */
+  beforeSkillLinkPublication?: (linkPath: string) => void;
+  /** Test seam for a state-save failure after a discovery link is exposed. */
+  afterSkillLinkPublication?: (linkPath: string) => void;
   /** Test seam for a namespace mutation after removal validates ownership. */
   afterRemovalAudit?: (target: string) => void;
   /** Test seam for a namespace mutation after removal isolates the owned root. */
@@ -307,6 +324,8 @@ export function initProvisioning(hooks: {
   afterFirstInstallMove = hooks.afterFirstInstallMove;
   beforeSkillCandidateMove = hooks.beforeSkillCandidateMove;
   afterFirstInstallReconciliationIdentityCheck = hooks.afterFirstInstallReconciliationIdentityCheck;
+  beforeSkillLinkPublication = hooks.beforeSkillLinkPublication;
+  afterSkillLinkPublication = hooks.afterSkillLinkPublication;
   afterRemovalAudit = hooks.afterRemovalAudit;
   afterRemovalIsolation = hooks.afterRemovalIsolation;
   afterConfigRemoval = hooks.afterConfigRemoval;
@@ -736,7 +755,7 @@ function samePathEntryIdentity(left: string, right: string): boolean {
   }
 }
 
-function isolateRecordedSkillLink(link: InstalledSkillLink): boolean {
+function retainRecordedSkillLink(link: InstalledSkillLink): string | undefined {
   const quarantine = path.join(
     path.dirname(link.path),
     `.provision-link-${randomBytes(16).toString("hex")}`,
@@ -748,16 +767,17 @@ function isolateRecordedSkillLink(link: InstalledSkillLink): boolean {
 	    renameSync(link.path, quarantine);
 	    return true;
 	  } catch (err) {
-	    if ((err as NodeJS.ErrnoException).code === "ENOENT") return false;
+	    if ((err as NodeJS.ErrnoException).code === "ENOENT") return undefined;
 	    throw err;
 	  }
 	})()
       : renameDirectoryNoReplace(link.path, quarantine);
+    if (moved === undefined) return undefined;
     if (!moved) {
       throw new ProvisionError(`Skill link recovery path already exists for "${link.path}"`, "untracked_content");
     }
   } catch (err) {
-    if ((err as NodeJS.ErrnoException).code === "ENOENT") return false;
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") return undefined;
     throw err;
   }
 
@@ -773,7 +793,43 @@ function isolateRecordedSkillLink(link: InstalledSkillLink): boolean {
       "untracked_content",
     );
   }
+  return quarantine;
+}
+
+function restoreRetainedSkillLink(link: InstalledSkillLink, quarantine: string): void {
+  const restored = process.platform === "win32"
+    ? (() => {
+	try {
+	  renameSync(quarantine, link.path);
+	  return true;
+	} catch (err) {
+	  if ((err as NodeJS.ErrnoException).code === "EEXIST") return false;
+	  throw err;
+	}
+      })()
+    : renameDirectoryNoReplace(quarantine, link.path);
+  if (!restored || !sameSkillLinkIdentity(link.path, link)) {
+    throw new ProvisionError(
+      `Could not restore retained skill link "${link.path}"`,
+      "untracked_content",
+    );
+  }
+}
+
+function discardRetainedSkillLink(link: InstalledSkillLink, quarantine: string): void {
+  if (!sameSkillLinkIdentity(quarantine, link)) {
+    throw new ProvisionError(
+      `Retained skill link "${link.path}" changed before cleanup`,
+      "untracked_content",
+    );
+  }
   unlinkSync(quarantine);
+}
+
+function isolateRecordedSkillLink(link: InstalledSkillLink): boolean {
+  const quarantine = retainRecordedSkillLink(link);
+  if (!quarantine) return false;
+  discardRetainedSkillLink(link, quarantine);
   return true;
 }
 
@@ -817,6 +873,16 @@ function finishSkillLinkPublication(
   if (!publication) return undefined;
   let link: InstalledSkillLink | undefined;
   if (pathEntryExists(publication.path)) {
+    const retained = (record.skillLinks ?? []).find((entry) =>
+      sameSkillLinkIdentity(publication.path, entry));
+    if (retained && retained.target !== publication.target) {
+      // A failed retarget can durably preclaim the new target but restore the
+      // exact old link before its cleanup save fails. Withdraw only that stale
+      // intent; normal reconciliation below will safely retarget the owned inode.
+      delete record.skillLinkPublication;
+      persist();
+      return undefined;
+    }
     link = adoptPublishedSkillLink(publication.path, publication.target);
   } else if (publishIfMissing) {
     link = createSkillLink(publication.path, publication.target);
@@ -842,6 +908,7 @@ function publishSkillLink(
   if (record.skillLinkPublication) {
     throw new ProvisionError("Another skill link publication is still pending", "untracked_content");
   }
+  beforeSkillLinkPublication?.(linkPath);
   record.skillLinkPublication = { path: linkPath, target };
   // The durable intent makes an exact link recoverable if publication or the
   // following identity save is interrupted.
@@ -852,7 +919,15 @@ function publishSkillLink(
     link,
   ];
   delete record.skillLinkPublication;
-  persist();
+  try {
+    afterSkillLinkPublication?.(linkPath);
+    persist();
+  } catch (err) {
+    // Keep the in-memory journal aligned with the durable pre-publication save
+    // so the caller can remove this exact exposed link before rolling back.
+    record.skillLinkPublication = { path: linkPath, target };
+    throw err;
+  }
   return link;
 }
 
@@ -951,8 +1026,10 @@ function ensureSkillLinks(
 
   const result: InstalledSkillLink[] = [];
   const created: InstalledSkillLink[] = [];
+  const retained: Array<{ link: InstalledSkillLink; quarantine: string }> = [];
   try {
     for (const linkPath of desiredPaths) {
+      if (result.some((link) => samePathEntryIdentity(linkPath, link.path))) continue;
       const owned = desiredOwnership.get(linkPath);
       if (owned) {
 	if (!pathEntryExists(linkPath)) {
@@ -976,7 +1053,8 @@ function ensureSkillLinks(
 	    : adoptPublishedSkillLink(linkPath, owned.target));
 	  continue;
 	}
-	isolateRecordedSkillLink(owned);
+	const quarantine = retainRecordedSkillLink(owned);
+	if (quarantine) retained.push({ link: owned, quarantine });
 	const replacement = publishSkillLink(linkPath, target, record, persist);
 	result.push(replacement);
 	created.push(replacement);
@@ -997,17 +1075,54 @@ function ensureSkillLinks(
       if (matchedRecordedLinks.has(link)) continue;
       isolateRecordedSkillLink(link);
     }
+    for (const entry of retained) discardRetainedSkillLink(entry.link, entry.quarantine);
     return result;
   } catch (err) {
+    const rollbackErrors: unknown[] = [];
+    const interrupted = record.skillLinkPublication;
+    if (interrupted && pathEntryExists(interrupted.path)) {
+      try {
+	const published = (record.skillLinks ?? []).find((link) =>
+	  link.path === interrupted.path
+	    && link.target === interrupted.target
+	    && sameSkillLinkIdentity(interrupted.path, link));
+	if (published) isolateRecordedSkillLink(published);
+      } catch (rollbackError) {
+	// Preserve any path that cannot be proven to be this publication.
+	rollbackErrors.push(rollbackError);
+      }
+    }
     for (const link of created.reverse()) {
       try {
 	isolateRecordedSkillLink(link);
 	record.skillLinks = (record.skillLinks ?? []).filter((entry) => entry.path !== link.path);
-      } catch {
+      } catch (rollbackError) {
 	// Preserve an entry that changed before rollback.
+	rollbackErrors.push(rollbackError);
       }
     }
-    if (created.length > 0) persist();
+    for (const entry of retained.reverse()) {
+      try {
+	restoreRetainedSkillLink(entry.link, entry.quarantine);
+      } catch (rollbackError) {
+	// Preserve the retained link at its recovery pathname if its original
+	// pathname was claimed or changed during rollback.
+	rollbackErrors.push(rollbackError);
+      }
+    }
+    if (rollbackErrors.length > 0) throw new SkillLinkRollbackError(err, rollbackErrors);
+    delete record.skillLinkPublication;
+    record.skillLinks = recordedLinks;
+    if (created.length > 0 || retained.length > 0 || interrupted) {
+      try {
+	persist();
+      } catch (persistError) {
+	// Keep the canonical candidate and migration journal aligned with the
+	// durable pre-publication state. Startup can withdraw a stale intent after
+	// proving the exact old link inode was restored.
+	throw new SkillLinkRollbackError(err, [persistError]);
+      }
+    }
     throw err;
   }
 }
@@ -1430,6 +1545,27 @@ function restoreLegacySkillMigration(
       : {}),
   };
   finalizeRemovalRecoveries(state);
+}
+
+/** Reject an exposed canonical candidate and restore its exact legacy migration tree. */
+function rollbackLegacySkillMigration(
+  state: ProvisionStateFile,
+  key: string,
+  record: InstalledRecord,
+): void {
+  const name = key.slice(key.indexOf("/") + 1);
+  const installRoot = skillInstallRoot(record);
+  if (targetMatchesCandidateIdentity(name, record.candidateIdentity, installRoot)) {
+    isolateRejectedCandidate(
+      path.join(installRoot, name),
+      name,
+      installRoot,
+      record.rejectionRecoveryId,
+      record.candidateIdentity,
+    );
+  }
+  delete record.skillLinkPublication;
+  restoreLegacySkillMigration(state, key, record);
 }
 
 function reconcileUpgradeJournal(name: string, record: InstalledRecord): InstalledRecord {
@@ -2202,13 +2338,13 @@ async function runSync(generation: number): Promise<ProvisionStatusView> {
 	  );
 	}
       } finally {
-	finalizeUpgradeRecoveries(state);
+	if (!state.installed[key]?.legacySkillMigration) finalizeUpgradeRecoveries(state);
       }
       }
       // Finalizing drops the upgrade journal. If this save later fails, the
       // persisted stable+pending pair lets the next sync recognize either side.
       const linkOwnershipRecord = item.type === "skill" ? state.installed[key] : previousRecord;
-      state.installed[key] = {
+      const completedRecord: InstalledRecord = {
 	sha256: fingerprint,
 	...(source ? { source } : {}),
 	files: result.files,
@@ -2223,13 +2359,27 @@ async function runSync(generation: number): Promise<ProvisionStatusView> {
       };
 
       if (item.type === "skill") {
-	const installedRecord = state.installed[key]!;
-	installedRecord.skillLinks = ensureSkillLinks(
+	// Keep a root-migration journal durable until discovery fanout commits. A
+	// publication failure can then reject the candidate and restore the exact
+	// legacy tree instead of degrading into an ordinary upgrade journal.
+	const installedRecord = linkOwnershipRecord?.legacySkillMigration
+	  ? linkOwnershipRecord
+	  : completedRecord;
+	state.installed[key] = installedRecord;
+	const links = ensureSkillLinks(
 	  item.name,
 	  installedRecord,
 	  () => saveState(state),
 	);
+	completedRecord.skillLinks = links;
+	if (installedRecord.skillLinkPublication) {
+	  completedRecord.skillLinkPublication = installedRecord.skillLinkPublication;
+	} else {
+	  delete completedRecord.skillLinkPublication;
+	}
       }
+      state.installed[key] = completedRecord;
+      if (item.type === "skill") finalizeUpgradeRecoveries(state);
       if (!state.approved.includes(key)) state.approved.push(key);
       views.push({
 	type: item.type,
@@ -2240,15 +2390,25 @@ async function runSync(generation: number): Promise<ProvisionStatusView> {
     } catch (err) {
       if (err instanceof SupersededSyncError) throw err;
       const journal = state.installed[key];
-      if (journal?.pending) {
+      let failure = err;
+      if (journal?.legacySkillMigration && !(failure instanceof SkillLinkRollbackError)) {
+	try {
+	  rollbackLegacySkillMigration(state, key, journal);
+	} catch (rollbackError) {
+	  failure = rollbackError;
+	}
+      } else if (journal?.pending) {
 	state.installed[key] = item.type === "config"
 	  ? reconcileConfigUpgradeJournal(item.name, journal)
 	  : reconcileUpgradeJournal(item.name, journal);
       }
+      if (item.type === "skill" && !state.installed[key]?.legacySkillMigration) {
+	finalizeUpgradeRecoveries(state);
+      }
       if (item.type === "config" && state.installed[key]?.uncommitted) {
 	reconcileFirstInstallJournals(state);
       }
-      const message = err instanceof Error ? err.message : String(err);
+      const message = failure instanceof Error ? failure.message : String(failure);
       views.push({
 	type: item.type,
 	name: item.name,
@@ -2482,6 +2642,8 @@ function clearProvisioningState(): void {
   afterFirstInstallMove = undefined;
   beforeSkillCandidateMove = undefined;
   afterFirstInstallReconciliationIdentityCheck = undefined;
+  beforeSkillLinkPublication = undefined;
+  afterSkillLinkPublication = undefined;
   afterRemovalAudit = undefined;
   afterRemovalIsolation = undefined;
   afterConfigRemoval = undefined;
