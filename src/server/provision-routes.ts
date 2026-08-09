@@ -79,8 +79,17 @@ export async function handleProvisionSync(_req: Request, res: Response): Promise
 
 /** POST /v1/provision/items/:type/:name/approve — lift the TOFU stop for one item. */
 export async function handleProvisionApprove(req: Request, res: Response): Promise<void> {
+  const adopt = (req.body as { adopt?: unknown } | undefined)?.adopt;
+  if (adopt !== undefined && typeof adopt !== "boolean") {
+    fail(res, 400, "`adopt` must be a boolean", "invalid_item");
+    return;
+  }
   try {
-    res.json(await approveItem(String(req.params.type ?? ""), String(req.params.name ?? "")));
+    res.json(await approveItem(
+      String(req.params.type ?? ""),
+      String(req.params.name ?? ""),
+      { adopt: adopt === true },
+    ));
   } catch (err) {
     sendError(res, err);
   }

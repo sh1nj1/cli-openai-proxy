@@ -75,6 +75,17 @@ describe("provision state", () => {
     assert.deepEqual(loadState(), state);
   });
 
+  test("round-trips canonical adopt grants and drops malformed entries", () => {
+    saveState({
+      version: 1,
+      approved: [],
+      revoked: [],
+      adopted: ["config/collavre", "Config/Collavre", "not-a-key", "a/b/c"],
+      installed: {},
+    });
+    assert.deepEqual(loadState().adopted, ["config/collavre"]);
+  });
+
   test("a pre-branch git source treats its pinned revision as both ref and commit", () => {
     mkdirSync(path.dirname(stateFilePath()), { recursive: true });
     writeFileSync(stateFilePath(), JSON.stringify({
@@ -141,6 +152,11 @@ describe("provision state", () => {
 	  installedAt: "2026-08-02T00:00:00.000Z",
 	  uncommitted: true as const,
 	  candidateIdentity: { dev: "123", ino: "456" },
+	  configCandidate: {
+	    name: `.provision-config-candidate-${"e".repeat(32)}`,
+	    dev: "789",
+	    ino: "1011",
+	  },
 	  installMarker: "c".repeat(32),
 	  rejectionRecoveryId: "d".repeat(32),
 	},

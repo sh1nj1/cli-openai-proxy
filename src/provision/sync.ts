@@ -44,6 +44,11 @@ import {
   resolveGitRevision,
 } from "./installer.js";
 import {
+  discardConfigCandidate,
+  installConfig,
+  removeConfig,
+} from "./config-installer.js";
+import {
   loadRegisteredManifestUrl,
   loadOrCreateLocalManifestKey,
   loadState,
@@ -145,6 +150,7 @@ let afterFirstInstallMove: ((target: string) => void) | undefined;
 let afterFirstInstallReconciliationIdentityCheck: ((target: string) => void) | undefined;
 let afterRemovalAudit: ((target: string) => void) | undefined;
 let afterRemovalIsolation: ((target: string) => void) | undefined;
+let perUserWorkers = false;
 
 class SupersededSyncError extends Error {
   constructor() {
@@ -177,6 +183,15 @@ function skillsDir(): string {
   return process.env.PROVISION_SKILLS_DIR?.trim() || path.join(homedir(), ".claude", "skills");
 }
 
+function configDir(): string {
+  // Collavre reads ~/.config directly; honoring XDG here would split producer and consumer paths.
+  return process.env.PROVISION_CONFIG_DIR?.trim() || path.join(homedir(), ".config");
+}
+
+function itemRoot(type: string, name: string): string {
+  return path.join(type === "config" ? configDir() : skillsDir(), name);
+}
+
 function refetchMs(): number {
   const raw = process.env.PROVISION_REFETCH_MS;
   if (raw === undefined || raw === "") return DEFAULT_REFETCH_MS;
@@ -185,6 +200,8 @@ function refetchMs(): number {
 }
 
 export function initProvisioning(hooks: {
+  /** Gate credentials out of a shared gateway HOME when workers own user scope. */
+  perUserWorkers?: boolean;
   /** Test seam for a mutation immediately after a first install is exposed. */
   afterFirstInstallMove?: (target: string) => void;
   /** Test seam for a namespace swap after restart reconciliation checks identity. */
@@ -199,6 +216,7 @@ export function initProvisioning(hooks: {
   manifestUrl: string | null;
 } {
   resetProvisioning();
+  perUserWorkers = hooks.perUserWorkers === true;
   afterFirstInstallMove = hooks.afterFirstInstallMove;
   afterFirstInstallReconciliationIdentityCheck = hooks.afterFirstInstallReconciliationIdentityCheck;
   afterRemovalAudit = hooks.afterRemovalAudit;
@@ -218,6 +236,7 @@ export function initProvisioning(hooks: {
   // Consume even while provisioning is disabled: a signed URL left in the
   // gateway environment is readable through /proc by same-uid CLI children.
   const fixed = takeProxySecret("PROVISION_MANIFEST_URL")?.trim();
+  if (perUserWorkers) removeGatewayConfigState();
   if (enabled) {
     // What the lockfile already records survives a restart in the status view,
     // so an operator sees their installs before (and without) the next sync.
@@ -352,8 +371,22 @@ function installedSnapshotIntactAt(root: string, record: InstalledSnapshot): boo
   }
 }
 
-function installedRecordIntact(name: string, record: InstalledSnapshot): boolean {
-  return installedSnapshotIntactAt(path.join(skillsDir(), name), record);
+function configSnapshotIntact(name: string, record: InstalledSnapshot): boolean {
+  const root = itemRoot("config", name);
+  if (!installedSnapshotIntactAt(root, record)) return false;
+  try {
+    if ((lstatSync(root).mode & 0o777) !== 0o700) return false;
+    return record.files.every((relative) =>
+      (lstatSync(path.join(root, relative)).mode & 0o777) === 0o600);
+  } catch {
+    return false;
+  }
+}
+
+function installedRecordIntact(type: string, name: string, record: InstalledSnapshot): boolean {
+  return type === "config"
+    ? configSnapshotIntact(name, record)
+    : installedSnapshotIntactAt(itemRoot(type, name), record);
 }
 
 function hasInterruptedRemovalForRecord(
@@ -405,11 +438,140 @@ function installedRecordMatchesEntireTree(name: string, record: InstalledSnapsho
   return installedSnapshotMatchesEntireTreeAt(path.join(skillsDir(), name), record);
 }
 
+function configSnapshotComplete(
+  name: string,
+  snapshot: InstalledSnapshot,
+  other: InstalledSnapshot,
+): boolean {
+  const root = itemRoot("config", name);
+  if (!configSnapshotIntact(name, snapshot)) return false;
+  return other.files
+    .filter((file) => !snapshot.files.includes(file))
+    .every((file) => !existsSync(path.join(root, file)));
+}
+
+function publishedConfigCandidateIntact(
+  name: string,
+  snapshot: InstalledSnapshot,
+  record: InstalledRecord,
+): boolean {
+  if (!record.candidateIdentity || !record.configCandidate
+    || snapshot.files.length !== 1 || snapshot.files[0] !== "config.json"
+    || snapshot.fileHashes?.["config.json"] === undefined) return false;
+  const target = itemRoot("config", name);
+  let targetFd: number | undefined;
+  let fileFd: number | undefined;
+  try {
+    targetFd = openSync(
+      target,
+      fsConstants.O_RDONLY | fsConstants.O_DIRECTORY | fsConstants.O_NOFOLLOW,
+    );
+    const targetStat = fstatSync(targetFd, { bigint: true });
+    if (targetStat.dev.toString() !== record.candidateIdentity.dev
+      || targetStat.ino.toString() !== record.candidateIdentity.ino
+      || (targetStat.mode & 0o777n) !== 0o700n) return false;
+    fileFd = openSync(
+      path.join(target, "config.json"),
+      fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW,
+    );
+    const fileStat = fstatSync(fileFd, { bigint: true });
+    if (fileStat.dev.toString() !== record.configCandidate.dev
+      || fileStat.ino.toString() !== record.configCandidate.ino
+      || (fileStat.mode & 0o777n) !== 0o600n) return false;
+    const digest = createHash("sha256").update(readFileSync(fileFd)).digest("hex");
+    if (digest !== snapshot.fileHashes["config.json"]) return false;
+    const canonicalTarget = lstatSync(target, { bigint: true });
+    const canonicalFile = lstatSync(path.join(target, "config.json"), { bigint: true });
+    return canonicalTarget.dev === targetStat.dev
+      && canonicalTarget.ino === targetStat.ino
+      && canonicalFile.dev === fileStat.dev
+      && canonicalFile.ino === fileStat.ino;
+  } catch {
+    return false;
+  } finally {
+    if (fileFd !== undefined) closeSync(fileFd);
+    if (targetFd !== undefined) closeSync(targetFd);
+  }
+}
+
+function configTargetIdentityMatches(name: string, record: InstalledRecord): boolean {
+  if (!record.candidateIdentity) return false;
+  try {
+    const stat = lstatSync(itemRoot("config", name), { bigint: true });
+    return stat.isDirectory()
+      && stat.dev.toString() === record.candidateIdentity.dev
+      && stat.ino.toString() === record.candidateIdentity.ino;
+  } catch {
+    return false;
+  }
+}
+
+function reconcileConfigUpgradeJournal(name: string, record: InstalledRecord): InstalledRecord {
+  if (!record.pending) return record;
+  if (configSnapshotComplete(name, record.pending, record)
+    && publishedConfigCandidateIntact(name, record.pending, record)) return { ...record.pending };
+  if (configSnapshotComplete(name, record, record.pending)
+    && configTargetIdentityMatches(name, record)
+    && discardRecordedConfigCandidate(name, record)) {
+    return { ...stableSnapshot(record) };
+  }
+  return record;
+}
+
+function configOwnedFiles(record: InstalledRecord): string[] {
+  return [...new Set([
+    ...record.files,
+    ...(record.pending?.files ?? []),
+  ])];
+}
+
+function discardRecordedConfigCandidate(name: string, record: InstalledRecord): boolean {
+  if (!record.candidateIdentity && !record.configCandidate) return true;
+  return discardConfigCandidate(name, {
+    configDir: configDir(),
+    targetIdentity: record.candidateIdentity,
+    candidate: record.configCandidate,
+  });
+}
+
+function configRecordForRemoval(name: string, record: InstalledRecord): InstalledRecord {
+  const reconciled = record.pending ? reconcileConfigUpgradeJournal(name, record) : record;
+  if (reconciled.uncommitted || reconciled.pending) {
+    throw new ProvisionError(
+      `Cannot remove "${name}" until its interrupted config journal is resolved`,
+      "untracked_content",
+    );
+  }
+  return reconciled;
+}
+
+function removeGatewayConfigState(): void {
+  const state = loadState();
+  reconcileFirstInstallJournals(state);
+  let changed = false;
+  for (const [key, record] of Object.entries(state.installed)) {
+    if (!key.startsWith("config/")) continue;
+    const name = key.slice("config/".length);
+    const removable = configRecordForRemoval(name, record);
+    removeConfig(name, { configDir: configDir(), files: configOwnedFiles(removable) });
+    delete state.installed[key];
+    changed = true;
+  }
+  const adopted = state.adopted ?? [];
+  const retainedAdopted = adopted.filter((key) => !key.startsWith("config/"));
+  if (retainedAdopted.length !== adopted.length) {
+    state.adopted = retainedAdopted;
+    changed = true;
+  }
+  if (changed) saveState(state);
+}
+
 function stableSnapshot(record: InstalledRecord): InstalledSnapshot {
   const {
     pending: _pending,
     uncommitted: _uncommitted,
     candidateIdentity: _candidateIdentity,
+    configCandidate: _configCandidate,
     installMarker: _installMarker,
     rejectionRecoveryId: _rejectionRecoveryId,
     removalRecoveryId: _removalRecoveryId,
@@ -526,6 +688,24 @@ function reconcileFirstInstallJournals(state: ProvisionStateFile): Set<string> {
   const rejected = new Set<string>();
   for (const [key, record] of Object.entries(state.installed)) {
     if (!record.uncommitted) continue;
+    if (key.startsWith("config/")) {
+      const name = key.slice(key.indexOf("/") + 1);
+      if (publishedConfigCandidateIntact(name, record, record)) {
+	const next = { ...record };
+	delete next.uncommitted;
+	delete next.candidateIdentity;
+	delete next.configCandidate;
+	state.installed[key] = next;
+      } else {
+	if (discardRecordedConfigCandidate(name, record)) {
+	  delete state.installed[key];
+	  rejected.add(key);
+	}
+      }
+      changed = true;
+      continue;
+    }
+    if (!key.startsWith("skill/")) continue;
     const name = key.slice(key.indexOf("/") + 1);
     const target = path.join(skillsDir(), name);
     const { originalCandidateIsTarget, contentsMatch } = auditFirstInstallCandidate(name, record);
@@ -567,6 +747,7 @@ function reconcileFirstInstallJournals(state: ProvisionStateFile): Set<string> {
 
   changed = false;
   for (const [key, record] of Object.entries(state.installed)) {
+    if (!key.startsWith("skill/")) continue;
     if (record.uncommitted || !record.installMarker) continue;
     const name = key.slice(key.indexOf("/") + 1);
     const marker = record.installMarker;
@@ -804,6 +985,36 @@ async function runSync(generation: number): Promise<ProvisionStatusView> {
       continue;
     }
 
+    if (item.type === "config" && perUserWorkers) {
+      const installed = state.installed[key];
+      if (installed) {
+	try {
+	  removeConfig(item.name, { configDir: configDir(), files: configOwnedFiles(installed) });
+	  delete state.installed[key];
+	  saveState(state);
+	} catch (err) {
+	  views.push({
+	    type: item.type,
+	    name: item.name,
+	    status: "failed",
+	    ...itemSourceView(item),
+	    error: `config items install per-user; gateway copy removal failed: ${
+	      err instanceof Error ? err.message : String(err)
+	    }`,
+	  });
+	  continue;
+	}
+      }
+      views.push({
+	type: item.type,
+	name: item.name,
+	status: "failed",
+	...itemSourceView(item),
+	error: "config items install per-user; enable PROVISION_SYNC on the worker unit instead",
+      });
+      continue;
+    }
+
     const migrationFailure = legacyMigrationFailures.get(key);
     if (migrationFailure) {
       views.push({
@@ -816,8 +1027,21 @@ async function runSync(generation: number): Promise<ProvisionStatusView> {
       continue;
     }
 
+    if (state.installed[key]?.uncommitted) {
+      views.push({
+	type: item.type,
+	name: item.name,
+	status: "failed",
+	...itemSourceView(item),
+	error: `Cannot install "${item.name}" until its interrupted ownership journal is resolved`,
+      });
+      continue;
+    }
+
     if (state.installed[key]?.pending) {
-      const reconciled = reconcileUpgradeJournal(item.name, state.installed[key]!);
+      const reconciled = item.type === "config"
+	? reconcileConfigUpgradeJournal(item.name, state.installed[key]!)
+	: reconcileUpgradeJournal(item.name, state.installed[key]!);
       state.installed[key] = reconciled;
       if (reconciled.pending) {
 	views.push({
@@ -845,9 +1069,19 @@ async function runSync(generation: number): Promise<ProvisionStatusView> {
       continue;
     }
 
+    const adoptKey = item.type === "config" && (state.adopted ?? []).includes(key);
+    if (adoptKey) {
+      state.adopted = (state.adopted ?? []).filter((entry) => entry !== key);
+      // Adoption is authority for this sync attempt, including an idempotent
+      // one; it must never linger until unrelated future drift.
+      saveState(state);
+    }
+
     // The install target belongs to the lockfile boundary: a directory we did
     // not record is someone else's, and a name collision must not overwrite it.
-    if (!(key in state.installed) && existsSync(path.join(skillsDir(), item.name))) {
+    if (item.type === "skill"
+      && !(key in state.installed)
+      && existsSync(path.join(skillsDir(), item.name))) {
       views.push({
         type: item.type,
         name: item.name,
@@ -862,7 +1096,7 @@ async function runSync(generation: number): Promise<ProvisionStatusView> {
     let resolvedGitRevision: string | undefined;
     try {
       if (item.git) resolvedGitRevision = await resolveGitRevision(item.git, checkUrl);
-      else checkUrl(item.url!);
+      else if (item.type !== "config") checkUrl(item.url!);
 
       // Branches are resolved on every sync. The resolved commit participates
       // in idempotency, so a moved branch upgrades while an unchanged one does
@@ -870,8 +1104,9 @@ async function runSync(generation: number): Promise<ProvisionStatusView> {
       const fingerprint = itemFingerprint(item, resolvedGitRevision);
       const source = installedSource(item, resolvedGitRevision);
       if (state.installed[key]?.sha256 === fingerprint
+	&& !state.installed[key]!.pending
 	&& !state.installed[key]!.installMarker
-	&& installedRecordIntact(item.name, state.installed[key]!)) {
+	&& installedRecordIntact(item.type, item.name, state.installed[key]!)) {
 	if (state.installed[key]!.removalRecoveryId) {
 	  delete state.installed[key]!.removalRecoveryId;
 	  finalizeRemovalRecoveries(state);
@@ -892,6 +1127,58 @@ async function runSync(generation: number): Promise<ProvisionStatusView> {
       const managedFiles = previousRecord
 	? [...new Set([...previousRecord.files, ...(previousRecord.pending?.files ?? [])])]
 	: undefined;
+      let result: {
+	files: string[];
+	directories?: string[];
+	fileHashes: Record<string, string>;
+      };
+      if (item.type === "config") {
+	result = await installConfig(
+	  { name: item.name, url: item.url!, sha256: item.sha256! },
+	  {
+	    configDir: configDir(),
+	    checkUrl,
+	    beforeMutation: () => assertCurrentGeneration(generation),
+	    managedFiles,
+	    adopt: adoptKey,
+	    beforeCommit: (candidate, journal) => {
+	      const candidateRecord: InstalledSnapshot = {
+		sha256: fingerprint,
+		files: candidate.files,
+		directories: [],
+		fileHashes: candidate.fileHashes,
+		installedAt: new Date().toISOString(),
+	      };
+	      state.installed[key] = previousRecord
+		? {
+		    ...stableSnapshot(previousRecord),
+		    pending: candidateRecord,
+		    candidateIdentity: journal.targetIdentity,
+		    configCandidate: journal.candidate,
+		  }
+		: {
+		    ...candidateRecord,
+		    uncommitted: true,
+		    candidateIdentity: journal.targetIdentity,
+		    configCandidate: journal.candidate,
+		  };
+	      try {
+		saveState(state);
+	      } catch (err) {
+		if (previousRecord) state.installed[key] = previousRecord;
+		else delete state.installed[key];
+		throw err;
+	      }
+	    },
+	  },
+	);
+	if (!previousRecord && reconcileFirstInstallJournals(state).has(key)) {
+	  throw new ProvisionError(
+	    `First installation of "${item.name}" changed before ownership could be finalized`,
+	    "untracked_content",
+	  );
+	}
+      } else {
       const managedDirectories = previousRecord && previousRecord.directories !== undefined
 	&& (!previousRecord.pending || previousRecord.pending.directories !== undefined)
 	? [...new Set([
@@ -917,7 +1204,6 @@ async function runSync(generation: number): Promise<ProvisionStatusView> {
 	: false;
       const upgradeRecovery = previousRecord ? prepareUpgradeRecovery(state) : undefined;
       const rejectedCandidateRecovery = prepareRejectedCandidateRecovery(state);
-      let result: Awaited<ReturnType<typeof installSkill>>;
       try {
 	result = await installSkill(
 	  item.git
@@ -979,13 +1265,14 @@ async function runSync(generation: number): Promise<ProvisionStatusView> {
       } finally {
 	finalizeUpgradeRecoveries(state);
       }
+      }
       // Finalizing drops the upgrade journal. If this save later fails, the
       // persisted stable+pending pair lets the next sync recognize either side.
       state.installed[key] = {
 	sha256: fingerprint,
 	...(source ? { source } : {}),
 	files: result.files,
-	directories: result.directories,
+	directories: result.directories ?? [],
 	fileHashes: result.fileHashes,
 	installedAt: new Date().toISOString(),
       };
@@ -1000,7 +1287,12 @@ async function runSync(generation: number): Promise<ProvisionStatusView> {
       if (err instanceof SupersededSyncError) throw err;
       const journal = state.installed[key];
       if (journal?.pending) {
-	state.installed[key] = reconcileUpgradeJournal(item.name, journal);
+	state.installed[key] = item.type === "config"
+	  ? reconcileConfigUpgradeJournal(item.name, journal)
+	  : reconcileUpgradeJournal(item.name, journal);
+      }
+      if (item.type === "config" && state.installed[key]?.uncommitted) {
+	reconcileFirstInstallJournals(state);
       }
       const message = err instanceof Error ? err.message : String(err);
       views.push({
@@ -1038,6 +1330,9 @@ async function runSync(generation: number): Promise<ProvisionStatusView> {
 	} finally {
 	  finalizeRemovalRecoveries(state);
 	}
+      } else if (canonicalType === "config") {
+	const removable = configRecordForRemoval(canonicalName, record);
+	removeConfig(canonicalName, { configDir: configDir(), files: configOwnedFiles(removable) });
       }
       delete state.installed[key];
       views.push({ type: canonicalType, name: canonicalName, status: "removed" });
@@ -1050,6 +1345,7 @@ async function runSync(generation: number): Promise<ProvisionStatusView> {
   // A DELETE tombstone lasts while the manifest still asks for that item. Once
   // it disappears, a later re-add is a fresh desired-state decision.
   state.revoked = state.revoked.filter((key) => desired.has(key));
+  state.adopted = (state.adopted ?? []).filter((key) => desired.has(key));
 
   saveState(state);
   itemViews = views;
@@ -1101,8 +1397,15 @@ export function getStatus(): ProvisionStatusView {
   };
 }
 
-export async function approveItem(type: string, name: string): Promise<ProvisionStatusView> {
+export async function approveItem(
+  type: string,
+  name: string,
+  opts: { adopt?: boolean } = {},
+): Promise<ProvisionStatusView> {
   assertAcceptingOperations();
+  if (opts.adopt && type !== "config") {
+    throw new ProvisionError("`adopt` is supported only for config items", "invalid_item");
+  }
   const key = `${type}/${name}`;
   const approvalGeneration = manifestGeneration;
   // Approval is consent to something the operator has SEEN: only names the
@@ -1124,6 +1427,9 @@ export async function approveItem(type: string, name: string): Promise<Provision
     const state = loadState();
     state.revoked = state.revoked.filter((entry) => entry !== key);
     if (!state.approved.includes(key)) state.approved.push(key);
+    if (opts.adopt) {
+      state.adopted = [...new Set([...(state.adopted ?? []), key])];
+    }
     saveState(state);
   });
   return syncNow();
@@ -1162,10 +1468,14 @@ export function deleteItem(type: string, name: string): Promise<{ removed: boole
 	finalizeRemovalRecoveries(state);
 	saveState(state);
       }
+    } else if (record && type === "config") {
+      const removable = configRecordForRemoval(name, record);
+      removeConfig(name, { configDir: configDir(), files: configOwnedFiles(removable) });
     }
     if (installedKey) delete state.installed[installedKey];
     // Revoked, not just uninstalled: auto mode must not undo an explicit DELETE.
     state.approved = state.approved.filter((entry) => entry !== key);
+    state.adopted = (state.adopted ?? []).filter((entry) => entry !== key);
     if (!state.revoked.includes(key)) state.revoked.push(key);
     saveState(state);
     itemViews = itemViews.filter((item) => !(item.type === type && item.name === name));
@@ -1210,6 +1520,7 @@ function clearProvisioningState(): void {
   afterFirstInstallReconciliationIdentityCheck = undefined;
   afterRemovalAudit = undefined;
   afterRemovalIsolation = undefined;
+  perUserWorkers = false;
 }
 
 /**

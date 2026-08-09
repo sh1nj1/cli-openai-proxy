@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash, randomUUID } from "node:crypto";
-import { existsSync, mkdtempSync } from "node:fs";
+import { existsSync, lstatSync, mkdtempSync } from "node:fs";
 import { readFile, rm } from "node:fs/promises";
 import http from "node:http";
 import type { AddressInfo } from "node:net";
@@ -156,17 +156,33 @@ function skillArchive(content: string, fileName = "SKILL.md"): Buffer {
 
 const sha256Hex = (buf: Buffer) => createHash("sha256").update(buf).digest("hex");
 
-/** Serves a real provisioning manifest + skill tarball over 127.0.0.1, like sync.test.ts. */
-async function startManifestServer(): Promise<{ baseUrl: string; close: () => Promise<void> }> {
+/** Serves a mutable real manifest so two workers receive distinct config credentials. */
+async function startManifestServer(): Promise<{
+  baseUrl: string;
+  setConfigToken: (token: string) => void;
+  close: () => Promise<void>;
+}> {
   const archive = skillArchive("watch the demo");
+  let configArchive = skillArchive(JSON.stringify({
+    url: "https://collavre.example.com",
+    token: "worker-a-token",
+  }), "config.json");
   const manifest = {
     schema: "agent-provisioning/v1",
-    items: [{
-      type: "skill",
-      name: "demo-skill",
-      url: "PLACEHOLDER/demo-skill.tgz",
-      sha256: sha256Hex(archive),
-    }],
+    items: [
+      {
+	type: "skill",
+	name: "demo-skill",
+	url: "PLACEHOLDER/demo-skill.tgz",
+	sha256: sha256Hex(archive),
+      },
+      {
+	type: "config",
+	name: "collavre",
+	url: "PLACEHOLDER/config.tgz",
+	sha256: sha256Hex(configArchive),
+      },
+    ],
   };
   const server = http.createServer((req, res) => {
     if (req.url === "/provision.json") {
@@ -176,6 +192,10 @@ async function startManifestServer(): Promise<{ baseUrl: string; close: () => Pr
     }
     if (req.url === "/demo-skill.tgz") {
       res.end(archive);
+      return;
+    }
+    if (req.url === "/config.tgz") {
+      res.end(configArchive);
       return;
     }
     res.statusCode = 404;
@@ -190,8 +210,16 @@ async function startManifestServer(): Promise<{ baseUrl: string; close: () => Pr
   });
   const baseUrl = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
   manifest.items[0]!.url = `${baseUrl}/demo-skill.tgz`;
+  manifest.items[1]!.url = `${baseUrl}/config.tgz`;
   return {
     baseUrl,
+    setConfigToken: (token: string) => {
+      configArchive = skillArchive(JSON.stringify({
+	url: "https://collavre.example.com",
+	token,
+      }), "config.json");
+      manifest.items[1]!.sha256 = sha256Hex(configArchive);
+    },
     close: () => new Promise<void>((resolve) => server.close(() => resolve())),
   };
 }
@@ -234,13 +262,15 @@ test("authorized login installs into the worker's own state dirs only", async ()
   // engine's dirs, or vice versa — would be caught by the assertions below.
   const workerAStateDir = mkdtempSync(path.join(tmpdir(), "worker-a-state-"));
   const workerASkillsDir = mkdtempSync(path.join(tmpdir(), "worker-a-skills-"));
+  const workerAConfigDir = mkdtempSync(path.join(tmpdir(), "worker-a-config-"));
   const gatewayStateDir = mkdtempSync(path.join(tmpdir(), "gateway-state-"));
   const gatewaySkillsDir = mkdtempSync(path.join(tmpdir(), "gateway-skills-"));
+  const gatewayConfigDir = mkdtempSync(path.join(tmpdir(), "gateway-config-"));
 
   const savedEnv = new Map<string, string | undefined>();
   for (const name of [
     "PROVISION_SYNC", "PROVISION_AUTOAPPLY", "PROVISION_STATE_DIR",
-    "PROVISION_SKILLS_DIR", "PROVISION_ALLOWLIST",
+    "PROVISION_SKILLS_DIR", "PROVISION_CONFIG_DIR", "PROVISION_ALLOWLIST",
   ] as const) {
     savedEnv.set(name, process.env[name]);
   }
@@ -248,7 +278,7 @@ test("authorized login installs into the worker's own state dirs only", async ()
   const realResolve = engineRegistry.resolve;
   const realIds = engineRegistry.ids;
 
-  let manifestServer: { baseUrl: string; close: () => Promise<void> } | undefined;
+  let manifestServer: Awaited<ReturnType<typeof startManifestServer>> | undefined;
   let close: (() => Promise<void>) | undefined;
 
   try {
@@ -260,6 +290,7 @@ test("authorized login installs into the worker's own state dirs only", async ()
     process.env.PROVISION_AUTOAPPLY = "auto";
     process.env.PROVISION_STATE_DIR = workerAStateDir;
     process.env.PROVISION_SKILLS_DIR = workerASkillsDir;
+    process.env.PROVISION_CONFIG_DIR = workerAConfigDir;
     process.env.PROVISION_ALLOWLIST = "127.0.0.1";
 
     const worker = createApp({ role: "worker" }).listen(0);
@@ -289,9 +320,12 @@ test("authorized login installs into the worker's own state dirs only", async ()
 
     // handleAuthorizedSession runs fire-and-forget off the submit response, so
     // the skill install lands asynchronously.
-    await waitFor(() => existsSync(path.join(workerASkillsDir, "demo-skill", "SKILL.md")));
+    await waitFor(() => existsSync(path.join(workerAConfigDir, "collavre", "config.json")));
 
     assert.ok(existsSync(path.join(workerASkillsDir, "demo-skill", "SKILL.md")));
+    const workerAConfigFile = path.join(workerAConfigDir, "collavre", "config.json");
+    assert.equal(JSON.parse(await readFile(workerAConfigFile, "utf8")).token, "worker-a-token");
+    assert.equal(lstatSync(workerAConfigFile).mode & 0o777, 0o600);
     assert.ok(existsSync(path.join(workerAStateDir, "provision.lock.json")));
     assert.ok(existsSync(path.join(workerAStateDir, "manifest.key")));
     // Nothing about this login has touched the second engine's dirs — at this
@@ -305,6 +339,7 @@ test("authorized login installs into the worker's own state dirs only", async ()
     // exist, but that they're byte-identical to what worker-a produced).
     const workerAManifestKeyBefore = await readFile(path.join(workerAStateDir, "manifest.key"), "utf8");
     const workerASkillFileBefore = await readFile(path.join(workerASkillsDir, "demo-skill", "SKILL.md"), "utf8");
+    const workerAConfigFileBefore = await readFile(workerAConfigFile, "utf8");
 
     // Retire worker-a's app before starting the second engine: the
     // provisioning module is a process-wide singleton, so a second
@@ -316,6 +351,8 @@ test("authorized login installs into the worker's own state dirs only", async ()
 
     process.env.PROVISION_STATE_DIR = gatewayStateDir;
     process.env.PROVISION_SKILLS_DIR = gatewaySkillsDir;
+    process.env.PROVISION_CONFIG_DIR = gatewayConfigDir;
+    manifestServer.setConfigToken("worker-b-token");
 
     const secondEngine = createApp({ role: "worker" }).listen(0);
     await new Promise<void>((resolve) => secondEngine.once("listening", resolve));
@@ -339,13 +376,16 @@ test("authorized login installs into the worker's own state dirs only", async ()
     const submittedSecondView = await submittedSecond.json() as { status: string };
     assert.equal(submittedSecondView.status, "authorized");
 
-    await waitFor(() => existsSync(path.join(gatewaySkillsDir, "demo-skill", "SKILL.md")));
+    await waitFor(() => existsSync(path.join(gatewayConfigDir, "collavre", "config.json")));
 
     // The second engine really did write into its own dirs — this is what
     // makes the earlier "gateway dir untouched" assertion non-vacuous:
     // something is now demonstrably capable of writing there, and it wrote
     // only there.
     assert.ok(existsSync(path.join(gatewaySkillsDir, "demo-skill", "SKILL.md")));
+    const workerBConfigFile = path.join(gatewayConfigDir, "collavre", "config.json");
+    assert.equal(JSON.parse(await readFile(workerBConfigFile, "utf8")).token, "worker-b-token");
+    assert.equal(lstatSync(workerBConfigFile).mode & 0o777, 0o600);
     assert.ok(existsSync(path.join(gatewayStateDir, "provision.lock.json")));
     assert.ok(existsSync(path.join(gatewayStateDir, "manifest.key")));
 
@@ -353,8 +393,10 @@ test("authorized login installs into the worker's own state dirs only", async ()
     // untouched files, byte-for-byte.
     const workerAManifestKeyAfter = await readFile(path.join(workerAStateDir, "manifest.key"), "utf8");
     const workerASkillFileAfter = await readFile(path.join(workerASkillsDir, "demo-skill", "SKILL.md"), "utf8");
+    const workerAConfigFileAfter = await readFile(workerAConfigFile, "utf8");
     assert.equal(workerAManifestKeyAfter, workerAManifestKeyBefore);
     assert.equal(workerASkillFileAfter, workerASkillFileBefore);
+    assert.equal(workerAConfigFileAfter, workerAConfigFileBefore);
   } finally {
     if (close) await close();
     if (manifestServer) await manifestServer.close();
@@ -366,7 +408,14 @@ test("authorized login installs into the worker's own state dirs only", async ()
       if (value === undefined) delete process.env[name as string];
       else process.env[name as string] = value;
     }
-    await Promise.all([workerAStateDir, workerASkillsDir, gatewayStateDir, gatewaySkillsDir].map((dir) =>
+    await Promise.all([
+      workerAStateDir,
+      workerASkillsDir,
+      workerAConfigDir,
+      gatewayStateDir,
+      gatewaySkillsDir,
+      gatewayConfigDir,
+    ].map((dir) =>
       rm(dir, { recursive: true, force: true })));
   }
 });

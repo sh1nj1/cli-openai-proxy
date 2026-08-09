@@ -44,6 +44,48 @@ describe("provision manifest", () => {
     assert.equal(manifest.items[0]!.name, "pr-monitor");
   });
 
+  test("config items require a pinned archive and never accept git", () => {
+    const parsed = parseManifest({
+      schema: "agent-provisioning/v1",
+      items: [{
+	type: "config",
+	name: "collavre",
+	url: "https://collavre.com/config.tar.gz",
+	sha256: "a".repeat(64),
+      }],
+    });
+    assert.equal(parsed.items[0]!.type, "config");
+    assert.throws(
+      () => parseManifest({
+	schema: "agent-provisioning/v1",
+	items: [{
+	  type: "config",
+	  name: "collavre",
+	  git: { url: "https://github.com/example/config.git", rev: "main" },
+	}],
+      }),
+      (err: ProvisionError) => err.code === "invalid_item" && /config/.test(err.message),
+    );
+    assert.throws(
+      () => parseManifest({
+	schema: "agent-provisioning/v1",
+	items: [{ type: "config", name: "collavre", url: "https://collavre.com/config.tar.gz" }],
+      }),
+      (err: ProvisionError) => err.code === "invalid_item",
+    );
+  });
+
+  test("skill and config items with the same name remain distinct", () => {
+    const manifest = parseManifest({
+      schema: "agent-provisioning/v1",
+      items: [
+	{ type: "skill", name: "collavre", url: "https://host/a", sha256: "a".repeat(64) },
+	{ type: "config", name: "collavre", url: "https://host/b", sha256: "b".repeat(64) },
+      ],
+    });
+    assert.equal(manifest.items.length, 2);
+  });
+
   test("a git source accepts a pinned commit or branch and optional repository subpath", () => {
     const raw = valid() as unknown as Record<string, unknown>;
     raw.items = [{

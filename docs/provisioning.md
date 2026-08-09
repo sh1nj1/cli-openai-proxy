@@ -38,6 +38,7 @@ enabling a manifest that contains `git` sources.
 | `PROVISION_REFETCH_MS` | Drift-correction re-fetch interval. Default 3600000 (1h), `0` disables. |
 | `PROVISION_STATE_DIR` | Lockfile directory. Default `~/.cli-openai-proxy`. |
 | `PROVISION_SKILLS_DIR` | Install dir for `skill` items. Default `~/.claude/skills`. |
+| `PROVISION_CONFIG_DIR` | Install root for `config` items. Default `~/.config`; `XDG_CONFIG_HOME` is intentionally ignored because consuming CLIs read `~/.config` directly. |
 
 ## Per-user scope (worker mode)
 
@@ -79,6 +80,14 @@ relay. Keep
 per user — the commented-out block in the worker unit file calls this out for
 the same reason.
 
+`config` items make this rule fail closed: a gateway configured with per-user
+workers reports them as `failed` and instructs the operator to enable
+`PROVISION_SYNC` on the worker unit. A workspace credential is installed only
+by the worker whose HOME and lockfile belong to that identity. Any config files
+previously managed by the gateway are removed with the normal file-level
+ownership rules during this transition. `skill` items retain their existing
+gateway behavior during a mixed rollout.
+
 ## The manifest
 
 ```json
@@ -106,13 +115,19 @@ the same reason.
       "git": {
 	"url": "https://github.com/sh1nj1/plan42/tree/main/skills/collavre"
       }
+    },
+    {
+      "type": "config",
+      "name": "collavre",
+      "url": "https://collavre.com/registry/workspace-config.tar.gz",
+      "sha256": "6a4d…"
     }
   ]
 }
 ```
 
 - `items[]` with a per-item `type` is the whole contract. v1 supports
-  `type: "skill"`; a type this proxy version does not know reports
+  `type: "skill"` and `type: "config"`; a type this proxy version does not know reports
   `unsupported` in the status view rather than failing the sync — a newer
   external app can ship new types before every proxy understands them.
 - `name` must match `[a-z0-9][a-z0-9_-]{0,63}` — uppercase is rejected so
@@ -130,7 +145,8 @@ the same reason.
     Slash-containing branch names use the explicit `url` + `rev` + `path` form
     because GitHub tree URLs do not delimit the branch from the path.
 - **The manifest never chooses paths.** Each type maps to a hardcoded sandbox
-  (`skill` → `~/.claude/skills/{name}`). `git.path` selects source content only;
+  (`skill` → `~/.claude/skills/{name}`, `config` → `~/.config/{name}`).
+  `git.path` selects source content only;
   it never affects the destination, so the channel cannot become an arbitrary
   remote file write.
 
@@ -139,6 +155,35 @@ directory. Git sources reject submodules and install only the selected tree.
 Removing an item from the manifest uninstalls it on the next sync; an **empty
 `items` array removes everything managed** (distinct from having no manifest
 registered, which syncs nothing).
+
+### `type: "config"`
+
+A config item installs at `{CONFIG_ROOT}/{name}`, where `CONFIG_ROOT` is
+`PROVISION_CONFIG_DIR` or `~/.config`. Use the consuming CLI's directory name
+as the item name—for Collavre, `name: "collavre"` places `config.json` at
+`~/.config/collavre/config.json`.
+
+- Config sources must use `url` + `sha256`; public `git` sources are refused.
+- The archive must contain exactly one flat regular text file named
+  `config.json`, or place that file below one wrapper directory matching the
+  item name. The file is limited to 1 MiB (with the shared 10 MiB extracted
+  archive ceiling). Links, traversal, nested directories, and NUL bytes are
+  refused.
+- The item directory is forced to `0700` and installed files to `0600`.
+- Ownership is per file because the directory is shared with the CLI. Existing
+  sibling files survive upgrades and removal. A colliding untracked file fails
+  with `untracked_content`; approve again with `{"adopt": true}` to hand that
+  file to provisioning explicitly.
+- Removing the item deletes only lockfile-recorded files, then removes its
+  directory only when empty. A changed archive hash rotates credentials without
+  another approval; an unchanged, intact item is not rewritten.
+- Interrupted publication recovery reopens the recorded inode and erases its
+  credential bytes through that descriptor. It may retain an empty, random
+  `.provision-config-candidate-*` placeholder rather than risk unlinking a user
+  file raced into the same name.
+- Config contents are never executed or returned. The skill-specific
+  remote-execution text heuristic is not applied, while all archive, size,
+  binary, and path checks above remain enforced.
 
 ## How the manifest URL arrives
 
@@ -196,13 +241,18 @@ itself cannot be fetched or parsed.
 Lift the trust-on-first-use stop for one item and sync. Only items present in
 the current manifest can be approved. Once a name is approved, later upgrades
 (new archive sha256, git revision, or branch head) apply without another stop.
+For a config item that failed on a colliding untracked file, an optional JSON
+body `{"adopt": true}` grants that one install permission to take over the file.
 
 ### `DELETE /v1/provision/items/{type}/{name}`
 
 Uninstall and **revoke approval** — without revocation the next sync would
-silently reinstall and DELETE would be a no-op. The item returns as
-`pending_approval` if the manifest still names it, including in `auto` mode.
-The tombstone clears after the item leaves the manifest.
+silently reinstall and DELETE would be a no-op. `DELETE` removes the item from
+the status list immediately because the list reflects the last sync. The next
+sync returns it as `pending_approval` if the manifest still names it, including
+in `auto` mode. A client rendering immediately after deletion should either
+re-sync or show the item as absent. The tombstone clears after the item leaves
+the manifest.
 
 ## Security model
 
@@ -238,13 +288,16 @@ The tombstone clears after the item leaves the manifest.
   tags, submodules, URL credentials, and interactive authentication are
   refused.
 - **Install = file placement only.** Nothing from either source is executed. Link
-  entries, traversal names, binaries, files over 1 MiB, and text matching
-  pipe-download-into-shell patterns are refused. Extraction stages next to the
-  target and publishes with the platform's atomic no-replace rename; a failed
-  upgrade leaves the previous install recoverable. The optional native helper
-  ships for macOS and Linux on arm64/x64 (glibc and musl on Linux); installs that
-  omit optional dependencies or use another POSIX target fail closed instead of
-  falling back to a racy check-then-rename.
+  entries and traversal names are refused. Skills additionally reject binaries,
+  files over 1 MiB, and text matching pipe-download-into-shell patterns; config
+  items use the tighter limits and text-only rules documented above but skip the
+  skill-specific text heuristic. Skills publish their staged directory with the
+  platform's atomic no-replace rename; config files use atomic per-file renames,
+  so a reader sees either the previous complete file or the replacement. The
+  optional native helper for descriptor-relative no-replace publication and
+  removal ships for macOS and Linux on arm64/x64 (glibc and musl on Linux);
+  installs that omit optional dependencies or use another POSIX target fail
+  closed instead of falling back to racy path checks.
 - **Lockfile ownership.** `~/.cli-openai-proxy/provision.lock.json` records
   what the proxy installed, including archive-owned directories and per-file
   hashes used to repair missing or modified content on the next sync. Upgrades
@@ -278,7 +331,8 @@ declaration that the manifest's publisher is inside your trust boundary.
 Provisioning installs into whichever process's HOME its engine runs in — see
 [Per-user scope (worker mode)](#per-user-scope-worker-mode) above. With
 `PROVISION_SYNC=1` on the worker units, each user's worker installs skills
-into that worker's own `~/.claude/skills`, so the CLI process that actually
-runs as that user sees them. Leaving `PROVISION_SYNC` unset on worker units
+and config into that worker's own `~/.claude/skills` and `~/.config`, so the
+CLI process that actually runs as that user sees them. Leaving
+`PROVISION_SYNC` unset on worker units
 (the default) leaves provisioning off for that deployment entirely; it does
 not fall back to installing into the gateway's HOME.

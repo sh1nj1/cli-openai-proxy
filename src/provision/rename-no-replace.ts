@@ -1,3 +1,4 @@
+import { spawnSync } from "node:child_process";
 import { closeSync, constants, openSync } from "node:fs";
 import { createRequire } from "node:module";
 import path from "node:path";
@@ -7,6 +8,7 @@ import { ProvisionError } from "./types.js";
 interface NativeRenameBinding {
   metadata(): unknown;
   renameNoReplace(parentFd: number, source: string, destination: string): unknown;
+  removeAt(parentFd: number, basename: string, directory: boolean): unknown;
 }
 
 const HELPER_VERSION = "0.5.0-beta.1";
@@ -58,6 +60,7 @@ function loadBinding(): NativeRenameBinding {
     || typeof candidate !== "object"
     || typeof (candidate as Partial<NativeRenameBinding>).metadata !== "function"
     || typeof (candidate as Partial<NativeRenameBinding>).renameNoReplace !== "function"
+    || typeof (candidate as Partial<NativeRenameBinding>).removeAt !== "function"
   ) {
     throw new ProvisionError(
       "Atomic no-replace rename helper failed validation",
@@ -77,6 +80,81 @@ function loadBinding(): NativeRenameBinding {
   return binding;
 }
 
+function resultCode(result: unknown, operation: string): number {
+  if (!Number.isInteger(result) || (result as number) < 0) {
+    throw new ProvisionError(
+      `Atomic ${operation} helper returned an invalid result`,
+      "atomic_rename_unavailable",
+    );
+  }
+  return result as number;
+}
+
+/** Atomically rename paths relative to an already-open directory descriptor. */
+export function renameAtNoReplace(
+  parentFd: number,
+  source: string,
+  destination: string,
+): boolean {
+  if (process.platform === "win32") {
+    throw new ProvisionError(
+      "Windows uses the platform rename implementation directly",
+      "atomic_rename_unavailable",
+    );
+  }
+
+  const result = resultCode(
+    loadBinding().renameNoReplace(parentFd, source, destination),
+    "no-replace rename",
+  );
+  if (result === 0) return true;
+  const code = getSystemErrorName(-result);
+  if (code === "EEXIST" || code === "ENOTEMPTY") return false;
+  throw Object.assign(new Error(`Atomic no-replace rename failed with ${code}`), { code });
+}
+
+/** Remove one basename relative to an open directory descriptor. */
+export function removeAt(parentFd: number, basename: string, directory = false): boolean {
+  if (path.basename(basename) !== basename || basename === "." || basename === "..") {
+    throw new ProvisionError("FD-relative removal requires one basename", "invalid_item");
+  }
+  const result = resultCode(loadBinding().removeAt(parentFd, basename, directory), "remove-at");
+  if (result === 0) return true;
+  const code = getSystemErrorName(-result);
+  if (code === "ENOENT") return false;
+  throw Object.assign(new Error(`FD-relative removal failed with ${code}`), { code });
+}
+
+const REPLACE_SCRIPT = [
+  'const fs = require("node:fs")',
+  "const opened = fs.fstatSync(3, { bigint: true })",
+  'const cwd = fs.statSync(".", { bigint: true })',
+  "if (!opened.isDirectory() || opened.dev !== cwd.dev || opened.ino !== cwd.ino) process.exit(65)",
+  "fs.renameSync(process.argv[1], process.argv[2])",
+].join(";");
+
+/** Atomically replace one sibling through a cwd verified against the open parent FD. */
+export function renameAtReplace(
+  parentFd: number,
+  parentPath: string,
+  source: string,
+  destination: string,
+): void {
+  if ([source, destination].some((name) =>
+    path.basename(name) !== name || name === "." || name === "..")) {
+    throw new ProvisionError("FD-relative rename requires sibling basenames", "invalid_item");
+  }
+  const child = spawnSync(process.execPath, ["-e", REPLACE_SCRIPT, source, destination], {
+    cwd: parentPath,
+    stdio: ["ignore", "ignore", "ignore", parentFd],
+  });
+  if (child.status === 0) return;
+  if (child.status === 65) {
+    throw new ProvisionError("Rename target changed during publication", "untracked_content");
+  }
+  throw new ProvisionError("Atomic replace helper failed", "atomic_rename_unavailable");
+}
+
 /** Atomically rename sibling directories without replacing an existing target. */
 export function renameDirectoryNoReplace(source: string, target: string): boolean {
   const parent = path.dirname(target);
@@ -86,30 +164,10 @@ export function renameDirectoryNoReplace(source: string, target: string): boolea
       "atomic_rename_unavailable",
     );
   }
-  if (process.platform === "win32") {
-    throw new ProvisionError(
-      "Windows uses the platform rename implementation directly",
-      "atomic_rename_unavailable",
-    );
-  }
 
   const parentFd = openSync(parent, constants.O_RDONLY | constants.O_DIRECTORY);
   try {
-    const result = loadBinding().renameNoReplace(
-      parentFd,
-      path.basename(source),
-      path.basename(target),
-    );
-    if (!Number.isInteger(result) || (result as number) < 0) {
-      throw new ProvisionError(
-        "Atomic no-replace rename helper returned an invalid result",
-        "atomic_rename_unavailable",
-      );
-    }
-    if (result === 0) return true;
-    const code = getSystemErrorName(-(result as number));
-    if (code === "EEXIST" || code === "ENOTEMPTY") return false;
-    throw Object.assign(new Error(`Atomic no-replace rename failed with ${code}`), { code });
+    return renameAtNoReplace(parentFd, path.basename(source), path.basename(target));
   } finally {
     closeSync(parentFd);
   }
