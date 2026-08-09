@@ -15,6 +15,7 @@
 
 import { createHash, randomBytes } from "crypto";
 import {
+  accessSync,
   closeSync,
   constants as fsConstants,
   existsSync,
@@ -214,6 +215,20 @@ function resolvedPathThroughExistingAncestor(candidate: string): string {
     suffix.push(path.basename(ancestor));
     ancestor = parent;
   }
+}
+
+function assertSkillLinkDirectoryWritable(directory: string): void {
+  let ancestor = path.resolve(directory);
+  while (!pathEntryExists(ancestor)) {
+    const parent = path.dirname(ancestor);
+    if (parent === ancestor) break;
+    ancestor = parent;
+  }
+  const real = realpathSync(ancestor);
+  if (!lstatSync(real).isDirectory()) {
+    throw new ProvisionError(`Skill link parent is not a directory: "${ancestor}"`, "untracked_content");
+  }
+  accessSync(real, fsConstants.W_OK | fsConstants.X_OK);
 }
 
 function skillLinkDirs(): string[] {
@@ -836,6 +851,29 @@ function removeRecordedSkillLinks(
       throw new ProvisionError(`Invalid recorded skill link for "${name}"`, "untracked_content");
     }
     isolateRecordedSkillLink(link);
+  }
+}
+
+function assertRecordedSkillLinksRemovable(name: string, record: InstalledRecord): void {
+  const publication = record.skillLinkPublication;
+  if (publication) {
+    if (path.basename(publication.path) !== name || path.basename(publication.target) !== name) {
+      throw new ProvisionError(`Invalid pending skill link for "${name}"`, "untracked_content");
+    }
+    if (pathEntryExists(publication.path)) {
+      adoptPublishedSkillLink(publication.path, publication.target);
+    }
+  }
+  for (const link of record.skillLinks ?? []) {
+    if (path.basename(link.path) !== name || path.basename(link.target) !== name) {
+      throw new ProvisionError(`Invalid recorded skill link for "${name}"`, "untracked_content");
+    }
+    if (pathEntryExists(link.path) && !sameSkillLinkIdentity(link.path, link)) {
+      throw new ProvisionError(
+	`Refusing to remove changed skill link "${link.path}"`,
+	"untracked_content",
+      );
+    }
   }
 }
 
@@ -1576,11 +1614,15 @@ function executeLegacySkillRootMigration(
   const canonicalName = migration.canonicalKey.slice(migration.canonicalKey.indexOf("/") + 1);
   for (const directory of skillLinkDirs()) {
     const linkPath = path.join(directory, canonicalName);
-    if (!pathEntryExists(linkPath) || samePathEntryIdentity(linkPath, legacyTarget)) continue;
-    throw new ProvisionError(
-      `Refusing to replace untracked content at skill link "${linkPath}"`,
-      "untracked_content",
-    );
+    if (pathEntryExists(linkPath) && !samePathEntryIdentity(linkPath, legacyTarget)) {
+      throw new ProvisionError(
+	`Refusing to replace untracked content at skill link "${linkPath}"`,
+	"untracked_content",
+      );
+    }
+    // A migration must not hide the live legacy tree when its replacement link
+    // cannot even be created under the current filesystem permissions.
+    assertSkillLinkDirectoryWritable(directory);
   }
   const canonicalTarget = path.join(skillsDir(), migration.name.toLowerCase());
   if (pathEntryExists(canonicalTarget)) {
@@ -2168,7 +2210,7 @@ async function runSync(generation: number): Promise<ProvisionStatusView> {
       if (rootDiscoveryFailure) throw new ProvisionError(rootDiscoveryFailure, "untracked_content");
       const record = state.installed[key]!;
       if (canonicalType === "skill") {
-	removeRecordedSkillLinks(name, record, () => saveState(state));
+	assertRecordedSkillLinksRemovable(name, record);
 	const recovery = prepareRemovalRecovery(state, key);
 	try {
 	  const snapshot = removalSnapshot(record);
@@ -2182,6 +2224,7 @@ async function runSync(generation: number): Promise<ProvisionStatusView> {
 	} finally {
 	  finalizeRemovalRecoveries(state);
 	}
+	removeRecordedSkillLinks(name, record, () => saveState(state));
       } else if (canonicalType === "config") {
 	removeOwnedConfig(canonicalName, state, key, record);
       }
@@ -2310,7 +2353,7 @@ export function deleteItem(type: string, name: string): Promise<{ removed: boole
 	  throw new ProvisionError(rootDiscoveryFailure, "untracked_content");
 	}
 	const installedName = installedKey!.slice(installedKey!.indexOf("/") + 1);
-      removeRecordedSkillLinks(installedName, record, () => saveState(state));
+      assertRecordedSkillLinksRemovable(installedName, record);
       const recovery = prepareRemovalRecovery(state, installedKey!);
       try {
 	const snapshot = removalSnapshot(record);
@@ -2325,6 +2368,7 @@ export function deleteItem(type: string, name: string): Promise<{ removed: boole
 	finalizeRemovalRecoveries(state);
 	saveState(state);
       }
+      removeRecordedSkillLinks(installedName, record, () => saveState(state));
     } else if (record && type === "config") {
       removeOwnedConfig(name, state, installedKey!, record);
     }
