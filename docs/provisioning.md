@@ -331,7 +331,10 @@ declaration that the manifest's publisher is inside your trust boundary.
 See [Per-user scope (worker mode)](#per-user-scope-worker-mode) above. With
 `PROVISION_SYNC=1` on worker units, v2 requests install skills and config below
 `~/workspaces/<workspace-id>`, while the CLI child receives that directory as
-`HOME`. `PAPERCLIP_HOME` remains `<worker HOME>/.paperclip`, so Codex login is
-shared by all of that user's agents. The run `cwd` remains a fresh temporary
-directory. Leaving `PROVISION_SYNC` unset on worker units (the default) leaves
-provisioning off; it does not fall back to the gateway HOME.
+`HOME`. `PAPERCLIP_HOME` remains `<worker HOME>/.paperclip`, and `CODEX_HOME` is
+explicitly pinned to its user-scoped managed `codex-home`; the adapter seeds
+that home from the login CLI's `<worker HOME>/.codex`. Codex login is therefore
+shared by all of that user's agents without following the workspace `HOME`.
+The run `cwd` remains a fresh temporary directory. Leaving `PROVISION_SYNC`
+unset on worker units (the default) leaves provisioning off; it does not fall
+back to the gateway HOME.

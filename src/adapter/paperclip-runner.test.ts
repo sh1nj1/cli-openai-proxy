@@ -131,17 +131,19 @@ test("assigns a unique runId per run even within the same millisecond/process", 
   assert.equal(new Set(runIds).size, 3, "each run must get a distinct runId");
 });
 
-test("a named workspace changes agent HOME while sharing the user's Paperclip credentials", async () => {
+test("a named workspace changes agent HOME while sharing the user's Codex credentials", async () => {
   const workspaceBase = await mkdtemp(path.join(tmpdir(), "paperclip-workspaces-"));
   const previous = process.env.PROVISION_WORKSPACE_ROOT;
+  const previousInstanceId = process.env.PAPERCLIP_INSTANCE_ID;
   process.env.PROVISION_WORKSPACE_ROOT = workspaceBase;
+  delete process.env.PAPERCLIP_INSTANCE_ID;
   let captured: import("@paperclipai/adapter-utils").AdapterExecutionContext | undefined;
   try {
     await runInWorkspace("agent-12", async () => {
       const runner = new PaperclipRunner(async (ctx) => {
 	captured = ctx;
 	return { exitCode: 0, signal: null, timedOut: false, sessionId: "s" };
-      }, { engine: "cli" });
+      }, { engine: "cli" }, { engine: "codex" });
       const closed = new Promise<void>((resolve) => runner.on("close", () => resolve()));
       await runner.start("workspace prompt", {});
       await closed;
@@ -152,10 +154,17 @@ test("a named workspace changes agent HOME while sharing the user's Paperclip cr
     assert.equal(env.HOME, workspace);
     assert.equal(env.CLAUDE_CONFIG_DIR, path.join(workspace, ".claude"));
     assert.equal(env.PAPERCLIP_HOME, path.join(homedir(), ".paperclip"));
+    assert.equal(
+      env.CODEX_HOME,
+      path.join(homedir(), ".paperclip", "instances", "default", "companies", "local", "codex-home"),
+    );
+    assert.notEqual(env.CODEX_HOME, path.join(workspace, ".codex"));
     assert.match(String(captured!.config.cwd), /paperclip-run-/, "cwd remains ephemeral per run");
   } finally {
     if (previous === undefined) delete process.env.PROVISION_WORKSPACE_ROOT;
     else process.env.PROVISION_WORKSPACE_ROOT = previous;
+    if (previousInstanceId === undefined) delete process.env.PAPERCLIP_INSTANCE_ID;
+    else process.env.PAPERCLIP_INSTANCE_ID = previousInstanceId;
     await rm(workspaceBase, { recursive: true, force: true });
   }
 });
