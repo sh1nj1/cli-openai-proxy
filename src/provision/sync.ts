@@ -28,7 +28,7 @@ import {
   realpathSync,
   mkdirSync,
   renameSync,
-  symlinkSync,
+  rmdirSync,
   unlinkSync,
 } from "fs";
 import { homedir } from "os";
@@ -56,7 +56,14 @@ import {
   installConfig,
   removeConfig,
 } from "./config-installer.js";
-import { renameDirectoryNoReplace } from "./rename-no-replace.js";
+import {
+  AnchoredPublicationAmbiguousError,
+  mkdirAt,
+  removeAtIdentity,
+  renameDirectoryNoReplace,
+  symlinkAt,
+  type AnchoredEntryIdentity,
+} from "./rename-no-replace.js";
 import {
   loadRegisteredManifestUrl,
   loadOrCreateLocalManifestKey,
@@ -244,18 +251,104 @@ function assertSkillLinkDirectoryWritable(directory: string): void {
   accessSync(real, fsConstants.W_OK | fsConstants.X_OK);
 }
 
+function pathContains(root: string, candidate: string): boolean {
+  const relative = path.relative(root, candidate);
+  return relative === ""
+    || (relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative));
+}
+
+function pathsMayOverlapByLookupSemantics(left: string, right: string): boolean {
+  const leftRoot = path.parse(left).root;
+  const rightRoot = path.parse(right).root;
+  if (leftRoot !== rightRoot) return false;
+  const leftParts = path.relative(leftRoot, left).split(path.sep).filter(Boolean);
+  const rightParts = path.relative(rightRoot, right).split(path.sep).filter(Boolean);
+  const shorter = leftParts.length <= rightParts.length ? leftParts : rightParts;
+  const longer = shorter === leftParts ? rightParts : leftParts;
+  const collator = new Intl.Collator("und", { usage: "search", sensitivity: "base" });
+  return shorter.every((part, index) => collator.compare(part, longer[index]!) === 0);
+}
+
+function pathsOverlapByFilesystemLookup(left: string, right: string): boolean {
+  if (pathContains(left, right) || pathContains(right, left)) return true;
+  if (pathEntryExists(left) && pathEntryExists(right)) return false;
+  if (!pathsMayOverlapByLookupSemantics(left, right)) return false;
+
+  const root = path.parse(left).root;
+  const leftParts = path.relative(root, left).split(path.sep).filter(Boolean);
+  const rightParts = path.relative(root, right).split(path.sep).filter(Boolean);
+  let commonLength = 0;
+  while (leftParts[commonLength] !== undefined
+    && leftParts[commonLength] === rightParts[commonLength]) commonLength += 1;
+  const commonDirectory = path.resolve(root, ...leftParts.slice(0, commonLength));
+  if (!pathEntryExists(commonDirectory)) return false;
+
+  const leftSuffix = leftParts.slice(commonLength);
+  const rightSuffix = rightParts.slice(commonLength);
+  const shorter = leftSuffix.length <= rightSuffix.length ? leftSuffix : rightSuffix;
+  const longer = shorter === leftSuffix ? rightSuffix : leftSuffix;
+  const probeRoot = path.join(
+    realpathSync(commonDirectory),
+    `.provision-lookup-${randomBytes(16).toString("hex")}`,
+  );
+  const created = [probeRoot];
+  mkdirSync(probeRoot, { mode: 0o700 });
+  try {
+    let createdPath = probeRoot;
+    for (const component of shorter) {
+      createdPath = path.join(createdPath, component);
+      mkdirSync(createdPath, { mode: 0o700 });
+      created.push(createdPath);
+    }
+    const alternatePath = path.join(probeRoot, ...longer.slice(0, shorter.length));
+    try {
+      const createdStat = lstatSync(createdPath, { bigint: true });
+      const alternateStat = lstatSync(alternatePath, { bigint: true });
+      return createdStat.dev === alternateStat.dev && createdStat.ino === alternateStat.ino;
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === "ENOENT") return false;
+      throw err;
+    }
+  } finally {
+    for (const directory of created.reverse()) rmdirSync(directory);
+  }
+}
+
+function assertDiscoveryRootOutsideCanonical(
+  entry: string,
+  canonical: string,
+): void {
+  const resolved = resolvedPathThroughExistingAncestor(entry);
+  const resolvedCanonical = resolvedPathThroughExistingAncestor(canonical);
+  if (pathsOverlapByFilesystemLookup(resolved, resolvedCanonical)) {
+    throw new ProvisionError(
+      `Skill discovery root "${entry}" overlaps canonical skills directory "${canonical}"`,
+      "untracked_content",
+    );
+  }
+}
+
 function skillLinkDirs(): string[] {
   const configured = process.env.PROVISION_SKILL_LINK_DIRS;
   const entries = configured === undefined
     ? [path.join(homedir(), ".claude", "skills")]
     : configured.split(",").map((entry) => entry.trim()).filter(Boolean);
   const canonical = path.resolve(skillsDir());
-  const seenResolvedPaths = new Set([resolvedPathThroughExistingAncestor(canonical)]);
+  const resolvedCanonical = resolvedPathThroughExistingAncestor(canonical);
+  const seenResolvedPaths = [resolvedCanonical];
   return [...new Set(entries.map((entry) => path.resolve(entry)))].filter((entry) => {
     if (entry === canonical) return false;
     const resolved = resolvedPathThroughExistingAncestor(entry);
-    if (seenResolvedPaths.has(resolved)) return false;
-    seenResolvedPaths.add(resolved);
+    if (resolved === resolvedCanonical) return false;
+    assertDiscoveryRootOutsideCanonical(entry, canonical);
+    for (const seen of seenResolvedPaths) {
+      if (seen === resolved) return false;
+      const seenDepth = path.relative(path.parse(seen).root, seen).split(path.sep).filter(Boolean).length;
+      const resolvedDepth = path.relative(path.parse(resolved).root, resolved)
+	.split(path.sep).filter(Boolean).length;
+      if (seenDepth === resolvedDepth && pathsOverlapByFilesystemLookup(seen, resolved)) return false;
+    }
+    seenResolvedPaths.push(resolved);
     return true;
   });
 }
@@ -833,24 +926,163 @@ function isolateRecordedSkillLink(link: InstalledSkillLink): boolean {
   return true;
 }
 
-function createSkillLink(linkPath: string, target: string): InstalledSkillLink {
-  mkdirSync(path.dirname(linkPath), { recursive: true });
+function openVerifiedDirectory(directory: string, allowAlias: boolean): number {
+  const fd = openSync(
+    directory,
+    fsConstants.O_RDONLY
+      | (fsConstants.O_DIRECTORY ?? 0)
+      | (allowAlias ? 0 : (fsConstants.O_NOFOLLOW ?? 0)),
+  );
   try {
-    symlinkSync(target, linkPath, process.platform === "win32" ? "junction" : "dir");
-  } catch (err) {
-    if ((err as NodeJS.ErrnoException).code === "EEXIST") {
+    const opened = fstatSync(fd, { bigint: true });
+    const current = lstatSync(allowAlias ? realpathSync(directory) : directory, { bigint: true });
+    if (!opened.isDirectory() || !current.isDirectory()
+      || opened.dev !== current.dev || opened.ino !== current.ino) {
       throw new ProvisionError(
-	`Refusing to replace untracked content at skill link "${linkPath}"`,
+	`Skill link directory changed while it was opened at "${directory}"`,
 	"untracked_content",
       );
     }
+    return fd;
+  } catch (err) {
+    closeSync(fd);
     throw err;
   }
-  const stat = lstatSync(linkPath, { bigint: true });
-  if (!stat.isSymbolicLink() || absoluteLinkTarget(linkPath) !== target) {
-    throw new ProvisionError(`Skill link publication failed at "${linkPath}"`, "untracked_content");
+}
+
+function createSkillLink(
+  linkPath: string,
+  target: string,
+  commit?: (link: InstalledSkillLink) => void,
+): InstalledSkillLink {
+  const directory = path.dirname(linkPath);
+  const canonical = path.resolve(skillsDir());
+  assertDiscoveryRootOutsideCanonical(directory, canonical);
+
+  const suffix: string[] = [];
+  let existing = directory;
+  while (!pathEntryExists(existing)) {
+    suffix.unshift(path.basename(existing));
+    const parent = path.dirname(existing);
+    if (parent === existing) break;
+    existing = parent;
   }
-  return { path: linkPath, target, dev: stat.dev.toString(), ino: stat.ino.toString() };
+
+  const openFds: number[] = [];
+  const createdDirectories: Array<{
+    parentFd: number;
+    parentPath: string;
+    basename: string;
+    identity: AnchoredEntryIdentity;
+  }> = [];
+  let parentPath = existing;
+  let parentFd = openVerifiedDirectory(parentPath, true);
+  openFds.push(parentFd);
+  let published: InstalledSkillLink | undefined;
+  try {
+    assertDiscoveryRootOutsideCanonical(directory, canonical);
+    for (const basename of suffix) {
+      const identity = mkdirAt(parentFd, parentPath, basename);
+      const childPath = path.join(parentPath, basename);
+      const childFd = openVerifiedDirectory(childPath, false);
+      openFds.push(childFd);
+      const opened = fstatSync(childFd, { bigint: true });
+      if (identity && (opened.dev.toString() !== identity.dev || opened.ino.toString() !== identity.ino)) {
+	throw new ProvisionError(
+	  `Created skill link directory changed at "${childPath}"`,
+	  "untracked_content",
+	);
+      }
+      if (identity) {
+	createdDirectories.push({ parentFd, parentPath, basename, identity });
+      }
+      parentPath = childPath;
+      parentFd = childFd;
+      assertDiscoveryRootOutsideCanonical(directory, canonical);
+    }
+
+    assertDiscoveryRootOutsideCanonical(directory, canonical);
+    beforeSkillLinkPublication?.(linkPath);
+    const identity = symlinkAt(
+      parentFd,
+      parentPath,
+      target,
+      path.basename(linkPath),
+      process.platform === "win32" ? "junction" : "dir",
+    );
+    if (!identity) {
+      throw Object.assign(new Error("Skill link path already exists"), { code: "EEXIST" });
+    }
+    published = { path: linkPath, target, ...identity };
+    const opened = fstatSync(parentFd, { bigint: true });
+    const current = lstatSync(realpathSync(directory), { bigint: true });
+    if (opened.dev !== current.dev || opened.ino !== current.ino) {
+      throw new ProvisionError(
+	`Skill link directory changed during publication at "${directory}"`,
+	"untracked_content",
+      );
+    }
+    assertDiscoveryRootOutsideCanonical(directory, canonical);
+    if (!sameSkillLinkIdentity(linkPath, published)) {
+      throw new ProvisionError(
+	`Skill link changed during publication at "${linkPath}"`,
+	"untracked_content",
+      );
+    }
+    commit?.(published);
+    return published;
+  } catch (err) {
+    const rollbackErrors: unknown[] = [];
+    if (published) {
+      try {
+	if (!removeAtIdentity(
+	  parentFd,
+	  parentPath,
+	  path.basename(linkPath),
+	  false,
+	  published,
+	)) {
+	  rollbackErrors.push(new Error(`Published skill link changed at "${linkPath}"`));
+	}
+      } catch (rollbackError) {
+	rollbackErrors.push(rollbackError);
+      }
+    }
+    for (const created of createdDirectories.reverse()) {
+      try {
+	if (!removeAtIdentity(
+	  created.parentFd,
+	  created.parentPath,
+	  created.basename,
+	  true,
+	  created.identity,
+	)) {
+	  rollbackErrors.push(new Error(
+	    `Created skill link directory changed at "${path.join(created.parentPath, created.basename)}"`,
+	  ));
+	}
+      } catch (rollbackError) {
+	rollbackErrors.push(rollbackError);
+      }
+    }
+    if (err instanceof AnchoredPublicationAmbiguousError) {
+      throw new SkillLinkRollbackError(err, [
+	new Error("Durable discovery-link publication intent retained for recovery"),
+      ]);
+    }
+    if ((err as NodeJS.ErrnoException).code === "EEXIST") {
+      const collision = new ProvisionError(
+	`Refusing to replace untracked content at skill link "${linkPath}"`,
+	"untracked_content",
+      );
+      if (rollbackErrors.length > 0) throw new SkillLinkRollbackError(collision, rollbackErrors);
+      throw collision;
+    }
+    if (rollbackErrors.length > 0) throw new SkillLinkRollbackError(err, rollbackErrors);
+    throw err;
+  } finally {
+    for (const fd of openFds.reverse()) closeSync(fd);
+  }
 }
 
 function adoptPublishedSkillLink(linkPath: string, target: string): InstalledSkillLink {
@@ -908,27 +1140,34 @@ function publishSkillLink(
   if (record.skillLinkPublication) {
     throw new ProvisionError("Another skill link publication is still pending", "untracked_content");
   }
-  beforeSkillLinkPublication?.(linkPath);
   record.skillLinkPublication = { path: linkPath, target };
   // The durable intent makes an exact link recoverable if publication or the
   // following identity save is interrupted.
   persist();
-  const link = createSkillLink(linkPath, target);
-  record.skillLinks = [
-    ...(record.skillLinks ?? []).filter((entry) => entry.path !== linkPath),
-    link,
-  ];
-  delete record.skillLinkPublication;
+  const previousLinks = record.skillLinks;
   try {
-    afterSkillLinkPublication?.(linkPath);
-    persist();
+    return createSkillLink(linkPath, target, (link) => {
+      record.skillLinks = [
+	...(record.skillLinks ?? []).filter((entry) => entry.path !== linkPath),
+	link,
+      ];
+      delete record.skillLinkPublication;
+      try {
+	afterSkillLinkPublication?.(linkPath);
+	persist();
+      } catch (err) {
+	// Keep the in-memory journal aligned with the durable pre-publication save.
+	record.skillLinkPublication = { path: linkPath, target };
+	throw err;
+      }
+    });
   } catch (err) {
-    // Keep the in-memory journal aligned with the durable pre-publication save
-    // so the caller can remove this exact exposed link before rolling back.
-    record.skillLinkPublication = { path: linkPath, target };
+    if (!(err instanceof SkillLinkRollbackError)) {
+      record.skillLinks = previousLinks;
+      delete record.skillLinkPublication;
+    }
     throw err;
   }
-  return link;
 }
 
 function removeRecordedSkillLinks(
@@ -1026,7 +1265,6 @@ function ensureSkillLinks(
 
   const result: InstalledSkillLink[] = [];
   const created: InstalledSkillLink[] = [];
-  const retained: Array<{ link: InstalledSkillLink; quarantine: string }> = [];
   try {
     for (const linkPath of desiredPaths) {
       if (result.some((link) => samePathEntryIdentity(linkPath, link.path))) continue;
@@ -1054,10 +1292,34 @@ function ensureSkillLinks(
 	  continue;
 	}
 	const quarantine = retainRecordedSkillLink(owned);
-	if (quarantine) retained.push({ link: owned, quarantine });
-	const replacement = publishSkillLink(linkPath, target, record, persist);
-	result.push(replacement);
-	created.push(replacement);
+	try {
+	  const replacement = publishSkillLink(linkPath, target, record, persist);
+	  result.push(replacement);
+	  created.push(replacement);
+	  if (quarantine) discardRetainedSkillLink(owned, quarantine);
+	} catch (err) {
+	  if (quarantine) {
+	    try {
+	      const publication = record.skillLinkPublication;
+	      const replacementIsLive = err instanceof SkillLinkRollbackError
+		&& publication !== undefined
+		&& pathEntryExists(publication.path)
+		&& (() => {
+		  try {
+		    adoptPublishedSkillLink(publication.path, publication.target);
+		    return true;
+		  } catch {
+		    return false;
+		  }
+		})();
+	      if (replacementIsLive) discardRetainedSkillLink(owned, quarantine);
+	      else restoreRetainedSkillLink(owned, quarantine);
+	    } catch (rollbackError) {
+	      throw new SkillLinkRollbackError(err, [rollbackError]);
+	    }
+	  }
+	  throw err;
+	}
 	continue;
       }
 
@@ -1075,54 +1337,22 @@ function ensureSkillLinks(
       if (matchedRecordedLinks.has(link)) continue;
       isolateRecordedSkillLink(link);
     }
-    for (const entry of retained) discardRetainedSkillLink(entry.link, entry.quarantine);
     return result;
   } catch (err) {
-    const rollbackErrors: unknown[] = [];
+    // createSkillLink already attempted its anchored rollback. If that rollback
+    // was incomplete, retain the durable publication intent for startup repair.
+    if (err instanceof SkillLinkRollbackError) throw err;
     const interrupted = record.skillLinkPublication;
-    if (interrupted && pathEntryExists(interrupted.path)) {
-      try {
-	const published = (record.skillLinks ?? []).find((link) =>
-	  link.path === interrupted.path
-	    && link.target === interrupted.target
-	    && sameSkillLinkIdentity(interrupted.path, link));
-	if (published) isolateRecordedSkillLink(published);
-      } catch (rollbackError) {
-	// Preserve any path that cannot be proven to be this publication.
-	rollbackErrors.push(rollbackError);
-      }
+    if (interrupted || created.length > 0) {
+      // Successful publications are already durable. Keep that partial commit
+      // instead of reopening lexical paths that may now identify another tree;
+      // startup/retry can finish the remaining desired fanout.
+      throw new SkillLinkRollbackError(err, [
+	new Error("Durable discovery-link publication retained for recovery"),
+      ]);
     }
-    for (const link of created.reverse()) {
-      try {
-	isolateRecordedSkillLink(link);
-	record.skillLinks = (record.skillLinks ?? []).filter((entry) => entry.path !== link.path);
-      } catch (rollbackError) {
-	// Preserve an entry that changed before rollback.
-	rollbackErrors.push(rollbackError);
-      }
-    }
-    for (const entry of retained.reverse()) {
-      try {
-	restoreRetainedSkillLink(entry.link, entry.quarantine);
-      } catch (rollbackError) {
-	// Preserve the retained link at its recovery pathname if its original
-	// pathname was claimed or changed during rollback.
-	rollbackErrors.push(rollbackError);
-      }
-    }
-    if (rollbackErrors.length > 0) throw new SkillLinkRollbackError(err, rollbackErrors);
     delete record.skillLinkPublication;
     record.skillLinks = recordedLinks;
-    if (created.length > 0 || retained.length > 0 || interrupted) {
-      try {
-	persist();
-      } catch (persistError) {
-	// Keep the canonical candidate and migration journal aligned with the
-	// durable pre-publication state. Startup can withdraw a stale intent after
-	// proving the exact old link inode was restored.
-	throw new SkillLinkRollbackError(err, [persistError]);
-      }
-    }
     throw err;
   }
 }
@@ -1976,6 +2206,13 @@ async function runSync(generation: number): Promise<ProvisionStatusView> {
   lastManifest = manifest;
   lastManifestGeneration = generation;
 
+  let skillLinkConfigurationFailure: string | undefined;
+  try {
+    skillLinkDirs();
+  } catch (err) {
+    skillLinkConfigurationFailure = err instanceof Error ? err.message : String(err);
+  }
+
   const state = loadState();
   const legacyRootDiscoveryFailures = discoverLegacySkillInstallRoots(state);
   reconcileFirstInstallJournals(state);
@@ -1984,7 +2221,9 @@ async function runSync(generation: number): Promise<ProvisionStatusView> {
   const {
     failures: legacyRootMigrationFailures,
     migrations: legacyRootMigrations,
-  } = planLegacySkillRootMigrations(state, desired);
+  } = skillLinkConfigurationFailure
+    ? { failures: new Map<string, string>(), migrations: new Map<string, LegacySkillRootMigration>() }
+    : planLegacySkillRootMigrations(state, desired);
   const legacyMigrationFailures = migrateLegacyDesiredItems(
     state,
     desired,
@@ -1992,6 +2231,11 @@ async function runSync(generation: number): Promise<ProvisionStatusView> {
       ...legacyRootDiscoveryFailures.keys(),
       ...legacyRootMigrationFailures.keys(),
       ...legacyRootMigrations.keys(),
+      ...(skillLinkConfigurationFailure
+	? manifest.items
+	  .filter((item) => item.type === "skill")
+	  .map((item) => `${item.type}/${item.name}`)
+	: []),
     ]),
   );
 
@@ -2001,6 +2245,17 @@ async function runSync(generation: number): Promise<ProvisionStatusView> {
 
     if (!SUPPORTED_PROVISION_TYPES.has(item.type)) {
       views.push({ type: item.type, name: item.name, status: "unsupported" });
+      continue;
+    }
+
+    if (item.type === "skill" && skillLinkConfigurationFailure) {
+      views.push({
+	type: item.type,
+	name: item.name,
+	status: "failed",
+	...itemSourceView(item),
+	error: skillLinkConfigurationFailure,
+      });
       continue;
     }
 

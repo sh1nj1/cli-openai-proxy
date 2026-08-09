@@ -590,6 +590,252 @@ describe("provision sync", () => {
     );
   });
 
+  test("rejects discovery roots overlapping the canonical namespace before install", async () => {
+    const canonicalRoot = path.join(stateDir, "Overlap-Canonical");
+    process.env.PROVISION_SKILLS_DIR = canonicalRoot;
+    process.env.PROVISION_AUTOAPPLY = "auto";
+    const skill = serveSkill("/overlapping-discovery-root.tgz", "must not install");
+    const manifestUrl = serveManifest([{ type: "skill", name: "linked", ...skill }]);
+    const probe = path.join(stateDir, "Overlap-Case-Probe");
+    mkdirSync(probe);
+    const caseInsensitive = existsSync(path.join(stateDir, "overlap-case-probe"));
+    rmSync(probe, { recursive: true });
+    const linkRoots = [path.join(canonicalRoot, "shared"), path.dirname(canonicalRoot)];
+    if (caseInsensitive) {
+      linkRoots.push(path.join(stateDir, "overlap-canonical", "shared"));
+    }
+
+    for (const linkRoot of linkRoots) {
+      process.env.PROVISION_SKILL_LINK_DIRS = linkRoot;
+      initProvisioning();
+      registerManifestUrl(manifestUrl);
+      const refused = await syncNow();
+      assert.equal(statusOf(refused, "linked"), "failed");
+      assert.match(refused.data[0]!.error!, /overlaps canonical skills directory/);
+      assert.equal(existsSync(path.join(canonicalRoot, "linked")), false);
+      assert.equal(existsSync(path.join(linkRoot, "linked")), false);
+    }
+  });
+
+  test("uses filesystem Unicode normalization when checking discovery-root overlap", async () => {
+    const probe = path.join(stateDir, "Normalization-Café");
+    mkdirSync(probe);
+    const normalizationInsensitive = existsSync(probe.normalize("NFD"));
+    rmSync(probe, { recursive: true });
+    const canonicalRoot = path.join(stateDir, "Canonical-Café");
+    const linkRoot = path.join(path.join(stateDir, "Canonical-Café").normalize("NFD"), "shared");
+    process.env.PROVISION_SKILLS_DIR = canonicalRoot;
+    process.env.PROVISION_SKILL_LINK_DIRS = linkRoot;
+    process.env.PROVISION_AUTOAPPLY = "auto";
+    initProvisioning();
+    const skill = serveSkill("/normalized-overlap.tgz", "normalization-aware overlap");
+    registerManifestUrl(serveManifest([{ type: "skill", name: "normalized", ...skill }]));
+
+    const result = await syncNow();
+
+    assert.equal(statusOf(result, "normalized"), normalizationInsensitive ? "failed" : "installed");
+    if (normalizationInsensitive) {
+      assert.match(result.data[0]!.error!, /overlaps canonical skills directory/);
+      assert.equal(existsSync(path.join(canonicalRoot, "normalized")), false);
+      assert.equal(existsSync(path.join(linkRoot, "normalized")), false);
+    } else {
+      assert.equal(lstatSync(path.join(linkRoot, "normalized")).isSymbolicLink(), true);
+    }
+  });
+
+  test("uses filesystem full Unicode case folding for discovery-root overlap", async () => {
+    const probe = path.join(stateDir, "Fold-Straße");
+    mkdirSync(probe);
+    const fullCaseFolded = existsSync(path.join(stateDir, "FOLD-STRASSE"));
+    rmSync(probe, { recursive: true });
+    const canonicalRoot = path.join(stateDir, "Canonical-Straße");
+    const linkRoot = path.join(stateDir, "CANONICAL-STRASSE", "shared");
+    process.env.PROVISION_SKILLS_DIR = canonicalRoot;
+    process.env.PROVISION_SKILL_LINK_DIRS = linkRoot;
+    process.env.PROVISION_AUTOAPPLY = "auto";
+    initProvisioning();
+    const skill = serveSkill("/full-case-fold-overlap.tgz", "full case-fold overlap");
+    registerManifestUrl(serveManifest([{ type: "skill", name: "folded", ...skill }]));
+
+    const result = await syncNow();
+
+    assert.equal(statusOf(result, "folded"), fullCaseFolded ? "failed" : "installed");
+    if (fullCaseFolded) {
+      assert.match(result.data[0]!.error!, /overlaps canonical skills directory/);
+      assert.equal(existsSync(path.join(canonicalRoot, "folded")), false);
+      assert.equal(existsSync(path.join(linkRoot, "folded")), false);
+    } else {
+      assert.equal(lstatSync(path.join(linkRoot, "folded")).isSymbolicLink(), true);
+    }
+  });
+
+  test("revalidates discovery-root overlap after the publication hook", async () => {
+    const canonicalRoot = path.join(stateDir, "publication-race-canonical");
+    const discoveryParent = path.join(stateDir, "publication-race-parent");
+    const linkRoot = path.join(discoveryParent, "links");
+    mkdirSync(discoveryParent);
+    process.env.PROVISION_SKILLS_DIR = canonicalRoot;
+    process.env.PROVISION_SKILL_LINK_DIRS = linkRoot;
+    process.env.PROVISION_AUTOAPPLY = "auto";
+    let raced = false;
+    initProvisioning({
+      beforeSkillLinkPublication: () => {
+	if (raced) return;
+	raced = true;
+	rmSync(discoveryParent, { recursive: true });
+	symlinkSync(canonicalRoot, discoveryParent, process.platform === "win32" ? "junction" : "dir");
+	mkdirSync(path.join(canonicalRoot, "links"));
+      },
+    });
+    const skill = serveSkill("/overlap-publication-race.tgz", "must not publish through race");
+    registerManifestUrl(serveManifest([{ type: "skill", name: "raced", ...skill }]));
+
+    const refused = await syncNow();
+
+    assert.equal(statusOf(refused, "raced"), "failed");
+    assert.match(refused.data[0]!.error!, /Skill link parent changed during publication/);
+    assert.equal(existsSync(path.join(canonicalRoot, "links", "raced")), false);
+  });
+
+  test("preserves uppercase legacy skills when discovery roots overlap canonical", async () => {
+    const canonicalRoot = path.join(stateDir, "overlap-uppercase-canonical");
+    const legacyTarget = path.join(canonicalRoot, "Demo");
+    mkdirSync(legacyTarget, { recursive: true });
+    writeFileSync(path.join(legacyTarget, "SKILL.md"), "trusted legacy contents");
+    writeFileSync(path.join(stateDir, "provision.lock.json"), JSON.stringify({
+      version: 1,
+      approved: [],
+      revoked: [],
+      installed: {
+	"skill/Demo": {
+	  sha256: "a".repeat(64),
+	  files: ["SKILL.md"],
+	  directories: [],
+	  fileHashes: { "SKILL.md": sha(Buffer.from("trusted legacy contents")) },
+	  installedAt: new Date().toISOString(),
+	  installRoot: canonicalRoot,
+	},
+      },
+    }));
+    process.env.PROVISION_SKILLS_DIR = canonicalRoot;
+    process.env.PROVISION_SKILL_LINK_DIRS = path.join(canonicalRoot, "shared");
+    process.env.PROVISION_AUTOAPPLY = "auto";
+    const legacyIdentity = lstatSync(legacyTarget, { bigint: true }).ino;
+    initProvisioning();
+    const replacement = serveSkill("/overlap-uppercase-migration.tgz", "replacement contents");
+    registerManifestUrl(serveManifest([{ type: "skill", name: "demo", ...replacement }]));
+
+    const refused = await syncNow();
+
+    assert.equal(statusOf(refused, "demo"), "failed");
+    assert.match(refused.data[0]!.error!, /overlaps canonical skills directory/);
+    assert.equal(
+	readFileSync(path.join(legacyTarget, "SKILL.md"), "utf8"),
+	"trusted legacy contents",
+    );
+    assert.equal(lstatSync(legacyTarget, { bigint: true }).ino, legacyIdentity);
+    assert.equal(
+	readdirSync(canonicalRoot).some((entry) => entry.startsWith(".provision-removed-")),
+	false,
+    );
+    const state = JSON.parse(readFileSync(path.join(stateDir, "provision.lock.json"), "utf8"));
+    assert.equal(state.installed["skill/Demo"].installRoot, canonicalRoot);
+    assert.equal(state.installed["skill/demo"], undefined);
+    assert.deepEqual(state.removalRecoveries ?? [], []);
+  });
+
+  test("does not probe unrelated read-only roots during idempotent link sync", {
+    skip: process.platform === "win32",
+  }, async () => {
+    const canonicalRoot = path.join(stateDir, "read-only-canonical");
+    const linkRoot = path.join(stateDir, "read-only-discovery");
+    process.env.PROVISION_SKILLS_DIR = canonicalRoot;
+    process.env.PROVISION_SKILL_LINK_DIRS = linkRoot;
+    process.env.PROVISION_AUTOAPPLY = "auto";
+    initProvisioning();
+    const skill = serveSkill("/read-only-roots.tgz", "read-only roots");
+    const manifestUrl = serveManifest([{ type: "skill", name: "linked", ...skill }]);
+    registerManifestUrl(manifestUrl);
+    assert.equal(statusOf(await syncNow(), "linked"), "installed");
+
+    chmodSync(canonicalRoot, 0o555);
+    chmodSync(linkRoot, 0o555);
+    try {
+      initProvisioning();
+      registerManifestUrl(manifestUrl);
+      assert.equal(statusOf(await syncNow(), "linked"), "installed");
+    } finally {
+      chmodSync(canonicalRoot, 0o755);
+      chmodSync(linkRoot, 0o755);
+    }
+  });
+
+  test("does not probe collator-equivalent existing roots below a read-only parent", {
+    skip: process.platform === "win32",
+  }, async () => {
+    const commonParent = path.join(stateDir, "read-only-accent-parent");
+    const canonicalRoot = path.join(commonParent, "Café");
+    const linkRoot = path.join(commonParent, "Cafe");
+    mkdirSync(canonicalRoot, { recursive: true });
+    mkdirSync(linkRoot, { recursive: true });
+    const canonicalIdentity = lstatSync(canonicalRoot, { bigint: true });
+    const linkIdentity = lstatSync(linkRoot, { bigint: true });
+    if (canonicalIdentity.dev === linkIdentity.dev && canonicalIdentity.ino === linkIdentity.ino) return;
+    process.env.PROVISION_SKILLS_DIR = canonicalRoot;
+    process.env.PROVISION_SKILL_LINK_DIRS = linkRoot;
+    process.env.PROVISION_AUTOAPPLY = "auto";
+    initProvisioning();
+    const skill = serveSkill("/read-only-accent-roots.tgz", "accent-distinct roots");
+    const manifestUrl = serveManifest([{ type: "skill", name: "linked", ...skill }]);
+    registerManifestUrl(manifestUrl);
+    assert.equal(statusOf(await syncNow(), "linked"), "installed");
+
+    chmodSync(commonParent, 0o555);
+    try {
+      initProvisioning();
+      registerManifestUrl(manifestUrl);
+      assert.equal(statusOf(await syncNow(), "linked"), "installed");
+    } finally {
+      chmodSync(commonParent, 0o755);
+    }
+  });
+
+  test("keeps a durable created link when a later root races onto canonical", async () => {
+    const canonicalRoot = path.join(stateDir, "partial-link-canonical");
+    const firstRoot = path.join(stateDir, "partial-link-first");
+    const displacedFirstRoot = path.join(stateDir, "partial-link-first-displaced");
+    const secondRoot = path.join(stateDir, "partial-link-second");
+    const firstLink = path.join(firstRoot, "linked");
+    const secondLink = path.join(secondRoot, "linked");
+    process.env.PROVISION_SKILLS_DIR = canonicalRoot;
+    process.env.PROVISION_SKILL_LINK_DIRS = `${firstRoot},${secondRoot}`;
+    process.env.PROVISION_AUTOAPPLY = "auto";
+    let raced = false;
+    initProvisioning({
+      beforeSkillLinkPublication: (linkPath) => {
+	if (raced || linkPath !== secondLink) return;
+	raced = true;
+	renameSync(firstRoot, displacedFirstRoot);
+	symlinkSync(canonicalRoot, firstRoot, process.platform === "win32" ? "junction" : "dir");
+	mkdirSync(secondLink, { recursive: true });
+      },
+    });
+    const skill = serveSkill("/partial-link-race.tgz", "canonical survives link rollback race");
+    registerManifestUrl(serveManifest([{ type: "skill", name: "linked", ...skill }]));
+
+    const failed = await syncNow();
+
+    assert.equal(statusOf(failed, "linked"), "failed");
+    assert.match(failed.data[0]!.error!, /discovery-link rollback could not complete/);
+    assert.equal(
+	readFileSync(path.join(canonicalRoot, "linked", "SKILL.md"), "utf8"),
+	"canonical survives link rollback race",
+    );
+    assert.equal(lstatSync(path.join(displacedFirstRoot, "linked")).isSymbolicLink(), true);
+    assert.equal(lstatSync(path.join(firstRoot, "linked")).isDirectory(), true);
+    assert.equal(lstatSync(secondLink).isDirectory(), true);
+  });
+
   test("keeps old discovery links when a newly configured root collides", async () => {
     const oldRoot = path.join(stateDir, "old-discovery-root");
     const newRoot = path.join(stateDir, "new-discovery-root");
@@ -871,7 +1117,7 @@ describe("provision sync", () => {
     const state = JSON.parse(readFileSync(path.join(stateDir, "provision.lock.json"), "utf8"));
     assert.equal(state.installed["skill/migrated"].installRoot, newRoot);
     assert.notEqual(state.installed["skill/migrated"].legacySkillMigration, undefined);
-    assert.notEqual(state.installed["skill/migrated"].skillLinkPublication, undefined);
+    assert.equal(state.installed["skill/migrated"].skillLinkPublication, undefined);
     assert.equal(state.removalRecoveries.length, 1);
     assert.equal(state.upgradeRecoveries.length, 1);
 

@@ -1,4 +1,5 @@
 import { spawnSync } from "node:child_process";
+import { randomBytes } from "node:crypto";
 import {
   closeSync,
   constants,
@@ -144,6 +145,43 @@ const WINDOWS_REMOVE_SCRIPT = [
     + 'catch (err) { if (err && err.code === "ENOENT") process.exit(2); throw err }',
 ].join(";");
 
+const MKDIR_AT_SCRIPT = [
+  ...VERIFIED_DIRECTORY_PREFIX,
+  'try { fs.mkdirSync(process.argv[1], { mode: 0o700 }) } catch (err) { '
+    + 'if (err && err.code === "EEXIST") process.exit(17); throw err }',
+  "const created = fs.lstatSync(process.argv[1], { bigint: true })",
+  "if (!created.isDirectory()) process.exit(66)",
+  "process.stdout.write(JSON.stringify({ dev: created.dev.toString(), ino: created.ino.toString() }))",
+].join(";");
+
+const SYMLINK_AT_SCRIPT = [
+  ...VERIFIED_DIRECTORY_PREFIX,
+  'try { fs.symlinkSync(process.argv[1], process.argv[2], process.argv[3]) } catch (err) { '
+    + 'if (err && err.code === "EEXIST") process.exit(17); throw err }',
+  "const created = fs.lstatSync(process.argv[2], { bigint: true })",
+  "if (!created.isSymbolicLink() || fs.readlinkSync(process.argv[2]) !== process.argv[1]) process.exit(66)",
+  "process.stdout.write(JSON.stringify({ dev: created.dev.toString(), ino: created.ino.toString() }))",
+].join(";");
+
+const INSPECT_AT_IDENTITY_SCRIPT = [
+  ...VERIFIED_DIRECTORY_PREFIX,
+  "let candidate",
+  "try { candidate = fs.lstatSync(process.argv[1], { bigint: true }) } "
+    + 'catch (err) { if (err && err.code === "ENOENT") process.exit(2); throw err }',
+  "if (candidate.dev.toString() !== process.argv[3] "
+    + "|| candidate.ino.toString() !== process.argv[4] "
+    + "|| (process.argv[2] === '1') !== candidate.isDirectory()) process.exit(66)",
+].join(";");
+
+const INSPECT_SYMLINK_AT_SCRIPT = [
+  ...VERIFIED_DIRECTORY_PREFIX,
+  "let candidate",
+  "try { candidate = fs.lstatSync(process.argv[2], { bigint: true }) } "
+    + 'catch (err) { if (err && err.code === "ENOENT") process.exit(2); throw err }',
+  "if (!candidate.isSymbolicLink() || fs.readlinkSync(process.argv[2]) !== process.argv[1]) process.exit(66)",
+  "process.stdout.write(JSON.stringify({ dev: candidate.dev.toString(), ino: candidate.ino.toString() }))",
+].join(";");
+
 const WINDOWS_REMOVE_PUBLISHED_LINK_SCRIPT = [
   ...VERIFIED_DIRECTORY_PREFIX,
   "const expectedDev = process.argv[3]",
@@ -172,6 +210,199 @@ function spawnVerifiedChild(
     cwd: parentPath,
     stdio: ["ignore", "ignore", "ignore", parentFd],
   });
+}
+
+function spawnVerifiedChildWithOutput(
+  parentFd: number,
+  parentPath: string,
+  script: string,
+  args: string[],
+) {
+  return spawnSync(process.execPath, ["-e", script, ...args], {
+    cwd: parentPath,
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "ignore", parentFd],
+  });
+}
+
+type VerifiedOutputChildResult = Pick<
+  ReturnType<typeof spawnVerifiedChildWithOutput>,
+  "status" | "stdout"
+>;
+type VerifiedOutputChildRunner = (
+  parentFd: number,
+  parentPath: string,
+  script: string,
+  args: string[],
+) => VerifiedOutputChildResult;
+
+export interface AnchoredEntryIdentity {
+  dev: string;
+  ino: string;
+}
+
+/** The helper may have published below the opened parent, but cannot prove its result. */
+export class AnchoredPublicationAmbiguousError extends ProvisionError {
+  constructor(message: string) {
+    super(message, "atomic_rename_unavailable");
+    this.name = "AnchoredPublicationAmbiguousError";
+  }
+}
+
+function parseAnchoredIdentity(output: string | Buffer | null): AnchoredEntryIdentity {
+  try {
+    const parsed = JSON.parse(output?.toString() ?? "") as Partial<AnchoredEntryIdentity>;
+    if (typeof parsed.dev === "string" && /^\d+$/.test(parsed.dev)
+      && typeof parsed.ino === "string" && /^\d+$/.test(parsed.ino)) {
+      return { dev: parsed.dev, ino: parsed.ino };
+    }
+  } catch {
+    // Normalize malformed helper output below.
+  }
+  throw new ProvisionError("Anchored filesystem helper returned invalid identity", "atomic_rename_unavailable");
+}
+
+/** Create one directory basename relative to a cwd verified against an open parent FD. */
+export function mkdirAt(
+  parentFd: number,
+  parentPath: string,
+  basename: string,
+): AnchoredEntryIdentity | undefined {
+  assertSiblingBasenames(basename);
+  const child = spawnVerifiedChildWithOutput(parentFd, parentPath, MKDIR_AT_SCRIPT, [basename]);
+  if (child.status === 0) return parseAnchoredIdentity(child.stdout);
+  if (child.status === 17) return undefined;
+  if (child.status === 65) {
+    throw new ProvisionError("Directory parent changed during creation", "untracked_content");
+  }
+  throw new ProvisionError("Anchored directory creation failed", "atomic_rename_unavailable");
+}
+
+/** Create one symlink basename relative to a cwd verified against an open parent FD. */
+export function symlinkAt(
+  parentFd: number,
+  parentPath: string,
+  target: string,
+  basename: string,
+  type: "dir" | "junction",
+  runVerifiedChild: VerifiedOutputChildRunner = spawnVerifiedChildWithOutput,
+): AnchoredEntryIdentity | undefined {
+  assertSiblingBasenames(basename);
+  const child = runVerifiedChild(
+    parentFd,
+    parentPath,
+    SYMLINK_AT_SCRIPT,
+    [target, basename, type],
+  );
+  if (child.status === 0) return parseAnchoredIdentity(child.stdout);
+  if (child.status === 17) return undefined;
+  if (child.status === 65) {
+    throw new ProvisionError("Skill link parent changed during publication", "untracked_content");
+  }
+  const inspected = spawnVerifiedChildWithOutput(
+    parentFd,
+    parentPath,
+    INSPECT_SYMLINK_AT_SCRIPT,
+    [target, basename],
+  );
+  if (inspected.status === 0) return parseAnchoredIdentity(inspected.stdout);
+  if (inspected.status === 2) {
+    throw new ProvisionError("Anchored skill link publication failed", "atomic_rename_unavailable");
+  }
+  if (inspected.status === 65) {
+    throw new AnchoredPublicationAmbiguousError(
+      "Skill link parent changed while an ambiguous publication was recovered",
+    );
+  }
+  throw new AnchoredPublicationAmbiguousError(
+    "Anchored skill link publication may have completed without recoverable identity",
+  );
+}
+
+/** Remove one anchored entry only when its current identity is still the recorded inode. */
+export function removeAtIdentity(
+  parentFd: number,
+  parentPath: string,
+  basename: string,
+  directory: boolean,
+  expected: AnchoredEntryIdentity,
+  renameOperation: typeof renameEntryAtNoReplace = renameEntryAtNoReplace,
+): boolean {
+  assertSiblingBasenames(basename);
+  const quarantine = `.provision-retained-${randomBytes(16).toString("hex")}`;
+  let moved: boolean;
+  try {
+    moved = renameOperation(parentFd, parentPath, basename, quarantine);
+  } catch (err) {
+    if (entryAtMatchesIdentity(parentFd, parentPath, quarantine, directory, expected)) {
+      moved = true;
+    } else {
+      throw err;
+    }
+  }
+  if (!moved) return false;
+  if (!entryAtMatchesIdentity(parentFd, parentPath, quarantine, directory, expected)) {
+    renameOperation(parentFd, parentPath, quarantine, basename);
+    return false;
+  }
+  try {
+    return removeAt(parentFd, parentPath, quarantine, directory);
+  } catch (err) {
+    let restored = false;
+    try {
+      restored = renameOperation(parentFd, parentPath, quarantine, basename);
+    } catch (restoreError) {
+      throw new ProvisionError(
+	`Anchored cleanup failed and its quarantine could not be restored: ${
+	  restoreError instanceof Error ? restoreError.message : String(restoreError)
+	}`,
+	"atomic_rename_unavailable",
+      );
+    }
+    if (!restored) {
+      throw new ProvisionError(
+	"Anchored cleanup failed and its quarantine destination was occupied",
+	"untracked_content",
+      );
+    }
+    throw err;
+  }
+}
+
+function entryAtMatchesIdentity(
+  parentFd: number,
+  parentPath: string,
+  basename: string,
+  directory: boolean,
+  expected: AnchoredEntryIdentity,
+): boolean {
+  const child = spawnVerifiedChild(
+    parentFd,
+    parentPath,
+    INSPECT_AT_IDENTITY_SCRIPT,
+    [basename, directory ? "1" : "0", expected.dev, expected.ino],
+  );
+  if (child.status === 0) return true;
+  if (child.status === 2 || child.status === 66) return false;
+  if (child.status === 65) {
+    throw new ProvisionError("Identity inspection parent changed", "untracked_content");
+  }
+  throw new ProvisionError("Anchored identity inspection failed", "atomic_rename_unavailable");
+}
+
+function renameEntryAtNoReplace(
+  parentFd: number,
+  parentPath: string,
+  source: string,
+  destination: string,
+): boolean {
+  if (process.platform !== "win32") {
+    return renameAtNoReplace(parentFd, parentPath, source, destination);
+  }
+  throw new ProvisionError(
+    "Anchored no-replace entry rename is unavailable on Windows",
+    "atomic_rename_unavailable",
+  );
 }
 
 type VerifiedChildResult = Pick<ReturnType<typeof spawnSync>, "status">;
