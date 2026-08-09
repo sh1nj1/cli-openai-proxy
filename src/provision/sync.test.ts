@@ -482,6 +482,59 @@ describe("provision sync", () => {
     assert.equal(lstatSync(path.join(actualRoot, "deduplicated")).isSymbolicLink(), true);
   });
 
+  test("deduplicates missing discovery roots beneath aliased parents", async () => {
+    const actualParent = path.join(stateDir, "shared-discovery-parent");
+    const aliasParent = path.join(stateDir, "shared-discovery-parent-alias");
+    mkdirSync(actualParent);
+    symlinkSync(actualParent, aliasParent, process.platform === "win32" ? "junction" : "dir");
+    const aliasRoot = path.join(aliasParent, "new-skills");
+    const actualRoot = path.join(actualParent, "new-skills");
+    process.env.PROVISION_SKILL_LINK_DIRS = `${aliasRoot},${actualRoot}`;
+    process.env.PROVISION_AUTOAPPLY = "auto";
+    initProvisioning();
+    const skill = serveSkill("/deduplicated-missing-roots.tgz", "deduplicated missing roots");
+    registerManifestUrl(serveManifest([{ type: "skill", name: "deduplicated", ...skill }]));
+
+    assert.equal(statusOf(await syncNow(), "deduplicated"), "installed");
+    assert.equal(statusOf(await syncNow(), "deduplicated"), "installed");
+    const state = JSON.parse(readFileSync(path.join(stateDir, "provision.lock.json"), "utf8"));
+    assert.equal(state.installed["skill/deduplicated"].skillLinks.length, 1);
+    assert.equal(
+      state.installed["skill/deduplicated"].skillLinks[0].path,
+      path.join(aliasRoot, "deduplicated"),
+    );
+    assert.equal(lstatSync(path.join(actualRoot, "deduplicated")).isSymbolicLink(), true);
+  });
+
+  test("keeps old discovery links when a newly configured root collides", async () => {
+    const oldRoot = path.join(stateDir, "old-discovery-root");
+    const newRoot = path.join(stateDir, "new-discovery-root");
+    process.env.PROVISION_SKILL_LINK_DIRS = oldRoot;
+    process.env.PROVISION_AUTOAPPLY = "auto";
+    initProvisioning();
+    const skill = serveSkill("/changed-link-roots.tgz", "changed link roots");
+    const manifestUrl = serveManifest([{ type: "skill", name: "linked", ...skill }]);
+    registerManifestUrl(manifestUrl);
+    assert.equal(statusOf(await syncNow(), "linked"), "installed");
+    const oldLink = path.join(oldRoot, "linked");
+    const oldIdentity = lstatSync(oldLink, { bigint: true }).ino;
+
+    const collision = path.join(newRoot, "linked");
+    mkdirSync(collision, { recursive: true });
+    writeFileSync(path.join(collision, "USER.md"), "untracked collision");
+    process.env.PROVISION_SKILL_LINK_DIRS = newRoot;
+    initProvisioning();
+    registerManifestUrl(manifestUrl);
+
+    const refused = await syncNow();
+    assert.equal(statusOf(refused, "linked"), "failed");
+    assert.match(refused.data[0]!.error!, /untracked content at skill link/);
+    assert.equal(lstatSync(oldLink, { bigint: true }).ino, oldIdentity);
+    assert.equal(readFileSync(path.join(collision, "USER.md"), "utf8"), "untracked collision");
+    const state = JSON.parse(readFileSync(path.join(stateDir, "provision.lock.json"), "utf8"));
+    assert.equal(state.installed["skill/linked"].skillLinks[0].path, oldLink);
+  });
+
   test("recovers a discovery link published after its ownership intent was saved", async () => {
     const linkDir = path.join(stateDir, "claude-skills");
     process.env.PROVISION_SKILL_LINK_DIRS = linkDir;

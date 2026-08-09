@@ -203,20 +203,31 @@ function existingRealPath(candidate: string): string | undefined {
   }
 }
 
+function resolvedPathThroughExistingAncestor(candidate: string): string {
+  let ancestor = path.resolve(candidate);
+  const suffix: string[] = [];
+  while (true) {
+    const real = existingRealPath(ancestor);
+    if (real !== undefined) return path.resolve(real, ...suffix.reverse());
+    const parent = path.dirname(ancestor);
+    if (parent === ancestor) return path.resolve(candidate);
+    suffix.push(path.basename(ancestor));
+    ancestor = parent;
+  }
+}
+
 function skillLinkDirs(): string[] {
   const configured = process.env.PROVISION_SKILL_LINK_DIRS;
   const entries = configured === undefined
     ? [path.join(homedir(), ".claude", "skills")]
     : configured.split(",").map((entry) => entry.trim()).filter(Boolean);
   const canonical = path.resolve(skillsDir());
-  const canonicalReal = existingRealPath(canonical);
-  const seenRealPaths = new Set(canonicalReal ? [canonicalReal] : []);
+  const seenResolvedPaths = new Set([resolvedPathThroughExistingAncestor(canonical)]);
   return [...new Set(entries.map((entry) => path.resolve(entry)))].filter((entry) => {
     if (entry === canonical) return false;
-    const real = existingRealPath(entry);
-    if (real === undefined) return true;
-    if (seenRealPaths.has(real)) return false;
-    seenRealPaths.add(real);
+    const resolved = resolvedPathThroughExistingAncestor(entry);
+    if (seenResolvedPaths.has(resolved)) return false;
+    seenResolvedPaths.add(resolved);
     return true;
   });
 }
@@ -842,9 +853,23 @@ function ensureSkillLinks(
   }
   const recorded = new Map((record.skillLinks ?? []).map((link) => [link.path, link]));
 
-  for (const link of record.skillLinks ?? []) {
-    if (desiredPaths.includes(link.path)) continue;
-    isolateRecordedSkillLink(link);
+  // Verify the whole destination set before changing any existing link. This
+  // keeps the previous discovery fanout live when a newly configured root is
+  // already occupied.
+  for (const linkPath of desiredPaths) {
+    const owned = recorded.get(linkPath);
+    if (owned && pathEntryExists(linkPath) && !sameSkillLinkIdentity(linkPath, owned)) {
+      throw new ProvisionError(
+	`Refusing to replace changed skill link "${linkPath}"`,
+	"untracked_content",
+      );
+    }
+    if (!owned && pathEntryExists(linkPath)) {
+      throw new ProvisionError(
+	`Refusing to replace untracked content at skill link "${linkPath}"`,
+	"untracked_content",
+      );
+    }
   }
 
   const result: InstalledSkillLink[] = [];
@@ -885,6 +910,10 @@ function ensureSkillLinks(
       const link = publishSkillLink(linkPath, target, record, persist);
       result.push(link);
       created.push(link);
+    }
+    for (const link of record.skillLinks ?? []) {
+      if (desiredPaths.includes(link.path)) continue;
+      isolateRecordedSkillLink(link);
     }
     return result;
   } catch (err) {
