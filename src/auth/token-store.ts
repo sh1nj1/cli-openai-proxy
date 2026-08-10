@@ -63,9 +63,26 @@ export function clearAllCredentials(): void {
  * every future path into the store remembering to ask.
  */
 export function getProvisionedAuthEnv(engine: string | undefined): Record<string, string> {
-  if (!engine || !hasInjectableCredential(engine)) return {};
-  const cred = credentials.get(engine);
+  const cred = getProvisionedCredential(engine);
   return cred ? { [cred.envVar]: cred.value } : {};
+}
+
+/**
+ * Take one immutable-enough view of a provisioned credential for a single run.
+ *
+ * A custom gateway's URL and its key are one security boundary: callers that
+ * need both must use this rather than reading them independently across async
+ * work. Return copies so no consumer can mutate the stored routing for another
+ * run.
+ */
+export function getProvisionedCredential(engine: string | undefined): StoredCredential | null {
+  if (!engine || !hasInjectableCredential(engine)) return null;
+  const credential = credentials.get(engine);
+  if (!credential) return null;
+  return {
+    ...credential,
+    ...(credential.gateway ? { gateway: { ...credential.gateway } } : {}),
+  };
 }
 
 /**
@@ -76,6 +93,5 @@ export function getProvisionedAuthEnv(engine: string | undefined): Record<string
  * the key itself, so a run can never be pointed at a gateway it has no key for.
  */
 export function getProvisionedGateway(engine: string | undefined): CredentialGateway | null {
-  if (!engine || !hasInjectableCredential(engine)) return null;
-  return credentials.get(engine)?.gateway ?? null;
+  return getProvisionedCredential(engine)?.gateway ?? null;
 }

@@ -19,7 +19,7 @@ import { CodexJsonlParser } from "./codex-jsonl-parser.js";
 import { adapterRunError, engineUnauthenticatedError } from "./adapter-error.js";
 import { prepareCodexCustomHome } from "./codex-custom-home.js";
 import { blankedProxySecrets, getBgWaitCeilingMs } from "../config.js";
-import { getProvisionedAuthEnv, getProvisionedGateway } from "../auth/token-store.js";
+import { getProvisionedAuthEnv, getProvisionedCredential } from "../auth/token-store.js";
 import {
   currentWorkspaceContext,
   ensureWorkspaceRoot,
@@ -124,8 +124,17 @@ export class PaperclipRunner extends EventEmitter implements AgentRunner {
     // names the engine, the same shape a CLI auth failure produces) beats
     // launching a CLI that would authenticate against nothing and fail opaquely.
     let codexCustomHome: string | undefined;
+    // Capture routing and its bearer key together before any await. Reprovisioning
+    // while prepareCodexCustomHome writes config.toml must never pair one
+    // credential's key with another credential's gateway.
+    const codexCustomCredential = this.engine === "codex_custom"
+      ? getProvisionedCredential(this.engine)
+      : null;
+    const provisionedAuthEnv = codexCustomCredential
+      ? { [codexCustomCredential.envVar]: codexCustomCredential.value }
+      : getProvisionedAuthEnv(this.engine);
     if (this.engine === "codex_custom") {
-      const gateway = getProvisionedGateway(this.engine);
+      const gateway = codexCustomCredential?.gateway;
       if (!gateway) {
         this.emit(
           "error",
@@ -226,7 +235,7 @@ export class PaperclipRunner extends EventEmitter implements AgentRunner {
           // is the sole channel that reaches the adapter's CLI child. Scoped to
           // THIS adapter's engine: every adapter spawns a different vendor's CLI,
           // so an unscoped merge would hand one vendor's token to another's process.
-          ...getProvisionedAuthEnv(this.engine),
+	  ...provisionedAuthEnv,
         },
       },
       context,

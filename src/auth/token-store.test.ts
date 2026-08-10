@@ -5,6 +5,7 @@ import {
   clearAllCredentials,
   clearCredential,
   getProvisionedAuthEnv,
+  getProvisionedCredential,
   getProvisionedGateway,
   hasCredential,
   hasInjectableCredential,
@@ -109,6 +110,32 @@ describe("token-store", () => {
     // engine that still reports somewhere to send requests.
     clearCredential("codex_custom");
     assert.strictEqual(getProvisionedGateway("codex_custom"), null);
+  });
+
+  test("a credential snapshot keeps its key and gateway together after reprovisioning", () => {
+    setCredential("codex_custom", {
+      envVar: "CODEX_CUSTOM_API_KEY",
+      value: "sk-or-one",
+      gateway: { baseUrl: "https://one.example/v1" },
+    });
+    const snapshot = getProvisionedCredential("codex_custom");
+
+    setCredential("codex_custom", {
+      envVar: "CODEX_CUSTOM_API_KEY",
+      value: "sk-or-two",
+      gateway: { baseUrl: "https://two.example/v1" },
+    });
+
+    assert.deepStrictEqual(snapshot, {
+      envVar: "CODEX_CUSTOM_API_KEY",
+      value: "sk-or-one",
+      gateway: { baseUrl: "https://one.example/v1" },
+    });
+    assert.deepStrictEqual(getProvisionedCredential("codex_custom"), {
+      envVar: "CODEX_CUSTOM_API_KEY",
+      value: "sk-or-two",
+      gateway: { baseUrl: "https://two.example/v1" },
+    });
   });
 
   test("an undeclared trust boundary withholds the gateway as well as the key", () => {
