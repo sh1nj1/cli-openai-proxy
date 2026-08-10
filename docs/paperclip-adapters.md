@@ -9,8 +9,42 @@ anything after it is the CLI's model string. Registered adapters:
 |--------------------------|-------------------------------------|----------------------------|-----------------------|
 | `paperclip/claude_local` | `@paperclipai/adapter-claude-local` | `claude`                   | token-by-token        |
 | `paperclip/codex_local`  | `@paperclipai/adapter-codex-local`  | `codex`                    | per message block     |
+| `paperclip/codex_custom` | `@paperclipai/adapter-codex-local`  | `codex` + a gateway provisioned through `/v1/auth/codex_custom` | per message block |
 
 All adapters run `engine: "cli"`. Option 1 is **stateless** (no session resume).
+
+## `codex_local` vs `codex_custom`
+
+Same package, same CLI, same stdout dialect — the difference is which credential
+a run spends, and that difference forces two adapter ids rather than one.
+
+Codex has no flag or env var for a custom OpenAI-compatible endpoint: it is a
+`[model_providers.<id>]` table in `$CODEX_HOME/config.toml` selected by a
+**file-global** `model_provider` key. One codex home therefore selects one
+provider, so an adapter that could be either would have to rewrite that key per
+request and race itself under concurrency.
+
+`codex_custom` consequently gets its own `CODEX_HOME`
+(`<paperclip-instance-root>/cli-openai-proxy/codex-custom-home`, written by
+`src/adapter/codex-custom-home.ts`), deliberately outside the Paperclip-managed
+`companies/` tree:
+
+- `codex_local` shares the managed company home, whose `auth.json` is a symlink
+  to the host's `~/.codex` login. A gateway written into that home would make the
+  two adapters fight over one file every run.
+- A home the codex adapter classifies as managed is refused before launch when it
+  has neither `auth.json` nor `OPENAI_API_KEY`. A custom provider needs neither —
+  it reads its bearer token from the env var its table names — so satisfying that
+  gate would mean writing a key to disk for a check that does not apply.
+
+The generated `config.toml` pins `wire_api = "responses"`: codex ≥ 0.145 refuses
+to load a config asking for Chat Completions, so the gateway must serve OpenAI's
+Responses API at `<base_url>/responses`. The key itself never enters the file —
+`env_key` points at `CODEX_CUSTOM_API_KEY`, injected per run from memory.
+
+A run with nothing provisioned is refused before the CLI is spawned, as
+`401 engine_unauthenticated` naming `codex_custom`, so a client opens the right
+login flow instead of reading an opaque stream error.
 
 ## Notes & limitations
 

@@ -19,6 +19,16 @@
 export type AuthFlow = "api-key" | "paste-code" | "device-code";
 
 /**
+ * Where a provisioned key is spent, for an engine whose endpoint is not fixed by
+ * its vendor. `codex_custom` routes through any OpenAI-compatible gateway, so the
+ * key alone does not say who to send it to — the caller supplies both.
+ */
+export interface CredentialGateway {
+  /** OpenAI-compatible API root, without a trailing slash (e.g. https://openrouter.ai/api/v1). */
+  baseUrl: string;
+}
+
+/**
  * A credential the CLI hands BACK to us instead of persisting itself.
  * `claude setup-token` prints its token and expects the caller to export it —
  * it never writes ~/.claude — so we must hold it and inject it into every run.
@@ -28,6 +38,21 @@ export interface StoredCredential {
   /** Env var the engine reads this credential from (e.g. CLAUDE_CODE_OAUTH_TOKEN). */
   envVar: string;
   value: string;
+  /**
+   * Routing provisioned together with the key, for engines that have no fixed
+   * endpoint. Kept on the credential rather than in a second store so forgetting
+   * one forgets both: a key left behind with no gateway (or the reverse) would be
+   * a half-provisioned engine that reports authenticated and cannot run.
+   */
+  gateway?: CredentialGateway;
+}
+
+/**
+ * Settings a caller submits alongside the secret. Empty for every vendor-hosted
+ * flow; `codex_custom` needs `baseUrl` because the endpoint is the caller's choice.
+ */
+export interface AuthSubmitOptions {
+  baseUrl?: string;
 }
 
 export interface AuthStartResult {
@@ -51,7 +76,11 @@ export interface AuthSubmitResult {
  */
 export interface EngineAuthSession {
   start(): Promise<AuthStartResult>;
-  submit(input: string): Promise<AuthSubmitResult>;
+  /**
+   * `options` carries non-secret settings that arrived with the submission. A
+   * flow whose endpoint its vendor fixes ignores it entirely.
+   */
+  submit(input: string, options?: AuthSubmitOptions): Promise<AuthSubmitResult>;
   cancel(): void;
   /**
    * Present only for flows that complete without a submission ("device-code"):
@@ -88,6 +117,12 @@ export interface EngineFlowDescriptor {
    * one never enters a child environment we build.
    */
   injectsCredential?: boolean;
+  /**
+   * True when the submission must carry `baseUrl` as well as the secret. Advertised
+   * so a client renders the extra field from the engine list rather than from a
+   * hardcoded engine name — the same reason `flow` is advertised at all.
+   */
+  requiresBaseUrl?: boolean;
   createSession(): EngineAuthSession;
 }
 

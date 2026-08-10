@@ -5,10 +5,12 @@
  */
 
 import { CodexApiKeySession, commandRunner } from "./adapters/codex-api-key.js";
+import { CodexCustomApiKeySession } from "./adapters/codex-custom-api-key.js";
 import { CodexDeviceAuthSession } from "./adapters/codex-device-auth.js";
 import { ClaudeApiKeySession } from "./adapters/claude-api-key.js";
 import { CLAUDE_OAUTH_TOKEN_ENV, ClaudeSetupTokenSession } from "./adapters/claude-setup-token.js";
-import { hasInjectableCredential } from "./token-store.js";
+import { getProvisionedGateway, hasCredential, hasInjectableCredential } from "./token-store.js";
+import { TRUST_COMPLETION_CALLERS_VAR, trustsCompletionCallers } from "../config.js";
 import type { EngineAuthDescriptor, EngineAuthStatus } from "./types.js";
 
 const STATUS_TIMEOUT_MS = 15_000;
@@ -65,6 +67,34 @@ async function codexStatus(): Promise<EngineAuthStatus> {
   }
 }
 
+/**
+ * Unlike claude and codex, this engine has no host-side credential to be unsure
+ * about: a custom gateway exists only if it was provisioned through this API, so
+ * "not provisioned" is a definitive `unauthenticated` rather than `unknown`.
+ */
+async function codexCustomStatus(): Promise<EngineAuthStatus> {
+  const gateway = getProvisionedGateway("codex_custom");
+  if (gateway) {
+    return { state: "authenticated", source: "provisioned", detail: `routing to ${gateway.baseUrl}` };
+  }
+  // Held but unusable: the key can only reach the CLI through a completion
+  // child's environment, and that injection is withheld until the operator
+  // declares those callers trusted. Saying "authenticated" here would advertise
+  // a credential no run can spend.
+  if (hasCredential("codex_custom") && !trustsCompletionCallers()) {
+    return {
+      state: "unauthenticated",
+      detail:
+        `A gateway is provisioned but withheld from runs: set ${TRUST_COMPLETION_CALLERS_VAR}=1 ` +
+        "to declare that every completion caller may read it.",
+    };
+  }
+  return {
+    state: "unauthenticated",
+    detail: "No gateway provisioned. Submit an API key and `base_url` through this API.",
+  };
+}
+
 const REGISTRY: Record<string, EngineAuthDescriptor> = {
   claude: {
     engine: "claude",
@@ -98,6 +128,23 @@ const REGISTRY: Record<string, EngineAuthDescriptor> = {
       { flow: "device-code", createSession: () => new CodexDeviceAuthSession() },
     ],
     checkStatus: codexStatus,
+  },
+  codex_custom: {
+    engine: "codex_custom",
+    flows: [
+      {
+        flow: "api-key",
+        // No `codex login` equivalent exists for a custom provider: its table in
+        // config.toml reads the key from an env var, so the proxy holds it and
+        // injects it per run — the same custody as the claude flows.
+        injectsCredential: true,
+        // The endpoint is the caller's choice, so the key alone is not a
+        // complete submission.
+        requiresBaseUrl: true,
+        createSession: () => new CodexCustomApiKeySession(),
+      },
+    ],
+    checkStatus: codexCustomStatus,
   },
 };
 

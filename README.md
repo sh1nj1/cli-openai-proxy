@@ -106,6 +106,7 @@ paperclip/<adapter>[/<cli-model>]
 | `paperclip/claude_local/claude-opus-4-6` | Claude Code with `--model claude-opus-4-6` | `claude` |
 | `paperclip/codex_local` | Codex (`codex`), CLI's default model | `codex` |
 | `paperclip/codex_local/gpt-5.4-mini` | Codex with `--model gpt-5.4-mini` | `codex` |
+| `paperclip/codex_custom/anthropic/claude-sonnet-4.5` | Codex against a custom gateway (e.g. OpenRouter) | `codex_custom` |
 
 The adapter part is matched against the registry; everything after it is the
 model, passed to the CLI verbatim. The proxy keeps no model catalog of its own,
@@ -277,14 +278,51 @@ curl -X POST -H "Authorization: Bearer sk-admin-xyz789" \
   http://localhost:3456/v1/auth/codex/sessions/$SESSION_ID
 ```
 
-`AUTH_TRUST_COMPLETION_CALLERS=1` is required only for Claude provisioning. It
-declares that every completion-key holder is trusted with the provisioned OAuth
-credential; without it, the Claude session request returns `403
-caller_trust_not_declared`.
+`AUTH_TRUST_COMPLETION_CALLERS=1` is required for the `claude` and `codex_custom`
+engines. It declares that every completion-key holder is trusted with the
+provisioned credential — those CLIs read it from their environment, so the proxy
+has to hand it to a child any completion caller can inspect. Without it, the
+session request returns `403 caller_trust_not_declared`. `codex` does not need it:
+`codex login` persists its own credential and nothing is injected.
 
 A completion whose CLI is unauthenticated answers `401` with
 `code: "engine_unauthenticated"` and the `engine` to re-authenticate, so a client
 can trigger the right flow automatically.
+
+### Custom gateways (OpenRouter and other OpenAI-compatible endpoints)
+
+`paperclip/codex_custom` runs the same `codex` CLI against an endpoint you
+provision, on that endpoint's own API key. Both values are submitted together —
+a key alone does not say where to spend it:
+
+```bash
+SESSION_ID=$(curl -sX POST -H "Authorization: Bearer sk-admin-xyz789" \
+  http://localhost:3456/v1/auth/codex_custom/sessions | jq -r .sessionId)
+
+curl -X POST -H "Authorization: Bearer sk-admin-xyz789" \
+  -H "Content-Type: application/json" \
+  -d '{"api_key": "sk-or-v1-...", "base_url": "https://openrouter.ai/api/v1"}' \
+  http://localhost:3456/v1/auth/codex_custom/sessions/$SESSION_ID
+```
+
+Then name a model the gateway serves:
+`{"model": "paperclip/codex_custom/anthropic/claude-sonnet-4.5"}`. There is no
+default worth inheriting here — the CLI's own default model is an OpenAI id the
+gateway probably does not carry — so pass the `<cli-model>` part.
+
+Requirements and behaviour:
+
+- **The gateway must serve OpenAI's Responses API** (`POST <base_url>/responses`).
+  Codex ≥ 0.145 refuses to load a config asking for Chat Completions, so a
+  Chat-only gateway cannot be used. OpenRouter serves both.
+- `base_url` must be `https`, except on loopback: the key travels to it as a
+  bearer token on every request.
+- The key is held in proxy memory only and reaches the CLI as
+  `CODEX_CUSTOM_API_KEY`. It is never written to disk — the generated
+  `config.toml` references the env var rather than the value.
+- This engine is independent of `paperclip/codex_local`, which keeps running on
+  your `codex login`. They use separate `CODEX_HOME` directories, so provisioning
+  a gateway never disturbs a ChatGPT subscription login.
 
 See [docs/cli-auth-provisioning.md](docs/cli-auth-provisioning.md).
 

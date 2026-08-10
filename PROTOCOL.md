@@ -247,7 +247,9 @@ lanes is also driven by this resolved result.
    through `/v1/auth` (a `setup-token` OAuth token or an Anthropic API key) is
    held in proxy memory (`token-store.ts`) and — only when the operator sets
    `AUTH_TRUST_COMPLETION_CALLERS=1` — injected into the completion subprocess
-   environment; a Codex API key is instead forwarded to
+   environment; a `codex_custom` gateway key is held the same way (with the
+   gateway URL it authenticates against, which the proxy renders into a
+   `config.toml` of its own); a Codex API key is instead forwarded to
    `codex login --with-api-key`, which persists it under `~/.codex` itself, so
    no in-memory holding or trust flag is involved.
 2. **Stateless**: no `--session-id`/`--resume` is used; every request is a

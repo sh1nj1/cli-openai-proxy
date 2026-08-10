@@ -16,9 +16,10 @@ import { isSystemInit } from "../types/claude-cli.js";
 import type { AgentRunner, RunnerOptions } from "./agent-runner.js";
 import { StreamJsonParser, type StreamJsonSink } from "./stream-json-parser.js";
 import { CodexJsonlParser } from "./codex-jsonl-parser.js";
-import { adapterRunError } from "./adapter-error.js";
+import { adapterRunError, engineUnauthenticatedError } from "./adapter-error.js";
+import { prepareCodexCustomHome } from "./codex-custom-home.js";
 import { blankedProxySecrets, getBgWaitCeilingMs } from "../config.js";
-import { getProvisionedAuthEnv } from "../auth/token-store.js";
+import { getProvisionedAuthEnv, getProvisionedCredential } from "../auth/token-store.js";
 import {
   currentWorkspaceContext,
   ensureWorkspaceRoot,
@@ -105,6 +106,9 @@ export class PaperclipRunner extends EventEmitter implements AgentRunner {
   }
 
   async start(prompt: string, options: RunnerOptions): Promise<void> {
+    // One ID also names the custom Codex home, binding its config.toml to this
+    // invocation rather than a mutable home shared with another completion.
+    const runId = `run-${randomUUID()}`;
     const workspace = currentWorkspaceContext();
     if (workspace?.scoped) ensureWorkspaceRoot(workspace);
     const sharedPaperclipHome = workspace?.scoped
@@ -116,6 +120,38 @@ export class PaperclipRunner extends EventEmitter implements AgentRunner {
     const sharedCodexHome = sharedPaperclipInstanceRoot
       ? path.join(sharedPaperclipInstanceRoot, "companies", "local", "codex-home")
       : undefined;
+
+    // codex_custom reaches its models through a gateway that exists only once
+    // provisioned, and the CLI takes that routing from a config file rather than
+    // any flag — so resolve it up front. Refusing here (as a classified 401 that
+    // names the engine, the same shape a CLI auth failure produces) beats
+    // launching a CLI that would authenticate against nothing and fail opaquely.
+    let codexCustomHome: string | undefined;
+    // Capture routing and its bearer key together before any await. Reprovisioning
+    // while prepareCodexCustomHome writes config.toml must never pair one
+    // credential's key with another credential's gateway.
+    const codexCustomCredential = this.engine === "codex_custom"
+      ? getProvisionedCredential(this.engine)
+      : null;
+    const provisionedAuthEnv = codexCustomCredential
+      ? { [codexCustomCredential.envVar]: codexCustomCredential.value }
+      : getProvisionedAuthEnv(this.engine);
+    if (this.engine === "codex_custom") {
+      const gateway = codexCustomCredential?.gateway;
+      if (!gateway) {
+        this.emit(
+          "error",
+          engineUnauthenticatedError(
+            this.engine,
+            "No gateway is provisioned for paperclip/codex_custom. Submit an API key and " +
+              "`base_url` to POST /v1/auth/codex_custom/sessions first.",
+          ),
+        );
+        this.emit("close", 1);
+        return;
+      }
+      codexCustomHome = await prepareCodexCustomHome(gateway.baseUrl, runId, sharedPaperclipHome);
+    }
     // Each adapter emits a different stdout dialect: claude speaks stream-json
     // (per-token deltas), codex speaks `codex exec --json` NDJSON (per-message
     // blocks). Pick the matching live parser; both expose push()/flush().
@@ -163,7 +199,7 @@ export class PaperclipRunner extends EventEmitter implements AgentRunner {
       // randomUUID (not Date.now()+pid): Paperclip keys per-run bookkeeping
       // (runningProcesses map, ${runId}.log) on runId, so concurrent runs in the
       // same process/millisecond must not collide.
-      runId: `run-${randomUUID()}`,
+      runId,
       agent: { id: "cli-openai-proxy", companyId: "local", name: "proxy", adapterType: null, adapterConfig: null },
       runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null, taskKey: null },
       config: {
@@ -190,6 +226,10 @@ export class PaperclipRunner extends EventEmitter implements AgentRunner {
 	      CODEX_HOME: sharedCodexHome!,
 	    } : {}),
 	  } : {}),
+          // Deliberately outside the Paperclip-managed company tree: this home
+          // carries no auth.json, and a managed one without it is refused before
+          // launch. See src/adapter/codex-custom-home.ts.
+          ...(codexCustomHome ? { CODEX_HOME: codexCustomHome } : {}),
           // The adapter merges this over process.env, so shadowing is the only way
           // to keep the keys that authenticate callers TO the proxy out of a child
           // that runs with permissions skipped.
@@ -198,7 +238,7 @@ export class PaperclipRunner extends EventEmitter implements AgentRunner {
           // is the sole channel that reaches the adapter's CLI child. Scoped to
           // THIS adapter's engine: every adapter spawns a different vendor's CLI,
           // so an unscoped merge would hand one vendor's token to another's process.
-          ...getProvisionedAuthEnv(this.engine),
+	  ...provisionedAuthEnv,
         },
       },
       context,
@@ -224,7 +264,7 @@ export class PaperclipRunner extends EventEmitter implements AgentRunner {
 
     // Resolve immediately so the route can begin streaming while execute runs.
     void this.execute(ctx)
-      .then((result) => {
+      .then(async (result) => {
         // Emit any buffered newline-less trailing line (e.g. a final codex
         // agent_message with no trailing newline) before deciding the terminal state.
         parser.flush();
@@ -244,7 +284,7 @@ export class PaperclipRunner extends EventEmitter implements AgentRunner {
           // successful run (a failure falls through to the shared handling below).
           this.emitCodexTerminal(result);
         }
-        this.cleanupCwd();
+	await this.cleanupRunDirectories(codexCustomHome);
         if (failed) {
           this.emit("error", adapterRunError(this.failureMessage(result), result, this.engine));
           this.emit("close", this.failureCloseCode(result));
@@ -252,9 +292,9 @@ export class PaperclipRunner extends EventEmitter implements AgentRunner {
         }
         this.emit("close", result.exitCode ?? (result.timedOut ? 124 : 0));
       })
-      .catch((err: unknown) => {
+      .catch(async (err: unknown) => {
         parser.flush();
-        this.cleanupCwd();
+	await this.cleanupRunDirectories(codexCustomHome);
         this.emit("error", err instanceof Error ? err : new Error(String(err)));
         this.emit("close", 1);
       });
@@ -433,12 +473,17 @@ export class PaperclipRunner extends EventEmitter implements AgentRunner {
     };
   }
 
-  private cleanupCwd(): void {
+  private async cleanupRunDirectories(codexCustomHome?: string): Promise<void> {
+    const removals: Array<Promise<void>> = [];
     if (this.cwd) {
       const dir = this.cwd;
       this.cwd = null;
-      void fs.rm(dir, { recursive: true, force: true }).catch(() => {});
+      removals.push(fs.rm(dir, { recursive: true, force: true }).catch(() => {}));
     }
+    if (codexCustomHome) {
+      removals.push(fs.rm(codexCustomHome, { recursive: true, force: true }).catch(() => {}));
+    }
+    await Promise.all(removals);
   }
 
   kill(signal: NodeJS.Signals = "SIGTERM"): void {

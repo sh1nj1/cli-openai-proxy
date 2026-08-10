@@ -181,13 +181,20 @@ describe("auth-routes", () => {
   test("GET engines advertises each engine's flows so the caller can branch its UI", () => {
     const res = fakeRes();
     handleAuthEngines(fakeReq(), res);
-    const data = (res.payload as { data: Array<{ engine: string; flows: string[] }> }).data;
+    const data = (res.payload as {
+      data: Array<{ engine: string; flows: string[]; base_url_flows: string[] }>;
+    }).data;
     // Order is the contract: the first flow is the default a caller naming none gets.
     assert.deepEqual(data.find((e) => e.engine === "claude"), {
-      engine: "claude", flows: ["paste-code", "api-key"],
+      engine: "claude", flows: ["paste-code", "api-key"], base_url_flows: [],
     });
     assert.deepEqual(data.find((e) => e.engine === "codex"), {
-      engine: "codex", flows: ["api-key", "device-code"],
+      engine: "codex", flows: ["api-key", "device-code"], base_url_flows: [],
+    });
+    // A flow needing more than the secret says so here, so the caller renders
+    // the extra field without learning which engine names need one.
+    assert.deepEqual(data.find((e) => e.engine === "codex_custom"), {
+      engine: "codex_custom", flows: ["api-key"], base_url_flows: ["api-key"],
     });
   });
 
@@ -514,7 +521,8 @@ describe("auth-routes", () => {
     const res = fakeRes();
     await handleAuthStatus(fakeReq({ params: { engine: "fake" } as any }), res);
     assert.deepEqual(res.payload, {
-      engine: "fake", flows: ["paste-code"], state: "authenticated", source: "provisioned",
+      engine: "fake", flows: ["paste-code"], base_url_flows: [],
+      state: "authenticated", source: "provisioned",
     });
   });
 

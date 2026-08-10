@@ -9,7 +9,7 @@
  */
 
 import { trustsCompletionCallers } from "../config.js";
-import type { StoredCredential } from "./types.js";
+import type { CredentialGateway, StoredCredential } from "./types.js";
 
 const credentials = new Map<string, StoredCredential>();
 
@@ -63,7 +63,35 @@ export function clearAllCredentials(): void {
  * every future path into the store remembering to ask.
  */
 export function getProvisionedAuthEnv(engine: string | undefined): Record<string, string> {
-  if (!engine || !hasInjectableCredential(engine)) return {};
-  const cred = credentials.get(engine);
+  const cred = getProvisionedCredential(engine);
   return cred ? { [cred.envVar]: cred.value } : {};
+}
+
+/**
+ * Take one immutable-enough view of a provisioned credential for a single run.
+ *
+ * A custom gateway's URL and its key are one security boundary: callers that
+ * need both must use this rather than reading them independently across async
+ * work. Return copies so no consumer can mutate the stored routing for another
+ * run.
+ */
+export function getProvisionedCredential(engine: string | undefined): StoredCredential | null {
+  if (!engine || !hasInjectableCredential(engine)) return null;
+  const credential = credentials.get(engine);
+  if (!credential) return null;
+  return {
+    ...credential,
+    ...(credential.gateway ? { gateway: { ...credential.gateway } } : {}),
+  };
+}
+
+/**
+ * Where `engine`'s provisioned key is meant to be spent, for an engine whose
+ * endpoint the caller chooses (see CredentialGateway). Null when nothing is
+ * provisioned, when the credential carries no gateway, or when the operator has
+ * not declared completion callers trusted — the same predicate that withholds
+ * the key itself, so a run can never be pointed at a gateway it has no key for.
+ */
+export function getProvisionedGateway(engine: string | undefined): CredentialGateway | null {
+  return getProvisionedCredential(engine)?.gateway ?? null;
 }

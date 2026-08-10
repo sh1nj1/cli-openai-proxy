@@ -3,10 +3,12 @@ import assert from "node:assert/strict";
 import { PaperclipRunner, type AdapterExecute } from "./paperclip-runner.js";
 import { AdapterRunError } from "./adapter-error.js";
 import type { ClaudeCliStreamEvent, ClaudeCliResult } from "../types/claude-cli.js";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import path from "node:path";
 import { runInWorkspace } from "../provision/workspace-context.js";
+import { clearAllCredentials, setCredential } from "../auth/token-store.js";
+import { TRUST_COMPLETION_CALLERS_VAR } from "../config.js";
 
 const deltaLine = JSON.stringify({
   type: "stream_event",
@@ -796,4 +798,150 @@ test("forwards the configured model to a task-context adapter (claude)", async (
   await closed;
 
   assert.equal(captured!.model, "claude-opus-4-8");
+});
+
+test("codex_custom refuses the run when no gateway is provisioned", async () => {
+  // Refused before the CLI is spawned: a codex with no provider table would
+  // authenticate against nothing and fail with a stream error that names neither
+  // the cause nor the fix.
+  clearAllCredentials();
+  let spawned = false;
+  const runner = new PaperclipRunner(
+    async () => { spawned = true; return { exitCode: 0, signal: null, timedOut: false }; },
+    { engine: "cli", command: "codex" },
+    { engine: "codex_custom" },
+  );
+
+  const failure = new Promise<Error>((resolve) => runner.on("error", resolve));
+  const closeCode = new Promise<number | null>((resolve) => runner.on("close", resolve));
+  await runner.start("hi", {});
+  const err = await failure;
+
+  assert.equal(spawned, false, "no CLI may be launched");
+  assert.ok(err instanceof AdapterRunError);
+  // The same 401 shape a CLI-reported auth failure produces, so a caller reacts
+  // identically: open the /v1/auth flow this names.
+  assert.equal((err as AdapterRunError).openai.status, 401);
+  assert.equal((err as AdapterRunError).openai.code, "engine_unauthenticated");
+  assert.equal((err as AdapterRunError).openai.engine, "codex_custom");
+  assert.match(err.message, /\/v1\/auth\/codex_custom\/sessions/);
+  assert.equal(await closeCode, 1);
+});
+
+test("codex_custom points the CLI at its own home and hands it the gateway key", async () => {
+  const paperclipHome = await mkdtemp(path.join(tmpdir(), "codex-custom-run-"));
+  const savedPaperclipHome = process.env.PAPERCLIP_HOME;
+  process.env.PAPERCLIP_HOME = paperclipHome;
+  process.env[TRUST_COMPLETION_CALLERS_VAR] = "1";
+  clearAllCredentials();
+  setCredential("codex_custom", {
+    envVar: "CODEX_CUSTOM_API_KEY",
+    value: "sk-or-run",
+    gateway: { baseUrl: "https://openrouter.ai/api/v1" },
+  });
+
+  try {
+    let seenEnv: Record<string, string> = {};
+    let configToml = "";
+    const runner = new PaperclipRunner(
+      async (ctx) => {
+        seenEnv = (ctx.config as { env: Record<string, string> }).env;
+	configToml = await readFile(path.join(seenEnv.CODEX_HOME, "config.toml"), "utf8");
+        return { exitCode: 0, signal: null, timedOut: false, summary: "ok" };
+      },
+      { engine: "cli", command: "codex" },
+      { engine: "codex_custom", outputMode: "codex-jsonl", cliFlags: [] },
+    );
+    const closeCode = new Promise<number | null>((resolve) => runner.on("close", resolve));
+    await runner.start("hi", {});
+    await closeCode;
+
+    const home = seenEnv.CODEX_HOME;
+    assert.ok(home, "CODEX_HOME must be set");
+    // Not the managed company tree: that home is codex_local's, gated on an
+    // auth.json this adapter has no reason to write.
+    assert.ok(!home.includes(`${path.sep}companies${path.sep}`), home);
+    assert.equal(seenEnv.CODEX_CUSTOM_API_KEY, "sk-or-run");
+
+    assert.match(configToml, /base_url = "https:\/\/openrouter\.ai\/api\/v1"/);
+    assert.match(configToml, /env_key = "CODEX_CUSTOM_API_KEY"/);
+    // The key reaches the CLI through the environment, never through the file.
+    assert.ok(!configToml.includes("sk-or-run"), "the key must not be written to disk");
+    await assert.rejects(readFile(path.join(home, "config.toml"), "utf8"), /ENOENT/,
+      "the per-run home is removed once the child exits");
+  } finally {
+    clearAllCredentials();
+    delete process.env[TRUST_COMPLETION_CALLERS_VAR];
+    if (savedPaperclipHome === undefined) delete process.env.PAPERCLIP_HOME;
+    else process.env.PAPERCLIP_HOME = savedPaperclipHome;
+    await rm(paperclipHome, { recursive: true, force: true });
+  }
+});
+
+test("concurrent codex_custom runs retain the gateway paired with their credential snapshot", async () => {
+  const paperclipHome = await mkdtemp(path.join(tmpdir(), "codex-custom-snapshot-"));
+  const savedPaperclipHome = process.env.PAPERCLIP_HOME;
+  process.env.PAPERCLIP_HOME = paperclipHome;
+  process.env[TRUST_COMPLETION_CALLERS_VAR] = "1";
+  clearAllCredentials();
+
+  let releaseFirst!: () => void;
+  const firstMayFinish = new Promise<void>((resolve) => { releaseFirst = resolve; });
+  let firstStarted!: () => void;
+  const firstDidStart = new Promise<void>((resolve) => { firstStarted = resolve; });
+  let secondStarted!: () => void;
+  const secondDidStart = new Promise<void>((resolve) => { secondStarted = resolve; });
+  const captured: Array<{ home: string; key: string; config: string }> = [];
+  const execute: AdapterExecute = async (ctx) => {
+    const env = (ctx.config as { env: Record<string, string> }).env;
+    captured.push({
+      home: env.CODEX_HOME,
+      key: env.CODEX_CUSTOM_API_KEY,
+      config: await readFile(path.join(env.CODEX_HOME, "config.toml"), "utf8"),
+    });
+    if (captured.length === 1) {
+      firstStarted();
+      await firstMayFinish;
+    } else {
+      secondStarted();
+    }
+    return { exitCode: 0, signal: null, timedOut: false, summary: "ok" };
+  };
+
+  try {
+    setCredential("codex_custom", {
+      envVar: "CODEX_CUSTOM_API_KEY", value: "key-a", gateway: { baseUrl: "https://gateway-a.example/v1" },
+    });
+    const first = new PaperclipRunner(execute, { engine: "cli", command: "codex" },
+      { engine: "codex_custom", outputMode: "codex-jsonl", cliFlags: [] });
+    const firstClosed = new Promise<void>((resolve) => first.on("close", resolve));
+    await first.start("first", {});
+    await firstDidStart;
+
+    setCredential("codex_custom", {
+      envVar: "CODEX_CUSTOM_API_KEY", value: "key-b", gateway: { baseUrl: "https://gateway-b.example/v1" },
+    });
+    const second = new PaperclipRunner(execute, { engine: "cli", command: "codex" },
+      { engine: "codex_custom", outputMode: "codex-jsonl", cliFlags: [] });
+    const secondClosed = new Promise<void>((resolve) => second.on("close", resolve));
+    await second.start("second", {});
+    await secondDidStart;
+
+    assert.equal(captured.length, 2);
+    assert.notEqual(captured[0].home, captured[1].home, "concurrent runs must not share CODEX_HOME");
+    assert.equal(captured[0].key, "key-a");
+    assert.match(captured[0].config, /gateway-a\.example/);
+    assert.equal(captured[1].key, "key-b");
+    assert.match(captured[1].config, /gateway-b\.example/);
+
+    releaseFirst();
+    await Promise.all([firstClosed, secondClosed]);
+  } finally {
+    releaseFirst();
+    clearAllCredentials();
+    delete process.env[TRUST_COMPLETION_CALLERS_VAR];
+    if (savedPaperclipHome === undefined) delete process.env.PAPERCLIP_HOME;
+    else process.env.PAPERCLIP_HOME = savedPaperclipHome;
+    await rm(paperclipHome, { recursive: true, force: true });
+  }
 });

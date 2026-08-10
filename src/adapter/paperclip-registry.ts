@@ -45,6 +45,13 @@ export interface PaperclipModelSpec {
    * full ids that turn over, suggests none.
    */
   suggestedCliModels: string[];
+  /**
+   * True when running this adapter needs more than the CLI being installed — a
+   * gateway provisioned through /v1/auth. Such an adapter is never the fallback
+   * suggested to a host that has only proved its CLI runs, because a fresh host
+   * has provisioned nothing.
+   */
+  requiresProvisionedGateway?: boolean;
 }
 
 const CLAUDE_LOCAL_SPEC: PaperclipModelSpec = {
@@ -59,29 +66,50 @@ const CLAUDE_LOCAL_SPEC: PaperclipModelSpec = {
   suggestedCliModels: ["fable", "opus", "sonnet", "haiku"],
 };
 
+/**
+ * Shared by both codex adapters: same CLI, same stdout dialect, same flags. Only
+ * the credential each one spends differs, so keeping one base makes that the only
+ * visible difference instead of a diff to read twice.
+ */
+const CODEX_BASE = {
+  execute: codexLocalExecute as AdapterExecute,
+  // codex reads its own approval-bypass key; claude's dangerouslySkipPermissions
+  // is ignored by buildCodexExecArgs. Without this codex blocks on approvals headless.
+  baseConfig: { engine: "cli", command: "codex", dangerouslyBypassApprovalsAndSandbox: true },
+  // codex ignores paperclipTaskMarkdown (prompt comes from rendered promptTemplate),
+  // rejects claude-only flags, and streams its own `codex exec --json` NDJSON, which
+  // PaperclipRunner parses live (a content delta per completed agent_message block).
+  promptInjection: "prompt-template" as PromptInjection,
+  outputMode: "codex-jsonl" as OutputMode,
+  // PaperclipRunner runs every adapter in a fresh /tmp/paperclip-run-* dir, which
+  // is deliberately not a git repo. buildCodexExecArgs only adds --skip-git-repo-check
+  // for its own sandbox lane, not for local `codex exec`, so declare it here (codex
+  // appends extraArgs verbatim) to keep local runs from tripping the git-repo guard.
+  cliFlags: ["--skip-git-repo-check"],
+  // `codex --model` takes full ids only, and they turn over faster than this
+  // package ships; the adapter's own default is the entry that stays correct.
+  suggestedCliModels: [],
+};
+
 const REGISTRY: Record<string, PaperclipModelSpec> = {
   "paperclip/claude_local": CLAUDE_LOCAL_SPEC,
   "paperclip/codex_local": {
+    ...CODEX_BASE,
     adapterType: "codex_local",
-    execute: codexLocalExecute as AdapterExecute,
-    // codex reads its own approval-bypass key; claude's dangerouslySkipPermissions
-    // is ignored by buildCodexExecArgs. Without this codex blocks on approvals headless.
-    baseConfig: { engine: "cli", command: "codex", dangerouslyBypassApprovalsAndSandbox: true },
-    // codex ignores paperclipTaskMarkdown (prompt comes from rendered promptTemplate),
-    // rejects claude-only flags, and streams its own `codex exec --json` NDJSON, which
-    // PaperclipRunner parses live (a content delta per completed agent_message block).
-    promptInjection: "prompt-template",
-    outputMode: "codex-jsonl",
-    // PaperclipRunner runs every adapter in a fresh /tmp/paperclip-run-* dir, which
-    // is deliberately not a git repo. buildCodexExecArgs only adds --skip-git-repo-check
-    // for its own sandbox lane, not for local `codex exec`, so declare it here (codex
-    // appends extraArgs verbatim) to keep local runs from tripping the git-repo guard.
-    cliFlags: ["--skip-git-repo-check"],
     authEngine: "codex",
     credentialNote: "the codex CLI on whatever `codex login` signed in with (ChatGPT plan or OpenAI API key)",
-    // `codex --model` takes full ids only, and they turn over faster than this
-    // package ships; the adapter's own default is the entry that stays correct.
-    suggestedCliModels: [],
+  },
+  "paperclip/codex_custom": {
+    ...CODEX_BASE,
+    adapterType: "codex_custom",
+    authEngine: "codex_custom",
+    credentialNote:
+      "the codex CLI against the OpenAI-compatible gateway provisioned for the codex_custom engine " +
+      "(POST /v1/auth/codex_custom/sessions), on that gateway's own API key",
+    // The gateway's catalog is the gateway's business, and the CLI's own default
+    // model almost certainly is not in it — so a request should name one:
+    // paperclip/codex_custom/<provider>/<model>.
+    requiresProvisionedGateway: true,
   },
 };
 
@@ -150,6 +178,9 @@ export async function defaultModelForHost(
   for (const id of PAPERCLIP_MODEL_IDS) {
     const spec = REGISTRY[id];
     if (spec.authEngine === "claude") continue;
+    // A runnable CLI is not enough for these; suggesting one to a fresh host
+    // would swap a login hint for a provisioning hint the caller never asked for.
+    if (spec.requiresProvisionedGateway) continue;
     const command = String(spec.baseConfig.command ?? "");
     if (command && (await canRun(command))) return id;
   }

@@ -130,3 +130,55 @@ describe("codex auth status", () => {
     assert.strictEqual(status.detail, "codex CLI not found on the service PATH");
   });
 });
+
+describe("codex_custom status", () => {
+  const codexCustomStatus = () => resolveEngine("codex_custom")!.checkStatus();
+  const provision = () =>
+    setCredential("codex_custom", {
+      envVar: "CODEX_CUSTOM_API_KEY",
+      value: "sk-or-1",
+      gateway: { baseUrl: "https://openrouter.ai/api/v1" },
+    });
+
+  beforeEach(() => {
+    clearAllCredentials();
+    process.env[TRUST_COMPLETION_CALLERS_VAR] = "1";
+  });
+  afterEach(() => {
+    clearAllCredentials();
+    delete process.env[TRUST_COMPLETION_CALLERS_VAR];
+  });
+
+  test("offers exactly one flow, and it holds the credential itself", () => {
+    // There is no `codex login` for a custom provider: its table reads the key
+    // from an env var, so the proxy must inject it into every run.
+    const flows = resolveEngine("codex_custom")!.flows;
+    assert.deepStrictEqual(flows.map((f) => f.flow), ["api-key"]);
+    assert.strictEqual(flows[0].injectsCredential, true);
+  });
+
+  test("nothing provisioned is a definitive unauthenticated, not unknown", async () => {
+    // Unlike claude and codex, this engine has no host-side credential store to
+    // be unsure about — so telling the caller to log in is never a wrong guess.
+    const status = await codexCustomStatus();
+    assert.strictEqual(status.state, "unauthenticated");
+    assert.match(status.detail ?? "", /No gateway provisioned/);
+  });
+
+  test("a provisioned gateway is reported with the endpoint runs will use", async () => {
+    provision();
+    const status = await codexCustomStatus();
+    assert.strictEqual(status.state, "authenticated");
+    assert.strictEqual(status.source, "provisioned");
+    assert.match(status.detail ?? "", /openrouter\.ai\/api\/v1/);
+  });
+
+  test("a credential runs cannot spend is not reported as authenticated", async () => {
+    provision();
+    delete process.env[TRUST_COMPLETION_CALLERS_VAR];
+
+    const status = await codexCustomStatus();
+    assert.strictEqual(status.state, "unauthenticated");
+    assert.match(status.detail ?? "", new RegExp(TRUST_COMPLETION_CALLERS_VAR));
+  });
+});

@@ -179,6 +179,36 @@ test("usage-limit failure streams the verbatim error in-band (streaming)", async
   }
 });
 
+test("a rejected runner start ends an already-open SSE response", async () => {
+  // A codex_custom home can fail before its adapter starts (read-only disk,
+  // permissions, full volume). Headers are flushed before start(), so this must
+  // become an in-band SSE error rather than rejecting to the outer HTTP handler.
+  const orig = runnerFactory.create;
+  runnerFactory.create = (model: string) => {
+    if (!model.startsWith("paperclip/")) return orig(model);
+    const failedStart = new EventEmitter() as EventEmitter & {
+      start: () => Promise<void>;
+      kill: () => void;
+    };
+    failedStart.start = async () => { throw new Error("cannot prepare custom Codex home"); };
+    failedStart.kill = () => {};
+    return failedStart as unknown as ReturnType<typeof runnerFactory.create>;
+  };
+
+  try {
+    const req = { body: { model: "paperclip/codex_custom", stream: true,
+      messages: [{ role: "user", content: "hi" }] } } as unknown as Request;
+    const res = fakeRes();
+    await handleChatCompletions(req, res);
+
+    assert.match(res.body, /cannot prepare custom Codex home/);
+    assert.match(res.body, /"type":"server_error"/);
+    assert.ok(res.ended, "the SSE response must be ended");
+  } finally {
+    runnerFactory.create = orig;
+  }
+});
+
 test("unregistered paperclip/* model returns 404 model_not_found (never runs Claude)", async () => {
   // Uses the REAL runnerFactory.create: an unregistered paperclip/* id must produce a
   // clean client error, not a spawned Claude subprocess and not a generic 500.
