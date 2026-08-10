@@ -79,51 +79,47 @@ test("escapes quotes and backslashes so a hostile URL cannot break out of the st
   assert.match(toml, /base_url = ".*\\"/);
 });
 
-test("resolves a home outside the Paperclip-managed company tree", () => {
+test("resolves a per-run home outside the Paperclip-managed company tree", () => {
   // A home the codex adapter classifies as managed is seeded with (and gated on)
   // an auth.json this adapter deliberately does not have.
-  const home = resolveCodexCustomHome("/tmp/example-paperclip-home");
+  const home = resolveCodexCustomHome("run-abc", "/tmp/example-paperclip-home");
 
   assert.ok(home.startsWith("/tmp/example-paperclip-home/instances/"));
   assert.ok(!home.includes(`${path.sep}companies${path.sep}`), `must not live under companies/: ${home}`);
-  assert.ok(home.endsWith(path.join("cli-openai-proxy", "codex-custom-home")));
+  assert.ok(home.endsWith(path.join("cli-openai-proxy", "codex-custom-homes", "run-abc")));
 });
 
-test("prepare creates the home and rewrites config.toml on every call", async () => {
+test("prepare creates separate homes for separate runs", async () => {
   const paperclipHome = await mkdtemp(path.join(tmpdir(), "codex-custom-home-test-"));
   try {
-    const home = await prepareCodexCustomHome("https://one.example/v1", paperclipHome);
-    const configPath = path.join(home, "config.toml");
-    assert.match(await readFile(configPath, "utf8"), /one\.example/);
+    const one = await prepareCodexCustomHome("https://one.example/v1", "run-one", paperclipHome);
+    const two = await prepareCodexCustomHome("https://two.example/v1", "run-two", paperclipHome);
 
-    // A run must never inherit the gateway of a credential since replaced.
-    await prepareCodexCustomHome("https://two.example/v1", paperclipHome);
-    const after = await readFile(configPath, "utf8");
-    assert.match(after, /two\.example/);
-    assert.doesNotMatch(after, /one\.example/);
+    assert.notEqual(one, two);
+    assert.match(await readFile(path.join(one, "config.toml"), "utf8"), /one\.example/);
+    assert.match(await readFile(path.join(two, "config.toml"), "utf8"), /two\.example/);
+    assert.doesNotMatch(await readFile(path.join(one, "config.toml"), "utf8"), /two\.example/);
   } finally {
     await rm(paperclipHome, { recursive: true, force: true });
   }
 });
 
-test("concurrent prepares leave one complete file and no staging debris", async () => {
-  // Completions share this home, so a plain in-place write could be read
-  // half-finished by a codex booting at that moment.
+test("concurrent prepares give each run a complete isolated file", async () => {
   const paperclipHome = await mkdtemp(path.join(tmpdir(), "codex-custom-home-test-"));
   try {
     const homes = await Promise.all(
-      Array.from({ length: 8 }, () => prepareCodexCustomHome("https://one.example/v1", paperclipHome)),
+      Array.from({ length: 8 }, (_, index) =>
+	prepareCodexCustomHome(`https://gateway-${index}.example/v1`, `run-${index}`, paperclipHome),
+      ),
     );
-    const home = homes[0];
-
-    const configToml = await readFile(path.join(home, "config.toml"), "utf8");
-    assert.equal(configToml.match(/^model_provider =/gm)?.length, 1);
-    assert.match(configToml, /^# <<< cli-openai-proxy codex_custom provider \(table\) <<<$/m);
-    assert.deepEqual(
-      (await readdir(home)).filter((name) => name.endsWith(".tmp")),
-      [],
-      "staging files must not survive",
-    );
+    assert.equal(new Set(homes).size, 8, "each run gets its own home");
+    for (const [index, home] of homes.entries()) {
+      const configToml = await readFile(path.join(home, "config.toml"), "utf8");
+      assert.match(configToml, new RegExp(`gateway-${index}\\.example`));
+      assert.equal(configToml.match(/^model_provider =/gm)?.length, 1);
+      assert.match(configToml, /^# <<< cli-openai-proxy codex_custom provider \(table\) <<<$/m);
+      assert.deepEqual((await readdir(home)).filter((name) => name.endsWith(".tmp")), []);
+    }
   } finally {
     await rm(paperclipHome, { recursive: true, force: true });
   }
@@ -132,11 +128,11 @@ test("concurrent prepares leave one complete file and no staging debris", async 
 test("prepare keeps an existing config.toml's foreign content", async () => {
   const paperclipHome = await mkdtemp(path.join(tmpdir(), "codex-custom-home-test-"));
   try {
-    const home = resolveCodexCustomHome(paperclipHome);
+    const home = resolveCodexCustomHome("run-foreign", paperclipHome);
     await mkdir(home, { recursive: true });
     await writeFile(path.join(home, "config.toml"), '[mcp_servers.kept]\ncommand = "npx"\n');
 
-    await prepareCodexCustomHome("https://one.example/v1", paperclipHome);
+    await prepareCodexCustomHome("https://one.example/v1", "run-foreign", paperclipHome);
 
     const merged = await readFile(path.join(home, "config.toml"), "utf8");
     assert.match(merged, /\[mcp_servers\.kept\]/);

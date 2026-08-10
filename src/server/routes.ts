@@ -164,7 +164,7 @@ async function handleStreamingResponse(
   // Send initial comment to confirm connection is alive
   res.write(":ok\n\n");
 
-  return new Promise<void>((resolve, reject) => {
+  return new Promise<void>((resolve) => {
     let isFirst = true;
     let isComplete = false;
     let jsonBuffer = "";
@@ -285,7 +285,8 @@ async function handleStreamingResponse(
       resolve();
     });
 
-    subprocess.on("error", (error: Error) => {
+    const handleSubprocessError = (error: Error) => {
+      isComplete = true;
       console.error("[Streaming] Error:", error.message);
       clearKeepalive();
 
@@ -318,7 +319,8 @@ async function handleStreamingResponse(
         res.end();
       }
       resolve();
-    });
+    };
+    subprocess.on("error", handleSubprocessError);
 
     subprocess.on("close", (code: number | null) => {
       clearKeepalive();
@@ -341,9 +343,10 @@ async function handleStreamingResponse(
       sessionId: cliInput.sessionId,
       timeout: getTimeoutMs(),
     }).catch((err) => {
-      clearKeepalive();
-      console.error("[Streaming] Subprocess start error:", err);
-      reject(err);
+      // Headers were deliberately flushed above, so rejecting would reach the
+      // outer handler too late to write a response and leave this SSE stream open.
+      // Treat a failed preflight exactly like an asynchronous runner error.
+      handleSubprocessError(err instanceof Error ? err : new Error(String(err)));
     });
   });
 }
