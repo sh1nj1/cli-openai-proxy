@@ -26,6 +26,7 @@
 
 import fs from "fs/promises";
 import path from "path";
+import { randomUUID } from "crypto";
 import { resolvePaperclipInstanceRootForAdapter } from "@paperclipai/adapter-utils/server-utils";
 import { CODEX_CUSTOM_API_KEY_ENV } from "../auth/adapters/codex-custom-api-key.js";
 
@@ -132,12 +133,24 @@ export function renderCodexCustomConfigToml(existing: string, baseUrl: string): 
  * Rewritten every run rather than once at provisioning time: the file is derived
  * state, and a run must not inherit the gateway of a credential that has since
  * been replaced or forgotten.
+ *
+ * Published by rename, because concurrent completions share this home: a plain
+ * write truncates the file in place, and a codex booting at that moment would
+ * read a half-written config and refuse to start. The temp name carries a UUID so
+ * two preparing runs cannot collide on it either.
  */
 export async function prepareCodexCustomHome(baseUrl: string, paperclipHome?: string): Promise<string> {
   const home = resolveCodexCustomHome(paperclipHome);
   await fs.mkdir(home, { recursive: true });
   const configPath = path.join(home, "config.toml");
   const existing = await fs.readFile(configPath, "utf8").catch(() => "");
-  await fs.writeFile(configPath, renderCodexCustomConfigToml(existing, baseUrl), { mode: 0o600 });
+  const staged = `${configPath}.${randomUUID()}.tmp`;
+  try {
+    await fs.writeFile(staged, renderCodexCustomConfigToml(existing, baseUrl), { mode: 0o600 });
+    await fs.rename(staged, configPath);
+  } catch (err) {
+    await fs.rm(staged, { force: true }).catch(() => {});
+    throw err;
+  }
   return home;
 }

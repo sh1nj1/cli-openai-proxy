@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, rm, writeFile, mkdir } from "node:fs/promises";
+import { mkdtemp, mkdir, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import {
@@ -101,6 +101,29 @@ test("prepare creates the home and rewrites config.toml on every call", async ()
     const after = await readFile(configPath, "utf8");
     assert.match(after, /two\.example/);
     assert.doesNotMatch(after, /one\.example/);
+  } finally {
+    await rm(paperclipHome, { recursive: true, force: true });
+  }
+});
+
+test("concurrent prepares leave one complete file and no staging debris", async () => {
+  // Completions share this home, so a plain in-place write could be read
+  // half-finished by a codex booting at that moment.
+  const paperclipHome = await mkdtemp(path.join(tmpdir(), "codex-custom-home-test-"));
+  try {
+    const homes = await Promise.all(
+      Array.from({ length: 8 }, () => prepareCodexCustomHome("https://one.example/v1", paperclipHome)),
+    );
+    const home = homes[0];
+
+    const configToml = await readFile(path.join(home, "config.toml"), "utf8");
+    assert.equal(configToml.match(/^model_provider =/gm)?.length, 1);
+    assert.match(configToml, /^# <<< cli-openai-proxy codex_custom provider \(table\) <<<$/m);
+    assert.deepEqual(
+      (await readdir(home)).filter((name) => name.endsWith(".tmp")),
+      [],
+      "staging files must not survive",
+    );
   } finally {
     await rm(paperclipHome, { recursive: true, force: true });
   }
