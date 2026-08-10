@@ -49,6 +49,17 @@ function unauthenticatedShape(engine?: string): OpenAIErrorShape {
 }
 
 /**
+ * The proxy's own pre-flight refusal: an engine that cannot run because nothing
+ * was provisioned for it, decided before any CLI is spawned. Carries the same
+ * shape a CLI-reported auth failure would, so a caller reacts identically —
+ * opening the /v1/auth flow this names — whether the verdict came from the CLI
+ * or from us.
+ */
+export function engineUnauthenticatedError(engine: string, message: string): AdapterRunError {
+  return new AdapterRunError(message, unauthenticatedShape(engine));
+}
+
+/**
  * Map an adapter's classified failure to the OpenAI error contract. Prefer the
  * specific `errorCode`; fall back to the broader `errorFamily` (quota/transient)
  * so a run classified only at the family level still surfaces as a 429 rather

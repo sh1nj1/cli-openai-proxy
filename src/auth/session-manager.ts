@@ -35,6 +35,7 @@ import {
   AuthProvisioningError,
   type AuthFlow,
   type AuthStartResult,
+  type AuthSubmitOptions,
   type EngineAuthSession,
 } from "./types.js";
 
@@ -300,6 +301,7 @@ export async function submitSession(
   engine: string,
   sessionId: string,
   input: string,
+  options: AuthSubmitOptions = {},
 ): Promise<SessionView> {
   const record = requireSession(engine, sessionId);
   // Successful submit results remain queryable until TTL so a worker response
@@ -334,7 +336,7 @@ export async function submitSession(
   record.submitting = true;
 
   try {
-    const result = await record.handle.submit(input);
+    const result = await record.handle.submit(input, options);
     // A newer create, explicit cancellation, or TTL reap can dispose this
     // record while the adapter is still submitting. Its late success no longer
     // has authority to change credentials or register a manifest.

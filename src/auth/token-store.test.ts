@@ -5,6 +5,7 @@ import {
   clearAllCredentials,
   clearCredential,
   getProvisionedAuthEnv,
+  getProvisionedGateway,
   hasCredential,
   hasInjectableCredential,
   setCredential,
@@ -88,5 +89,38 @@ describe("token-store", () => {
     assert.strictEqual(clearCredential("claude"), false);
     assert.strictEqual(hasCredential("claude"), false);
     assert.deepStrictEqual(getProvisionedAuthEnv("claude"), {});
+  });
+
+  test("a credential's gateway travels with it, and only with it", () => {
+    assert.strictEqual(getProvisionedGateway("codex_custom"), null);
+
+    setCredential("codex_custom", {
+      envVar: "CODEX_CUSTOM_API_KEY",
+      value: "sk-or-1",
+      gateway: { baseUrl: "https://openrouter.ai/api/v1" },
+    });
+    assert.deepStrictEqual(getProvisionedGateway("codex_custom"), {
+      baseUrl: "https://openrouter.ai/api/v1",
+    });
+    // Routing is as engine-scoped as the key: no other adapter may be pointed at it.
+    assert.strictEqual(getProvisionedGateway("codex"), null);
+
+    // Forgetting the key forgets where it was spent — never a half-provisioned
+    // engine that still reports somewhere to send requests.
+    clearCredential("codex_custom");
+    assert.strictEqual(getProvisionedGateway("codex_custom"), null);
+  });
+
+  test("an undeclared trust boundary withholds the gateway as well as the key", () => {
+    // Otherwise a run could be routed at a gateway it has no key for.
+    setCredential("codex_custom", {
+      envVar: "CODEX_CUSTOM_API_KEY",
+      value: "sk-or-1",
+      gateway: { baseUrl: "https://openrouter.ai/api/v1" },
+    });
+    delete process.env[TRUST_COMPLETION_CALLERS_VAR];
+
+    assert.strictEqual(getProvisionedGateway("codex_custom"), null);
+    assert.deepStrictEqual(getProvisionedAuthEnv("codex_custom"), {});
   });
 });

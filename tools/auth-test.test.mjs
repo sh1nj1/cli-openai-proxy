@@ -8,12 +8,14 @@ const script = html.match(/<script>([\s\S]*?)<\/script>/)?.[1];
 const engineDescriptors = [
   { engine: "claude", flow: "paste-code", flows: ["paste-code"] },
   { engine: "codex", flow: "api-key", flows: ["api-key", "device-code"] },
+  { engine: "codex_custom", flow: "api-key", flows: ["api-key"], base_url_flows: ["api-key"] },
 ];
 const elementIds = [
   "baseUrl", "adminKey", "loadEngines", "engine", "flow", "checkStatus",
   "forgetCredential", "createSession", "sessionInfo", "userCodeInfo", "userCode",
   "submissionControls", "codeInput", "submitCode", "pollSession", "cancelSession",
   "apiKey", "model", "testCompletion", "resultStatus", "result",
+  "gatewayControls", "gatewayUrl",
 ];
 
 class FakeElement {
@@ -185,4 +187,58 @@ test("a stale terminal poll cannot clear a replacement device-code session", asy
   assert.equal(elements.userCode.textContent, "NEW-CODE");
   assert.equal(elements.userCodeInfo.hidden, false);
   assert.match(elements.sessionInfo.children[0], /new-session/);
+});
+
+test("the gateway field appears only for a flow the server said needs one", async () => {
+  const requests = [];
+  const responses = [
+    enginesResponse(),
+    response(201, { sessionId: "s-gw", engine: "codex_custom", flow: "api-key", status: "pending" }),
+    response(200, { sessionId: "s-gw", engine: "codex_custom", flow: "api-key", status: "authorized" }),
+  ];
+  const elements = loadPage(async (url, init = {}) => {
+    requests.push({ url, init });
+    return responses.shift();
+  });
+
+  await elements.loadEngines.onclick();
+  // An engine that declared no base_url flow must not grow a field it ignores.
+  assert.equal(elements.gatewayControls.hidden, true);
+
+  elements.engine.value = "codex_custom";
+  elements.engine.onchange();
+  assert.equal(elements.gatewayControls.hidden, false, "declared via base_url_flows, not by name");
+  assert.equal(elements.model.value, "paperclip/codex_custom/anthropic/claude-sonnet-4.5");
+
+  await elements.createSession.onclick({ target: elements.createSession });
+  elements.codeInput.value = "sk-or-v1-demo";
+  elements.gatewayUrl.value = "https://openrouter.ai/api/v1";
+  await elements.submitCode.onclick({ target: elements.submitCode });
+
+  assert.deepEqual(JSON.parse(requests[2].init.body), {
+    value: "sk-or-v1-demo",
+    base_url: "https://openrouter.ai/api/v1",
+  });
+});
+
+test("an engine that ignores base_url is never sent one", async () => {
+  const requests = [];
+  const responses = [
+    enginesResponse(),
+    response(201, { sessionId: "s-claude", engine: "claude", flow: "paste-code", status: "pending" }),
+    response(200, { sessionId: "s-claude", engine: "claude", flow: "paste-code", status: "authorized" }),
+  ];
+  const elements = loadPage(async (url, init = {}) => {
+    requests.push({ url, init });
+    return responses.shift();
+  });
+
+  await elements.loadEngines.onclick();
+  await elements.createSession.onclick({ target: elements.createSession });
+  elements.codeInput.value = "code#state";
+  // Set anyway: a hidden field's leftover value must not reach the wire.
+  elements.gatewayUrl.value = "https://leftover.example/v1";
+  await elements.submitCode.onclick({ target: elements.submitCode });
+
+  assert.deepEqual(JSON.parse(requests[2].init.body), { value: "code#state" });
 });

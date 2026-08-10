@@ -224,3 +224,39 @@ test("a suffixed id is labelled by its adapter, not by its CLI model", () => {
   assert.equal(adapterLabel("paperclip/claude_local/opus"), "Claude Local");
   assert.equal(adapterLabel("paperclip/codex_local"), "Codex Local");
 });
+
+test("codex_custom is advertised and routes to its own auth engine", () => {
+  assert.ok(
+    PAPERCLIP_MODEL_IDS.includes("paperclip/codex_custom"),
+    "Collavre selects this adapter by id, so it has to be listed",
+  );
+
+  const resolved = resolvePaperclipModel("paperclip/codex_custom");
+  assert.ok(resolved);
+  assert.equal(resolved!.spec.adapterType, "codex_custom");
+  // A separate engine is the point: config.toml's model_provider is file-global,
+  // so one codex home can select one provider. Splitting the adapter keeps
+  // codex_local on its ChatGPT/OpenAI login and codex_custom on the gateway.
+  assert.equal(resolved!.spec.authEngine, "codex_custom");
+  assert.notEqual(
+    resolvePaperclipModel("paperclip/codex_local")!.spec.authEngine,
+    resolved!.spec.authEngine,
+  );
+});
+
+test("a gateway model id keeps its slashes on the way to the CLI", () => {
+  // OpenRouter names models "<provider>/<model>", and the adapter key match is
+  // exact, so everything after it is one verbatim model string.
+  const resolved = resolvePaperclipModel("paperclip/codex_custom/anthropic/claude-sonnet-4.5");
+  assert.ok(resolved);
+  assert.equal(resolved!.spec.adapterType, "codex_custom");
+  assert.equal(resolved!.cliModel, "anthropic/claude-sonnet-4.5");
+});
+
+test("an adapter needing a provisioned gateway is never the fallback suggestion", async () => {
+  // Its CLI running proves nothing: a fresh host has provisioned no gateway, so
+  // suggesting it would swap a login hint for a provisioning one nobody asked for.
+  const suggested = await defaultModelForHost(false, async () => true);
+  assert.notEqual(suggested, "paperclip/codex_custom");
+  assert.ok(!resolvePaperclipModel(suggested)!.spec.requiresProvisionedGateway);
+});

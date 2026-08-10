@@ -86,6 +86,10 @@
   <p id="sessionInfo"></p>
   <p id="userCodeInfo" hidden>One-time code: <strong><code id="userCode"></code></strong></p>
   <div id="submissionControls">
+    <div id="gatewayControls" hidden>
+      <label for="gatewayUrl">Gateway base URL</label>
+      <input id="gatewayUrl" placeholder="https://openrouter.ai/api/v1" autocomplete="off">
+    </div>
     <label for="codeInput">Code / API key</label>
     <input id="codeInput" type="password" autocomplete="off">
     <button id="submitCode">Submit</button>
@@ -162,18 +166,39 @@ function clearSessionInfo() {
   syncFlowControls();
 }
 
-function syncFlowControls() {
-  $("submissionControls").hidden = (session?.flow ?? flow()) === "device-code";
+// Which engine a session belongs to matters more than what is selected now: the
+// selector can move while a session is live.
+function descriptorFor(id) {
+  return engines.find(({ engine: engineId }) => engineId === id);
 }
 
+function syncFlowControls() {
+  const activeEngine = session?.engine ?? engine();
+  const activeFlow = session?.flow ?? flow();
+  $("submissionControls").hidden = activeFlow === "device-code";
+  // Declared by the server (base_url_flows), not inferred from the engine name.
+  $("gatewayControls").hidden =
+    !(descriptorFor(activeEngine)?.base_url_flows ?? []).includes(activeFlow);
+}
+
+// Auth engines are named after the adapter they unlock; the *_local adapters are
+// the ones whose ids differ from their engine by a suffix.
+const MODEL_FOR_ENGINE = {
+  claude: "paperclip/claude_local",
+  codex: "paperclip/codex_local",
+  codex_custom: "paperclip/codex_custom/anthropic/claude-sonnet-4.5",
+};
+
 function syncEngine() {
-  const descriptor = engines.find(({ engine: id }) => id === engine());
+  const descriptor = descriptorFor(engine());
   const flows = descriptor?.flows ?? [];
   const selectedFlow = $("flow").value;
   $("flow").replaceChildren(...flows.map((name) => new Option(name, name)));
   if (flows.includes(selectedFlow)) $("flow").value = selectedFlow;
   syncFlowControls();
-  if (descriptor) $("model").value = `paperclip/${descriptor.engine}_local`;
+  if (descriptor) {
+    $("model").value = MODEL_FOR_ENGINE[descriptor.engine] ?? `paperclip/${descriptor.engine}`;
+  }
 }
 
 $("loadEngines").onclick = async () => {
@@ -272,12 +297,16 @@ $("submitCode").onclick = async (e) => {
   if (!session) return show("!", "Create a session first.");
   const submitted = session;
   const value = $("codeInput").value;
+  // Sent only for a flow that declared it; an engine that ignores base_url would
+  // otherwise receive a stray empty string.
+  const gatewayUrl = $("gatewayControls").hidden ? undefined : $("gatewayUrl").value;
   // One submission drives a session at a time (409 session_submitting) — and the
   // Claude token exchange can take up to ~2 minutes, so hold the button down.
   e.target.disabled = true;
   try {
     const done = await call("POST", `/v1/auth/${submitted.engine}/sessions/${submitted.id}`,
-      { body: { value }, base: submitted.base, key: submitted.key,
+      { body: gatewayUrl === undefined ? { value } : { value, base_url: gatewayUrl },
+	base: submitted.base, key: submitted.key,
 	userKey: submitted.userKey, okStatus: 404 });
     if (!done) return;
     // A 404 (error envelope, not a session view) confirms the session no longer

@@ -67,15 +67,16 @@ restart still wins, which is how you rotate keys without a new process.
 | `AUTH_TRUST_COMPLETION_CALLERS` | Declares completion callers trusted with provisioned credentials. Required for `claude` — see below. |
 | `AUTH_SESSION_TTL_MS` | Session lifetime before reaping (default `600000`). |
 
-## A provisioned Claude credential is visible to completion callers
+## An injected credential is visible to completion callers
 
-Neither claude flow ends in a credential the CLI persists: `claude setup-token`
-prints its token instead of writing it anywhere, and the claude CLI has no
-api-key login command at all — it reads `ANTHROPIC_API_KEY` from its
-environment. So the proxy holds the credential and injects it into the CLI
-child of every completion. **That child's environment is readable by whoever
-wrote the prompt**, so a provisioned Claude credential is recoverable by any
-caller who can reach `/v1/chat/completions`.
+Some flows end in a credential no CLI persists: `claude setup-token` prints its
+token instead of writing it anywhere, the claude CLI has no api-key login command
+at all (it reads `ANTHROPIC_API_KEY` from its environment), and a codex custom
+provider reads its bearer token from the env var its `config.toml` table names.
+So for `claude` and `codex_custom` the proxy holds the credential and injects it
+into the CLI child of every completion. **That child's environment is readable by
+whoever wrote the prompt**, so such a credential is recoverable by any caller who
+can reach `/v1/chat/completions`.
 
 This is not something the proxy can filter away:
 
@@ -95,9 +96,12 @@ AUTH_TRUST_COMPLETION_CALLERS=1
 
 Set it only when every holder of an `API_KEYS` entry is as trusted as the holder
 of `AUTH_ADMIN_KEYS` — on a single-operator proxy they are usually the same
-person. Without it, `POST /v1/auth/claude/sessions` answers `403
-caller_trust_not_declared` (refused before you complete a login, so no token is
-minted), and any credential already held is withheld from CLI children.
+person. Without it, `POST /v1/auth/claude/sessions` and
+`POST /v1/auth/codex_custom/sessions` answer `403 caller_trust_not_declared`
+(refused before you complete a login, so no token is minted), and any credential
+already held is withheld from CLI children. For `codex_custom` the gateway URL is
+withheld on the same predicate, so a run is never pointed at an endpoint it has
+no key for.
 
 `codex` is not gated: both of its flows (`codex login --with-api-key` and
 `codex login --device-auth`) persist to `~/.codex` themselves, so nothing of
@@ -118,6 +122,7 @@ first is its default, and `POST …/sessions` picks one by name:
 | `codex` | `device-code` | `codex login --device-auth` | in `~/.codex`, written by the CLI |
 | `claude` | `paste-code` (default) | `claude setup-token` | in proxy memory, injected per run — requires `AUTH_TRUST_COMPLETION_CALLERS` |
 | `claude` | `api-key` | none — validated against the Anthropic API | in proxy memory, injected per run — requires `AUTH_TRUST_COMPLETION_CALLERS` |
+| `codex_custom` | `api-key` | none — probed against the submitted gateway | in proxy memory, injected per run — requires `AUTH_TRUST_COMPLETION_CALLERS` |
 
 **`api-key`** — no verification URL. Submit the key. For codex the CLI stores
 it itself (`codex login --with-api-key`). The claude CLI has no such command —
@@ -127,6 +132,36 @@ key travels in a header, never in the URL) and then holds it in memory like a
 `setup-token` credential. Only a definitive HTTP answer is a verdict: `401`/`403`
 fail the session with `invalid_api_key`, while an unreachable API fails it with
 `validation_unavailable` — never as a bad key.
+
+**`codex_custom`** — the same `codex` CLI pointed at any OpenAI-compatible
+gateway (OpenRouter and friends), on that gateway's own key. It is a separate
+engine from `codex` because a codex home selects exactly one provider: splitting
+them lets `paperclip/codex_local` keep running on your `codex login` while
+`paperclip/codex_custom` runs on the gateway.
+
+The submission carries two fields, because the key alone does not say where to
+spend it:
+
+```json
+{ "api_key": "sk-or-v1-…", "base_url": "https://openrouter.ai/api/v1" }
+```
+
+- `base_url` is required (`missing_base_url` otherwise) and must be `https`
+  except on loopback — the key rides to it as a bearer token on every request.
+  A URL carrying credentials, a query string, or a fragment is refused rather
+  than repaired: the CLI appends `/responses` to this value.
+- The gateway is probed once with `GET <base_url>/models`. `401`/`403` fails the
+  session with `invalid_api_key`; an unreachable host fails it with
+  `gateway_unreachable`. Anything else is accepted — some gateways serve
+  `/models` publicly, so a `200` proves the URL is a live OpenAI-compatible root
+  but says nothing about the key.
+- **The gateway must serve OpenAI's Responses API.** Codex ≥ 0.145 refuses to
+  load a config asking for Chat Completions, so that is the only wire protocol
+  this engine can generate.
+- The key is held in memory and injected as `CODEX_CUSTOM_API_KEY`, alongside a
+  generated `config.toml` in a `CODEX_HOME` of this adapter's own — kept out of
+  the Paperclip-managed tree so it never collides with `codex_local`'s login. The
+  file references the env var, so the key itself is never written to disk.
 
 **`device-code`** — the ChatGPT *subscription* login for codex. Plain
 `codex login` cannot work remotely: its OAuth redirect targets localhost on the
@@ -241,7 +276,9 @@ expires — and its CLI child is killed immediately. Retry to get the slot back.
 
 ### `POST /v1/auth/{engine}/sessions/{sessionId}`
 
-Body takes `value` (aliases: `code`, `api_key`, `apiKey`):
+Body takes `value` (aliases: `code`, `api_key`, `apiKey`), plus `base_url`
+(alias: `baseUrl`) for engines that route through a caller-chosen gateway —
+required by `codex_custom`, ignored by every other engine:
 
 ```bash
 curl -X POST -H "Authorization: Bearer $ADMIN_KEY" -H 'content-type: application/json' \

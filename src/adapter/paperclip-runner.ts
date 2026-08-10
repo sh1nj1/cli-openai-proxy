@@ -16,9 +16,10 @@ import { isSystemInit } from "../types/claude-cli.js";
 import type { AgentRunner, RunnerOptions } from "./agent-runner.js";
 import { StreamJsonParser, type StreamJsonSink } from "./stream-json-parser.js";
 import { CodexJsonlParser } from "./codex-jsonl-parser.js";
-import { adapterRunError } from "./adapter-error.js";
+import { adapterRunError, engineUnauthenticatedError } from "./adapter-error.js";
+import { prepareCodexCustomHome } from "./codex-custom-home.js";
 import { blankedProxySecrets, getBgWaitCeilingMs } from "../config.js";
-import { getProvisionedAuthEnv } from "../auth/token-store.js";
+import { getProvisionedAuthEnv, getProvisionedGateway } from "../auth/token-store.js";
 import {
   currentWorkspaceContext,
   ensureWorkspaceRoot,
@@ -116,6 +117,29 @@ export class PaperclipRunner extends EventEmitter implements AgentRunner {
     const sharedCodexHome = sharedPaperclipInstanceRoot
       ? path.join(sharedPaperclipInstanceRoot, "companies", "local", "codex-home")
       : undefined;
+
+    // codex_custom reaches its models through a gateway that exists only once
+    // provisioned, and the CLI takes that routing from a config file rather than
+    // any flag — so resolve it up front. Refusing here (as a classified 401 that
+    // names the engine, the same shape a CLI auth failure produces) beats
+    // launching a CLI that would authenticate against nothing and fail opaquely.
+    let codexCustomHome: string | undefined;
+    if (this.engine === "codex_custom") {
+      const gateway = getProvisionedGateway(this.engine);
+      if (!gateway) {
+        this.emit(
+          "error",
+          engineUnauthenticatedError(
+            this.engine,
+            "No gateway is provisioned for paperclip/codex_custom. Submit an API key and " +
+              "`base_url` to POST /v1/auth/codex_custom/sessions first.",
+          ),
+        );
+        this.emit("close", 1);
+        return;
+      }
+      codexCustomHome = await prepareCodexCustomHome(gateway.baseUrl, sharedPaperclipHome);
+    }
     // Each adapter emits a different stdout dialect: claude speaks stream-json
     // (per-token deltas), codex speaks `codex exec --json` NDJSON (per-message
     // blocks). Pick the matching live parser; both expose push()/flush().
@@ -190,6 +214,10 @@ export class PaperclipRunner extends EventEmitter implements AgentRunner {
 	      CODEX_HOME: sharedCodexHome!,
 	    } : {}),
 	  } : {}),
+          // Deliberately outside the Paperclip-managed company tree: this home
+          // carries no auth.json, and a managed one without it is refused before
+          // launch. See src/adapter/codex-custom-home.ts.
+          ...(codexCustomHome ? { CODEX_HOME: codexCustomHome } : {}),
           // The adapter merges this over process.env, so shadowing is the only way
           // to keep the keys that authenticate callers TO the proxy out of a child
           // that runs with permissions skipped.

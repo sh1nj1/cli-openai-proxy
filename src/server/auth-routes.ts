@@ -135,11 +135,25 @@ function flowsOf(engine: string): string[] {
   return resolveEngine(engine)!.flows.map((f) => f.flow);
 }
 
+/**
+ * Flows whose submission needs a `base_url` alongside the secret. Advertised as
+ * a list of flow names (rather than a flag on the engine) so a client renders
+ * the extra field from what the server declares, never from an engine name it
+ * had to learn — the same contract `flows` itself provides.
+ */
+function baseUrlFlowsOf(engine: string): string[] {
+  return resolveEngine(engine)!.flows.filter((f) => f.requiresBaseUrl).map((f) => f.flow);
+}
+
 /** GET /v1/auth/engines — lets the caller build its UI without hardcoding flows. */
 export function handleAuthEngines(_req: Request, res: Response): void {
   res.json({
     object: "list",
-    data: engineRegistry.ids().map((engine) => ({ engine, flows: flowsOf(engine) })),
+    data: engineRegistry.ids().map((engine) => ({
+      engine,
+      flows: flowsOf(engine),
+      base_url_flows: baseUrlFlowsOf(engine),
+    })),
   });
 }
 
@@ -149,7 +163,7 @@ export async function handleAuthStatus(req: Request, res: Response): Promise<voi
   if (!engine) return;
   try {
     const status = await resolveEngine(engine)!.checkStatus();
-    res.json({ engine, flows: flowsOf(engine), ...status });
+    res.json({ engine, flows: flowsOf(engine), base_url_flows: baseUrlFlowsOf(engine), ...status });
   } catch (err) {
     sendError(res, err);
   }
@@ -217,12 +231,20 @@ export async function handleSubmitAuthSession(req: Request, res: Response): Prom
     fail(res, 400, "Request body must include a non-empty `value` (alias: code, api_key).", "missing_value");
     return;
   }
+  // Only meaningful to a flow whose endpoint the caller chooses (codex_custom);
+  // every other flow ignores it. Rejected here only for being the wrong TYPE —
+  // whether a given engine accepts or requires one is the adapter's judgement.
+  const baseUrl = body.base_url ?? body.baseUrl;
+  if (baseUrl !== undefined && typeof baseUrl !== "string") {
+    fail(res, 400, "`base_url` must be a string.", "invalid_base_url");
+    return;
+  }
   try {
     const sessionId = String(req.params.sessionId ?? "");
     const notification = req.app?.locals.cliProxyRole === "worker"
       ? getSessionProvisioningNotification(engine, sessionId)
       : undefined;
-    const result = await submitSession(engine, sessionId, raw);
+    const result = await submitSession(engine, sessionId, raw, { baseUrl });
     if (result.status === "authorized") notifyGatewayWhenWorker(req, res, notification);
     res.json(result);
   } catch (err) {

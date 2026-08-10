@@ -9,7 +9,7 @@
  */
 
 import { trustsCompletionCallers } from "../config.js";
-import type { StoredCredential } from "./types.js";
+import type { CredentialGateway, StoredCredential } from "./types.js";
 
 const credentials = new Map<string, StoredCredential>();
 
@@ -66,4 +66,16 @@ export function getProvisionedAuthEnv(engine: string | undefined): Record<string
   if (!engine || !hasInjectableCredential(engine)) return {};
   const cred = credentials.get(engine);
   return cred ? { [cred.envVar]: cred.value } : {};
+}
+
+/**
+ * Where `engine`'s provisioned key is meant to be spent, for an engine whose
+ * endpoint the caller chooses (see CredentialGateway). Null when nothing is
+ * provisioned, when the credential carries no gateway, or when the operator has
+ * not declared completion callers trusted — the same predicate that withholds
+ * the key itself, so a run can never be pointed at a gateway it has no key for.
+ */
+export function getProvisionedGateway(engine: string | undefined): CredentialGateway | null {
+  if (!engine || !hasInjectableCredential(engine)) return null;
+  return credentials.get(engine)?.gateway ?? null;
 }
