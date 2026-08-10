@@ -31,3 +31,4 @@ coverage/
 .ruby-lsp/
 docs/superpowers/
 tmp/
+.preview/
