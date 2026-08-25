@@ -27,6 +27,8 @@ export interface CliInput {
   systemPrompt?: string;
   sessionId?: string;
   jsonMode?: boolean;
+  /** Verbatim `reasoning_effort` from the request; the runner decides what it means. */
+  reasoningEffort?: string;
 }
 
 /**
@@ -164,5 +166,6 @@ export function openaiToCli(request: OpenAIChatRequest): CliInput {
     systemPrompt,
     sessionId: request.user,
     jsonMode,
+    reasoningEffort: request.reasoning_effort,
   };
 }

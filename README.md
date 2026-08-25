@@ -320,6 +320,17 @@ Requirements and behaviour:
 - The key is held in proxy memory only and reaches the CLI as
   `CODEX_CUSTOM_API_KEY`. It is never written to disk — the generated
   `config.toml` references the env var rather than the value.
+- **Runs default to `reasoning_effort: "medium"`,** and the request's own
+  `reasoning_effort` (`none` | `minimal` | `low` | `medium` | `high` | `xhigh`)
+  overrides
+  it. Codex reads reasoning effort from built-in metadata keyed by model id, and
+  no gateway model is in that table, so its fallback is "none" — which reaches
+  the wire as a `reasoning` block carrying no effort. Endpoints serving
+  reasoning-mandatory models reject that outright, e.g. OpenRouter answering
+  `400 "Server tool request failed"` for `stealth/ox-alpha`. A value outside the
+  list above is ignored rather than written through: codex does not validate the
+  key, so an unknown effort would reach the endpoint verbatim and come back as a
+  bare `400 "Invalid Responses API request"`.
 - This engine is independent of `paperclip/codex_local`, which keeps running on
   your `codex login`. They use separate `CODEX_HOME` directories, so provisioning
   a gateway never disturbs a ChatGPT subscription login.

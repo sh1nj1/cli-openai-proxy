@@ -42,6 +42,20 @@ to load a config asking for Chat Completions, so the gateway must serve OpenAI's
 Responses API at `<base_url>/responses`. The key itself never enters the file —
 `env_key` points at `CODEX_CUSTOM_API_KEY`, injected per run from memory.
 
+It also writes `model_reasoning_effort`, defaulting to `medium` and overridden by
+the request's `reasoning_effort`. Codex takes reasoning effort from built-in
+metadata keyed by model id; a gateway's ids are never in that table (`Model
+metadata for <id> not found`), and its fallback metadata says `none`, which codex
+sends as a `reasoning` object with no `effort`. Endpoints whose models cannot run
+without reasoning reject that request outright — OpenRouter answers `Reasoning is
+mandatory for this endpoint and cannot be disabled`, or, when codex's `web_search`
+tool is in the same request, the less obvious `400 "Server tool request failed"`.
+Accepted efforts are `none`, `minimal`, `low`, `medium`, `high`, and `xhigh`;
+anything else is dropped in favour of the default. Codex does not validate the
+key — it copies an unknown effort straight into the request — so passing one
+through would turn a caller's typo into a bare `400 "Invalid Responses API
+request"` with nothing pointing at the field that caused it.
+
 A run with nothing provisioned is refused before the CLI is spawned, as
 `401 engine_unauthenticated` naming `codex_custom`, so a client opens the right
 login flow instead of reading an opaque stream error.

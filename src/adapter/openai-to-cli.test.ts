@@ -224,3 +224,22 @@ describe("openaiToCli", () => {
     assert.ok(!result.systemPrompt?.includes("cat /etc/passwd"));
   });
 });
+
+describe("reasoning_effort", () => {
+  it("passes the request's reasoning effort through to the runner", () => {
+    const result = openaiToCli({
+      model: "paperclip/codex_custom/stealth/ox-alpha",
+      messages: [{ role: "user", content: "hi" }],
+      reasoning_effort: "high",
+    });
+    assert.equal(result.reasoningEffort, "high");
+  });
+
+  it("leaves it unset when the request names none", () => {
+    const result = openaiToCli({
+      model: "paperclip/codex_custom/stealth/ox-alpha",
+      messages: [{ role: "user", content: "hi" }],
+    });
+    assert.equal(result.reasoningEffort, undefined);
+  });
+});

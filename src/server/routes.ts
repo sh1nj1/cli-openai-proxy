@@ -342,6 +342,7 @@ async function handleStreamingResponse(
       systemPrompt: cliInput.systemPrompt,
       sessionId: cliInput.sessionId,
       timeout: getTimeoutMs(),
+      reasoningEffort: cliInput.reasoningEffort,
     }).catch((err) => {
       // Headers were deliberately flushed above, so rejecting would reach the
       // outer handler too late to write a response and leave this SSE stream open.
@@ -464,6 +465,7 @@ async function handleNonStreamingResponse(
         systemPrompt: cliInput.systemPrompt,
         sessionId: cliInput.sessionId,
         timeout: getTimeoutMs(),
+        reasoningEffort: cliInput.reasoningEffort,
       })
       .catch((error) => {
         res.status(500).json({

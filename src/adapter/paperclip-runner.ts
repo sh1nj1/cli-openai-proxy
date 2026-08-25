@@ -17,7 +17,7 @@ import type { AgentRunner, RunnerOptions } from "./agent-runner.js";
 import { StreamJsonParser, type StreamJsonSink } from "./stream-json-parser.js";
 import { CodexJsonlParser } from "./codex-jsonl-parser.js";
 import { adapterRunError, engineUnauthenticatedError } from "./adapter-error.js";
-import { prepareCodexCustomHome } from "./codex-custom-home.js";
+import { coerceCodexReasoningEffort, prepareCodexCustomHome } from "./codex-custom-home.js";
 import { blankedProxySecrets, getBgWaitCeilingMs } from "../config.js";
 import { getProvisionedAuthEnv, getProvisionedCredential } from "../auth/token-store.js";
 import {
@@ -150,7 +150,15 @@ export class PaperclipRunner extends EventEmitter implements AgentRunner {
         this.emit("close", 1);
         return;
       }
-      codexCustomHome = await prepareCodexCustomHome(gateway.baseUrl, runId, sharedPaperclipHome);
+      codexCustomHome = await prepareCodexCustomHome(
+        gateway.baseUrl,
+        runId,
+        sharedPaperclipHome,
+        // Unrecognised values fall back to the default rather than reaching the
+        // config file, which codex would copy verbatim into the request for the
+        // endpoint to reject as an opaque 400.
+        coerceCodexReasoningEffort(options.reasoningEffort),
+      );
     }
     // Each adapter emits a different stdout dialect: claude speaks stream-json
     // (per-token deltas), codex speaks `codex exec --json` NDJSON (per-message
