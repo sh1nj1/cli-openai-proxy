@@ -155,7 +155,8 @@ export class PaperclipRunner extends EventEmitter implements AgentRunner {
         runId,
         sharedPaperclipHome,
         // Unrecognised values fall back to the default rather than reaching the
-        // config file, where codex would refuse to load at all.
+        // config file, which codex would copy verbatim into the request for the
+        // endpoint to reject as an opaque 400.
         coerceCodexReasoningEffort(options.reasoningEffort),
       );
     }

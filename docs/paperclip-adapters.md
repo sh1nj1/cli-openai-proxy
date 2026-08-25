@@ -50,9 +50,11 @@ sends as a `reasoning` object with no `effort`. Endpoints whose models cannot ru
 without reasoning reject that request outright — OpenRouter answers `Reasoning is
 mandatory for this endpoint and cannot be disabled`, or, when codex's `web_search`
 tool is in the same request, the less obvious `400 "Server tool request failed"`.
-Efforts codex would not accept are dropped in favour of the default: an unknown
-value makes codex refuse the whole config, turning a caller's typo into a launch
-failure with nothing pointing at the field that caused it.
+Accepted efforts are `none`, `minimal`, `low`, `medium`, `high`, and `xhigh`;
+anything else is dropped in favour of the default. Codex does not validate the
+key — it copies an unknown effort straight into the request — so passing one
+through would turn a caller's typo into a bare `400 "Invalid Responses API
+request"` with nothing pointing at the field that caused it.
 
 A run with nothing provisioned is refused before the CLI is spawned, as
 `401 engine_unauthenticated` naming `codex_custom`, so a client opens the right
