@@ -33,6 +33,37 @@ import { CODEX_CUSTOM_API_KEY_ENV } from "../auth/adapters/codex-custom-api-key.
 /** TOML table name for the provisioned gateway, and the `model_provider` value. */
 export const CODEX_CUSTOM_PROVIDER_ID = "custom_gateway";
 
+/**
+ * Values codex accepts for `model_reasoning_effort`.
+ *
+ * Kept as a literal list rather than passed through, because an unknown value
+ * makes codex refuse the whole config — which would turn a caller's typo into a
+ * launch failure with nothing pointing at the request field that caused it.
+ */
+export const CODEX_REASONING_EFFORTS = ["none", "minimal", "low", "medium", "high"] as const;
+export type CodexReasoningEffort = (typeof CODEX_REASONING_EFFORTS)[number];
+
+/**
+ * Effort a run gets when the request names none.
+ *
+ * Not codex's own fallback, which is "none": codex derives effort from built-in
+ * metadata for the model, and no gateway model is in that table ("Model metadata
+ * for `<id>` not found"). "none" then reaches the wire as a `reasoning` block
+ * with no effort, which endpoints serving reasoning-mandatory models reject
+ * outright ("Reasoning is mandatory for this endpoint and cannot be disabled",
+ * surfaced by OpenRouter as a 400 "Server tool request failed" when codex's
+ * web_search tool is in the same request). "medium" is codex's own default for
+ * the models it does know, so it is what a caller who says nothing expects.
+ */
+export const DEFAULT_CODEX_REASONING_EFFORT: CodexReasoningEffort = "medium";
+
+/** Narrow a caller-supplied effort, ignoring anything codex would refuse. */
+export function coerceCodexReasoningEffort(value: unknown): CodexReasoningEffort | undefined {
+  return typeof value === "string" && (CODEX_REASONING_EFFORTS as readonly string[]).includes(value)
+    ? (value as CodexReasoningEffort)
+    : undefined;
+}
+
 // TOML requires root-level keys to appear before the first table header, while
 // the provider table must not swallow whatever root keys the rest of the file
 // has — so the managed content is split into a block prepended to the file and
@@ -102,14 +133,23 @@ export function resolveCodexCustomHome(runId: string, paperclipHome?: string): s
  * the codex CLI (>= 0.145) refuses to load a config that asks for "chat" —
  * accepting the value would only let a caller produce a file codex rejects.
  */
-export function renderCodexCustomConfigToml(existing: string, baseUrl: string): string {
+export function renderCodexCustomConfigToml(
+  existing: string,
+  baseUrl: string,
+  reasoningEffort: CodexReasoningEffort = DEFAULT_CODEX_REASONING_EFFORT,
+): string {
   const preserved = existing
     .replace(blockRe(ROOT_BEGIN, ROOT_END), "")
     .replace(blockRe(TABLE_BEGIN, TABLE_END), "")
     .replace(/^\n+/, "")
     .replace(/\n+$/, "");
 
-  const root = [ROOT_BEGIN, `model_provider = ${tomlString(CODEX_CUSTOM_PROVIDER_ID)}`, ROOT_END].join("\n");
+  const root = [
+    ROOT_BEGIN,
+    `model_provider = ${tomlString(CODEX_CUSTOM_PROVIDER_ID)}`,
+    `model_reasoning_effort = ${tomlString(reasoningEffort)}`,
+    ROOT_END,
+  ].join("\n");
   const table = [
     TABLE_BEGIN,
     `[model_providers.${CODEX_CUSTOM_PROVIDER_ID}]`,
@@ -135,6 +175,7 @@ export async function prepareCodexCustomHome(
   baseUrl: string,
   runId: string,
   paperclipHome?: string,
+  reasoningEffort: CodexReasoningEffort = DEFAULT_CODEX_REASONING_EFFORT,
 ): Promise<string> {
   const home = resolveCodexCustomHome(runId, paperclipHome);
   await fs.mkdir(home, { recursive: true });
@@ -142,7 +183,7 @@ export async function prepareCodexCustomHome(
   const existing = await fs.readFile(configPath, "utf8").catch(() => "");
   const staged = `${configPath}.${randomUUID()}.tmp`;
   try {
-    await fs.writeFile(staged, renderCodexCustomConfigToml(existing, baseUrl), { mode: 0o600 });
+    await fs.writeFile(staged, renderCodexCustomConfigToml(existing, baseUrl, reasoningEffort), { mode: 0o600 });
     await fs.rename(staged, configPath);
   } catch (err) {
     await fs.rm(staged, { force: true }).catch(() => {});

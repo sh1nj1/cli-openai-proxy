@@ -7,6 +7,11 @@ export interface RunnerOptions {
   systemPrompt?: string;
   /** Milliseconds; 0 means unbounded. */
   timeout?: number;
+  /**
+   * Reasoning effort the request asked for. Honoured only by adapters whose
+   * CLI takes one; the rest run identically with or without it.
+   */
+  reasoningEffort?: string;
 }
 
 /**

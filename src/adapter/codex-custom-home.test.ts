@@ -5,6 +5,8 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import {
   CODEX_CUSTOM_PROVIDER_ID,
+  DEFAULT_CODEX_REASONING_EFFORT,
+  coerceCodexReasoningEffort,
   prepareCodexCustomHome,
   renderCodexCustomConfigToml,
   resolveCodexCustomHome,
@@ -139,5 +141,55 @@ test("prepare keeps an existing config.toml's foreign content", async () => {
     assert.match(merged, /one\.example/);
   } finally {
     await rm(paperclipHome, { recursive: true, force: true });
+  }
+});
+
+test("pins a reasoning effort so a gateway model is not sent effort-less reasoning", () => {
+  // codex has no built-in metadata for a gateway's model ids, and its fallback
+  // metadata says effort "none" — which reaches the wire as a `reasoning` block
+  // with no effort and is rejected outright by reasoning-mandatory endpoints.
+  const toml = renderCodexCustomConfigToml("", "https://openrouter.ai/api/v1");
+
+  assert.match(toml, new RegExp(`^model_reasoning_effort = "${DEFAULT_CODEX_REASONING_EFFORT}"$`, "m"));
+  assert.ok(
+    toml.indexOf("model_reasoning_effort =") < toml.indexOf("[model_providers."),
+    "root key must precede the table header",
+  );
+});
+
+test("renders the requested reasoning effort", () => {
+  const toml = renderCodexCustomConfigToml("", "https://openrouter.ai/api/v1", "high");
+
+  assert.match(toml, /^model_reasoning_effort = "high"$/m);
+  assert.equal(toml.match(/^model_reasoning_effort =/gm)?.length, 1);
+});
+
+test("re-rendering replaces the previous effort instead of stacking a second one", () => {
+  const first = renderCodexCustomConfigToml("", "https://one.example/v1", "low");
+  const second = renderCodexCustomConfigToml(first, "https://one.example/v1", "high");
+
+  assert.equal(second.match(/^model_reasoning_effort =/gm)?.length, 1);
+  assert.match(second, /^model_reasoning_effort = "high"$/m);
+});
+
+test("coerces only efforts codex accepts", () => {
+  for (const effort of ["none", "minimal", "low", "medium", "high"]) {
+    assert.equal(coerceCodexReasoningEffort(effort), effort);
+  }
+  // An unknown value would make codex refuse the whole config, so it is dropped
+  // in favour of the default rather than written through.
+  for (const bad of ["MEDIUM", "ultra", "", 3, null, undefined]) {
+    assert.equal(coerceCodexReasoningEffort(bad), undefined);
+  }
+});
+
+test("prepareCodexCustomHome writes the requested effort into config.toml", async () => {
+  const home = await mkdtemp(path.join(tmpdir(), "codex-custom-effort-"));
+  try {
+    const codexHome = await prepareCodexCustomHome("https://openrouter.ai/api/v1", "run-effort", home, "low");
+    const toml = await readFile(path.join(codexHome, "config.toml"), "utf8");
+    assert.match(toml, /^model_reasoning_effort = "low"$/m);
+  } finally {
+    await rm(home, { recursive: true, force: true });
   }
 });

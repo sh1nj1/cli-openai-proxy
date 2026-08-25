@@ -865,10 +865,57 @@ test("codex_custom points the CLI at its own home and hands it the gateway key",
 
     assert.match(configToml, /base_url = "https:\/\/openrouter\.ai\/api\/v1"/);
     assert.match(configToml, /env_key = "CODEX_CUSTOM_API_KEY"/);
+    // No gateway model is in codex's metadata table, so without this its
+    // fallback sends `reasoning` with no effort — which reasoning-mandatory
+    // endpoints reject with a 400 before the run produces anything.
+    assert.match(configToml, /^model_reasoning_effort = "medium"$/m);
     // The key reaches the CLI through the environment, never through the file.
     assert.ok(!configToml.includes("sk-or-run"), "the key must not be written to disk");
     await assert.rejects(readFile(path.join(home, "config.toml"), "utf8"), /ENOENT/,
       "the per-run home is removed once the child exits");
+  } finally {
+    clearAllCredentials();
+    delete process.env[TRUST_COMPLETION_CALLERS_VAR];
+    if (savedPaperclipHome === undefined) delete process.env.PAPERCLIP_HOME;
+    else process.env.PAPERCLIP_HOME = savedPaperclipHome;
+    await rm(paperclipHome, { recursive: true, force: true });
+  }
+});
+
+test("codex_custom writes the requested reasoning effort, ignoring one codex would refuse", async () => {
+  const paperclipHome = await mkdtemp(path.join(tmpdir(), "codex-custom-effort-"));
+  const savedPaperclipHome = process.env.PAPERCLIP_HOME;
+  process.env.PAPERCLIP_HOME = paperclipHome;
+  process.env[TRUST_COMPLETION_CALLERS_VAR] = "1";
+  clearAllCredentials();
+  setCredential("codex_custom", {
+    envVar: "CODEX_CUSTOM_API_KEY",
+    value: "sk-or-run",
+    gateway: { baseUrl: "https://openrouter.ai/api/v1" },
+  });
+
+  const configFor = async (reasoningEffort?: string): Promise<string> => {
+    let configToml = "";
+    const runner = new PaperclipRunner(
+      async (ctx) => {
+        const env = (ctx.config as { env: Record<string, string> }).env;
+        configToml = await readFile(path.join(env.CODEX_HOME, "config.toml"), "utf8");
+        return { exitCode: 0, signal: null, timedOut: false, summary: "ok" };
+      },
+      { engine: "cli", command: "codex" },
+      { engine: "codex_custom", outputMode: "codex-jsonl", cliFlags: [] },
+    );
+    const closeCode = new Promise<number | null>((resolve) => runner.on("close", resolve));
+    await runner.start("hi", { reasoningEffort });
+    await closeCode;
+    return configToml;
+  };
+
+  try {
+    assert.match(await configFor("high"), /^model_reasoning_effort = "high"$/m);
+    // codex refuses to load a config naming an effort it does not know, which
+    // would turn a caller's typo into a launch failure instead of a run.
+    assert.match(await configFor("ludicrous"), /^model_reasoning_effort = "medium"$/m);
   } finally {
     clearAllCredentials();
     delete process.env[TRUST_COMPLETION_CALLERS_VAR];

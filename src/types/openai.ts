@@ -26,6 +26,8 @@ export interface OpenAIChatRequest {
   response_format?: { type: "text" | "json_object" | "json_schema"; json_schema?: unknown };
   stream_options?: { include_usage?: boolean };
   user?: string; // Used for session mapping
+  /** OpenAI reasoning control. Only adapters that run a reasoning model act on it. */
+  reasoning_effort?: string;
 }
 
 export interface OpenAIChatResponseChoice {
