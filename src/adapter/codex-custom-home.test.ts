@@ -173,11 +173,11 @@ test("re-rendering replaces the previous effort instead of stacking a second one
 });
 
 test("coerces only efforts codex accepts", () => {
-  for (const effort of ["none", "minimal", "low", "medium", "high"]) {
+  for (const effort of ["none", "minimal", "low", "medium", "high", "xhigh"]) {
     assert.equal(coerceCodexReasoningEffort(effort), effort);
   }
-  // An unknown value would make codex refuse the whole config, so it is dropped
-  // in favour of the default rather than written through.
+  // codex copies an unknown value straight into `reasoning.effort`, so writing
+  // one through only buys the caller an opaque upstream 400.
   for (const bad of ["MEDIUM", "ultra", "", 3, null, undefined]) {
     assert.equal(coerceCodexReasoningEffort(bad), undefined);
   }
@@ -186,9 +186,16 @@ test("coerces only efforts codex accepts", () => {
 test("prepareCodexCustomHome writes the requested effort into config.toml", async () => {
   const home = await mkdtemp(path.join(tmpdir(), "codex-custom-effort-"));
   try {
-    const codexHome = await prepareCodexCustomHome("https://openrouter.ai/api/v1", "run-effort", home, "low");
-    const toml = await readFile(path.join(codexHome, "config.toml"), "utf8");
-    assert.match(toml, /^model_reasoning_effort = "low"$/m);
+    for (const effort of ["low", "xhigh"] as const) {
+      const codexHome = await prepareCodexCustomHome(
+        "https://openrouter.ai/api/v1",
+        `run-effort-${effort}`,
+        home,
+        effort,
+      );
+      const toml = await readFile(path.join(codexHome, "config.toml"), "utf8");
+      assert.match(toml, new RegExp(`^model_reasoning_effort = "${effort}"$`, "m"));
+    }
   } finally {
     await rm(home, { recursive: true, force: true });
   }

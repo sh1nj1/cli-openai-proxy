@@ -913,8 +913,9 @@ test("codex_custom writes the requested reasoning effort, ignoring one codex wou
 
   try {
     assert.match(await configFor("high"), /^model_reasoning_effort = "high"$/m);
-    // codex refuses to load a config naming an effort it does not know, which
-    // would turn a caller's typo into a launch failure instead of a run.
+    assert.match(await configFor("xhigh"), /^model_reasoning_effort = "xhigh"$/m);
+    // codex forwards an effort it does not know verbatim, so a caller's typo
+    // would come back as an opaque upstream 400 instead of a run.
     assert.match(await configFor("ludicrous"), /^model_reasoning_effort = "medium"$/m);
   } finally {
     clearAllCredentials();

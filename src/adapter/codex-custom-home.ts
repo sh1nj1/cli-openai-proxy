@@ -36,11 +36,20 @@ export const CODEX_CUSTOM_PROVIDER_ID = "custom_gateway";
 /**
  * Values codex accepts for `model_reasoning_effort`.
  *
- * Kept as a literal list rather than passed through, because an unknown value
- * makes codex refuse the whole config — which would turn a caller's typo into a
- * launch failure with nothing pointing at the request field that caused it.
+ * Kept as a literal list rather than passed through, because codex does not
+ * validate this key: an unknown value is copied verbatim into the request's
+ * `reasoning.effort`, and the upstream endpoint rejects it as a bare
+ * "Invalid Responses API request" — the same opaque 400 this file exists to
+ * stop callers from having to decode.
  */
-export const CODEX_REASONING_EFFORTS = ["none", "minimal", "low", "medium", "high"] as const;
+export const CODEX_REASONING_EFFORTS = [
+  "none",
+  "minimal",
+  "low",
+  "medium",
+  "high",
+  "xhigh",
+] as const;
 export type CodexReasoningEffort = (typeof CODEX_REASONING_EFFORTS)[number];
 
 /**
@@ -54,6 +63,11 @@ export type CodexReasoningEffort = (typeof CODEX_REASONING_EFFORTS)[number];
  * surfaced by OpenRouter as a 400 "Server tool request failed" when codex's
  * web_search tool is in the same request). "medium" is codex's own default for
  * the models it does know, so it is what a caller who says nothing expects.
+ *
+ * Applying it to non-reasoning models costs nothing: codex sends `reasoning`
+ * on every request whatever this key says — omitting it only drops the nested
+ * `effort`, never the block — so a model that tolerated the run before still
+ * has to accept `reasoning`, and one that rejects the field was already failing.
  */
 export const DEFAULT_CODEX_REASONING_EFFORT: CodexReasoningEffort = "medium";
 
