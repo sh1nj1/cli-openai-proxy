@@ -245,7 +245,9 @@ export async function handleSubmitAuthSession(req: Request, res: Response): Prom
       ? getSessionProvisioningNotification(engine, sessionId)
       : undefined;
     const result = await submitSession(engine, sessionId, raw, { baseUrl });
-    if (result.status === "authorized") notifyGatewayWhenWorker(req, res, notification);
+    if (result.status === "authorized") {
+      notifyGatewayWhenWorker(req, res, notification);
+    }
     res.json(result);
   } catch (err) {
     sendError(res, err);

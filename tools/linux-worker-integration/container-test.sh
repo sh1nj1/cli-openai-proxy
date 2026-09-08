@@ -159,8 +159,13 @@ gw_user="$(unit_user cli-openai-proxy-gateway.service)"
 [[ "${gw_user}" == "cli-openai-proxy" ]] \
   || fail "gateway runs as ${gw_user}, expected cli-openai-proxy"
 
-step "Auth boundary: /health open, everything else fails closed"
+step "Auth boundary: health open, everything else fails closed"
 curl_expect 200 "${BASE_URL}/health"
+# Open for the same reason: an external monitor cannot hold a completion key.
+# Under worker routing it reports mode=per-user rather than this host's engines.
+curl_expect 200 "${BASE_URL}/health/ready"
+grep -q '"mode":"per-user"' "${BODY}" \
+  || fail "gateway answered readiness with host engines under worker routing: $(cat "${BODY}")"
 curl_expect 200 "${BASE_URL}/auth"
 curl_expect 401 "${BASE_URL}/v1/usage"
 curl_expect 401 -H "Authorization: Bearer ${KEY_UNMAPPED}" "${BASE_URL}/v1/usage"

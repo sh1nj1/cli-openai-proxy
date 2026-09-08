@@ -241,8 +241,12 @@ Unix-socket mode `0600` limits connections to the gateway service account.
 The worker also owns the user's `/v1/auth/*` sessions and `/v1/usage` data.
 Thus CLI login state and usage are per user. Named agent workspaces live below
 `~/workspaces/<workspace-id>` and share that user login; skills, config, and
-provisioning state remain workspace-specific. `/health` and `/v1/models`
-remain gateway-level endpoints.
+provisioning state remain workspace-specific. `/health`, `/health/ready` and
+`/v1/models` remain gateway-level endpoints — a health check must not depend on
+picking a user, so neither health path is forwarded to a worker. Readiness
+reports `engines.mode: "per-user"` here instead of this host's engines; for one
+user's login state, call `/v1/auth/{engine}/status` with their identity. See
+[health-monitoring.md](health-monitoring.md).
 
 ## Agent provisioning (optional)
 

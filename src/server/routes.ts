@@ -20,7 +20,10 @@ import {
 import type { OpenAIChatRequest } from "../types/openai.js";
 import type { ClaudeCliResult, ClaudeCliStreamEvent } from "../types/claude-cli.js";
 import { usageTracker, displayCostUsd } from "../usage/tracker.js";
-import { isAuthEnabled } from "./auth.js";
+import { isAuthEnabled, requestIsTrusted } from "./auth.js";
+import { authAdminEnabled } from "./auth-routes.js";
+import { provisionEnabled } from "../provision/sync.js";
+import { countReady, engineHealth, rollupStatus } from "./health.js";
 import { PKG_VERSION, getTimeoutMs, KEEPALIVE_INTERVAL_MS } from "../config.js";
 import { AUTH_UI_AVAILABLE_HEADER } from "../isolation/worker-protocol.js";
 import { AUTH_UI_PATH } from "./auth-ui.js";
@@ -547,22 +550,113 @@ export function handleUsageRecent(req: Request, res: Response): void {
 }
 
 /**
- * Handle GET /health
+ * Handle GET /health — liveness.
  *
- * Health check endpoint
+ * Answers 200 whenever the process can answer at all, and says nothing an
+ * unauthenticated caller should not see. Every consumer of this path (launchd
+ * KeepAlive, the docker healthcheck, both installers' probe) responds to a
+ * failure by restarting, so it must not reflect anything a restart cannot fix.
+ * Engine state is reported by /health/ready instead.
  */
-export function handleHealth(_req: Request, res: Response): void {
-  const summary = usageTracker.getSummary();
-
+export function handleHealth(req: Request, res: Response): void {
+  res.set("Cache-Control", "no-store");
   res.json({
     status: "ok",
-    provider: "claude-code-cli",
-    version: PKG_VERSION,
-    auth: isAuthEnabled() ? "enabled" : "disabled",
-    usage: {
-      totalRequests: summary.totalRequests,
-      estimatedSavingsUsd: summary.estimatedApiCostSavedUsd,
-    },
-    timestamp: new Date().toISOString(),
+    role: roleOf(req),
+    uptimeSeconds: Math.floor(process.uptime()),
   });
+}
+
+/**
+ * Handle GET /health/ready — readiness.
+ *
+ * Unauthenticated callers get the rollup and a ready/total count; a caller
+ * holding a valid API key gets the per-engine detail. The split follows the one
+ * knob that already decides this server's exposure (API_KEYS) rather than adding
+ * a second: with no keys configured the whole surface is open anyway, so there
+ * is nothing left to withhold here.
+ */
+export function handleHealthReady(req: Request, res: Response): void {
+  res.set("Cache-Control", "no-store");
+  const detailed = requestIsTrusted(req);
+  const perUser = req.app?.locals.userWorkerRouting === true;
+
+  // Under per-user routing the engines live in each worker's HOME, so probing
+  // this process would describe a machine no caller's requests actually run on.
+  // The gateway can still answer for itself: it is ready to route.
+  if (perUser) {
+    const body = {
+      status: "ok",
+      engines: {
+        mode: "per-user",
+        note: "Engine credentials are per user; ask /v1/auth/:engine/status with your identity.",
+      },
+    };
+    res.json(detailed ? { ...body, ...identity(req), features: featureFlags(true), usage: usageTotals() } : body);
+    return;
+  }
+
+  const health = engineHealth();
+  const status = rollupStatus(health.items);
+  if (status === "down") res.status(503);
+
+  if (!detailed) {
+    res.json({
+      status,
+      engines: { ready: countReady(health.items), total: Object.keys(health.items).length },
+    });
+    return;
+  }
+
+  res.json({
+    status,
+    ...identity(req),
+    engines: {
+      mode: "host",
+      probedAt: health.probedAt === null ? null : new Date(health.probedAt).toISOString(),
+      ageMs: health.ageMs,
+      stale: health.stale,
+      items: health.items,
+    },
+    features: featureFlags(false),
+    usage: usageTotals(),
+  });
+}
+
+function roleOf(req: Request): string {
+  return (req.app?.locals.cliProxyRole as string | undefined) ?? "gateway";
+}
+
+function identity(req: Request): Record<string, unknown> {
+  const uptime = process.uptime();
+  return {
+    role: roleOf(req),
+    version: PKG_VERSION,
+    // From the unrounded uptime: deriving it from the reported (floored) seconds
+    // would shift the boot time by up to a second on every call.
+    startedAt: new Date(Date.now() - uptime * 1000).toISOString(),
+    uptimeSeconds: Math.floor(uptime),
+  };
+}
+
+function featureFlags(userWorkers: boolean): Record<string, boolean> {
+  return {
+    apiKeyAuth: isAuthEnabled(),
+    authProvisioning: authAdminEnabled(),
+    agentProvisioning: provisionEnabled(),
+    userWorkers,
+  };
+}
+
+/**
+ * Counters, not a scan: this endpoint is reachable without a key, and the record
+ * list it would otherwise filter grows for the life of the install.
+ */
+function usageTotals(): Record<string, unknown> {
+  const totals = usageTracker.getTotals();
+  return {
+    totalRequests: totals.totalRequests,
+    failedRequests: totals.failedRequests,
+    lastRequestAt: totals.lastRequestAt === null ? null : new Date(totals.lastRequestAt).toISOString(),
+  };
 }

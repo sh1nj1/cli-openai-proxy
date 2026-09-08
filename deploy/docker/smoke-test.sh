@@ -69,6 +69,10 @@ unit_state() {
 
 expect 401 "${BASE_URL}/v1/usage"
 expect 200 -H "Authorization: Bearer ${KEY}" "${BASE_URL}/v1/usage"
+# Readiness answers an unauthenticated monitor. It is 200 even with no CLI
+# logged in (this image installs none) — only an all-engines-logged-out verdict
+# is 503, and an unprobed engine never produces one.
+expect 200 "${BASE_URL}/health/ready"
 expect 200 "${BASE_URL}/auth"
 curl -fsS "${BASE_URL}/auth" | grep -q "CLI authentication" \
   || { compose logs; echo "FAIL: auth UI asset is missing" >&2; exit 1; }
@@ -117,6 +121,7 @@ done
 compose exec -T proxy test ! -e /etc/cli-openai-proxy/gateway.env \
   || { compose logs; echo "FAIL: persisted gateway.env survived an empty seed" >&2; exit 1; }
 expect 000 "${BASE_URL}/health"
+expect 000 "${BASE_URL}/health/ready"
 expect 000 -H "Authorization: Bearer ${ROTATED_KEY}" "${BASE_URL}/v1/usage"
 
 # Recovery: repopulating the seed brings the gateway back on the next boot.

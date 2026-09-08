@@ -212,6 +212,12 @@ function legacyDataDir(): string {
 
 export class UsageTracker {
   private records: RequestRecord[] = [];
+  // Kept alongside the records because the health surface is reachable without
+  // an API key and the record list has no upper bound: filtering it per request
+  // would hand an unauthenticated caller a scan that grows with install age.
+  private totalRequests = 0;
+  private failedRequests = 0;
+  private lastRequestAt: number | null = null;
   private dataDir: string;
   private legacyDir: string | null;
   private loaded = false;
@@ -272,9 +278,11 @@ export class UsageTracker {
       const parsed = JSON.parse(data);
       this.records = parsed.records || [];
       this.startedAt = parsed.startedAt || Date.now();
+      this.recountTotals();
       this.loaded = true;
     } catch {
       this.records = [];
+      this.recountTotals();
       this.loaded = true;
     }
   }
@@ -316,6 +324,9 @@ export class UsageTracker {
     };
 
     this.records.push(record);
+    this.totalRequests++;
+    if (!entry.success) this.failedRequests++;
+    this.lastRequestAt = record.timestamp;
     this.debouncedSave();
   }
 
@@ -379,6 +390,27 @@ export class UsageTracker {
   }
 
   /**
+   * Lifetime counters in O(1), for callers that need the totals but must not pay
+   * a full scan for them (see the fields' comment).
+   */
+  getTotals(): { totalRequests: number; failedRequests: number; lastRequestAt: number | null } {
+    return {
+      totalRequests: this.totalRequests,
+      failedRequests: this.failedRequests,
+      lastRequestAt: this.lastRequestAt,
+    };
+  }
+
+  /** The one place records are replaced wholesale rather than appended to. */
+  private recountTotals(): void {
+    this.totalRequests = this.records.length;
+    this.failedRequests = this.records.filter(r => !r.success).length;
+    this.lastRequestAt = this.records.length > 0
+      ? this.records[this.records.length - 1].timestamp
+      : null;
+  }
+
+  /**
    * Get recent requests (last N)
    */
   getRecent(limit: number = 20): RequestRecord[] {
@@ -390,6 +422,7 @@ export class UsageTracker {
    */
   async clear(): Promise<void> {
     this.records = [];
+    this.recountTotals();
     this.startedAt = Date.now();
     await this.save();
   }
