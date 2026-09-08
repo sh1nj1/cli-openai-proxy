@@ -14,7 +14,7 @@
     "lint": "tsc --noEmit",
     "dev": "tsc --watch",
     "start": "node dist/server/standalone.js",
-    "test": "find dist -name '*.test.js' -print0 | xargs -0 node --test && node --test tools/auth-test.test.mjs && bash tools/publish-flow.test.sh",
+    "test": "find dist -name '*.test.js' -print0 | xargs -0 node --test && node --test tools/auth-test.test.mjs && bash tools/publish-flow.test.sh && bash tools/install-linux-single-user.test.sh",
     "test:integration:linux-workers": "bash tools/linux-worker-integration/run.sh",
     "test:coverage": "c8 --exclude-after-remap --all --src=src --include='**/*.ts' --exclude='**/*.test.ts' --reporter=text --reporter=lcov --check-coverage --statements=80 --branches=80 --functions=85 --lines=80 node --test $(find dist -name '*.test.js' -print)",
     "clean": "node tools/clean.mjs",
