@@ -2,6 +2,11 @@
 
 set -Eeuo pipefail
 
+if [[ "$(uname -s)" != "Linux" ]]; then
+  printf 'Skipping Linux installer trust tests on %s\n' "$(uname -s)"
+  exit 0
+fi
+
 ROOT="$(cd -- "${BASH_SOURCE[0]%/*}/.." && pwd -P)"
 # Load only the installer helpers; running the installer itself requires systemd.
 source <(sed -n '1,/^prepare_trusted_directory()/p' "$ROOT/scripts/install-linux-single-user.sh" | sed '$d')
@@ -29,7 +34,7 @@ if path_metadata_is_trusted "$CONTROL_PATH" directory; then
   exit 1
 fi
 [[ "$TRUST_FAILURE" != *$'\n'* ]]
-[[ "$TRUST_FAILURE" == *'\\n'* ]]
+[[ "$TRUST_FAILURE" == *'\n'* ]]
 
 TRUST_FAILURE="stale failure"
 if service_path_is_trusted relative/path; then
