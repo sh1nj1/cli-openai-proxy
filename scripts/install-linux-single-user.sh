@@ -44,6 +44,13 @@ trusted_command_path() {
   return 0
 }
 
+set_trust_failure() {
+  local escaped_path
+
+  printf -v escaped_path '%q' "$1"
+  TRUST_FAILURE="$escaped_path: $2"
+}
+
 unit_quote() {
   local value="$1"
   value="${value//\\/\\\\}"
@@ -83,34 +90,32 @@ path_metadata_is_trusted() {
   local metadata
   local owner
   local mode
-  local escaped_path
 
   if [[ "$expected_type" == "directory" ]]; then
     if [[ ! -d "$path" ]]; then
-      TRUST_FAILURE="$path: expected a directory"
+      set_trust_failure "$path" "expected a directory"
       return 1
     fi
   elif [[ ! -f "$path" ]]; then
-    TRUST_FAILURE="$path: expected a regular file"
+    set_trust_failure "$path" "expected a regular file"
     return 1
   fi
   metadata="$(LC_ALL=C "$STAT_BIN" --dereference --format='%u %a' -- "$path" 2>/dev/null)" \
     || {
-      TRUST_FAILURE="$path: unable to read owner and permissions"
+      set_trust_failure "$path" "unable to read owner and permissions"
       return 1
     }
   read -r owner mode <<<"$metadata"
   if [[ "$owner" != "0" && "$owner" != "$EUID" ]]; then
-    TRUST_FAILURE="$path: owner UID $owner is neither root (0) nor the installer user ($EUID)"
+    set_trust_failure "$path" "owner UID $owner is neither root (0) nor the installer user ($EUID)"
     return 1
   fi
   if [[ ! "$mode" =~ ^[0-7]+$ ]]; then
-    TRUST_FAILURE="$path: invalid permission mode reported by stat: $mode"
+    set_trust_failure "$path" "invalid permission mode reported by stat: $mode"
     return 1
   fi
   if (( (8#$mode & 8#022) != 0 )); then
-    printf -v escaped_path '%q' "$path"
-    TRUST_FAILURE="$path: mode $mode permits group or other users to write (remove with: chmod go-w -- $escaped_path)"
+    set_trust_failure "$path" "mode $mode permits group or other users to write (remove with: chmod go-w -- $(printf '%q' "$path"))"
     return 1
   fi
 }
@@ -121,7 +126,7 @@ trusted_existing_directory_ancestors() {
 
   while true; do
     if [[ -L "$current" && ! -e "$current" ]]; then
-      TRUST_FAILURE="$current: broken symbolic link"
+      set_trust_failure "$current" "broken symbolic link"
       return 1
     fi
     if [[ -e "$current" ]] && ! path_metadata_is_trusted "$current" directory; then
@@ -139,18 +144,31 @@ service_path_is_trusted() {
   local parent
   local resolved
 
-  [[ "$candidate" == /* ]] || return 1
+  TRUST_FAILURE=""
+  if [[ "$candidate" != /* ]]; then
+    set_trust_failure "$candidate" "expected an absolute path"
+    return 1
+  fi
   trusted_existing_directory_ancestors "$candidate" || return 1
 
   existing="$candidate"
   while [[ ! -e "$existing" ]]; do
-    [[ ! -L "$existing" ]] || return 1
+    if [[ -L "$existing" ]]; then
+      set_trust_failure "$existing" "symbolic link target does not exist"
+      return 1
+    fi
     parent="$("$DIRNAME_BIN" -- "$existing")"
-    [[ "$parent" != "$existing" ]] || return 1
+    if [[ "$parent" == "$existing" ]]; then
+      set_trust_failure "$existing" "could not find an existing parent directory"
+      return 1
+    fi
     existing="$parent"
   done
   resolved="$("$REALPATH_BIN" --canonicalize-existing -- "$existing" 2>/dev/null)" \
-    || return 1
+    || {
+      set_trust_failure "$existing" "unable to resolve the existing path"
+      return 1
+    }
   trusted_existing_directory_ancestors "$resolved"
 }
 
@@ -158,11 +176,21 @@ service_executable_is_trusted() {
   local executable="$1"
   local resolved
 
-  [[ "$executable" == /* && -f "$executable" && -x "$executable" ]] || return 1
+  TRUST_FAILURE=""
+  if [[ "$executable" != /* || ! -f "$executable" || ! -x "$executable" ]]; then
+    set_trust_failure "$executable" "expected an absolute executable regular file"
+    return 1
+  fi
   service_path_is_trusted "$("$DIRNAME_BIN" -- "$executable")" || return 1
   resolved="$("$REALPATH_BIN" --canonicalize-existing -- "$executable" 2>/dev/null)" \
-    || return 1
-  [[ -x "$resolved" ]] || return 1
+    || {
+      set_trust_failure "$executable" "unable to resolve the executable"
+      return 1
+    }
+  if [[ ! -x "$resolved" ]]; then
+    set_trust_failure "$resolved" "resolved file is not executable"
+    return 1
+  fi
   service_path_is_trusted "$("$DIRNAME_BIN" -- "$resolved")" || return 1
   path_metadata_is_trusted "$resolved" file
 }
@@ -171,10 +199,17 @@ service_file_is_trusted() {
   local file="$1"
   local resolved
 
-  [[ "$file" == /* && -f "$file" ]] || return 1
+  TRUST_FAILURE=""
+  if [[ "$file" != /* || ! -f "$file" ]]; then
+    set_trust_failure "$file" "expected an absolute regular file"
+    return 1
+  fi
   service_path_is_trusted "$("$DIRNAME_BIN" -- "$file")" || return 1
   resolved="$("$REALPATH_BIN" --canonicalize-existing -- "$file" 2>/dev/null)" \
-    || return 1
+    || {
+      set_trust_failure "$file" "unable to resolve the file"
+      return 1
+    }
   service_path_is_trusted "$("$DIRNAME_BIN" -- "$resolved")" || return 1
   path_metadata_is_trusted "$resolved" file
 }
@@ -201,10 +236,12 @@ project_build_inputs_are_trusted() {
     "tools"
   )
 
+  TRUST_FAILURE=""
+
   for file in "${required_files[@]}"; do
     entry="$root/$file"
     if [[ -L "$entry" ]]; then
-      TRUST_FAILURE="$entry: symbolic links are not allowed in project build inputs"
+      set_trust_failure "$entry" "symbolic links are not allowed in project build inputs"
       return 1
     fi
     path_metadata_is_trusted "$entry" file || return 1
@@ -213,7 +250,7 @@ project_build_inputs_are_trusted() {
     entry="$root/$file"
     if [[ -e "$entry" || -L "$entry" ]]; then
       if [[ -L "$entry" ]]; then
-        TRUST_FAILURE="$entry: symbolic links are not allowed in project build inputs"
+        set_trust_failure "$entry" "symbolic links are not allowed in project build inputs"
         return 1
       fi
       path_metadata_is_trusted "$entry" file || return 1
@@ -222,22 +259,22 @@ project_build_inputs_are_trusted() {
   for directory in "${input_directories[@]}"; do
     entry="$root/$directory"
     if [[ -L "$entry" ]]; then
-      TRUST_FAILURE="$entry: symbolic links are not allowed in project build inputs"
+      set_trust_failure "$entry" "symbolic links are not allowed in project build inputs"
       return 1
     fi
     path_metadata_is_trusted "$entry" directory || return 1
     input_list="$("$MKTEMP_BIN" "$root/.install-inputs.XXXXXX")" || {
-      TRUST_FAILURE="$root: unable to create the temporary build-input list"
+      set_trust_failure "$root" "unable to create the temporary build-input list"
       return 1
     }
     result=0
     if ! "$FIND_BIN" "$entry" -mindepth 1 -print0 >"$input_list"; then
-      TRUST_FAILURE="$entry: unable to enumerate project build inputs"
+      set_trust_failure "$entry" "unable to enumerate project build inputs"
       result=1
     else
       while IFS= read -r -d '' entry; do
 	if [[ -L "$entry" ]]; then
-	  TRUST_FAILURE="$entry: symbolic links are not allowed in project build inputs"
+	  set_trust_failure "$entry" "symbolic links are not allowed in project build inputs"
 	  result=1
 	  break
 	elif [[ -d "$entry" ]]; then
@@ -251,7 +288,7 @@ project_build_inputs_are_trusted() {
 	    break
 	  }
 	else
-	  TRUST_FAILURE="$entry: expected a regular file or directory"
+	  set_trust_failure "$entry" "expected a regular file or directory"
 	  result=1
 	  break
 	fi
