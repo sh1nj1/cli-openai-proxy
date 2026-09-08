@@ -127,6 +127,26 @@ describe("engine probe cache", () => {
     assert.equal(calls.codex, 2);
   });
 
+  // The likeliest shape of the race: a login takes seconds, so a poller's probe
+  // is very often already running when the credential lands.
+  test("a probe already running when the credential changed cannot publish its result", async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    let state: EngineAuthStatus["state"] = "unauthenticated";
+    const { calls } = stubEngines({ codex: async () => { await gate; return st(state); } });
+
+    const inFlight = warmEngineProbe();
+    state = "authenticated";
+    notifyCredentialChange();
+    release();
+    await inFlight;
+
+    assert.equal(engineHealth().probedAt, null, "the pre-change answer must not be published");
+    await warmEngineProbe();
+    assert.equal(engineHealth().items.codex?.state, "authenticated");
+    assert.equal(calls.codex, 2);
+  });
+
   test("a throwing check reports unknown rather than a login prompt", async () => {
     stubEngines({ codex: async () => { throw new Error("spawn codex ENOENT"); } });
     await warmEngineProbe();

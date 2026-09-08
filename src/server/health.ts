@@ -43,6 +43,8 @@ interface Snapshot {
 
 let snapshot: Snapshot | null = null;
 let inFlight: Promise<void> | null = null;
+/** Bumped by every invalidation, so a probe can tell whether it is still current. */
+let generation = 0;
 
 async function probeEngine(engine: string): Promise<EngineAuthStatus> {
   const descriptor = resolveEngine(engine);
@@ -75,11 +77,16 @@ async function probeEngine(engine: string): Promise<EngineAuthStatus> {
  */
 function refresh(): Promise<void> {
   if (inFlight) return inFlight;
+  const startedAt = generation;
   const run = (async () => {
     const ids = engineRegistry.ids();
     const results = await Promise.all(
       ids.map(async id => [id, await probeEngine(id)] as const),
     );
+    // The credential changed while this was running, so its answers describe the
+    // state before that change. Publishing them would reinstate exactly the
+    // stale verdict the invalidation existed to drop, for a further full TTL.
+    if (generation !== startedAt) return;
     snapshot = { probedAt: Date.now(), items: Object.fromEntries(results) };
   })();
   inFlight = run.then(
@@ -112,12 +119,18 @@ export function engineHealth(): EngineHealth {
  * the auth routes because the device-code flow authorizes with no request in
  * flight — see credential-events.
  */
-onCredentialChange(() => { snapshot = null; });
+onCredentialChange(() => {
+  snapshot = null;
+  generation += 1;
+});
 
 /** Test seam: also cancels the single-flight guard so probes do not leak between tests. */
 export function resetEngineProbe(): void {
   snapshot = null;
   inFlight = null;
+  // Dropping the guard alone would let a probe still running from the previous
+  // test publish its stubbed engines into the next one.
+  generation += 1;
 }
 
 /** Awaits the in-flight (or a fresh) probe. For tests and callers that want a warm cache. */
