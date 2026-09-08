@@ -490,6 +490,26 @@ cd cli-openai-proxy
 ./scripts/install-linux-single-user.sh
 ```
 
+For safety, the installer requires the checkout, its parent directories, and
+all build inputs to be owned by either the current user or root and not be
+writable by group or other users. Use a restrictive umask when cloning or
+updating the checkout:
+
+```bash
+umask 022
+```
+
+If an existing checkout was created with group-writable permissions (commonly
+mode `775`/`664` with umask `002`), the installer reports the first offending
+path. After verifying that the checkout is owned by your user, remove those
+write bits and rerun the installer without `sudo`:
+
+```bash
+chmod -R go-w /path/to/cli-openai-proxy
+chmod go-w /path/to/cli-openai-proxy/..  # only if the reported parent needs it
+./scripts/install-linux-single-user.sh
+```
+
 The installer reuses a trusted Node.js 22.13.0 or newer, or downloads and
 checksum-verifies the latest supported Node.js 22 runtime under `/opt` when none is
 available. It installs dependencies, builds the project, and enables the
