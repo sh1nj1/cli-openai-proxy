@@ -9,6 +9,7 @@
  * constant the process answers by being able to answer; readiness lives here.
  */
 
+import { onCredentialChange } from "../auth/credential-events.js";
 import { engineRegistry, resolveEngine } from "../auth/registry.js";
 import type { EngineAuthStatus } from "../auth/types.js";
 
@@ -104,10 +105,14 @@ export function engineHealth(): EngineHealth {
   return { probedAt: snapshot.probedAt, ageMs, stale, items: snapshot.items };
 }
 
-/** Drops the snapshot after a credential changed, so readiness does not lag a login. */
-export function invalidateEngineProbe(): void {
-  snapshot = null;
-}
+/**
+ * Readiness must not outlive the credential state it describes: a cached
+ * `unauthenticated` served for the rest of the TTL after a successful login
+ * reports a working gateway as broken. Subscribed here rather than called from
+ * the auth routes because the device-code flow authorizes with no request in
+ * flight — see credential-events.
+ */
+onCredentialChange(() => { snapshot = null; });
 
 /** Test seam: also cancels the single-flight guard so probes do not leak between tests. */
 export function resetEngineProbe(): void {

@@ -22,7 +22,6 @@ import {
 import { clearCredential } from "../auth/token-store.js";
 import { AuthProvisioningError } from "../auth/types.js";
 import { provisionEnabled } from "../provision/sync.js";
-import { invalidateEngineProbe } from "./health.js";
 import {
   AUTHORIZED_PROVISIONING_HEADER,
   PROVISIONING_GENERATION_HEADER,
@@ -246,10 +245,7 @@ export async function handleSubmitAuthSession(req: Request, res: Response): Prom
       ? getSessionProvisioningNotification(engine, sessionId)
       : undefined;
     const result = await submitSession(engine, sessionId, raw, { baseUrl });
-    // Readiness caches its probe for 30s; a login is exactly the event that
-    // cache must not outlive, or a freshly authenticated engine reads as broken.
     if (result.status === "authorized") {
-      invalidateEngineProbe();
       notifyGatewayWhenWorker(req, res, notification);
     }
     res.json(result);
@@ -293,7 +289,5 @@ export function handleCancelAuthSession(req: Request, res: Response): void {
 export function handleForgetCredential(req: Request, res: Response): void {
   const engine = engineOf(req, res);
   if (!engine) return;
-  const cleared = clearCredential(engine);
-  if (cleared) invalidateEngineProbe();
-  res.json({ engine, cleared });
+  res.json({ engine, cleared: clearCredential(engine) });
 }

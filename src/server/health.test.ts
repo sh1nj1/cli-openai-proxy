@@ -1,6 +1,7 @@
 import { test, describe, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
 
+import { notifyCredentialChange } from "../auth/credential-events.js";
 import { engineRegistry } from "../auth/registry.js";
 import type { EngineAuthDescriptor, EngineAuthStatus } from "../auth/types.js";
 import {
@@ -108,6 +109,22 @@ describe("engine probe cache", () => {
     assert.equal(health.stale, false);
     assert.ok(typeof health.ageMs === "number" && health.ageMs >= 0);
     assert.equal(calls.codex, 1, "a fresh snapshot must not spawn the CLI again");
+  });
+
+  // Without this the 30s TTL outlives the login: a device-code flow that just
+  // succeeded would keep reading as unauthenticated.
+  test("a credential change drops the snapshot so the next read re-probes", async () => {
+    let state: EngineAuthStatus["state"] = "unauthenticated";
+    const { calls } = stubEngines({ codex: async () => st(state) });
+    await warmEngineProbe();
+    assert.equal(engineHealth().items.codex?.state, "unauthenticated");
+
+    state = "authenticated";
+    notifyCredentialChange();
+    assert.equal(engineHealth().probedAt, null, "the stale snapshot must be gone at once");
+    await warmEngineProbe();
+    assert.equal(engineHealth().items.codex?.state, "authenticated");
+    assert.equal(calls.codex, 2);
   });
 
   test("a throwing check reports unknown rather than a login prompt", async () => {

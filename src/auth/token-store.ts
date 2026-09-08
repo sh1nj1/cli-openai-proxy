@@ -9,12 +9,14 @@
  */
 
 import { trustsCompletionCallers } from "../config.js";
+import { notifyCredentialChange } from "./credential-events.js";
 import type { CredentialGateway, StoredCredential } from "./types.js";
 
 const credentials = new Map<string, StoredCredential>();
 
 export function setCredential(engine: string, credential: StoredCredential): void {
   credentials.set(engine, credential);
+  notifyCredentialChange();
 }
 
 export function hasCredential(engine: string): boolean {
@@ -34,12 +36,15 @@ export function hasInjectableCredential(engine: string): boolean {
 }
 
 export function clearCredential(engine: string): boolean {
-  return credentials.delete(engine);
+  const cleared = credentials.delete(engine);
+  if (cleared) notifyCredentialChange();
+  return cleared;
 }
 
 /** Test-only reset; production code clears per engine. */
 export function clearAllCredentials(): void {
   credentials.clear();
+  notifyCredentialChange();
 }
 
 /**

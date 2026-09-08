@@ -170,6 +170,9 @@ Consequences for an integrator:
 - Concurrent callers cost exactly one probe, not one per request.
 - A login through `/v1/auth/*` or a credential deletion drops the snapshot
   immediately, so readiness does not lag behind an authentication by up to 30s.
+  This includes the device-code flow, which completes on its own without a final
+  request: the snapshot is dropped when the CLI reaches its verdict, not when
+  your next poll observes it.
 
 ---
 

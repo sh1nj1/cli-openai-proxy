@@ -29,6 +29,7 @@ import {
   currentWorkspaceContext,
   runInBoundWorkspace,
 } from "../provision/workspace-context.js";
+import { notifyCredentialChange } from "./credential-events.js";
 import { resolveEngine } from "./registry.js";
 import { setCredential } from "./token-store.js";
 import {
@@ -265,6 +266,10 @@ function settleWhenDone(record: SessionRecord): void {
     record.status = status;
     record.error = error;
     if (byEngine.get(record.engine) === record.sessionId) byEngine.delete(record.engine);
+    // A self-completing flow reaches this point with no request in hand — the
+    // caller only polls later, and the CLI may have persisted the credential
+    // itself. Announce it here or nothing else will.
+    if (status === "authorized") notifyCredentialChange();
   };
   record.handle.wait!().then(
     (result) => {
@@ -345,6 +350,9 @@ export async function submitSession(
     }
     if (result.credential) setCredential(engine, result.credential);
     record.status = "authorized";
+    // Not covered by setCredential above: flows whose CLI keeps the credential
+    // (codex) authorize without ever handing one back.
+    notifyCredentialChange();
     record.handle.cancel();
     if (byEngine.get(record.engine) === record.sessionId) byEngine.delete(record.engine);
     // Fire-and-forget: provisioning is a follow-on to a successful login, and

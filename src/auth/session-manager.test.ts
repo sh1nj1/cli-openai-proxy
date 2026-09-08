@@ -1,6 +1,7 @@
 import { test, describe, beforeEach, afterEach } from "node:test";
 import assert from "node:assert";
 import { TRUST_COMPLETION_CALLERS_VAR } from "../config.js";
+import { onCredentialChange } from "./credential-events.js";
 import { engineRegistry } from "./registry.js";
 import {
   cancelSession,
@@ -116,11 +117,17 @@ const fakeDescriptor: EngineAuthDescriptor = {
 /** Let the settleWhenDone continuation attached to a resolved wait() run. */
 const settle = () => new Promise((r) => setImmediate(r));
 
+// Subscribed once at module scope: onCredentialChange has no unsubscribe, so a
+// per-test listener would keep firing for the rest of the file.
+let credentialChanges = 0;
+onCredentialChange(() => { credentialChanges += 1; });
+
 describe("session-manager", () => {
   beforeEach(() => {
     created = [];
     behavior = {};
     clearAllCredentials();
+    credentialChanges = 0;
     process.env[TRUST_COMPLETION_CALLERS_VAR] = "1";
     engineRegistry.resolve = (engine) => (engine === "fake" ? fakeDescriptor : realResolve(engine));
   });
@@ -393,6 +400,22 @@ describe("session-manager", () => {
 
     // Still queryable: the poll that discovers the outcome needs something to read.
     assert.strictEqual(getSession("fake", view.sessionId).status, "authorized");
+  });
+
+  // The readiness cache keys off this announcement, and a self-completing flow
+  // reaches its verdict with no request in flight: nothing else can make it.
+  test("a self-completing session announces a credential change with no credential to store", async () => {
+    await createSession("fake", "device-code");
+    created[0].finishWait!({});
+    await settle();
+    assert.strictEqual(credentialChanges, 1);
+  });
+
+  test("a self-completing session that fails announces nothing", async () => {
+    await createSession("fake", "device-code");
+    created[0].failWait!(new AuthProvisioningError("denied", "login_failed"));
+    await settle();
+    assert.strictEqual(credentialChanges, 0);
   });
 
   test("a self-completing session that fails carries the CLI's reason", async () => {
