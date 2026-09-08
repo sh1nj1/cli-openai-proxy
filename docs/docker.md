@@ -22,8 +22,14 @@ cd deploy/docker
 cp gateway.env.example gateway.env   # edit keys
 chmod 600 gateway.env                # keep real keys off other local users' reach
 docker compose up -d --build
-curl http://127.0.0.1:3456/health
+curl http://127.0.0.1:3456/health        # liveness — what the healthcheck polls
+curl http://127.0.0.1:3456/health/ready  # readiness — are the CLIs logged in?
 ```
+
+The Compose healthcheck deliberately polls `/health`, not `/health/ready`: a
+logged-out CLI would otherwise mark the container unhealthy and restart it,
+which cannot log it back in. See
+[health-monitoring.md](health-monitoring.md).
 
 If you forget to create `gateway.env` before `docker compose up`, Docker
 materializes an empty directory in its place (both at this path and at

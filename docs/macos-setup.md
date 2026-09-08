@@ -61,8 +61,14 @@ launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.cli-openai-proxy.pli
 
 # Verify it's running
 launchctl list | grep cli-openai-proxy
-curl http://localhost:3456/health
+curl http://localhost:3456/health        # liveness — what KeepAlive relies on
+curl http://localhost:3456/health/ready  # readiness — are the CLIs logged in?
 ```
+
+On macOS `claude` reports `unknown` in the readiness body even when it is
+logged in: its credential lives in the OS keychain, which the proxy cannot
+read. That is expected and never produces a 503 — see
+[health-monitoring.md](health-monitoring.md).
 
 ## Management Commands
 

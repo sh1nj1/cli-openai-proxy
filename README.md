@@ -341,7 +341,8 @@ See [docs/cli-auth-provisioning.md](docs/cli-auth-provisioning.md).
 
 | Endpoint | Method | Description |
 |----------|--------|-------------|
-| `/health` | GET | Health check + usage summary |
+| `/health` | GET | Liveness — always 200 while the process answers. Wire supervisors here |
+| `/health/ready` | GET | Readiness — engine state rollup; 503 only when every CLI is logged out |
 | `/v1/models` | GET | Supported model catalog — static, does not check whether a CLI is installed or authenticated |
 | `/v1/chat/completions` | POST | Chat completions (streaming & non-streaming) |
 | `/v1/usage` | GET | Usage stats |
@@ -357,6 +358,11 @@ See [docs/cli-auth-provisioning.md](docs/cli-auth-provisioning.md).
 | `/v1/provision/sync` | POST | Re-fetch the provisioning manifest and apply it |
 | `/v1/provision/items/{type}/{name}/approve` | POST | Approve a first-seen provisioned item |
 | `/v1/provision/items/{type}/{name}` | DELETE | Uninstall an item and revoke its approval |
+
+Point supervisors (launchd, docker, systemd) at `/health` and monitors at
+`/health/ready` — a logged-out CLI is not something a restart fixes. See
+[docs/health-monitoring.md](docs/health-monitoring.md) for the response schema,
+status semantics, and wiring recipes.
 
 ## Integration Examples
 
@@ -538,6 +544,7 @@ systemctl --user restart com.cli-openai-proxy.service
 systemctl --user status com.cli-openai-proxy.service
 journalctl --user -u com.cli-openai-proxy.service -f
 curl http://127.0.0.1:3456/health
+curl http://127.0.0.1:3456/health/ready
 ```
 
 After pulling new code from `main`, rerun `./scripts/install-linux-single-user.sh`. Existing environment

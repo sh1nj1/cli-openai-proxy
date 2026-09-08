@@ -6,7 +6,15 @@
 
 import express, { Express, Request, Response, NextFunction, type RequestHandler } from "express";
 import { createServer, Server } from "http";
-import { handleChatCompletions, handleModels, handleHealth, handleUsage, handleUsageRecent } from "./routes.js";
+import {
+  handleChatCompletions,
+  handleModels,
+  handleHealth,
+  handleHealthReady,
+  handleUsage,
+  handleUsageRecent,
+} from "./routes.js";
+import { HEALTH_PATH, HEALTH_READY_PATH } from "./health.js";
 import { initAuth, authMiddleware } from "./auth.js";
 import {
   AUTH_PROVISIONING_PREFIX,
@@ -89,6 +97,9 @@ export function createApp(config: AppConfig = {}): Express {
   let onAuthorizedProvisioningUrl: AppConfig["onAuthorizedProvisioningUrl"];
   app.locals.cliProxyRole = role;
   app.locals.authUiEnabled = false;
+  // Read by /health/ready, which must not report this process's engines as the
+  // answer when each user's requests run against their own worker's HOME.
+  app.locals.userWorkerRouting = userWorkerProxy !== undefined;
 
   if (role === "gateway") {
     // Identity mappings must initialize first: mapped user keys are also valid
@@ -250,8 +261,11 @@ export function createApp(config: AppConfig = {}): Express {
     ];
   };
 
-  // Routes
-  app.get("/health", handleHealth);
+  // Routes. Both health paths stay unscoped: liveness is this process answering
+  // for itself, and readiness is the gateway's own rollup — forwarding either to
+  // a user worker would make a health check depend on picking a user.
+  app.get(HEALTH_PATH, handleHealth);
+  app.get(HEALTH_READY_PATH, handleHealthReady);
   if (role === "gateway") app.get(AUTH_UI_PATH, handleAuthUi);
   app.get("/v1/models", handleModels);
   app.post("/v1/chat/completions", ...scoped(handleChatCompletions));

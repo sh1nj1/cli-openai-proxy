@@ -14,6 +14,7 @@ import { AUTH_PROVISIONING_PREFIX } from "./auth-routes.js";
 import { AUTH_UI_PATH } from "./auth-ui.js";
 import { PROVISION_PREFIX } from "./provision-routes.js";
 import { mappedCompletionKeys } from "../isolation/request-identity.js";
+import { HEALTH_PATH, HEALTH_READY_PATH } from "./health.js";
 
 let validKeys: Set<string> | null = null;
 
@@ -55,7 +56,10 @@ export function authMiddleware(req: Request, res: Response, next: NextFunction):
 
   // The auth UI accepts the separate admin key inside the page and must be
   // loadable before the browser can attach that key to provisioning requests.
-  if (req.path === "/health" || req.path === AUTH_UI_PATH) {
+  // The health paths pass unauthenticated because an external monitor cannot be
+  // asked to hold a completion key; each decides for itself how much to say
+  // (see requestIsTrusted).
+  if (req.path === HEALTH_PATH || req.path === HEALTH_READY_PATH || req.path === AUTH_UI_PATH) {
     next();
     return;
   }
@@ -100,6 +104,21 @@ export function authMiddleware(req: Request, res: Response, next: NextFunction):
   }
 
   next();
+}
+
+/**
+ * Whether this request carried a credential this process accepts.
+ *
+ * True when auth is off: a server with no keys configured serves everything to
+ * everyone already, so a health endpoint withholding detail there would protect
+ * nothing. Used only by the health surface, which is reachable without a key and
+ * therefore decides its own verbosity rather than being gated by the middleware.
+ */
+export function requestIsTrusted(req: Request): boolean {
+  if (!validKeys) return true;
+  const header = req.headers.authorization;
+  if (!header) return false;
+  return validKeys.has(header.replace(/^Bearer\s+/i, "").trim());
 }
 
 /**

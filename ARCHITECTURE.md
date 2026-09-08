@@ -34,7 +34,8 @@ src/
 │   ├── standalone.ts           # bin entry: preflight, config banner, startServer
 │   ├── index.ts                # Express app wiring: middleware order, routes, lifecycle
 │   ├── routes.ts               # /v1/chat/completions, /v1/models, /v1/usage, /health
-│   ├── auth.ts                 # API_KEYS bearer auth (skips /health and /v1/auth/*)
+│   ├── health.ts               # cached engine probe + readiness rollup
+│   ├── auth.ts                 # API_KEYS bearer auth (skips /health*, /v1/auth/*)
 │   ├── auth-routes.ts          # /v1/auth/* provisioning API (AUTH_ADMIN_KEYS gated)
 │   ├── worker-standalone.ts     # socket-activated per-user worker entry point
 │   └── provisioner-standalone.ts # root Linux account provisioner entry point
@@ -105,7 +106,8 @@ substitute.
 | `POST /v1/chat/completions` | `API_KEYS` (if set) | Chat, streaming + non-streaming |
 | `GET /v1/models` | `API_KEYS` (if set) | Registered adapter ids (same registry that routes requests) |
 | `GET /v1/usage`, `/v1/usage/recent` | `API_KEYS` (if set) | Usage summary / recent requests |
-| `GET /health` | none | Liveness |
+| `GET /health` | none | Liveness — constant; never reflects engine state ([why](docs/health-monitoring.md)) |
+| `GET /health/ready` | none (detail with `API_KEYS`) | Readiness — cached engine probe rollup, 503 when every engine is logged out |
 | `/v1/auth/*` (engines, status, sessions, credential) | `AUTH_ADMIN_KEYS` | [Remote CLI auth provisioning](docs/cli-auth-provisioning.md) |
 
 ## Data & State
