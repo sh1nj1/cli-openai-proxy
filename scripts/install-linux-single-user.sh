@@ -12,6 +12,7 @@ READINESS_TIMEOUT="${INSTALL_READINESS_TIMEOUT:-30}"
 INSTALL_CLIS="${INSTALL_CLIS-@anthropic-ai/claude-code @openai/codex}"
 USER_PATH="${PATH:-}"
 BUILD_BIN_DIR=""
+TRUST_FAILURE=""
 
 log() {
   printf '[install] %s\n' "$*"
@@ -82,18 +83,36 @@ path_metadata_is_trusted() {
   local metadata
   local owner
   local mode
+  local escaped_path
 
   if [[ "$expected_type" == "directory" ]]; then
-    [[ -d "$path" ]] || return 1
-  else
-    [[ -f "$path" ]] || return 1
+    if [[ ! -d "$path" ]]; then
+      TRUST_FAILURE="$path: expected a directory"
+      return 1
+    fi
+  elif [[ ! -f "$path" ]]; then
+    TRUST_FAILURE="$path: expected a regular file"
+    return 1
   fi
   metadata="$(LC_ALL=C "$STAT_BIN" --dereference --format='%u %a' -- "$path" 2>/dev/null)" \
-    || return 1
+    || {
+      TRUST_FAILURE="$path: unable to read owner and permissions"
+      return 1
+    }
   read -r owner mode <<<"$metadata"
-  [[ "$owner" == "0" || "$owner" == "$EUID" ]] || return 1
-  [[ "$mode" =~ ^[0-7]+$ ]] || return 1
-  (( (8#$mode & 8#022) == 0 ))
+  if [[ "$owner" != "0" && "$owner" != "$EUID" ]]; then
+    TRUST_FAILURE="$path: owner UID $owner is neither root (0) nor the installer user ($EUID)"
+    return 1
+  fi
+  if [[ ! "$mode" =~ ^[0-7]+$ ]]; then
+    TRUST_FAILURE="$path: invalid permission mode reported by stat: $mode"
+    return 1
+  fi
+  if (( (8#$mode & 8#022) != 0 )); then
+    printf -v escaped_path '%q' "$path"
+    TRUST_FAILURE="$path: mode $mode permits group or other users to write (remove with: chmod go-w -- $escaped_path)"
+    return 1
+  fi
 }
 
 trusted_existing_directory_ancestors() {
@@ -101,7 +120,10 @@ trusted_existing_directory_ancestors() {
   local parent
 
   while true; do
-    [[ ! -L "$current" || -e "$current" ]] || return 1
+    if [[ -L "$current" && ! -e "$current" ]]; then
+      TRUST_FAILURE="$current: broken symbolic link"
+      return 1
+    fi
     if [[ -e "$current" ]] && ! path_metadata_is_trusted "$current" directory; then
       return 1
     fi
@@ -181,27 +203,41 @@ project_build_inputs_are_trusted() {
 
   for file in "${required_files[@]}"; do
     entry="$root/$file"
-    [[ ! -L "$entry" ]] || return 1
+    if [[ -L "$entry" ]]; then
+      TRUST_FAILURE="$entry: symbolic links are not allowed in project build inputs"
+      return 1
+    fi
     path_metadata_is_trusted "$entry" file || return 1
   done
   for file in "${optional_files[@]}"; do
     entry="$root/$file"
     if [[ -e "$entry" || -L "$entry" ]]; then
-      [[ ! -L "$entry" ]] || return 1
+      if [[ -L "$entry" ]]; then
+        TRUST_FAILURE="$entry: symbolic links are not allowed in project build inputs"
+        return 1
+      fi
       path_metadata_is_trusted "$entry" file || return 1
     fi
   done
   for directory in "${input_directories[@]}"; do
     entry="$root/$directory"
-    [[ ! -L "$entry" ]] || return 1
+    if [[ -L "$entry" ]]; then
+      TRUST_FAILURE="$entry: symbolic links are not allowed in project build inputs"
+      return 1
+    fi
     path_metadata_is_trusted "$entry" directory || return 1
-    input_list="$("$MKTEMP_BIN" "$root/.install-inputs.XXXXXX")" || return 1
+    input_list="$("$MKTEMP_BIN" "$root/.install-inputs.XXXXXX")" || {
+      TRUST_FAILURE="$root: unable to create the temporary build-input list"
+      return 1
+    }
     result=0
     if ! "$FIND_BIN" "$entry" -mindepth 1 -print0 >"$input_list"; then
+      TRUST_FAILURE="$entry: unable to enumerate project build inputs"
       result=1
     else
       while IFS= read -r -d '' entry; do
 	if [[ -L "$entry" ]]; then
+	  TRUST_FAILURE="$entry: symbolic links are not allowed in project build inputs"
 	  result=1
 	  break
 	elif [[ -d "$entry" ]]; then
@@ -215,6 +251,7 @@ project_build_inputs_are_trusted() {
 	    break
 	  }
 	else
+	  TRUST_FAILURE="$entry: expected a regular file or directory"
 	  result=1
 	  break
 	fi
@@ -459,8 +496,9 @@ service_executable_is_trusted "$NODE_BIN" \
   || die "Refusing Node.js executable with untrusted ownership or permissions: $NODE_BIN"
 service_executable_is_trusted "$NPM_BIN" \
   || die "Refusing npm executable with untrusted ownership or permissions: $NPM_BIN"
-service_path_is_trusted "$PROJECT_DIR" \
-  || die "Refusing project directory with untrusted ownership or permissions: $PROJECT_DIR"
+if ! service_path_is_trusted "$PROJECT_DIR"; then
+  die "Refusing project directory: $TRUST_FAILURE"
+fi
 
 SERVICE_USER="$("$ID_BIN" -un)"
 
@@ -516,8 +554,9 @@ append_service_path "/usr/local/bin"
 append_service_path "/usr/bin"
 append_service_path "/bin"
 
-project_build_inputs_are_trusted "$PROJECT_DIR" \
-  || die "Refusing project build inputs with untrusted ownership, permissions, or file types: $PROJECT_DIR"
+if ! project_build_inputs_are_trusted "$PROJECT_DIR"; then
+  die "Refusing project build inputs: $TRUST_FAILURE"
+fi
 
 BUILD_BIN_DIR="$("$MKTEMP_BIN" -d "$PROJECT_DIR/.install-build-bin.XXXXXX")" \
   || die "Failed to create a private build command directory"
