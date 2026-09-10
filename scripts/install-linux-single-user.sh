@@ -463,24 +463,26 @@ listener_belongs_to_pid() {
 
 read_effective_listener() {
   local pid="$1"
+  local environ_path="${2:-/proc/$pid/environ}"
   local env_entry
   local value
 
-  [[ -r "/proc/$pid/environ" ]] || return 1
   EFFECTIVE_HOST="127.0.0.1"
   EFFECTIVE_PORT="3456"
-  while IFS= read -r -d '' env_entry; do
-    case "$env_entry" in
-    HOST=*)
-      value="${env_entry#HOST=}"
-      [[ -z "$value" ]] || EFFECTIVE_HOST="$value"
-      ;;
-    PORT=*)
-      value="${env_entry#PORT=}"
-      [[ -z "$value" ]] || EFFECTIVE_PORT="$value"
-      ;;
-    esac
-  done <"/proc/$pid/environ"
+  {
+    while IFS= read -r -d '' env_entry; do
+      case "$env_entry" in
+      HOST=*)
+	value="${env_entry#HOST=}"
+	[[ -z "$value" ]] || EFFECTIVE_HOST="$value"
+	;;
+      PORT=*)
+	value="${env_entry#PORT=}"
+	[[ -z "$value" ]] || EFFECTIVE_PORT="$value"
+	;;
+      esac
+    done
+  } 2>/dev/null <"$environ_path" || return 1
 
   [[ -n "$EFFECTIVE_HOST" ]]
   [[ "$EFFECTIVE_PORT" =~ ^[0-9]+$ ]] \

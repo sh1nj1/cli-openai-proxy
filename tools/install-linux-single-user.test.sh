@@ -50,3 +50,22 @@ if service_path_is_trusted /usr/bin; then
   exit 1
 fi
 [[ "$TRUST_FAILURE" == '/usr/bin: unable to resolve the existing path' ]]
+
+for installer in \
+  "$ROOT/scripts/install-linux-single-user.sh" \
+  "$ROOT/scripts/install-linux-user-workers.sh"; do
+  source <(sed -n '/^read_effective_listener()/,/^}$/p' "$installer")
+
+  ENVIRON_FIXTURE="$TEST_DIR/environ"
+  printf 'HOST=0.0.0.0\0PORT=4567\0' >"$ENVIRON_FIXTURE"
+  read_effective_listener 0 "$ENVIRON_FIXTURE"
+  [[ "$EFFECTIVE_HOST" == "0.0.0.0" ]]
+  [[ "$EFFECTIVE_PORT" == "4567" ]]
+
+  READ_ERROR=""
+  if READ_ERROR="$(read_effective_listener 0 "$TEST_DIR/missing-environ" 2>&1)"; then
+    printf 'expected an unavailable process environment to be rejected\n' >&2
+    exit 1
+  fi
+  [[ -z "$READ_ERROR" ]]
+done
