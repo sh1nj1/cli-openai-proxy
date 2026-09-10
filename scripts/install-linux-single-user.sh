@@ -357,6 +357,7 @@ run_npm() {
   local -a build_env=(
     "HOME=$HOME"
     "PATH=$BUILD_PATH"
+    "CLI_OPENAI_PROXY_NPM_BIN=$NPM_BIN"
   )
 
   for name in HTTP_PROXY HTTPS_PROXY ALL_PROXY NO_PROXY http_proxy https_proxy all_proxy no_proxy; do
@@ -372,6 +373,31 @@ run_npm() {
     "--globalconfig=$NPM_GLOBAL_CONFIG" \
     --script-shell=/bin/sh \
     "$@"
+}
+
+prepare_build_bin() {
+  BUILD_BIN_DIR="$("$MKTEMP_BIN" -d "$PROJECT_DIR/.install-build-bin.XXXXXX")" \
+    || die "Failed to create a private build command directory"
+  service_path_is_trusted "$BUILD_BIN_DIR" \
+    || die "Private build command directory has untrusted ownership or permissions: $BUILD_BIN_DIR"
+  trap cleanup_build_bin EXIT
+  "$LN_BIN" -s -- "$NODE_BIN" "$BUILD_BIN_DIR/node"
+  {
+    printf '%s\n' '#!/bin/sh'
+    printf '%s\n' 'exec "$CLI_OPENAI_PROXY_NPM_BIN" "$@"'
+  } >"$BUILD_BIN_DIR/npm"
+  chmod 700 "$BUILD_BIN_DIR/npm"
+  path_metadata_is_trusted "$BUILD_BIN_DIR/npm" file \
+    || die "Private npm wrapper has untrusted ownership or permissions"
+  NPM_USER_CONFIG="$BUILD_BIN_DIR/user.npmrc"
+  NPM_GLOBAL_CONFIG="$BUILD_BIN_DIR/global.npmrc"
+  : >"$NPM_USER_CONFIG"
+  : >"$NPM_GLOBAL_CONFIG"
+  path_metadata_is_trusted "$NPM_USER_CONFIG" file \
+    || die "Private npm user config has untrusted ownership or permissions"
+  path_metadata_is_trusted "$NPM_GLOBAL_CONFIG" file \
+    || die "Private npm global config has untrusted ownership or permissions"
+  BUILD_PATH="$BUILD_BIN_DIR:/usr/bin:/bin"
 }
 
 health_check() {
@@ -595,22 +621,7 @@ if ! project_build_inputs_are_trusted "$PROJECT_DIR"; then
   die "Refusing project build inputs: $TRUST_FAILURE"
 fi
 
-BUILD_BIN_DIR="$("$MKTEMP_BIN" -d "$PROJECT_DIR/.install-build-bin.XXXXXX")" \
-  || die "Failed to create a private build command directory"
-service_path_is_trusted "$BUILD_BIN_DIR" \
-  || die "Private build command directory has untrusted ownership or permissions: $BUILD_BIN_DIR"
-trap cleanup_build_bin EXIT
-"$LN_BIN" -s -- "$NODE_BIN" "$BUILD_BIN_DIR/node"
-"$LN_BIN" -s -- "$NPM_BIN" "$BUILD_BIN_DIR/npm"
-NPM_USER_CONFIG="$BUILD_BIN_DIR/user.npmrc"
-NPM_GLOBAL_CONFIG="$BUILD_BIN_DIR/global.npmrc"
-: >"$NPM_USER_CONFIG"
-: >"$NPM_GLOBAL_CONFIG"
-path_metadata_is_trusted "$NPM_USER_CONFIG" file \
-  || die "Private npm user config has untrusted ownership or permissions"
-path_metadata_is_trusted "$NPM_GLOBAL_CONFIG" file \
-  || die "Private npm global config has untrusted ownership or permissions"
-BUILD_PATH="$BUILD_BIN_DIR:/usr/bin:/bin"
+prepare_build_bin
 
 log "Installing dependencies"
 (cd "$PROJECT_DIR" && run_npm ci)

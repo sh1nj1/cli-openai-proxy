@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -112,6 +112,60 @@ test("Single-user install provisions engine CLIs into a managed prefix on the se
   assert.ok(installClis >= 0 && installClis < appendPath);
   assert.ok(appendPath < single.indexOf("validate_service_cli_resolution claude"));
   assert.ok(writeUnit >= 0 && appendPath < writeUnit);
+});
+
+test("Single-user install preserves location-dependent npm launchers for nested scripts", async () => {
+  const script = await readScript("install-linux-single-user.sh");
+  const helperEnd = script.indexOf("\nhealth_check() {");
+  assert.notEqual(helperEnd, -1);
+  const scratch = await mkdtemp(join(tmpdir(), "cli-openai-proxy-npm-wrapper-"));
+  const project = join(scratch, "project");
+  const runtime = join(scratch, "runtime");
+  const helperPath = join(scratch, "installer-helpers.sh");
+  const nodeBin = join(runtime, "bin", "node");
+  const npmBin = join(runtime, "lib", "npm");
+
+  try {
+    await writeFile(helperPath, script.slice(0, helperEnd));
+    await mkdir(project);
+    await mkdir(join(runtime, "bin"), { recursive: true });
+    await mkdir(join(runtime, "lib"), { recursive: true });
+    await writeFile(nodeBin, "#!/bin/sh\nexit 0\n", { mode: 0o700 });
+    await writeFile(npmBin, `#!/bin/sh
+node_bin="$(dirname -- "$0")/../bin/node"
+if [ ! -x "$node_bin" ]; then
+  printf 'missing node: %s\\n' "$node_bin" >&2
+  exit 127
+fi
+if [ "\${NESTED_NPM-}" = 1 ]; then
+  printf 'nested npm ok\\n'
+  exit 0
+fi
+NESTED_NPM=1 npm nested
+`, { mode: 0o700 });
+
+    const output = execFileSync("bash", ["-c", `
+      source "$1"
+      PROJECT_DIR="$2"
+      NODE_BIN="$3"
+      NPM_BIN="$4"
+      MKTEMP_BIN="$(command -v mktemp)"
+      LN_BIN="$(command -v ln)"
+      RM_BIN="$(command -v rm)"
+      ENV_BIN="$(command -v env)"
+      service_path_is_trusted() { return 0; }
+      path_metadata_is_trusted() { return 0; }
+      prepare_build_bin
+      run_npm run build
+    `, "bash", helperPath, project, nodeBin, npmBin], {
+      encoding: "utf8",
+      env: { ...process.env, BASH_ENV: "" },
+    });
+
+    assert.equal(output, "nested npm ok\n");
+  } finally {
+    await rm(scratch, { recursive: true, force: true });
+  }
 });
 
 test("Linux installers share one minimum Node.js runtime policy", async () => {
