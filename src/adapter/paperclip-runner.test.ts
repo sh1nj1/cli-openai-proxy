@@ -339,7 +339,7 @@ test("codex-jsonl mode reports cached tokens separately from fresh input tokens"
   assert.equal(results[0].usage.input_tokens, 664, "cached share removed from fresh input");
 });
 
-test("codex-jsonl mode reports zero cached tokens when the adapter reports none", async () => {
+test("codex-jsonl mode preserves unreported cached tokens", async () => {
   const fakeExecute: AdapterExecute = async () => ({
     exitCode: 0, signal: null, timedOut: false, sessionId: "s",
     summary: "ok", usage: { inputTokens: 7, outputTokens: 3 },
@@ -359,7 +359,7 @@ test("codex-jsonl mode reports zero cached tokens when the adapter reports none"
   await closed;
 
   assert.equal(results[0].usage.input_tokens, 7);
-  assert.equal(results[0].usage.cache_read_input_tokens, 0);
+  assert.equal(results[0].usage.cache_read_input_tokens, undefined);
 });
 
 // Emulates the `codex exec --json` NDJSON stream (see src/adapter/codex-jsonl-parser.ts).

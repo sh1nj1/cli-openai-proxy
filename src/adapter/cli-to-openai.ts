@@ -13,20 +13,23 @@ import { runUsage } from "../usage/run-usage.js";
  * cache fields), while OpenAI's prompt_tokens is the whole prompt with
  * prompt_tokens_details.cached_tokens as the cached subset of it. Echoing
  * input_tokens alone would report 2 prompt tokens for a 30k-token cached turn.
- * Cache writes have no OpenAI counterpart, so they fold into prompt_tokens —
- * which is where they are billed anyway.
+ * Cache writes remain part of prompt_tokens and are exposed separately through
+ * the cache_write_tokens extension understood by RubyLLM. Missing counters stay
+ * absent; only provider-reported zeroes are serialized as zero.
  */
 export function cliUsageToOpenai(usage: ClaudeCliResult["usage"] | undefined): OpenAIUsage {
-  const cachedTokens = usage?.cache_read_input_tokens || 0;
-  const promptTokens =
-    (usage?.input_tokens || 0) + cachedTokens + (usage?.cache_creation_input_tokens || 0);
-  const completionTokens = usage?.output_tokens || 0;
+  if (!usage) return {};
+  const cachedTokens = usage.cache_read_input_tokens;
+  const writtenTokens = usage.cache_creation_input_tokens;
+  const promptTokens = usage.input_tokens === undefined ? undefined :
+    usage.input_tokens + (cachedTokens ?? 0) + (writtenTokens ?? 0);
+  const completionTokens = usage.output_tokens;
 
   return {
     prompt_tokens: promptTokens,
     completion_tokens: completionTokens,
-    total_tokens: promptTokens + completionTokens,
-    prompt_tokens_details: { cached_tokens: cachedTokens },
+    total_tokens: promptTokens === undefined || completionTokens === undefined ? undefined : promptTokens + completionTokens,
+    prompt_tokens_details: { cached_tokens: cachedTokens, cache_write_tokens: writtenTokens },
   };
 }
 

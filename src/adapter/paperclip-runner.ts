@@ -440,10 +440,10 @@ export class PaperclipRunner extends EventEmitter implements AgentRunner {
    * keeping the prompt total identical while the cache split stops reading zero.
    */
   private synthesizeUsage(usage: AdapterExecutionResult["usage"]): ClaudeCliResult["usage"] {
-    const cached = usage?.cachedInputTokens ?? 0;
+    const cached = usage?.cachedInputTokens;
     return {
-      input_tokens: Math.max(0, (usage?.inputTokens ?? 0) - cached),
-      output_tokens: usage?.outputTokens ?? 0,
+      input_tokens: usage?.inputTokens === undefined ? undefined : Math.max(0, usage.inputTokens - (cached ?? 0)),
+      output_tokens: usage?.outputTokens,
       cache_read_input_tokens: cached,
     };
   }

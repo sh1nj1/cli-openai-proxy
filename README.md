@@ -183,7 +183,10 @@ walkthrough: [docs/paperclip-adapters.md](docs/paperclip-adapters.md#collavre-in
   chunk (empty `choices`) just before `[DONE]`
 - **Cache-aware token counts** — `prompt_tokens` covers the whole prompt, cache
   reads included, with the cached share broken out as
-  `usage.prompt_tokens_details.cached_tokens`
+  `usage.prompt_tokens_details.cached_tokens`. Cache writes are included once in
+  `prompt_tokens` and separately exposed as `prompt_tokens_details.cache_write_tokens`
+  for accounting clients such as RubyLLM. Unreported counters are omitted, while
+  reported zeroes remain zero.
 - **Image input** — OpenAI `image_url` parts (base64 data URLs) are materialized
   to temp files and handed to the CLI as inline links, so the agent can see them;
   works across all adapters

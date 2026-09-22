@@ -81,19 +81,20 @@ describe("cliUsageToOpenai", () => {
       cache_creation_input_tokens: 500,
     });
     assert.equal(usage.prompt_tokens_details?.cached_tokens, 30_000);
+    assert.equal(usage.prompt_tokens_details?.cache_write_tokens, 500);
   });
 
-  it("reports zero cached tokens when the run had no cache hits", () => {
+  it("keeps unreported cache tokens absent", () => {
     const usage = cliUsageToOpenai({ input_tokens: 100, output_tokens: 50 });
     assert.equal(usage.prompt_tokens, 100);
-    assert.equal(usage.prompt_tokens_details?.cached_tokens, 0);
+    assert.equal(usage.prompt_tokens_details?.cached_tokens, undefined);
   });
 
-  it("reports zeroes for a missing usage block", () => {
+  it("keeps a missing usage block unknown", () => {
     const usage = cliUsageToOpenai(undefined);
-    assert.equal(usage.prompt_tokens, 0);
-    assert.equal(usage.completion_tokens, 0);
-    assert.equal(usage.total_tokens, 0);
+    assert.equal(usage.prompt_tokens, undefined);
+    assert.equal(usage.completion_tokens, undefined);
+    assert.equal(usage.total_tokens, undefined);
   });
 });
 
@@ -230,5 +231,33 @@ describe("extractJsonFromText", () => {
   it("returns original text if no valid JSON found", () => {
     const text = "This is just plain text with no JSON.";
     assert.equal(extractJsonFromText(text), text);
+  });
+});
+
+describe("cache write accounting", () => {
+  it("preserves writes in both streaming and non-streaming output without adding them twice", () => {
+    const result = makeResult("done");
+    result.usage = { input_tokens: 10, output_tokens: 5, cache_read_input_tokens: 30, cache_creation_input_tokens: 20 };
+    result.modelUsage = {};
+    const responses = [createUsageChunk("cache", "paperclip/claude_local", result), cliResultToOpenai(result, "cache", "paperclip/claude_local")];
+    for (const response of responses) {
+      assert.equal(response.usage?.prompt_tokens, 60);
+      assert.equal(response.usage?.prompt_tokens_details?.cache_write_tokens, 20);
+      assert.equal(response.usage?.prompt_tokens_details?.cached_tokens, 30);
+      assert.equal(response.usage?.total_tokens, 65);
+    }
+  });
+
+  it("preserves reported zeroes and omits unreported counters on the wire", () => {
+    const zero = cliUsageToOpenai({ input_tokens: 0, output_tokens: 0, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 });
+    assert.equal(zero.prompt_tokens_details?.cache_write_tokens, 0);
+    assert.equal(zero.prompt_tokens_details?.cached_tokens, 0);
+    assert.equal(zero.total_tokens, 0);
+    const missing = JSON.parse(JSON.stringify(cliUsageToOpenai({ output_tokens: 5 })));
+    assert.equal(missing.completion_tokens, 5);
+    assert.equal(Object.hasOwn(missing, "prompt_tokens"), false);
+    assert.equal(Object.hasOwn(missing, "total_tokens"), false);
+    assert.deepEqual(missing.prompt_tokens_details, {});
+    assert.deepEqual(createUsageChunk("missing", "paperclip/codex_local", undefined).usage, {});
   });
 });
