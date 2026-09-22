@@ -136,7 +136,30 @@ export function parseManifest(raw: unknown): ProvisionManifest {
     };
   });
 
-  return { schema: MANIFEST_SCHEMA, items };
+  let runtime: ProvisionManifest["runtime"];
+  if (obj.runtime !== undefined) {
+    const runtimeObject = strictRuntimeObject(obj.runtime, "runtime", ["codex"]);
+    runtime = {};
+    if (runtimeObject.codex !== undefined) {
+      const codex = strictRuntimeObject(runtimeObject.codex, "runtime.codex", ["fast_mode"]);
+      if (codex.fast_mode !== undefined && typeof codex.fast_mode !== "boolean") {
+	throw new ProvisionError("runtime.codex.fast_mode must be a boolean", "invalid_manifest");
+      }
+      runtime.codex = codex.fast_mode === undefined ? {} : { fastMode: codex.fast_mode as boolean };
+    }
+  }
+  return { schema: MANIFEST_SCHEMA, items, ...(runtime ? { runtime } : {}) };
+}
+
+function strictRuntimeObject(value: unknown, field: string, allowed: string[]): Record<string, unknown> {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw new ProvisionError(`${field} must be an object`, "invalid_manifest");
+  }
+  const object = value as Record<string, unknown>;
+  if (Object.keys(object).some((key) => !allowed.includes(key))) {
+    throw new ProvisionError(`${field} contains unsupported fields`, "invalid_manifest");
+  }
+  return object;
 }
 
 const LOOPBACK_HOSTS = new Set(["localhost", "127.0.0.1", "::1", "[::1]"]);

@@ -28,6 +28,7 @@ import {
   approveItem,
   deleteItem,
   getStatus,
+  getProvisionedRuntimeConfig,
   handleAuthorizedSession,
   initProvisioning,
   provisionEnabled,
@@ -36,6 +37,7 @@ import {
   shutdownProvisioning,
   syncNow,
 } from "./sync.js";
+import { createRunner, resolvePaperclipModel } from "../adapter/paperclip-registry.js";
 import { ProvisionError } from "./types.js";
 import { firstInstallMarkerPath } from "./installer.js";
 import { registeredManifestFilePath } from "./state.js";
@@ -243,6 +245,70 @@ describe("provision sync", () => {
     rmSync(skillsDir, { recursive: true, force: true });
     rmSync(configDir, { recursive: true, force: true });
     rmSync(workspaceRoot, { recursive: true, force: true });
+  });
+
+  test("runtime is scoped, observable, removed on omission and retained on fetch/parse failure", async () => {
+    responses.set("/fast.json", { schema: "agent-provisioning/v1", items: [],
+      runtime: { codex: { fast_mode: true } } });
+    await runInWorkspace("fast-agent", async () => {
+      registerManifestUrl(`${baseUrl}/fast.json`);
+      assert.equal(getProvisionedRuntimeConfig().codexFastMode, false);
+      assert.equal((await syncNow()).runtime.codex.fast_mode, true);
+      responses.set("/fast.json", { schema: "agent-provisioning/v1", items: [],
+	runtime: { codex: { fast_mode: "true" } } });
+      await assert.rejects(syncNow(), { code: "invalid_manifest" });
+      assert.equal(getProvisionedRuntimeConfig().codexFastMode, true);
+      responses.delete("/fast.json");
+      await assert.rejects(syncNow());
+      assert.equal(getProvisionedRuntimeConfig().codexFastMode, true);
+    });
+    await runInWorkspace("normal-agent", async () => {
+      registerManifestUrl(serveManifest([]));
+      assert.equal((await syncNow()).runtime.codex.fast_mode, false);
+    });
+    assert.equal(getProvisionedRuntimeConfig().codexFastMode, false);
+    await runInWorkspace("fast-agent", async () => {
+      responses.set("/fast.json", { schema: "agent-provisioning/v1", items: [] });
+      assert.equal((await syncNow()).runtime.codex.fast_mode, false);
+      responses.set("/fast.json", { schema: "agent-provisioning/v1", items: [],
+	runtime: { codex: { fast_mode: true } } });
+      await syncNow();
+      registerManifestUrl(`${baseUrl}/replacement.json`);
+      assert.equal(getProvisionedRuntimeConfig().codexFastMode, false);
+    });
+  });
+
+  test("each Codex runner snapshots current runtime without changing other adapters", async () => {
+    registerManifestUrl(serveManifest([]));
+    responses.set("/provision.json", { schema: "agent-provisioning/v1", items: [],
+      runtime: { codex: { fast_mode: true } } });
+    await syncNow();
+    const spec = resolvePaperclipModel("paperclip/codex_local")!.spec;
+    const originalExecute = spec.execute;
+    const captured: unknown[] = [];
+    spec.execute = async (context) => {
+      captured.push(context.config.fastMode);
+      return { exitCode: 0, signal: null, timedOut: false };
+    };
+    try {
+      const first = createRunner("paperclip/codex_local");
+      responses.set("/provision.json", { schema: "agent-provisioning/v1", items: [],
+	runtime: { codex: { fast_mode: false } } });
+      await syncNow();
+      const second = createRunner("paperclip/codex_local");
+      responses.delete("/provision.json");
+      for (const runner of [first, second]) {
+	const closed = new Promise<void>((resolve) => runner.once("close", () => resolve()));
+	await runner.start("test", {});
+	await closed;
+      }
+      assert.deepEqual(captured, [true, false]);
+      for (const model of ["codex_local", "codex_custom", "claude_local"]) {
+	assert.equal(resolvePaperclipModel(`paperclip/${model}`)!.spec.baseConfig.fastMode, undefined);
+      }
+    } finally {
+      spec.execute = originalExecute;
+    }
   });
 
   function serveManifest(items: object[]): string {
@@ -3365,7 +3431,7 @@ describe("provision sync", () => {
     });
     const first = serveSkill("/first.tgz", "first");
     const second = serveSkill("/second.tgz", "second");
-    responses.set("/first.json", { schema: "agent-provisioning/v1", items: [{ type: "skill", name: "first", ...first }] });
+    responses.set("/first.json", { schema: "agent-provisioning/v1", runtime: { codex: { fast_mode: true } }, items: [{ type: "skill", name: "first", ...first }] });
     responses.set("/second.json", { schema: "agent-provisioning/v1", items: [{ type: "skill", name: "second", ...second }] });
     let release!: () => void;
     responseGates.set("/first.tgz", new Promise<void>((resolve) => { release = resolve; }));
@@ -3378,6 +3444,7 @@ describe("provision sync", () => {
     await Promise.all([firstSync, switched]);
 
     assert.equal(getStatus().manifest_url, `${baseUrl}/second.json`);
+    assert.equal(getProvisionedRuntimeConfig().codexFastMode, false);
     assert.equal(firstExposed, false);
     assert.equal(existsSync(path.join(skillsDir, "first")), false);
     assert.equal(existsSync(path.join(skillsDir, "second", "SKILL.md")), true);
@@ -3393,7 +3460,7 @@ describe("provision sync", () => {
     });
     const first = serveSkill("/first.tgz", "first");
     const second = serveSkill("/second.tgz", "second");
-    responses.set("/first.json", { schema: "agent-provisioning/v1", items: [{ type: "skill", name: "first", ...first }] });
+    responses.set("/first.json", { schema: "agent-provisioning/v1", runtime: { codex: { fast_mode: true } }, items: [{ type: "skill", name: "first", ...first }] });
     responses.set("/second.json", { schema: "agent-provisioning/v1", items: [{ type: "skill", name: "second", ...second }] });
     let release!: () => void;
     responseGates.set("/first.json", new Promise<void>((resolve) => { release = resolve; }));
@@ -3405,6 +3472,7 @@ describe("provision sync", () => {
     release();
     await Promise.all([firstSync, switched]);
 
+    assert.equal(getProvisionedRuntimeConfig().codexFastMode, false);
     assert.equal(firstExposed, false);
     assert.equal(existsSync(path.join(skillsDir, "first")), false);
     assert.equal(existsSync(path.join(skillsDir, "second", "SKILL.md")), true);

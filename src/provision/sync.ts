@@ -108,6 +108,7 @@ export interface ProvisionStatusView {
   last_error: string | null;
   workspace_id: string | null;
   data: ProvisionItemView[];
+  runtime: { codex: { fast_mode: boolean } };
 }
 
 const DEFAULT_REFETCH_MS = 60 * 60_000;
@@ -156,6 +157,7 @@ function installedSource(
 let enabled = false;
 let autoApply: "auto" | "approve" = "approve";
 interface WorkspaceRuntime {
+  codexFastMode: boolean;
   manifestPersistenceKeys: string[];
   manifestUrl: string | null;
   lastManifest: ProvisionManifest | null;
@@ -189,6 +191,7 @@ let warnedNamedWorkspaceOverrides = false;
 
 function freshRuntime(): WorkspaceRuntime {
   return {
+    codexFastMode: false,
     manifestPersistenceKeys: [],
     manifestUrl: null,
     lastManifest: null,
@@ -664,6 +667,7 @@ export function registerManifestUrl(url: string, options: { persist?: boolean } 
     workspace.manifestGeneration += 1;
     // Approvals are consent to the manifest currently registered. A previously
     // fetched manifest must not authorize names while the replacement is pending.
+    workspace.codexFastMode = false;
     workspace.lastManifest = null;
     workspace.lastManifestGeneration = null;
     if (workspace.inFlight) workspace.syncRequested = true;
@@ -2867,7 +2871,9 @@ async function runSync(generation: number): Promise<ProvisionStatusView> {
   state.revoked = state.revoked.filter((key) => desired.has(key));
   state.adopted = (state.adopted ?? []).filter((key) => desired.has(key));
 
+  assertCurrentGeneration(generation);
   saveState(state);
+  workspace.codexFastMode = manifest.runtime?.codex?.fastMode ?? false;
   workspace.itemViews = views;
   workspace.lastSyncAt = new Date().toISOString();
   workspace.lastError = null;
@@ -2906,6 +2912,11 @@ export async function syncNow(): Promise<ProvisionStatusView> {
   return workspace.inFlight;
 }
 
+/** Read the workspace cache; initial workspace access may schedule its startup sync. */
+export function getProvisionedRuntimeConfig(): Readonly<{ codexFastMode: boolean }> {
+  return { codexFastMode: enabled && !perUserWorkers ? runtime().codexFastMode : false };
+}
+
 export function getStatus(): ProvisionStatusView {
   const workspace = runtime();
   return {
@@ -2917,6 +2928,7 @@ export function getStatus(): ProvisionStatusView {
     last_error: workspace.lastError,
     workspace_id: currentWorkspaceId() ?? null,
     data: [...workspace.itemViews],
+    runtime: { codex: { fast_mode: getProvisionedRuntimeConfig().codexFastMode } },
   };
 }
 

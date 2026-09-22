@@ -31,6 +31,7 @@ export interface GitProvisionSource {
 export interface ProvisionManifest {
   schema: "agent-provisioning/v1";
   items: ProvisionItem[];
+  runtime?: { codex?: { fastMode?: boolean } };
 }
 
 /**

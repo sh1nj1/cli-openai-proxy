@@ -12,6 +12,7 @@ import {
   type OutputMode,
 } from "./paperclip-runner.js";
 import type { AgentRunner } from "./agent-runner.js";
+import { getProvisionedRuntimeConfig } from "../provision/sync.js";
 import { commandRuns } from "../cli/command.js";
 
 export interface PaperclipModelSpec {
@@ -248,7 +249,10 @@ export function createRunner(model: string): AgentRunner {
     throw new UnknownPaperclipModelError(model, PAPERCLIP_MODEL_IDS);
   }
   const { spec, cliModel } = resolved;
-  return new PaperclipRunner(spec.execute, spec.baseConfig, {
+  const baseConfig = spec.adapterType === "codex_local"
+    ? { ...spec.baseConfig, fastMode: getProvisionedRuntimeConfig().codexFastMode }
+    : spec.baseConfig;
+  return new PaperclipRunner(spec.execute, baseConfig, {
     model: cliModel,
     promptInjection: spec.promptInjection,
     outputMode: spec.outputMode,
