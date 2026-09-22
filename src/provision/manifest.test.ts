@@ -436,3 +436,17 @@ describe("provision manifest", () => {
     await result;
   });
 });
+
+test("runtime accepts only the typed Codex fast mode contract", () => {
+  for (const fast_mode of [true, false]) {
+    assert.deepEqual(parseManifest({ ...valid(), runtime: { codex: { fast_mode } } }).runtime,
+      { codex: { fastMode: fast_mode } });
+  }
+  assert.equal(parseManifest(valid()).runtime, undefined);
+  for (const runtime of [null, [], true, { codex: null }, { codex: [] },
+    { codex: { fast_mode: "true" } }, { codex: { fast_mode: 1 } },
+    { codex: { fast_mode: null } }, { codex: { extraArgs: [] } },
+    { codex: { service_tier: "fast" } }, { extraArgs: [] }]) {
+    assert.equal(codeOf(() => parseManifest({ ...valid(), runtime })), "invalid_manifest");
+  }
+});

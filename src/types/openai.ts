@@ -3,6 +3,8 @@
  * Used for Clawdbot integration
  */
 
+import type { ToolEvent } from "../adapter/tool-events.js";
+
 export interface OpenAIContentPart {
   type: "text" | "image_url";
   text?: string;
@@ -28,6 +30,11 @@ export interface OpenAIChatRequest {
   user?: string; // Used for session mapping
   /** OpenAI reasoning control. Only adapters that run a reasoning model act on it. */
   reasoning_effort?: string;
+  /**
+   * Proxy extension. "reasoning" surfaces the tool calls/results the CLI already ran
+   * as `reasoning_content` (plus structured `x_cli_events`); default "off".
+   */
+  x_cli_events?: "off" | "reasoning";
 }
 
 export interface OpenAIChatResponseChoice {
@@ -35,6 +42,8 @@ export interface OpenAIChatResponseChoice {
   message: {
     role: "assistant";
     content: string;
+    reasoning_content?: string;
+    x_cli_events?: ToolEvent[];
   };
   finish_reason: "stop" | "length" | "content_filter" | null;
 }
@@ -58,6 +67,8 @@ export interface OpenAIChatResponse {
 export interface OpenAIChatChunkDelta {
   role?: "assistant";
   content?: string;
+  reasoning_content?: string;
+  x_cli_events?: ToolEvent[];
 }
 
 export interface OpenAIChatChunkChoice {

@@ -8,18 +8,22 @@
  * single `item.completed` line once that message is fully generated (there are no
  * token deltas), so each completed agent_message block is the natural streaming unit.
  * Terminal usage/errors come from the adapter's normalized result, so this parser
- * only surfaces the incremental answer text.
+ * only surfaces the incremental answer text and the item lifecycle (tool activity).
  */
+import type { CodexItem } from "./tool-events.js";
+
 export interface CodexJsonlSink {
   /** One completed agent_message block's text (one call per `item.completed`). */
   onAgentMessage(text: string): void;
+  /** Every item.started / item.completed, agent_message included; the sink picks what it surfaces. */
+  onItem?(phase: "call" | "result", item: CodexItem): void;
   /** A stdout line that is not codex JSONL (e.g. the "Reading … stdin" notice). */
   onRaw?(line: string): void;
 }
 
 interface CodexEvent {
   type?: string;
-  item?: { type?: string; text?: unknown };
+  item?: CodexItem & { text?: unknown };
 }
 
 export class CodexJsonlParser {
@@ -52,6 +56,9 @@ export class CodexJsonlParser {
     } catch {
       this.sink.onRaw?.(trimmed);
       return;
+    }
+    if ((event.type === "item.started" || event.type === "item.completed") && event.item) {
+      this.sink.onItem?.(event.type === "item.started" ? "call" : "result", event.item);
     }
     if (
       event.type === "item.completed"

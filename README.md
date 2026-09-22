@@ -181,6 +181,13 @@ walkthrough: [docs/paperclip-adapters.md](docs/paperclip-adapters.md#collavre-in
 - **Streaming** — SSE deltas as the CLI produces output. Send
   `"stream_options": {"include_usage": true}` to get the OpenAI terminal usage
   chunk (empty `choices`) just before `[DONE]`
+- **Tool trace** — send `"x_cli_events": "reasoning"` to see the tool calls the
+  CLI ran (commands, file edits, MCP calls) and their results. They arrive as
+  `delta.reasoning_content` (streaming) or `message.reasoning_content`, which
+  reasoning-aware UIs such as OpenWebUI already render, with the structured events
+  alongside in `x_cli_events`. `content` stays the bare answer, so JSON mode is
+  unaffected. They are not sent as `tool_calls`: the CLI has already run the
+  tools, so there is nothing left for the client to execute. Off by default
 - **Cache-aware token counts** — `prompt_tokens` covers the whole prompt, cache
   reads included, with the cached share broken out as
   `usage.prompt_tokens_details.cached_tokens`
@@ -603,6 +610,9 @@ src/
 - Every run gets a fresh temporary working directory
 - CLIs run with approvals bypassed — **anyone who can call `/v1/chat/completions`
   can run code on the host.** Set `API_KEYS` on any non-loopback bind
+- The opt-in tool trace (`x_cli_events`) caps each input/output at 4 KB (UTF-8 bytes) and
+  rewrites the proxy user's home directory to `~`. Otherwise it returns what the
+  tools read, which a caller could already get by asking for it in the answer
 - Proxy access keys and user-identity secrets are captured before startup
   preflight and removed from every CLI subprocess environment
 - Per-user mode never trusts the OpenAI `user` field, and never falls back to a

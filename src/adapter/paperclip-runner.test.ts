@@ -1038,3 +1038,46 @@ for (const baseEffort of [undefined, "medium"]) {
     }
   });
 }
+
+test("stream-json mode emits a tool_event for each tool_use and tool_result", async () => {
+  const fakeExecute: AdapterExecute = async (ctx) => {
+    await ctx.onLog("stdout", JSON.stringify({ type: "assistant", message: {
+      content: [{ type: "tool_use", id: "t1", name: "Bash", input: { command: "ls" } }] } }) + "\n");
+    await ctx.onLog("stdout", JSON.stringify({ type: "user", message: {
+      content: [{ type: "tool_result", tool_use_id: "t1", content: "a.txt" }] } }) + "\n");
+    await ctx.onLog("stdout", resultLine);
+    return { exitCode: 0, signal: null, timedOut: false, sessionId: "s", usage: { inputTokens: 5, outputTokens: 1 } };
+  };
+  const runner = new PaperclipRunner(fakeExecute, { engine: "cli", command: "claude" });
+  const events: unknown[] = [];
+  const closed = new Promise<void>((resolve) => {
+    runner.on("tool_event", (e: unknown) => events.push(e));
+    runner.on("close", () => resolve());
+  });
+  await runner.start("hi", {});
+  await closed;
+  assert.deepEqual(events, [
+    { id: "t1", phase: "call", name: "Bash", input: { command: "ls" } },
+    { id: "t1", phase: "result", name: "Bash", output: "a.txt", ok: true },
+  ]);
+});
+
+test("codex-jsonl mode emits tool_events for tool items but not agent messages", async () => {
+  const fakeExecute: AdapterExecute = async (ctx) => {
+    await ctx.onLog("stdout", codexLine({ type: "item.started", item: { id: "i1", type: "command_execution", command: "ls" } }));
+    await ctx.onLog("stdout", codexLine({ type: "item.completed",
+      item: { id: "i1", type: "command_execution", command: "ls", aggregated_output: "a.txt\n", exit_code: 0, status: "completed" } }));
+    await ctx.onLog("stdout", codexAgentMessage("done"));
+    return { exitCode: 0, signal: null, timedOut: false, sessionId: "s", summary: "done", usage: { inputTokens: 1, outputTokens: 1 } };
+  };
+  const runner = new PaperclipRunner(fakeExecute, { engine: "cli", command: "codex" },
+    { promptInjection: "prompt-template", outputMode: "codex-jsonl", cliFlags: [] });
+  const events: Array<{ phase: string; name: string }> = [];
+  const closed = new Promise<void>((resolve) => {
+    runner.on("tool_event", (e: { phase: string; name: string }) => events.push(e));
+    runner.on("close", () => resolve());
+  });
+  await runner.start("hi", {});
+  await closed;
+  assert.deepEqual(events.map((e) => [e.phase, e.name]), [["call", "command_execution"], ["result", "command_execution"]]);
+});

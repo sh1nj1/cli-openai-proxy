@@ -16,7 +16,7 @@ export interface RunnerOptions {
 
 /**
  * Agent-agnostic execution contract consumed by the OpenAI-compatible routes.
- * Implementations emit content_delta/result/error/close events.
+ * Implementations emit content_delta/tool_event/result/error/close events.
  */
 export interface AgentRunner extends EventEmitter {
   start(prompt: string, options: RunnerOptions): Promise<void>;

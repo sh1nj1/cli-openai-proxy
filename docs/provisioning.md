@@ -43,6 +43,45 @@ enabling a manifest that contains `git` sources.
 | `PROVISION_WORKSPACE_ROOT` | Named workspace parent. Default `<worker HOME>/workspaces`. |
 | `PROVISION_MAX_WORKSPACES_PER_USER` | Maximum named workspaces per worker/user. Default `32`; existing on-disk workspaces count toward the limit. |
 
+## Codex Fast mode
+
+Collavre can configure `paperclip/codex_local` through the same manifest:
+
+```json
+{
+  "schema": "agent-provisioning/v1",
+  "runtime": { "codex": { "fast_mode": true } },
+  "items": []
+}
+```
+
+Register its URL through `provisioning_url` at authentication or
+`POST /v1/provision/manifest` with `{"url":"https://example.com/provision.json"}`.
+After changing the manifest, call `POST /v1/provision/sync`, or wait for the
+configured refetch interval. No manifest or Fast setting is sent with each
+`/v1/chat/completions` request.
+
+`fast_mode` accepts only a JSON boolean. Unknown runtime fields are rejected
+with `invalid_manifest`; arbitrary CLI arguments and environment variables are
+not accepted. Runtime settings apply after a completed sync, independently of
+item approval (`PROVISION_AUTOAPPLY` governs artifact installation only).
+Per-item installation failures remain visible in `data` and do not prevent
+runtime application when the sync itself completes.
+
+`GET /v1/provision` reports the current setting in `runtime.codex.fast_mode`.
+Each new runner snapshots that workspace's setting; active runners retain their
+original setting. Other adapters, including `paperclip/codex_custom`, are
+unaffected. The Paperclip adapter controls model support and may ignore Fast
+mode for unsupported models; the status reports configuration, not a guarantee
+of the service tier delivered by the provider.
+
+An omitted field or `false` disables the provisioned Fast request. Failed
+fetches or invalid manifests retain the last applied value. Registering a
+different URL clears the old value immediately. Settings live in memory:
+restart clears them to `false` until the registered manifest is fetched again.
+The proxy passes `fastMode` to the adapter; CLI-local configuration still has
+its own defaults when Fast mode is not requested.
+
 ## Per-user scope (worker mode)
 
 Where the engine runs depends on deployment mode, not on any new flag:
