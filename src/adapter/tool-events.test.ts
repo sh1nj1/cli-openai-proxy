@@ -5,6 +5,7 @@ import {
   ClaudeToolEventExtractor,
   codexItemToToolEvent,
   formatToolEvent,
+  maskHome,
   TOOL_EVENT_MAX_BYTES,
 } from "./tool-events.js";
 
@@ -53,6 +54,14 @@ test("masks the home directory and truncates oversized output", () => {
   assert.match(result.output!, /\[truncated 10 bytes\]$/);
 });
 
+test("masks a Windows home in raw text and in JSON-escaped form", () => {
+  const home = "C:\\Users\\alice";
+  assert.equal(maskHome(`${home}\\a.txt`, home), "~\\a.txt");
+  const json = JSON.stringify({ file_path: `${home}\\a.txt` });
+  assert.equal(maskHome(json, home), JSON.stringify({ file_path: "~\\a.txt" }));
+  assert.doesNotMatch(maskHome(json, home), /alice/);
+});
+
 test("caps by UTF-8 bytes and never splits a multibyte character", () => {
   const x = new ClaudeToolEventExtractor();
   // 3 bytes per char: 4096 is not a multiple of 3, so a naive byte cut would land mid-character.
@@ -95,6 +104,9 @@ test("codex: file_change and mcp_tool_call normalize; agent chatter is not a too
   });
   assert.equal(mcp?.name, "gh.search");
   assert.equal(mcp?.ok, true);
+  const search = { id: "i5", type: "web_search", query: "q" };
+  assert.equal(codexItemToToolEvent("result", { ...search, status: "completed" })!.ok, true);
+  assert.equal(codexItemToToolEvent("result", { ...search, status: "failed" })!.ok, false);
   assert.equal(codexItemToToolEvent("result", { id: "i3", type: "agent_message" }), null);
   assert.equal(codexItemToToolEvent("result", { id: "i4", type: "reasoning" }), null);
 });

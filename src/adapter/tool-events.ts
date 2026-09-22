@@ -24,10 +24,17 @@ export interface ToolEvent {
 
 const HOME = homedir();
 
-function mask(text: string): string {
+/** @internal exported for tests — `home` lets a POSIX test run exercise a Windows home. */
+export function maskHome(text: string, home = HOME): string {
   // The absolute home path names the OS user running the proxy; callers only need the relative shape.
-  return HOME && HOME !== "/" ? text.split(HOME).join("~") : text;
+  if (!home || home === "/") return text;
+  // Inputs and non-string results are masked after JSON.stringify, which doubles Windows backslashes.
+  const escaped = JSON.stringify(home).slice(1, -1);
+  const masked = escaped === home ? text : text.split(escaped).join("~");
+  return masked.split(home).join("~");
 }
+
+const mask = (text: string): string => maskHome(text);
 
 function clip(text: string): string {
   const masked = mask(text);
@@ -161,7 +168,7 @@ export function codexItemToToolEvent(phase: "call" | "result", item: CodexItem):
         } : {}),
       });
     case "web_search":
-      return compact({ ...base, input: clipInput({ query: item.query }), ...(phase === "result" ? { ok: true } : {}) });
+      return compact({ ...base, input: clipInput({ query: item.query }), ...(phase === "result" ? { ok: item.status !== "failed" } : {}) });
     default:
       return compact({ ...base, ...(phase === "result" ? { ok: item.status !== "failed" } : {}) });
   }
