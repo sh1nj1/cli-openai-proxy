@@ -18,6 +18,7 @@ import {
   extractJsonFromText,
 } from "../adapter/cli-to-openai.js";
 import type { OpenAIChatRequest } from "../types/openai.js";
+import { formatToolEvent, type ToolEvent } from "../adapter/tool-events.js";
 import type { ClaudeCliResult, ClaudeCliStreamEvent } from "../types/claude-cli.js";
 import { usageTracker, displayCostUsd } from "../usage/tracker.js";
 import { isAuthEnabled, requestIsTrusted } from "./auth.js";
@@ -34,6 +35,17 @@ function authUiPath(req: Request, engine: string | undefined): string | undefine
   const available = (role === "gateway" && req.app.locals.authUiEnabled === true)
     || (role === "worker" && req.headers[AUTH_UI_AVAILABLE_HEADER] === "1");
   return available ? `${AUTH_UI_PATH}?engine=${encodeURIComponent(engine)}` : undefined;
+}
+
+/** Prints a result's call line too when that call never streamed on its own. */
+class ToolEventNarrator {
+  private readonly called = new Set<string>();
+
+  narrate(event: ToolEvent): string {
+    const seen = this.called.has(event.id);
+    this.called.add(event.id);
+    return formatToolEvent(event, event.phase === "result" && !seen);
+  }
 }
 
 /**
@@ -64,6 +76,19 @@ export async function handleChatCompletions(
       return;
     }
 
+    const cliEvents = body.x_cli_events ?? "off";
+    if (cliEvents !== "off" && cliEvents !== "reasoning") {
+      res.status(400).json({
+        error: {
+          message: `x_cli_events must be "off" or "reasoning"`,
+          type: "invalid_request_error",
+          code: "invalid_x_cli_events",
+        },
+      });
+      return;
+    }
+    const surfaceTools = cliEvents === "reasoning";
+
     // Materialize any image_url parts to local temp files (data URLs) or inline
     // links (http URLs) BEFORE conversion, so every adapter sees them uniformly.
     // cleanup removes the per-request temp files once the response completes.
@@ -74,9 +99,9 @@ export async function handleChatCompletions(
       const subprocess = runnerFactory.create(requestedModel);
 
       if (stream) {
-        await handleStreamingResponse(req, res, subprocess, cliInput, requestId, requestedModel, startTime, cliInput.jsonMode, body.stream_options?.include_usage === true);
+        await handleStreamingResponse(req, res, subprocess, cliInput, requestId, requestedModel, startTime, cliInput.jsonMode, body.stream_options?.include_usage === true, surfaceTools);
       } else {
-	await handleNonStreamingResponse(req, res, subprocess, cliInput, requestId, requestedModel, startTime, cliInput.jsonMode);
+	await handleNonStreamingResponse(req, res, subprocess, cliInput, requestId, requestedModel, startTime, cliInput.jsonMode, surfaceTools);
       }
     } finally {
       await cleanup();
@@ -152,7 +177,8 @@ async function handleStreamingResponse(
   requestedModel: string,
   startTime: number,
   jsonMode?: boolean,
-  includeUsage = false
+  includeUsage = false,
+  surfaceTools = false
 ): Promise<void> {
   // Set SSE headers
   res.setHeader("Content-Type", "text/event-stream");
@@ -231,6 +257,34 @@ async function handleStreamingResponse(
         }
       }
     });
+
+    // reasoning_content rather than content: the CLI already ran these tools, so
+    // they must not read as tool_calls for the client to execute, and content has
+    // to stay the bare answer for JSON mode and programmatic consumers.
+    if (surfaceTools) {
+      const narrated = new ToolEventNarrator();
+      subprocess.on("tool_event", (event: ToolEvent) => {
+        if (res.writableEnded) return;
+        const chunk = {
+          id: `chatcmpl-${requestId}`,
+          object: "chat.completion.chunk",
+          created: Math.floor(Date.now() / 1000),
+          model: requestedModel,
+          choices: [{
+            index: 0,
+            delta: {
+              role: isFirst ? "assistant" : undefined,
+              reasoning_content: narrated.narrate(event),
+              x_cli_events: [event],
+            },
+            finish_reason: null,
+          }],
+          ...usagePlaceholder,
+        };
+        res.write(`data: ${JSON.stringify(chunk)}\n\n`);
+        isFirst = false;
+      });
+    }
 
     subprocess.on("result", (result: ClaudeCliResult) => {
       isComplete = true;
@@ -366,11 +420,22 @@ async function handleNonStreamingResponse(
   requestId: string,
   requestedModel: string,
   startTime: number,
-  jsonMode?: boolean
+  jsonMode?: boolean,
+  surfaceTools = false
 ): Promise<void> {
   return new Promise((resolve) => {
     let finalResult: ClaudeCliResult | null = null;
     let isComplete = false;
+    const toolEvents: ToolEvent[] = [];
+    let reasoning = "";
+
+    if (surfaceTools) {
+      const narrated = new ToolEventNarrator();
+      subprocess.on("tool_event", (event: ToolEvent) => {
+        toolEvents.push(event);
+        reasoning += narrated.narrate(event);
+      });
+    }
 
     // With the request timeout unbounded by default, a client that disconnects
     // (or an intermediary that times out) would otherwise leave the subprocess
@@ -439,7 +504,11 @@ async function handleNonStreamingResponse(
         // res.writable is false once the client has disconnected; skip the
         // write (usage is still recorded above) to avoid write-after-end.
         if (res.writable) {
-          res.json(cliResultToOpenai(finalResult, requestId, requestedModel, jsonMode));
+          const response = cliResultToOpenai(finalResult, requestId, requestedModel, jsonMode);
+          if (toolEvents.length > 0) {
+            Object.assign(response.choices[0].message, { reasoning_content: reasoning, x_cli_events: toolEvents });
+          }
+          res.json(response);
         }
       } else if (!res.headersSent && res.writable) {
         usageTracker.record({

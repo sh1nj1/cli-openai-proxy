@@ -554,3 +554,64 @@ test("non-streaming usage covers subagent runs", async () => {
     runnerFactory.create = orig;
   }
 });
+
+const toolExecute: AdapterExecute = async (ctx) => {
+  await ctx.onLog("stdout", JSON.stringify({ type: "assistant", message: {
+    content: [{ type: "tool_use", id: "t1", name: "Bash", input: { command: "ls" } }] } }) + "\n");
+  await ctx.onLog("stdout", JSON.stringify({ type: "user", message: {
+    content: [{ type: "tool_result", tool_use_id: "t1", content: "a.txt" }] } }) + "\n");
+  await ctx.onLog("stdout", deltaLine);
+  await ctx.onLog("stdout", resultLine);
+  return { exitCode: 0, signal: null, timedOut: false, sessionId: "s", usage: { inputTokens: 3, outputTokens: 1 } };
+};
+
+test("x_cli_events:reasoning streams tool activity as reasoning_content, leaving content untouched", async () => {
+  const body = await streamThroughFakeAdapter(
+    { model: "paperclip/claude_local", x_cli_events: "reasoning" },
+    toolExecute,
+  );
+  const deltas = sseChunks(body).map((c) => c.choices[0]?.delta ?? {});
+  const reasoning = deltas.filter((d) => d.reasoning_content);
+  assert.equal(reasoning.length, 2, "one chunk per call and per result");
+  assert.equal(reasoning[0].role, "assistant", "the first chunk opens the assistant turn");
+  assert.equal(reasoning.map((d) => d.reasoning_content).join(""), "🔧 Bash(ls)\n  ✓\n  │ a.txt\n");
+  assert.deepEqual(reasoning[1].x_cli_events, [{ id: "t1", phase: "result", name: "Bash", output: "a.txt", ok: true }]);
+  assert.equal(deltas.filter((d) => d.content).map((d) => d.content).join(""), "Yo");
+  assert.ok(reasoning.every((d) => d.content === undefined), "tool text never leaks into content");
+});
+
+test("tool activity stays hidden unless x_cli_events opts in", async () => {
+  const body = await streamThroughFakeAdapter({ model: "paperclip/claude_local" }, toolExecute);
+  assert.doesNotMatch(body, /reasoning_content|x_cli_events/);
+  assert.match(body, /"content":"Yo"/);
+});
+
+test("x_cli_events:reasoning attaches the trace to a non-streaming message", async () => {
+  const body = await streamThroughFakeAdapter(
+    { model: "paperclip/claude_local", stream: false, x_cli_events: "reasoning" },
+    toolExecute,
+  );
+  const message = JSON.parse(body).choices[0].message;
+  assert.equal(message.content, "Yo");
+  assert.equal(message.reasoning_content, "🔧 Bash(ls)\n  ✓\n  │ a.txt\n");
+  assert.equal(message.x_cli_events.length, 2);
+});
+
+test("an unknown x_cli_events value is a 400 before any CLI runs", async () => {
+  let ran = false;
+  const statuses: number[] = [];
+  const orig = runnerFactory.create;
+  runnerFactory.create = (model: string) => { ran = true; return orig(model); };
+  try {
+    const res = fakeRes();
+    const status = res.status;
+    res.status = ((code: number) => { statuses.push(code); return status(code); }) as typeof res.status;
+    await handleChatCompletions({ body: { model: "paperclip/claude_local", x_cli_events: "inline",
+      messages: [{ role: "user", content: "hi" }] } } as unknown as Request, res);
+    assert.deepEqual(statuses, [400]);
+    assert.match(res.body, /invalid_x_cli_events/);
+    assert.equal(ran, false);
+  } finally {
+    runnerFactory.create = orig;
+  }
+});
