@@ -71,3 +71,17 @@ test("ignores non-agent_message items (reasoning, command_execution)", () => {
   p.push(JSON.stringify({ type: "item.completed", item: { type: "command_execution", text: "ls" } }) + "\n");
   assert.deepEqual(messages, [], "only agent_message blocks stream as content");
 });
+
+test("surfaces item.started / item.completed lifecycle to onItem", () => {
+  const items: Array<[string, string | undefined]> = [];
+  const p = new CodexJsonlParser({
+    onAgentMessage: () => {},
+    onItem: (phase, item) => items.push([phase, item.type]),
+  });
+  p.push([
+    JSON.stringify({ type: "item.started", item: { id: "i1", type: "command_execution", command: "ls" } }),
+    JSON.stringify({ type: "item.completed", item: { id: "i1", type: "command_execution", exit_code: 0 } }),
+    agentMessage("done"),
+  ].join("\n") + "\n");
+  assert.deepEqual(items, [["call", "command_execution"], ["result", "command_execution"], ["result", "agent_message"]]);
+});

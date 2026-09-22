@@ -16,6 +16,7 @@ import { isSystemInit } from "../types/claude-cli.js";
 import type { AgentRunner, RunnerOptions } from "./agent-runner.js";
 import { StreamJsonParser, type StreamJsonSink } from "./stream-json-parser.js";
 import { CodexJsonlParser } from "./codex-jsonl-parser.js";
+import { ClaudeToolEventExtractor, codexItemToToolEvent, type CodexItem } from "./tool-events.js";
 import { adapterRunError, engineUnauthenticatedError } from "./adapter-error.js";
 import { coerceCodexReasoningEffort, prepareCodexCustomHome } from "./codex-custom-home.js";
 import { blankedProxySecrets, getBgWaitCeilingMs } from "../config.js";
@@ -327,6 +328,10 @@ export class PaperclipRunner extends EventEmitter implements AgentRunner {
         };
         this.emit("content_delta", delta);
       },
+      onItem: (phase: "call" | "result", item: CodexItem) => {
+        const event = codexItemToToolEvent(phase, item);
+        if (event) this.emit("tool_event", event);
+      },
       onRaw: (line: string) => this.emit("raw", line),
     };
   }
@@ -449,10 +454,12 @@ export class PaperclipRunner extends EventEmitter implements AgentRunner {
   }
 
   private buildSink(): StreamJsonSink {
+    const tools = new ClaudeToolEventExtractor();
     return {
       onMessage: (message) => {
         if (isSystemInit(message)) this.mainChainModel = message.model;
         this.emit("message", message);
+        for (const event of tools.extract(message)) this.emit("tool_event", event);
       },
       onContentDelta: (event) => this.emit("content_delta", event),
       onAssistant: (message) => this.emit("assistant", message),
