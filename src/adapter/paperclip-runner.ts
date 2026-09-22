@@ -110,6 +110,9 @@ export class PaperclipRunner extends EventEmitter implements AgentRunner {
     // One ID also names the custom Codex home, binding its config.toml to this
     // invocation rather than a mutable home shared with another completion.
     const runId = `run-${randomUUID()}`;
+    const reasoningEffort = typeof options.reasoningEffort === "string"
+      ? options.reasoningEffort.trim()
+      : undefined;
     const workspace = currentWorkspaceContext();
     if (workspace?.scoped) ensureWorkspaceRoot(workspace);
     const sharedPaperclipHome = workspace?.scoped
@@ -158,7 +161,7 @@ export class PaperclipRunner extends EventEmitter implements AgentRunner {
         // Unrecognised values fall back to the default rather than reaching the
         // config file, which codex would copy verbatim into the request for the
         // endpoint to reject as an opaque 400.
-        coerceCodexReasoningEffort(options.reasoningEffort),
+        coerceCodexReasoningEffort(reasoningEffort),
       );
     }
     // Each adapter emits a different stdout dialect: claude speaks stream-json
@@ -204,6 +207,17 @@ export class PaperclipRunner extends EventEmitter implements AgentRunner {
       promptTemplate = `{{context.${RAW_PROMPT_CONTEXT_KEY}}}`;
     }
 
+    const effortConfig: Record<string, unknown> = {};
+    // Preserve base settings when the CLI would ignore an unsupported value.
+    if (this.engine === "claude" && reasoningEffort &&
+        ["low", "medium", "high", "xhigh", "max"].includes(reasoningEffort)) {
+      effortConfig.effort = reasoningEffort;
+    } else if (this.engine === "codex") {
+      const effort = coerceCodexReasoningEffort(reasoningEffort);
+      if (effort) effortConfig.modelReasoningEffort = effort;
+    }
+    // codex_custom already receives its effort through its per-run config.toml.
+
     const ctx: AdapterExecutionContext = {
       // randomUUID (not Date.now()+pid): Paperclip keys per-run bookkeeping
       // (runningProcesses map, ${runId}.log) on runId, so concurrent runs in the
@@ -213,6 +227,7 @@ export class PaperclipRunner extends EventEmitter implements AgentRunner {
       runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null, taskKey: null },
       config: {
         ...this.baseConfig,
+        ...effortConfig,
         engine: "cli", // MUST pin CLI lane (adapter defaults to ACP)
         cwd: this.cwd,
         promptTemplate,

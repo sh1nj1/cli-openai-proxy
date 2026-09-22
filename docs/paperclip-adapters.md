@@ -13,6 +13,30 @@ anything after it is the CLI's model string. Registered adapters:
 
 All adapters run `engine: "cli"`. Option 1 is **stateless** (no session resume).
 
+## Per-request reasoning effort
+
+Set the top-level `reasoning_effort` in each `/v1/chat/completions` request:
+
+```json
+{
+  "model": "paperclip/claude_local/sonnet",
+  "messages": [{ "role": "user", "content": "Review this code" }],
+  "reasoning_effort": "high"
+}
+```
+
+`claude_local` forwards it as Paperclip `config.effort`; `codex_local` forwards
+it as `config.modelReasoningEffort`. Both streaming and non-streaming requests
+support it. An omitted, null, or blank value preserves the adapter's base setting,
+or the CLI default when no base setting exists. Overrides affect only that run.
+Claude accepts `low`, `medium`, `high`, `xhigh`, and `max`; Codex accepts `none`,
+`minimal`, `low`, `medium`, `high`, and `xhigh`. Surrounding whitespace is trimmed
+for all three adapters. Unrecognized values preserve the local adapter's base
+setting, or the CLI default when no base setting exists.
+`codex_custom` keeps its existing per-run config-file behavior and `medium`
+fallback described below. Model selection remains independent through the
+`paperclip/<adapter>/<cli-model>` suffix.
+
 ## `codex_local` vs `codex_custom`
 
 Same package, same CLI, same stdout dialect — the difference is which credential

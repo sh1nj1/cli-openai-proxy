@@ -5,7 +5,7 @@ import { EventEmitter } from "events";
 
 // Import the module under test AND the registry we will stub.
 import { handleChatCompletions } from "./routes.js";
-import { runnerFactory } from "../adapter/paperclip-registry.js";
+import { runnerFactory, resolvePaperclipModel } from "../adapter/paperclip-registry.js";
 import { usageTracker } from "../usage/tracker.js";
 import { PaperclipRunner, type AdapterExecute } from "../adapter/paperclip-runner.js";
 import { AUTH_UI_AVAILABLE_HEADER } from "../isolation/worker-protocol.js";
@@ -554,6 +554,49 @@ test("non-streaming usage covers subagent runs", async () => {
     runnerFactory.create = orig;
   }
 });
+
+for (const engine of ["claude", "codex"] as const) {
+  for (const stream of [false, true]) {
+    test(`${engine} request effort overrides defaults per request (stream=${stream})`, async () => {
+      const key = engine === "claude" ? "effort" : "modelReasoningEffort";
+      const otherKey = engine === "claude" ? "modelReasoningEffort" : "effort";
+      const baseConfig = { [key]: "medium" };
+      const configs: Record<string, unknown>[] = [];
+      const fakeExecute: AdapterExecute = async (ctx) => {
+        configs.push(ctx.config);
+        await ctx.onLog("stdout", deltaLine);
+        await ctx.onLog("stdout", resultLine);
+        return { exitCode: 0, signal: null, timedOut: false };
+      };
+      const original = runnerFactory.create;
+      runnerFactory.create = (model) => {
+        const resolved = resolvePaperclipModel(model)!;
+        return new PaperclipRunner(fakeExecute, baseConfig, {
+          engine: resolved.spec.authEngine, model: resolved.cliModel,
+        });
+      };
+      try {
+        for (const effort of ["high", "low", undefined, null, "", "   "]) {
+          const res = fakeRes();
+          await handleChatCompletions({ body: {
+            model: `paperclip/${engine === "claude" ? "claude" : "codex"}_local/test-model`,
+            messages: [{ role: "user", content: "hi" }], stream,
+            ...(effort === undefined ? {} : { reasoning_effort: effort }),
+          } } as Request, res);
+          assert.match(res.body, /Yo/);
+          if (stream) assert.match(res.body, /data: \[DONE\]/);
+        }
+        assert.deepEqual(configs.map((config) => config[key]),
+          ["high", "low", "medium", "medium", "medium", "medium"]);
+        assert.ok(configs.every((config) => !(otherKey in config)));
+        assert.ok(configs.every((config) => config.model === "test-model"));
+        assert.deepEqual(baseConfig, { [key]: "medium" });
+      } finally {
+        runnerFactory.create = original;
+      }
+    });
+  }
+}
 
 const toolExecute: AdapterExecute = async (ctx) => {
   await ctx.onLog("stdout", JSON.stringify({ type: "assistant", message: {
