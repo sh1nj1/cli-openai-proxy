@@ -203,6 +203,19 @@ export class PaperclipRunner extends EventEmitter implements AgentRunner {
       promptTemplate = `{{context.${RAW_PROMPT_CONTEXT_KEY}}}`;
     }
 
+    const reasoningEffort = typeof options.reasoningEffort === "string"
+      ? options.reasoningEffort.trim()
+      : undefined;
+    const effortConfig: Record<string, unknown> = {};
+    // Only override a base setting when this request supplies an effort.
+    if (this.engine === "claude" && reasoningEffort) {
+      effortConfig.effort = reasoningEffort;
+    } else if (this.engine === "codex") {
+      const effort = coerceCodexReasoningEffort(reasoningEffort);
+      if (effort) effortConfig.modelReasoningEffort = effort;
+    }
+    // codex_custom already receives its effort through its per-run config.toml.
+
     const ctx: AdapterExecutionContext = {
       // randomUUID (not Date.now()+pid): Paperclip keys per-run bookkeeping
       // (runningProcesses map, ${runId}.log) on runId, so concurrent runs in the
@@ -212,6 +225,7 @@ export class PaperclipRunner extends EventEmitter implements AgentRunner {
       runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null, taskKey: null },
       config: {
         ...this.baseConfig,
+        ...effortConfig,
         engine: "cli", // MUST pin CLI lane (adapter defaults to ACP)
         cwd: this.cwd,
         promptTemplate,

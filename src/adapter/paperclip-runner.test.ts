@@ -993,3 +993,22 @@ test("concurrent codex_custom runs retain the gateway paired with their credenti
     await rm(paperclipHome, { recursive: true, force: true });
   }
 });
+
+for (const engine of ["claude", "codex"]) {
+  test(`${engine} omits effort configuration when the request and base have none`, async () => {
+    let config: Record<string, unknown> | undefined;
+    const runner = new PaperclipRunner(async (ctx) => {
+      config = ctx.config;
+      return { exitCode: 0, signal: null, timedOut: false };
+    }, {}, { engine });
+    const closed = new Promise<void>((resolve, reject) => {
+      runner.once("close", resolve);
+      runner.once("error", reject);
+    });
+    await runner.start("hi", {});
+    await closed;
+    assert.ok(config);
+    assert.equal(Object.hasOwn(config, "effort"), false);
+    assert.equal(Object.hasOwn(config, "modelReasoningEffort"), false);
+  });
+}
