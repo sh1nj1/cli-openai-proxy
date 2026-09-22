@@ -109,7 +109,11 @@ export function runUsage(
         mainChainModel?: string;
       }
     | undefined,
-): ClaudeCliResult["usage"] {
+): ClaudeCliResult["usage"] | undefined {
+  if (!result?.usage && !Object.keys(result?.modelUsage ?? {}).length) return undefined;
+  const models = Object.values(result?.modelUsage ?? {});
+  const reported = (runKey: keyof ClaudeCliResult["usage"], modelKey: keyof ModelUsage) =>
+    result?.usage?.[runKey] !== undefined || models.some((usage) => usage?.[modelKey] !== undefined);
   const totals = aggregateRunTokens(
     result?.modelUsage,
     {
@@ -122,9 +126,9 @@ export function runUsage(
   );
 
   return {
-    input_tokens: totals.inputTokens,
-    output_tokens: totals.outputTokens,
-    cache_read_input_tokens: totals.cacheReadTokens,
-    cache_creation_input_tokens: totals.cacheWriteTokens,
+    input_tokens: reported("input_tokens", "inputTokens") ? totals.inputTokens : undefined,
+    output_tokens: reported("output_tokens", "outputTokens") ? totals.outputTokens : undefined,
+    cache_read_input_tokens: reported("cache_read_input_tokens", "cacheReadInputTokens") ? totals.cacheReadTokens : undefined,
+    cache_creation_input_tokens: reported("cache_creation_input_tokens", "cacheCreationInputTokens") ? totals.cacheWriteTokens : undefined,
   };
 }

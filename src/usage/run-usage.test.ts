@@ -97,3 +97,15 @@ test("keeps the all-or-nothing fallback when the run never named its main chain"
   assert.equal(usage?.cache_read_input_tokens, 5_000);
   assert.equal(usage?.cache_creation_input_tokens, 2_000);
 });
+
+test("does not invent cache counters when no source reported them", () => {
+  assert.equal(runUsage(undefined), undefined);
+  const usage = runUsage({ usage: { input_tokens: 5, output_tokens: 2 }, modelUsage: {} });
+  assert.equal(usage?.input_tokens, 5);
+  assert.equal(usage?.cache_read_input_tokens, undefined);
+  assert.equal(usage?.cache_creation_input_tokens, undefined);
+  const partial = runUsage({ usage: { cache_creation_input_tokens: 0 } });
+  assert.equal(partial?.input_tokens, undefined);
+  assert.equal(partial?.output_tokens, undefined);
+  assert.equal(partial?.cache_creation_input_tokens, 0);
+});
