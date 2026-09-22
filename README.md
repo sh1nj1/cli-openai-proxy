@@ -610,7 +610,7 @@ src/
 - Every run gets a fresh temporary working directory
 - CLIs run with approvals bypassed — **anyone who can call `/v1/chat/completions`
   can run code on the host.** Set `API_KEYS` on any non-loopback bind
-- The opt-in tool trace (`x_cli_events`) caps each input/output at 4 KB and
+- The opt-in tool trace (`x_cli_events`) caps each input/output at 4 KB (UTF-8 bytes) and
   rewrites the proxy user's home directory to `~`. Otherwise it returns what the
   tools read, which a caller could already get by asking for it in the answer
 - Proxy access keys and user-identity secrets are captured before startup

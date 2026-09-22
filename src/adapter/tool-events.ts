@@ -5,8 +5,8 @@
  */
 import { homedir } from "node:os";
 
-/** Tool output and input are file contents and command lines — cap what one event can carry. */
-export const TOOL_EVENT_MAX_CHARS = 4096;
+/** Tool output and input are file contents and command lines — cap what one event can carry (UTF-8 bytes). */
+export const TOOL_EVENT_MAX_BYTES = 4096;
 
 export interface ToolEvent {
   /** Pairs a call with its result (claude tool_use id / codex item id). */
@@ -31,15 +31,19 @@ function mask(text: string): string {
 
 function clip(text: string): string {
   const masked = mask(text);
-  if (masked.length <= TOOL_EVENT_MAX_CHARS) return masked;
-  return `${masked.slice(0, TOOL_EVENT_MAX_CHARS)}… [truncated ${masked.length - TOOL_EVENT_MAX_CHARS} chars]`;
+  const bytes = Buffer.from(masked, "utf8");
+  if (bytes.length <= TOOL_EVENT_MAX_BYTES) return masked;
+  // Back off to a character boundary so the cut never emits a replacement char.
+  let end = TOOL_EVENT_MAX_BYTES;
+  while (end > 0 && (bytes[end] & 0xc0) === 0x80) end--;
+  return `${bytes.subarray(0, end).toString("utf8")}… [truncated ${bytes.length - end} bytes]`;
 }
 
 function clipInput(input: unknown): unknown {
   if (input === undefined) return undefined;
   const json = JSON.stringify(input) ?? "";
   const masked = mask(json);
-  if (masked.length <= TOOL_EVENT_MAX_CHARS) {
+  if (Buffer.byteLength(masked, "utf8") <= TOOL_EVENT_MAX_BYTES) {
     try { return JSON.parse(masked); } catch { return masked; }
   }
   return clip(json);
@@ -177,20 +181,28 @@ function summarizeInput(input: unknown): string {
   return JSON.stringify(input);
 }
 
-/**
- * Human-readable line(s) for `reasoning_content`; the structured event rides alongside for machines.
- * `withCall` prints the call line for a result whose call never streamed (codex file_change has no item.started).
- */
-export function formatToolEvent(event: ToolEvent, withCall = false): string {
+export interface FormatOptions {
+  /** Short per-run tag (e.g. "#2") so a result can be paired with its call when others interleave. */
+  label?: string;
+  /**
+   * What to print above a result: "call" when its call never streamed (codex file_change has no
+   * item.started), "ref" when other events came between call and result, "none" when adjacent.
+   */
+  head?: "none" | "call" | "ref";
+}
+
+/** Human-readable line(s) for `reasoning_content`; the structured event rides alongside for machines. */
+export function formatToolEvent(event: ToolEvent, { label, head = "none" }: FormatOptions = {}): string {
   const indent = event.parentId ? "  " : "";
-  const callLine = `${indent}🔧 ${event.name}(${summarizeInput(event.input)})\n`;
+  const tag = label ? `${label} ` : "";
+  const callLine = `${indent}🔧 ${tag}${event.name}(${summarizeInput(event.input)})\n`;
   if (event.phase === "call") return callLine;
-  const head = withCall ? callLine : "";
+  const headLine = head === "call" ? callLine : head === "ref" ? `${indent}↳ ${tag}${event.name}\n` : "";
   const status = event.ok === false
     ? `✗${event.exitCode != null ? ` exit ${event.exitCode}` : ""}`
     : "✓";
   const output = event.output?.trim();
-  if (!output) return `${head}${indent}  ${status}\n`;
+  if (!output) return `${headLine}${indent}  ${status}\n`;
   const body = output.split("\n").map((line) => `${indent}  │ ${line}`).join("\n");
-  return `${head}${indent}  ${status}\n${body}\n`;
+  return `${headLine}${indent}  ${status}\n${body}\n`;
 }

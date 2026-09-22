@@ -37,14 +37,24 @@ function authUiPath(req: Request, engine: string | undefined): string | undefine
   return available ? `${AUTH_UI_PATH}?engine=${encodeURIComponent(engine)}` : undefined;
 }
 
-/** Prints a result's call line too when that call never streamed on its own. */
+/**
+ * Numbers calls so a result stays attributable when parallel calls interleave
+ * (call A → call B → result A), and prints a result's call line when that call never streamed.
+ */
 class ToolEventNarrator {
-  private readonly called = new Set<string>();
+  private readonly labels = new Map<string, string>();
+  private lastId: string | undefined;
 
   narrate(event: ToolEvent): string {
-    const seen = this.called.has(event.id);
-    this.called.add(event.id);
-    return formatToolEvent(event, event.phase === "result" && !seen);
+    let label = this.labels.get(event.id);
+    const seen = label !== undefined;
+    if (!label) {
+      label = `#${this.labels.size + 1}`;
+      this.labels.set(event.id, label);
+    }
+    const head = event.phase === "call" ? "none" : !seen ? "call" : this.lastId === event.id ? "none" : "ref";
+    this.lastId = event.id;
+    return formatToolEvent(event, { label, head });
   }
 }
 

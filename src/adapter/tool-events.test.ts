@@ -5,7 +5,7 @@ import {
   ClaudeToolEventExtractor,
   codexItemToToolEvent,
   formatToolEvent,
-  TOOL_EVENT_MAX_CHARS,
+  TOOL_EVENT_MAX_BYTES,
 } from "./tool-events.js";
 
 const assistantToolUse = (id: string, name: string, input: unknown, parent: string | null = null) => ({
@@ -48,16 +48,28 @@ test("masks the home directory and truncates oversized output", () => {
   const x = new ClaudeToolEventExtractor();
   const [call] = x.extract(assistantToolUse("t3", "Read", { file_path: `${homedir()}/secret.txt` }));
   assert.deepEqual(call.input, { file_path: "~/secret.txt" });
-  const [result] = x.extract(userToolResult("t3", "x".repeat(TOOL_EVENT_MAX_CHARS + 10)));
-  assert.ok(result.output!.startsWith("x".repeat(TOOL_EVENT_MAX_CHARS)));
-  assert.match(result.output!, /\[truncated 10 chars\]$/);
+  const [result] = x.extract(userToolResult("t3", "x".repeat(TOOL_EVENT_MAX_BYTES + 10)));
+  assert.ok(result.output!.startsWith("x".repeat(TOOL_EVENT_MAX_BYTES)));
+  assert.match(result.output!, /\[truncated 10 bytes\]$/);
+});
+
+test("caps by UTF-8 bytes and never splits a multibyte character", () => {
+  const x = new ClaudeToolEventExtractor();
+  // 3 bytes per char: 4096 is not a multiple of 3, so a naive byte cut would land mid-character.
+  const [result] = x.extract(userToolResult("t5", "한".repeat(TOOL_EVENT_MAX_BYTES)));
+  const kept = result.output!.replace(/… \[truncated \d+ bytes\]$/, "");
+  assert.equal(Buffer.byteLength(kept, "utf8"), 4095);
+  assert.equal(kept, "한".repeat(1365));
+  assert.match(result.output!, /\[truncated 8193 bytes\]$/);
+  const [call] = x.extract(assistantToolUse("t6", "Write", { content: "한".repeat(2000) }));
+  assert.equal(typeof call.input, "string", "6 KB of Hangul is over the cap even though it is under 4096 UTF-16 units");
 });
 
 test("truncates an oversized input into a string", () => {
   const x = new ClaudeToolEventExtractor();
-  const [call] = x.extract(assistantToolUse("t4", "Write", { content: "y".repeat(TOOL_EVENT_MAX_CHARS * 2) }));
+  const [call] = x.extract(assistantToolUse("t4", "Write", { content: "y".repeat(TOOL_EVENT_MAX_BYTES * 2) }));
   assert.equal(typeof call.input, "string");
-  assert.match(call.input as string, /\[truncated \d+ chars\]$/);
+  assert.match(call.input as string, /\[truncated \d+ bytes\]$/);
 });
 
 test("codex: command_execution carries command, output and exit code", () => {
@@ -94,8 +106,12 @@ test("formats calls, results and results whose call never streamed", () => {
     "  ✓\n  │ a\n  │ b\n",
   );
   assert.equal(
-    formatToolEvent({ id: "b", phase: "result", name: "command_execution", input: { command: "false" }, exitCode: 1, ok: false }, true),
+    formatToolEvent({ id: "b", phase: "result", name: "command_execution", input: { command: "false" }, exitCode: 1, ok: false }, { head: "call" }),
     "🔧 command_execution(false)\n  ✗ exit 1\n",
+  );
+  assert.equal(
+    formatToolEvent({ id: "a", phase: "result", name: "Bash", output: "a", ok: true }, { label: "#1", head: "ref" }),
+    "↳ #1 Bash\n  ✓\n  │ a\n",
   );
   assert.equal(
     formatToolEvent({ id: "c", phase: "call", name: "file_change", input: { changes: [{ path: "a.txt", kind: "add" }] }, parentId: "p" }),
