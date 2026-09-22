@@ -109,6 +109,9 @@ export class PaperclipRunner extends EventEmitter implements AgentRunner {
     // One ID also names the custom Codex home, binding its config.toml to this
     // invocation rather than a mutable home shared with another completion.
     const runId = `run-${randomUUID()}`;
+    const reasoningEffort = typeof options.reasoningEffort === "string"
+      ? options.reasoningEffort.trim()
+      : undefined;
     const workspace = currentWorkspaceContext();
     if (workspace?.scoped) ensureWorkspaceRoot(workspace);
     const sharedPaperclipHome = workspace?.scoped
@@ -157,7 +160,7 @@ export class PaperclipRunner extends EventEmitter implements AgentRunner {
         // Unrecognised values fall back to the default rather than reaching the
         // config file, which codex would copy verbatim into the request for the
         // endpoint to reject as an opaque 400.
-        coerceCodexReasoningEffort(options.reasoningEffort),
+        coerceCodexReasoningEffort(reasoningEffort),
       );
     }
     // Each adapter emits a different stdout dialect: claude speaks stream-json
@@ -203,12 +206,10 @@ export class PaperclipRunner extends EventEmitter implements AgentRunner {
       promptTemplate = `{{context.${RAW_PROMPT_CONTEXT_KEY}}}`;
     }
 
-    const reasoningEffort = typeof options.reasoningEffort === "string"
-      ? options.reasoningEffort.trim()
-      : undefined;
     const effortConfig: Record<string, unknown> = {};
-    // Only override a base setting when this request supplies an effort.
-    if (this.engine === "claude" && reasoningEffort) {
+    // Preserve base settings when the CLI would ignore an unsupported value.
+    if (this.engine === "claude" && reasoningEffort &&
+        ["low", "medium", "high", "xhigh", "max"].includes(reasoningEffort)) {
       effortConfig.effort = reasoningEffort;
     } else if (this.engine === "codex") {
       const effort = coerceCodexReasoningEffort(reasoningEffort);

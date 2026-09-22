@@ -913,6 +913,8 @@ test("codex_custom writes the requested reasoning effort, ignoring one codex wou
 
   try {
     assert.match(await configFor("high"), /^model_reasoning_effort = "high"$/m);
+    assert.match(await configFor(" high "), /^model_reasoning_effort = "high"$/m);
+    assert.match(await configFor("   "), /^model_reasoning_effort = "medium"$/m);
     assert.match(await configFor("xhigh"), /^model_reasoning_effort = "xhigh"$/m);
     // codex forwards an effort it does not know verbatim, so a caller's typo
     // would come back as an opaque upstream 400 instead of a run.
@@ -1010,5 +1012,29 @@ for (const engine of ["claude", "codex"]) {
     assert.ok(config);
     assert.equal(Object.hasOwn(config, "effort"), false);
     assert.equal(Object.hasOwn(config, "modelReasoningEffort"), false);
+  });
+}
+
+for (const baseEffort of [undefined, "medium"]) {
+  test(`claude preserves base effort ${baseEffort} for unsupported values`, async () => {
+    const baseConfig = baseEffort ? { effort: baseEffort } : {};
+    for (const requested of ["none", "minimal", "ludicrous", "low", "medium", "high", "xhigh", "max", " high "]) {
+      let config: Record<string, unknown> | undefined;
+      const runner = new PaperclipRunner(async (ctx) => {
+        config = ctx.config;
+        return { exitCode: 0, signal: null, timedOut: false };
+      }, baseConfig, { engine: "claude" });
+      const closed = new Promise<void>((resolve, reject) => {
+        runner.once("close", resolve);
+        runner.once("error", reject);
+      });
+      await runner.start("hi", { reasoningEffort: requested });
+      await closed;
+      assert.ok(config);
+      const unsupported = ["none", "minimal", "ludicrous"].includes(requested);
+      assert.equal(config.effort, unsupported ? baseEffort : requested.trim());
+      if (unsupported && !baseEffort) assert.equal(Object.hasOwn(config, "effort"), false);
+      assert.deepEqual(baseConfig, baseEffort ? { effort: baseEffort } : {});
+    }
   });
 }

@@ -29,8 +29,10 @@ Set the top-level `reasoning_effort` in each `/v1/chat/completions` request:
 it as `config.modelReasoningEffort`. Both streaming and non-streaming requests
 support it. An omitted, null, or blank value preserves the adapter's base setting,
 or the CLI default when no base setting exists. Overrides affect only that run.
-Claude validates nonblank effort values in its CLI; Codex accepts `none`,
-`minimal`, `low`, `medium`, `high`, and `xhigh`, ignoring unrecognized values.
+Claude accepts `low`, `medium`, `high`, `xhigh`, and `max`; Codex accepts `none`,
+`minimal`, `low`, `medium`, `high`, and `xhigh`. Surrounding whitespace is trimmed
+for all three adapters. Unrecognized values preserve the local adapter's base
+setting, or the CLI default when no base setting exists.
 `codex_custom` keeps its existing per-run config-file behavior and `medium`
 fallback described below. Model selection remains independent through the
 `paperclip/<adapter>/<cli-model>` suffix.
